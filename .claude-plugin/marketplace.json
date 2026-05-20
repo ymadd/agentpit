@@ -1,0 +1,13 @@
+{
+  "name": "agentpit",
+  "owner": {
+    "name": "yamato"
+  },
+  "plugins": [
+    {
+      "name": "agentpit",
+      "source": ".",
+      "description": "Route /agentpit:* slash commands and MCP tools to Gemini / Claude / Codex backends."
+    }
+  ]
+}

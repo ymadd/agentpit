@@ -1,0 +1,296 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio_util::sync::CancellationToken;
+
+use super::{install_ctrlc_cancel, load_context, noop_streamer, resolve_cwd};
+use crate::auth::{check_auth, is_auth_failure};
+use crate::dispatch::{Registries, dispatch, resolve_transport};
+use crate::types::{BackendId, Transport};
+
+pub struct MemberOutcome {
+    pub backend: BackendId,
+    pub transport: Option<Transport>,
+    pub output: Option<String>,
+    pub error: Option<String>,
+}
+
+pub fn render_concatenated(outcomes: &[MemberOutcome]) -> String {
+    let mut sections = Vec::with_capacity(outcomes.len());
+    for o in outcomes {
+        let transport = o
+            .transport
+            .map(|t| t.as_str().to_string())
+            .unwrap_or_else(|| "skipped".into());
+        let header = format!("=== {} (transport={transport}) ===", o.backend);
+        let body = if let Some(out) = &o.output {
+            out.trim().to_string()
+        } else if let Some(err) = &o.error {
+            format!("[error] {err}")
+        } else {
+            "(no output)".to_string()
+        };
+        sections.push(format!("{header}\n{body}"));
+    }
+    sections.join("\n\n")
+}
+
+pub fn build_aggregator_prompt(original: &str, outcomes: &[MemberOutcome]) -> String {
+    let mut lines = vec![
+        "You are aggregating independent responses from multiple coding agents to the user's original task.".to_string(),
+        "Synthesize one best answer. Note disagreements explicitly. Cite each source as [backend].".to_string(),
+        String::new(),
+        "# Original task".to_string(),
+        original.to_string(),
+        String::new(),
+        "# Responses".to_string(),
+    ];
+    for o in outcomes {
+        if let Some(out) = &o.output {
+            lines.push(String::new());
+            lines.push(format!("## [{}]", o.backend));
+            lines.push(out.trim().to_string());
+        } else if let Some(err) = &o.error {
+            lines.push(String::new());
+            lines.push(format!("## [{}] (failed)", o.backend));
+            lines.push(err.clone());
+        }
+    }
+    lines.join("\n")
+}
+
+async fn run_one_member(
+    backend: BackendId,
+    prompt: String,
+    cwd: PathBuf,
+    cancel: CancellationToken,
+    regs: Arc<Registries>,
+) -> MemberOutcome {
+    let transport = resolve_transport(backend, &regs);
+    if transport.is_none() {
+        return MemberOutcome {
+            backend,
+            transport: None,
+            output: None,
+            error: Some("not registered".into()),
+        };
+    }
+
+    let auth = check_auth(backend).await;
+    if !auth.ok {
+        return MemberOutcome {
+            backend,
+            transport: None,
+            output: None,
+            error: Some(format!("auth missing — {}", auth.hint)),
+        };
+    }
+
+    let on_chunk = noop_streamer();
+    match dispatch(backend, &prompt, &cwd, cancel, on_chunk, &regs).await {
+        Ok(res) => {
+            if is_auth_failure(&res.output) {
+                return MemberOutcome {
+                    backend,
+                    transport: Some(res.transport),
+                    output: None,
+                    error: Some("auth failure during execution".into()),
+                };
+            }
+            MemberOutcome {
+                backend,
+                transport: Some(res.transport),
+                output: Some(res.output),
+                error: None,
+            }
+        }
+        Err(err) => MemberOutcome {
+            backend,
+            transport,
+            output: None,
+            error: Some(format!("{err:#}")),
+        },
+    }
+}
+
+pub async fn run(
+    prompt: String,
+    members: Option<Vec<BackendId>>,
+    aggregator: Option<BackendId>,
+    cwd: Option<String>,
+) -> Result<()> {
+    run_with_defaults(prompt, members, aggregator, cwd, false).await
+}
+
+pub async fn run_with_defaults(
+    prompt: String,
+    members_override: Option<Vec<BackendId>>,
+    aggregator_override: Option<BackendId>,
+    cwd: Option<String>,
+    use_review_defaults: bool,
+) -> Result<()> {
+    let ctx = load_context()?;
+    let members = members_override.unwrap_or_else(|| {
+        if use_review_defaults {
+            ctx.loaded.config.ensemble.review_members.clone()
+        } else {
+            ctx.loaded.config.ensemble.default_members.clone()
+        }
+    });
+    let aggregator = aggregator_override.or({
+        if use_review_defaults {
+            ctx.loaded.config.ensemble.review_aggregator
+        } else {
+            ctx.loaded.config.ensemble.aggregator
+        }
+    });
+
+    let cwd = resolve_cwd(cwd)?;
+    let cancel = CancellationToken::new();
+    install_ctrlc_cancel(cancel.clone());
+
+    let regs = Arc::new(ctx.regs);
+
+    let mut handles = Vec::new();
+    for m in members {
+        let cwd_c = cwd.clone();
+        let cancel_c = cancel.clone();
+        let regs_c = regs.clone();
+        let prompt_c = prompt.clone();
+        let handle =
+            tokio::spawn(
+                async move { run_one_member(m, prompt_c, cwd_c, cancel_c, regs_c).await },
+            );
+        handles.push((m, handle));
+    }
+
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for (backend, h) in handles {
+        match h.await {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(join_err) => outcomes.push(MemberOutcome {
+                backend,
+                transport: None,
+                output: None,
+                error: Some(format!("task join error: {join_err}")),
+            }),
+        }
+    }
+
+    let member_section = render_concatenated(&outcomes);
+    let any_success = outcomes.iter().any(|o| o.output.is_some());
+
+    if let Some(aggregator_id) = aggregator {
+        if !any_success {
+            println!("{member_section}");
+            anyhow::bail!("no members succeeded — skipping aggregator");
+        }
+        let transport = resolve_transport(aggregator_id, &regs);
+        if transport.is_none() {
+            println!(
+                "{member_section}\n\n=== aggregator skipped ===\n{aggregator_id} not registered"
+            );
+            return Ok(());
+        }
+        let auth = check_auth(aggregator_id).await;
+        if !auth.ok {
+            println!(
+                "{member_section}\n\n=== aggregator skipped ===\nauth missing for {aggregator_id}: {}",
+                auth.hint
+            );
+            return Ok(());
+        }
+
+        let agg_prompt = build_aggregator_prompt(&prompt, &outcomes);
+        let on_chunk = noop_streamer();
+        match dispatch(
+            aggregator_id,
+            &agg_prompt,
+            &cwd,
+            cancel.clone(),
+            on_chunk,
+            &regs,
+        )
+        .await
+        {
+            Ok(res) => {
+                println!(
+                    "{member_section}\n\n=== aggregator [{aggregator_id}] (transport={}) ===\n{}",
+                    res.transport.as_str(),
+                    res.output.trim()
+                );
+            }
+            Err(err) => {
+                println!(
+                    "{member_section}\n\n=== aggregator failed ===\n{aggregator_id}: {err:#}"
+                );
+                anyhow::bail!("aggregator failed");
+            }
+        }
+        return Ok(());
+    }
+
+    println!("{member_section}");
+    if !any_success {
+        anyhow::bail!("no members produced output");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> Vec<MemberOutcome> {
+        vec![
+            MemberOutcome {
+                backend: BackendId::Gemini,
+                transport: Some(Transport::Exec),
+                output: Some("Looks fine.".into()),
+                error: None,
+            },
+            MemberOutcome {
+                backend: BackendId::Opencode,
+                transport: Some(Transport::Acp),
+                output: Some("Found 2 issues.".into()),
+                error: None,
+            },
+            MemberOutcome {
+                backend: BackendId::Claude,
+                transport: None,
+                output: None,
+                error: Some("auth missing".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn emits_section_per_outcome() {
+        let text = render_concatenated(&fixture());
+        assert!(text.contains("=== gemini (transport=exec) ==="));
+        assert!(text.contains("Looks fine."));
+        assert!(text.contains("=== opencode (transport=acp) ==="));
+        assert!(text.contains("Found 2 issues."));
+        assert!(text.contains("=== claude (transport=skipped) ==="));
+        assert!(text.contains("[error] auth missing"));
+    }
+
+    #[test]
+    fn aggregator_prompt_includes_responses() {
+        let text = build_aggregator_prompt("review src/", &fixture());
+        assert!(text.contains("# Original task"));
+        assert!(text.contains("review src/"));
+        assert!(text.contains("## [gemini]"));
+        assert!(text.contains("Looks fine."));
+        assert!(text.contains("## [opencode]"));
+        assert!(text.contains("Found 2 issues."));
+    }
+
+    #[test]
+    fn aggregator_prompt_marks_failed_members() {
+        let text = build_aggregator_prompt("review src/", &fixture());
+        assert!(text.contains("## [claude] (failed)"));
+        assert!(text.contains("auth missing"));
+    }
+}

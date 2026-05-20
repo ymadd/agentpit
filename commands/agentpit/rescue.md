@@ -1,17 +1,18 @@
 ---
-description: Delegate a one-shot task to a backend agent (Gemini or Claude)
+description: Delegate a one-shot task to a backend agent (Gemini / Claude / Codex / OpenCode)
 argument-hint: [backend?] <task>
 ---
 
 Parse `$ARGUMENTS`:
-- If the first whitespace-separated token is one of `gemini`, `claude`, `codex`, treat it as the backend override; the rest is the task.
+- If the first whitespace-separated token is one of `gemini`, `claude`, `codex`, `opencode`, treat it as the backend override; the rest is the task.
 - Otherwise, the entire `$ARGUMENTS` is the task and agentpit picks the default backend.
 
-Call the MCP tool `mcp__agentpit__rescue` with:
-- `task`: the parsed task string.
-- `backend`: the parsed backend if any (else omit).
-- `cwd`: the current working directory (absolute).
+Run the `agentpit` CLI via Bash:
 
-Stream chunks back to the user as they arrive via `notifications/progress`.
-After the tool returns, summarize the result in two short sentences if helpful;
-otherwise just relay the final text.
+```
+agentpit rescue "<task>" [--backend <id>]
+```
+
+Relay the streamed output back to the user verbatim. If the command exits non-zero,
+surface the error — it likely indicates an auth issue and agentpit will have already
+opened a Terminal window for the OAuth flow.

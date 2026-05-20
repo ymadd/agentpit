@@ -1,13 +1,17 @@
 ---
-description: Explain code via a backend agent (default route prefers Gemini for large context)
+description: Explain code via a backend agent (Gemini-first for long context)
 argument-hint: <target> [--deep]
 ---
 
 Parse `$ARGUMENTS`:
 - The leading argument is `target`.
-- If `--deep` is present, pass `depth: "deep"`, else default to `brief`.
+- If `--deep` is present, pass `--deep`.
 
-Call `mcp__agentpit__explain` with `{ target, depth, cwd }`.
+Run:
 
-Relay the explanation directly. If the user asked a follow-up,
-re-run `mcp__agentpit__explain` rather than answering yourself.
+```
+agentpit explain "<target>" [--deep]
+```
+
+Relay the explanation directly. If the user asks a follow-up,
+re-run `agentpit explain` rather than answering yourself.

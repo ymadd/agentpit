@@ -1,14 +1,17 @@
 ---
-description: Run a code review via a backend agent (default route prefers Claude)
+description: Multi-agent code review (defaults to gemini + opencode in parallel)
 argument-hint: <target> [--focus=<topic>]
 ---
 
 Parse `$ARGUMENTS`:
 - The first whitespace-separated token (or quoted string) is `target` (path, glob, or description).
-- Look for a `--focus=<value>` flag and pass it as `focus`.
+- Look for a `--focus=<value>` flag.
 
-Call `mcp__agentpit__review` with `{ target, focus?, cwd }`. Do not pass `backend`
-unless the user explicitly typed `--backend=<id>`.
+Run:
 
-When the tool returns, print findings grouped by severity (CRITICAL / HIGH / MEDIUM / LOW).
-If the backend says it cannot access files, surface that directly.
+```
+agentpit review "<target>" [--focus <focus>]
+```
+
+The CLI emits per-backend sections with `=== gemini (transport=exec) ===` style headers.
+Relay verbatim, and group CRITICAL / HIGH findings at the top if helpful.

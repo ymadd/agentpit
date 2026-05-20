@@ -1,9 +1,0 @@
-{
-  "name": "agentpit",
-  "version": "0.1.0",
-  "description": "agentpit — route Claude Code work to Gemini / Claude / (Codex) backends via /agentpit:* commands.",
-  "author": {
-    "name": "yamato"
-  },
-  "license": "Apache-2.0"
-}

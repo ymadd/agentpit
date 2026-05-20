@@ -1,0 +1,168 @@
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+use crate::types::BackendId;
+
+mod common;
+mod ensemble;
+mod explain;
+mod init;
+mod login;
+mod refactor;
+mod rescue;
+mod review;
+mod status;
+mod update;
+
+pub(crate) use common::{
+    install_ctrlc_cancel, load_context, noop_streamer, resolve_cwd, stdout_streamer,
+};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "agentpit",
+    version,
+    about = "Multi-agent hub CLI for Claude Code, Gemini, Codex, and OpenCode."
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Delegate a one-shot task to a backend.
+    Rescue {
+        /// Task description (positional). Quote multi-word tasks.
+        task: String,
+        /// Override target backend.
+        #[arg(long)]
+        backend: Option<BackendId>,
+        /// Working directory (defaults to current).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Disable auto-login on auth failure.
+        #[arg(long, default_value_t = false)]
+        no_auto_login: bool,
+    },
+
+    /// Run a multi-agent code review (defaults to gemini + opencode).
+    Review {
+        target: String,
+        #[arg(long)]
+        focus: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        members: Option<Vec<BackendId>>,
+        #[arg(long)]
+        aggregator: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+
+    /// Explain a target via a backend agent.
+    Explain {
+        target: String,
+        #[arg(long)]
+        deep: bool,
+        #[arg(long)]
+        backend: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+
+    /// Plan a refactor via a backend agent.
+    Refactor {
+        path: String,
+        goal: String,
+        #[arg(long)]
+        backend: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+
+    /// Fan a prompt out to multiple backends in parallel.
+    Ensemble {
+        prompt: String,
+        #[arg(long, value_delimiter = ',')]
+        members: Option<Vec<BackendId>>,
+        #[arg(long)]
+        aggregator: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+
+    /// Show config + backend transport + auth state.
+    Status {
+        #[arg(long)]
+        backend: Option<BackendId>,
+    },
+
+    /// Check or launch a backend's login flow.
+    Login {
+        backend: BackendId,
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Install slash commands and skills into ~/.claude.
+    Init {
+        /// Overwrite existing files.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Check for or install a newer agentpit release from GitHub.
+    Update {
+        /// Only check; do not download or replace the binary.
+        #[arg(long)]
+        check: bool,
+    },
+}
+
+pub async fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Command::Rescue {
+            task,
+            backend,
+            cwd,
+            no_auto_login,
+        } => rescue::run(task, backend, cwd, !no_auto_login).await,
+
+        Command::Review {
+            target,
+            focus,
+            members,
+            aggregator,
+            cwd,
+        } => review::run(target, focus, members, aggregator, cwd).await,
+
+        Command::Explain {
+            target,
+            deep,
+            backend,
+            cwd,
+        } => explain::run(target, deep, backend, cwd).await,
+
+        Command::Refactor {
+            path,
+            goal,
+            backend,
+            cwd,
+        } => refactor::run(path, goal, backend, cwd).await,
+
+        Command::Ensemble {
+            prompt,
+            members,
+            aggregator,
+            cwd,
+        } => ensemble::run(prompt, members, aggregator, cwd).await,
+
+        Command::Status { backend } => status::run(backend).await,
+
+        Command::Login { backend, check } => login::run(backend, check).await,
+
+        Command::Init { force } => init::run(force).await,
+
+        Command::Update { check } => update::run(check).await,
+    }
+}

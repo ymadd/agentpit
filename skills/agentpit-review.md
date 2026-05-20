@@ -1,0 +1,31 @@
+---
+name: agentpit-review
+description: Run a multi-agent code review (Gemini + OpenCode in parallel by default). Invoke when the user asks for a code review, audit, or second/third-opinion review of files, diffs, or designs.
+---
+
+# agentpit:review
+
+Use this skill when the user asks for a code review across multiple agents.
+
+## When to invoke
+
+- "Review src/foo.ts"
+- "Get a panel to audit this PR"
+- "Two opinions on this design"
+
+## How to invoke
+
+```bash
+agentpit review "<target>" [--focus <topic>] [--members <a,b,c>] [--aggregator <id>]
+```
+
+Defaults:
+- members: `gemini, opencode`
+- aggregator: none (members run in parallel and each section is shown separately)
+
+## Output
+
+Per-backend sections with `=== <backend> (transport=...) ===` headers. If `--aggregator` is set,
+a trailing `=== aggregator [<id>] ===` section is also produced.
+
+Relay the output verbatim. Group `CRITICAL` / `HIGH` findings at the top if it helps the user.

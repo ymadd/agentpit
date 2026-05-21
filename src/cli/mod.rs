@@ -104,8 +104,11 @@ pub enum Command {
         check: bool,
     },
 
-    /// Install slash commands and skills into ~/.claude.
+    /// Install slash commands and skills into .claude/ (interactive picker if --scope is omitted).
     Init {
+        /// Install scope. Omit for an interactive picker.
+        #[arg(long, value_enum)]
+        scope: Option<init::Scope>,
         /// Overwrite existing files.
         #[arg(long)]
         force: bool,
@@ -161,7 +164,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Command::Login { backend, check } => login::run(backend, check).await,
 
-        Command::Init { force } => init::run(force).await,
+        Command::Init { scope, force } => init::run(scope, force).await,
 
         Command::Update { check } => update::run(check).await,
     }

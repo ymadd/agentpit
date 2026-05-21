@@ -1,6 +1,6 @@
 [package]
 name = "agentpit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["yamato"]
 license = "Apache-2.0"
@@ -16,6 +16,8 @@ path = "src/main.rs"
 agent-client-protocol = "0.12"
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
+cliclack = "0.5"
+console = "0.15"
 dirs = "5"
 regex = "1"
 self_update = "0.44"

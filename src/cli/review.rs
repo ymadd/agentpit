@@ -14,16 +14,15 @@ pub async fn run(
         String::new(),
         format!("Review target: {target}"),
         String::new(),
-        "Workflow:".to_string(),
-        "1. Resolve <target>:".to_string(),
+        "Workflow — MUST follow in order. Do not produce findings without reading.".to_string(),
+        "1. Read <target> in full before anything else:".to_string(),
         "   - file path  → read the file".to_string(),
         "   - directory / glob → walk the tree and read every relevant source file".to_string(),
         "   - git reference / \"last commit\" / \"current diff\" → inspect via git".to_string(),
-        "2. Read other files that the target depends on, imports, or is referenced from."
-            .to_string(),
-        "3. Report concrete issues with file:line citations.".to_string(),
+        "2. Read every file the target imports, is imported by, or otherwise depends on. Reviewing without reading the surrounding code is not acceptable.".to_string(),
+        "3. Report concrete issues with file:line citations. Speculation, paraphrased findings, or generic advice without a specific cite are not acceptable.".to_string(),
         "4. Categorize each finding as CRITICAL / HIGH / MEDIUM / LOW.".to_string(),
-        "5. If you cannot access required files or commands, say so explicitly.".to_string(),
+        "5. If a required file or command is genuinely inaccessible, say so explicitly — do not invent findings to fill the gap.".to_string(),
     ];
     if let Some(f) = focus {
         lines.push(String::new());

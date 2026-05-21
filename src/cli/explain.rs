@@ -14,9 +14,9 @@ pub async fn run(
         String::new(),
         format!("Explain: {target}"),
         String::new(),
-        "Workflow:".to_string(),
-        "1. Locate and read <target> (a file, symbol, module, or concept).".to_string(),
-        "2. Read related files (callers, callees, neighbouring modules) so the explanation is accurate, not speculative.".to_string(),
+        "Workflow — MUST follow. Do not produce an explanation without reading.".to_string(),
+        "1. Locate and read <target> in full (a file, symbol, module, or concept).".to_string(),
+        "2. Read related files (callers, callees, neighbouring modules) needed to explain it accurately. Speculation without reading the surrounding code is not acceptable.".to_string(),
         "3. Cite file:line when it helps the reader navigate.".to_string(),
         String::new(),
     ];

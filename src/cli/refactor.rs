@@ -10,11 +10,17 @@ pub async fn run(
     cwd: Option<String>,
 ) -> Result<()> {
     let lines = [
+        "You are working in a codebase rooted at the current working directory.".to_string(),
+        String::new(),
         format!("Refactor target: {path}"),
         format!("Goal: {goal}"),
-        "Plan the change first (what changes, why, in what order).".into(),
-        "Then propose the concrete edits as a unified diff if possible.".into(),
-        "Do not apply destructive operations without explicit user approval.".into(),
+        String::new(),
+        "Workflow:".to_string(),
+        "1. Read <path>.".to_string(),
+        "2. Read every file that <path> depends on or is referenced from, so the plan accounts for ripple effects.".to_string(),
+        "3. Plan the change first (what changes, why, in what order).".to_string(),
+        "4. Propose the concrete edits as a unified diff if possible.".to_string(),
+        "5. Do not apply destructive operations without explicit user approval.".to_string(),
     ];
     let prompt = lines.join("\n");
 

@@ -10,13 +10,26 @@ pub async fn run(
     cwd: Option<String>,
 ) -> Result<()> {
     let mut lines = vec![
-        format!("Perform a thorough code review of: {target}"),
-        "Report concrete issues with file:line citations.".to_string(),
-        "Categorize each finding as CRITICAL / HIGH / MEDIUM / LOW.".to_string(),
-        "If you cannot access files, say so explicitly.".to_string(),
+        "You are reviewing a codebase rooted at the current working directory.".to_string(),
+        String::new(),
+        format!("Review target: {target}"),
+        String::new(),
+        "Workflow:".to_string(),
+        "1. Resolve <target>:".to_string(),
+        "   - file path  → read the file".to_string(),
+        "   - directory / glob → walk the tree and read every relevant source file".to_string(),
+        "   - git reference / \"last commit\" / \"current diff\" → inspect via git".to_string(),
+        "2. Read other files that the target depends on, imports, or is referenced from."
+            .to_string(),
+        "3. Report concrete issues with file:line citations.".to_string(),
+        "4. Categorize each finding as CRITICAL / HIGH / MEDIUM / LOW.".to_string(),
+        "5. If you cannot access required files or commands, say so explicitly.".to_string(),
     ];
     if let Some(f) = focus {
-        lines.push(format!("Reviewer focus: {f}."));
+        lines.push(String::new());
+        lines.push(format!(
+            "Focus area (prioritise but do not ignore other issues): {f}"
+        ));
     }
     let ctx = super::load_context()?;
     let members =

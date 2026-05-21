@@ -45,6 +45,8 @@ pub enum Action {
 pub enum EnsembleTarget {
     Default,
     Review,
+    Rescue,
+    Refactor,
 }
 
 impl EnsembleTarget {
@@ -52,6 +54,8 @@ impl EnsembleTarget {
         match self {
             EnsembleTarget::Default => "default",
             EnsembleTarget::Review => "review",
+            EnsembleTarget::Rescue => "rescue",
+            EnsembleTarget::Refactor => "refactor",
         }
     }
 }

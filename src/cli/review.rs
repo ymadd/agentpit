@@ -18,5 +18,9 @@ pub async fn run(
     if let Some(f) = focus {
         lines.push(format!("Reviewer focus: {f}."));
     }
-    super::ensemble::run_with_defaults(lines.join("\n"), members, aggregator, cwd, true).await
+    let ctx = super::load_context()?;
+    let members =
+        members.unwrap_or_else(|| ctx.loaded.config.ensemble.review_members.clone());
+    let aggregator = aggregator.or(ctx.loaded.config.ensemble.review_aggregator);
+    super::ensemble::run_resolved(ctx, lines.join("\n"), members, aggregator, cwd).await
 }

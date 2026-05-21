@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+use super::common::Context;
 use super::{install_ctrlc_cancel, load_context, noop_streamer, resolve_cwd};
 use crate::auth::{check_auth, is_auth_failure};
 use crate::dispatch::{Registries, dispatch, resolve_transport};
@@ -120,32 +121,20 @@ pub async fn run(
     aggregator: Option<BackendId>,
     cwd: Option<String>,
 ) -> Result<()> {
-    run_with_defaults(prompt, members, aggregator, cwd, false).await
+    let ctx = load_context()?;
+    let members =
+        members.unwrap_or_else(|| ctx.loaded.config.ensemble.default_members.clone());
+    let aggregator = aggregator.or(ctx.loaded.config.ensemble.aggregator);
+    run_resolved(ctx, prompt, members, aggregator, cwd).await
 }
 
-pub async fn run_with_defaults(
+pub async fn run_resolved(
+    ctx: Context,
     prompt: String,
-    members_override: Option<Vec<BackendId>>,
-    aggregator_override: Option<BackendId>,
+    members: Vec<BackendId>,
+    aggregator: Option<BackendId>,
     cwd: Option<String>,
-    use_review_defaults: bool,
 ) -> Result<()> {
-    let ctx = load_context()?;
-    let members = members_override.unwrap_or_else(|| {
-        if use_review_defaults {
-            ctx.loaded.config.ensemble.review_members.clone()
-        } else {
-            ctx.loaded.config.ensemble.default_members.clone()
-        }
-    });
-    let aggregator = aggregator_override.or({
-        if use_review_defaults {
-            ctx.loaded.config.ensemble.review_aggregator
-        } else {
-            ctx.loaded.config.ensemble.aggregator
-        }
-    });
-
     let cwd = resolve_cwd(cwd)?;
     let cancel = CancellationToken::new();
     install_ctrlc_cancel(cancel.clone());

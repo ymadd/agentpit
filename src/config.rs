@@ -87,6 +87,14 @@ pub struct EnsembleSection {
     pub review_members: Vec<BackendId>,
     #[serde(default)]
     pub review_aggregator: Option<BackendId>,
+    #[serde(default)]
+    pub rescue_members: Vec<BackendId>,
+    #[serde(default)]
+    pub rescue_aggregator: Option<BackendId>,
+    #[serde(default)]
+    pub refactor_members: Vec<BackendId>,
+    #[serde(default)]
+    pub refactor_aggregator: Option<BackendId>,
 }
 
 impl Default for EnsembleSection {
@@ -96,6 +104,10 @@ impl Default for EnsembleSection {
             aggregator: None,
             review_members: default_review_members(),
             review_aggregator: None,
+            rescue_members: Vec::new(),
+            rescue_aggregator: None,
+            refactor_members: Vec::new(),
+            refactor_aggregator: None,
         }
     }
 }

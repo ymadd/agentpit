@@ -30,6 +30,14 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
             loaded.config.ensemble.review_members.clone(),
             loaded.config.ensemble.review_aggregator,
         ),
+        EnsembleTarget::Rescue => (
+            loaded.config.ensemble.rescue_members.clone(),
+            loaded.config.ensemble.rescue_aggregator,
+        ),
+        EnsembleTarget::Refactor => (
+            loaded.config.ensemble.refactor_members.clone(),
+            loaded.config.ensemble.refactor_aggregator,
+        ),
     };
 
     cliclack::intro(style(format!(" ensemble: {} ", target.as_str())).on_cyan().black())
@@ -76,6 +84,14 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
         EnsembleTarget::Review => {
             loaded.config.ensemble.review_members = members.clone();
             loaded.config.ensemble.review_aggregator = aggregator;
+        }
+        EnsembleTarget::Rescue => {
+            loaded.config.ensemble.rescue_members = members.clone();
+            loaded.config.ensemble.rescue_aggregator = aggregator;
+        }
+        EnsembleTarget::Refactor => {
+            loaded.config.ensemble.refactor_members = members.clone();
+            loaded.config.ensemble.refactor_aggregator = aggregator;
         }
     }
 

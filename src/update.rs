@@ -133,6 +133,7 @@ pub fn perform_update() -> Result<UpdateOutcome> {
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
+        .bin_path_in_archive(BIN_NAME)
         .target(self_update::get_target())
         .show_download_progress(true)
         .current_version(current_version())

@@ -16,6 +16,14 @@ pub async fn run(
     cwd: Option<String>,
     auto_login: bool,
 ) -> Result<()> {
+    if backend.is_none() {
+        let ctx = super::load_context()?;
+        let members = ctx.loaded.config.ensemble.rescue_members.clone();
+        if !members.is_empty() {
+            let aggregator = ctx.loaded.config.ensemble.rescue_aggregator;
+            return super::ensemble::run_resolved(ctx, task, members, aggregator, cwd).await;
+        }
+    }
     run_with_route(task, backend, cwd, auto_login, RouteKey::Rescue).await
 }
 

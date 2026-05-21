@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{BackendId, Transport};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
 pub enum RouteKey {
     Rescue,
     Review,
@@ -25,6 +28,12 @@ impl RouteKey {
             RouteKey::Explain => "explain",
             RouteKey::Refactor => "refactor",
         }
+    }
+}
+
+impl std::fmt::Display for RouteKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -102,13 +111,13 @@ pub struct HubConfig {
     #[serde(default)]
     pub default: DefaultSection,
     #[serde(default = "default_routes")]
-    pub routes: HashMap<RouteKey, BackendId>,
+    pub routes: BTreeMap<RouteKey, BackendId>,
     #[serde(default)]
     pub auto_route: AutoRouteSection,
     #[serde(default)]
     pub ensemble: EnsembleSection,
     #[serde(default)]
-    pub backends: HashMap<BackendId, BackendOverride>,
+    pub backends: BTreeMap<BackendId, BackendOverride>,
 }
 
 fn default_backend() -> BackendId {
@@ -137,13 +146,30 @@ fn default_ensemble_members() -> Vec<BackendId> {
 fn default_review_members() -> Vec<BackendId> {
     vec![BackendId::Gemini, BackendId::Opencode]
 }
-fn default_routes() -> HashMap<RouteKey, BackendId> {
-    let mut m = HashMap::new();
+fn default_routes() -> BTreeMap<RouteKey, BackendId> {
+    let mut m = BTreeMap::new();
     m.insert(RouteKey::Rescue, BackendId::Gemini);
     m.insert(RouteKey::Review, BackendId::Claude);
     m.insert(RouteKey::Explain, BackendId::Gemini);
     m.insert(RouteKey::Refactor, BackendId::Claude);
     m
+}
+
+pub fn save_config(config: &HubConfig) -> Result<PathBuf> {
+    let path = default_config_path();
+    save_config_at(config, &path)?;
+    Ok(path)
+}
+
+pub fn save_config_at(config: &HubConfig, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = toml::to_string_pretty(config)
+        .with_context(|| format!("failed to serialize config for {}", path.display()))?;
+    fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

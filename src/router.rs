@@ -129,10 +129,10 @@ fn contains_any_lowercased(text: &str, lowercased_keywords: &[String]) -> bool {
 mod tests {
     use super::*;
     use crate::config::{AutoRouteSection, DefaultSection, EnsembleSection, HubConfig};
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     fn base_config() -> HubConfig {
-        let mut routes = HashMap::new();
+        let mut routes = BTreeMap::new();
         routes.insert(RouteKey::Rescue, BackendId::Gemini);
         routes.insert(RouteKey::Review, BackendId::Claude);
         routes.insert(RouteKey::Explain, BackendId::Gemini);
@@ -150,7 +150,7 @@ mod tests {
                 review_backend: BackendId::Claude,
             },
             ensemble: EnsembleSection::default(),
-            backends: HashMap::new(),
+            backends: BTreeMap::new(),
         }
     }
 

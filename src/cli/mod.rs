@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use crate::types::BackendId;
 
 mod common;
+mod config;
 mod ensemble;
 mod explain;
 mod init;
@@ -120,6 +121,12 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
+
+    /// Inspect or modify the config file (~/.config/agentpit/config.toml).
+    Config {
+        #[command(subcommand)]
+        action: config::Action,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -167,5 +174,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Init { scope, force } => init::run(scope, force).await,
 
         Command::Update { check } => update::run(check).await,
+
+        Command::Config { action } => config::run(action).await,
     }
 }

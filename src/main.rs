@@ -7,7 +7,7 @@ use agentpit::cli::{Cli, Command, run};
 use agentpit::update;
 
 async fn maybe_show_banner(cli: &Cli) {
-    if matches!(cli.command, Command::Update { .. }) {
+    if matches!(cli.command, Some(Command::Update { .. })) {
         return;
     }
     let task = tokio::task::spawn_blocking(update::compute_banner);

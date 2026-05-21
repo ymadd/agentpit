@@ -4,16 +4,17 @@ use clap::{Parser, Subcommand};
 use crate::types::BackendId;
 
 mod common;
-mod config;
-mod ensemble;
-mod explain;
-mod init;
-mod login;
-mod refactor;
-mod rescue;
-mod review;
-mod status;
-mod update;
+pub mod config;
+pub mod ensemble;
+pub mod explain;
+pub mod init;
+pub mod login;
+mod menu;
+pub mod refactor;
+pub mod rescue;
+pub mod review;
+pub mod status;
+pub mod update;
 
 pub(crate) use common::{
     install_ctrlc_cancel, load_context, noop_streamer, resolve_cwd, stdout_streamer,
@@ -26,8 +27,9 @@ pub(crate) use common::{
     about = "Multi-agent hub CLI for Claude Code, Gemini, Codex, and OpenCode."
 )]
 pub struct Cli {
+    /// Run a subcommand. Omit to launch the interactive menu.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -122,15 +124,20 @@ pub enum Command {
         check: bool,
     },
 
-    /// Inspect or modify the config file (~/.config/agentpit/config.toml).
+    /// Inspect or modify the config file (~/.config/agentpit/config.toml). Omit the
+    /// sub-action to launch an interactive menu.
     Config {
         #[command(subcommand)]
-        action: config::Action,
+        action: Option<config::Action>,
     },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    let command = match cli.command {
+        Some(c) => c,
+        None => return menu::run_main().await,
+    };
+    match command {
         Command::Rescue {
             task,
             backend,
@@ -175,6 +182,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Command::Update { check } => update::run(check).await,
 
-        Command::Config { action } => config::run(action).await,
+        Command::Config { action } => match action {
+            Some(a) => config::run(a).await,
+            None => menu::run_config().await,
+        },
     }
 }

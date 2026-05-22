@@ -13,6 +13,7 @@ mod menu;
 pub mod refactor;
 pub mod rescue;
 pub mod review;
+pub mod security_review;
 pub mod status;
 pub mod update;
 
@@ -51,6 +52,20 @@ pub enum Command {
 
     /// Run a multi-agent code review (defaults to gemini + opencode).
     Review {
+        target: String,
+        #[arg(long)]
+        focus: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        members: Option<Vec<BackendId>>,
+        #[arg(long)]
+        aggregator: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+
+    /// Run a multi-agent security review (OWASP-style checklist, defaults to claude + codex).
+    #[command(name = "security-review")]
+    SecurityReview {
         target: String,
         #[arg(long)]
         focus: Option<String>,
@@ -115,6 +130,9 @@ pub enum Command {
         /// Overwrite existing files.
         #[arg(long)]
         force: bool,
+        /// Refresh existing installs in every detected scope (no prompt). Used internally by `agentpit update`.
+        #[arg(long)]
+        refresh: bool,
     },
 
     /// Check for or install a newer agentpit release from GitHub.
@@ -153,6 +171,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             cwd,
         } => review::run(target, focus, members, aggregator, cwd).await,
 
+        Command::SecurityReview {
+            target,
+            focus,
+            members,
+            aggregator,
+            cwd,
+        } => security_review::run(target, focus, members, aggregator, cwd).await,
+
         Command::Explain {
             target,
             deep,
@@ -178,7 +204,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Command::Login { backend, check } => login::run(backend, check).await,
 
-        Command::Init { scope, force } => init::run(scope, force).await,
+        Command::Init {
+            scope,
+            force,
+            refresh,
+        } => init::run(scope, force, refresh).await,
 
         Command::Update { check } => update::run(check).await,
 

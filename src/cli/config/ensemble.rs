@@ -30,6 +30,10 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
             loaded.config.ensemble.review_members.clone(),
             loaded.config.ensemble.review_aggregator,
         ),
+        EnsembleTarget::SecurityReview => (
+            loaded.config.ensemble.security_review_members.clone(),
+            loaded.config.ensemble.security_review_aggregator,
+        ),
         EnsembleTarget::Rescue => (
             loaded.config.ensemble.rescue_members.clone(),
             loaded.config.ensemble.rescue_aggregator,
@@ -84,6 +88,10 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
         EnsembleTarget::Review => {
             loaded.config.ensemble.review_members = members.clone();
             loaded.config.ensemble.review_aggregator = aggregator;
+        }
+        EnsembleTarget::SecurityReview => {
+            loaded.config.ensemble.security_review_members = members.clone();
+            loaded.config.ensemble.security_review_aggregator = aggregator;
         }
         EnsembleTarget::Rescue => {
             loaded.config.ensemble.rescue_members = members.clone();

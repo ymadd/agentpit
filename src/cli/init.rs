@@ -6,7 +6,7 @@ use clap::ValueEnum;
 use console::style;
 use tokio::fs;
 
-const COMMAND_FILES: &[(&str, &str)] = &[
+pub(crate) const COMMAND_FILES: &[(&str, &str)] = &[
     (
         "rescue.md",
         include_str!("../../commands/agentpit/rescue.md"),
@@ -14,6 +14,10 @@ const COMMAND_FILES: &[(&str, &str)] = &[
     (
         "review.md",
         include_str!("../../commands/agentpit/review.md"),
+    ),
+    (
+        "security-review.md",
+        include_str!("../../commands/agentpit/security-review.md"),
     ),
     (
         "explain.md",
@@ -37,7 +41,7 @@ const COMMAND_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-const SKILL_FILES: &[(&str, &str)] = &[
+pub(crate) const SKILL_FILES: &[(&str, &str)] = &[
     (
         "agentpit-rescue.md",
         include_str!("../../skills/agentpit-rescue.md"),
@@ -45,6 +49,10 @@ const SKILL_FILES: &[(&str, &str)] = &[
     (
         "agentpit-review.md",
         include_str!("../../skills/agentpit-review.md"),
+    ),
+    (
+        "agentpit-security-review.md",
+        include_str!("../../skills/agentpit-security-review.md"),
     ),
     (
         "agentpit-explain.md",
@@ -89,7 +97,7 @@ impl Scope {
     }
 }
 
-fn resolve_dirs(scope: Scope) -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn resolve_dirs(scope: Scope) -> Result<(PathBuf, PathBuf)> {
     let base = scope.base()?;
     Ok((
         base.join("commands").join("agentpit"),
@@ -116,7 +124,11 @@ fn prompt_scope() -> Result<Scope> {
     Ok(scope)
 }
 
-pub async fn run(scope: Option<Scope>, force: bool) -> Result<()> {
+pub async fn run(scope: Option<Scope>, force: bool, refresh: bool) -> Result<()> {
+    if refresh {
+        return refresh_existing_installs().await;
+    }
+
     let scope = match scope {
         Some(s) => s,
         None if std::io::stdin().is_terminal() => prompt_scope()?,
@@ -147,6 +159,54 @@ pub async fn run(scope: Option<Scope>, force: bool) -> Result<()> {
         println!("{summary}");
     }
     Ok(())
+}
+
+pub async fn refresh_existing_installs() -> Result<()> {
+    let mut touched = 0usize;
+    for scope in [Scope::Project, Scope::User] {
+        let (commands_dir, skills_dir) = resolve_dirs(scope)?;
+        let exists = fs::metadata(&commands_dir).await.is_ok()
+            || fs::metadata(&skills_dir).await.is_ok();
+        if !exists {
+            continue;
+        }
+        let updated = refresh_dir(&commands_dir, COMMAND_FILES).await?
+            + refresh_dir(&skills_dir, SKILL_FILES).await?;
+        if updated > 0 {
+            println!(
+                "refreshed {} files in {} scope ({})",
+                updated,
+                scope_label(scope),
+                commands_dir.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+            );
+        }
+        touched += 1;
+    }
+    if touched == 0 {
+        println!("no .claude/ install detected — run `agentpit init` first");
+    }
+    Ok(())
+}
+
+async fn refresh_dir(dir: &Path, files: &[(&str, &str)]) -> Result<usize> {
+    if fs::metadata(dir).await.is_err() {
+        return Ok(0);
+    }
+    let mut changed = 0;
+    for (name, content) in files {
+        let dest = dir.join(name);
+        let needs_write = match fs::read(&dest).await {
+            Ok(existing) => existing != content.as_bytes(),
+            Err(_) => true,
+        };
+        if needs_write {
+            fs::write(&dest, content)
+                .await
+                .with_context(|| format!("failed to refresh {}", dest.display()))?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
 }
 
 fn scope_label(scope: Scope) -> &'static str {
@@ -185,9 +245,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embeds_seven_commands_and_seven_skills() {
-        assert_eq!(COMMAND_FILES.len(), 7);
-        assert_eq!(SKILL_FILES.len(), 7);
+    fn embeds_eight_commands_and_eight_skills() {
+        assert_eq!(COMMAND_FILES.len(), 8);
+        assert_eq!(SKILL_FILES.len(), 8);
         for (name, content) in COMMAND_FILES.iter().chain(SKILL_FILES.iter()) {
             assert!(name.ends_with(".md"), "{name} must be a .md file");
             assert!(!content.is_empty(), "{name} content must be non-empty");

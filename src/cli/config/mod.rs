@@ -41,10 +41,11 @@ pub enum Action {
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-#[clap(rename_all = "lowercase")]
+#[clap(rename_all = "kebab-case")]
 pub enum EnsembleTarget {
     Default,
     Review,
+    SecurityReview,
     Rescue,
     Refactor,
 }
@@ -54,6 +55,7 @@ impl EnsembleTarget {
         match self {
             EnsembleTarget::Default => "default",
             EnsembleTarget::Review => "review",
+            EnsembleTarget::SecurityReview => "security-review",
             EnsembleTarget::Rescue => "rescue",
             EnsembleTarget::Refactor => "refactor",
         }

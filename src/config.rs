@@ -87,6 +87,10 @@ pub struct EnsembleSection {
     pub review_members: Vec<BackendId>,
     #[serde(default)]
     pub review_aggregator: Option<BackendId>,
+    #[serde(default = "default_security_review_members")]
+    pub security_review_members: Vec<BackendId>,
+    #[serde(default)]
+    pub security_review_aggregator: Option<BackendId>,
     #[serde(default)]
     pub rescue_members: Vec<BackendId>,
     #[serde(default)]
@@ -104,6 +108,8 @@ impl Default for EnsembleSection {
             aggregator: None,
             review_members: default_review_members(),
             review_aggregator: None,
+            security_review_members: default_security_review_members(),
+            security_review_aggregator: None,
             rescue_members: Vec::new(),
             rescue_aggregator: None,
             refactor_members: Vec::new(),
@@ -157,6 +163,9 @@ fn default_ensemble_members() -> Vec<BackendId> {
 }
 fn default_review_members() -> Vec<BackendId> {
     vec![BackendId::Gemini, BackendId::Opencode]
+}
+fn default_security_review_members() -> Vec<BackendId> {
+    vec![BackendId::Claude, BackendId::Codex]
 }
 fn default_routes() -> BTreeMap<RouteKey, BackendId> {
     let mut m = BTreeMap::new();

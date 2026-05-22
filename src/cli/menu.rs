@@ -9,6 +9,7 @@ use crate::types::BackendId;
 enum MainAction {
     Rescue,
     Review,
+    SecurityReview,
     Explain,
     Refactor,
     Ensemble,
@@ -35,6 +36,7 @@ pub async fn run_main() -> Result<()> {
     let action = cliclack::select("What do you want to do?")
         .item(MainAction::Rescue, "rescue", "one-shot task to a backend")
         .item(MainAction::Review, "review", "multi-agent code review")
+        .item(MainAction::SecurityReview, "security-review", "OWASP-style multi-agent security review")
         .item(MainAction::Explain, "explain", "explain a target")
         .item(MainAction::Refactor, "refactor", "plan a refactor")
         .item(MainAction::Ensemble, "ensemble", "fan a prompt out to multiple backends")
@@ -49,6 +51,7 @@ pub async fn run_main() -> Result<()> {
     match action {
         MainAction::Rescue => rescue_flow().await,
         MainAction::Review => review_flow().await,
+        MainAction::SecurityReview => security_review_flow().await,
         MainAction::Explain => explain_flow().await,
         MainAction::Refactor => refactor_flow().await,
         MainAction::Ensemble => ensemble_flow().await,
@@ -56,7 +59,7 @@ pub async fn run_main() -> Result<()> {
         MainAction::Status => super::status::run(None).await,
         MainAction::Login => login_flow().await,
         MainAction::Update => update_flow().await,
-        MainAction::Init => super::init::run(None, false).await,
+        MainAction::Init => super::init::run(None, false, false).await,
     }
 }
 
@@ -131,6 +134,24 @@ async fn review_flow() -> Result<()> {
     super::review::run(target, focus, None, None, None).await
 }
 
+async fn security_review_flow() -> Result<()> {
+    let target: String = cliclack::input("Target to security-review")
+        .placeholder("file path / diff / 'last commit'")
+        .interact()
+        .map_err(|e| anyhow!("input: {e}"))?;
+    let focus_raw: String = cliclack::input("Optional focus area (leave blank for full checklist)")
+        .default_input("")
+        .required(false)
+        .interact()
+        .map_err(|e| anyhow!("input: {e}"))?;
+    let focus = if focus_raw.trim().is_empty() {
+        None
+    } else {
+        Some(focus_raw)
+    };
+    super::security_review::run(target, focus, None, None, None).await
+}
+
 async fn explain_flow() -> Result<()> {
     let target: String = cliclack::input("Target to explain")
         .placeholder("file path / symbol")
@@ -203,6 +224,7 @@ fn pick_ensemble_target(prompt: &str) -> Result<EnsembleTarget> {
     cliclack::select(prompt)
         .item(EnsembleTarget::Default, "default", "agentpit ensemble subcommand")
         .item(EnsembleTarget::Review, "review", "agentpit review")
+        .item(EnsembleTarget::SecurityReview, "security-review", "agentpit security-review")
         .item(EnsembleTarget::Rescue, "rescue", "agentpit rescue")
         .item(EnsembleTarget::Refactor, "refactor", "agentpit refactor")
         .interact()

@@ -12,8 +12,8 @@ impl ExecAdapter for AntigravityExec {
         ExecSpec {
             command: "agy".into(),
             args: vec![
-                "--yolo".into(),
-                "-p".into(),
+                "--dangerously-skip-permissions".into(),
+                "--print".into(),
                 task.to_string(),
             ],
             env: Vec::new(),
@@ -30,8 +30,8 @@ mod tests {
     fn passes_task_as_prompt_arg() {
         let spec = AntigravityExec.build_spec("hello world");
         assert_eq!(spec.command, "agy");
-        assert!(spec.args.iter().any(|a| a == "--yolo"));
-        assert!(spec.args.iter().any(|a| a == "-p"));
+        assert!(spec.args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(spec.args.iter().any(|a| a == "--print"));
         assert_eq!(spec.args.last().unwrap(), "hello world");
         assert!(spec.stdin_input.is_none());
     }

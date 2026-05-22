@@ -152,7 +152,7 @@ agentpit config route explain --backend antigravity
 
 Notes:
 
-- Exec spec defaults to `agy --yolo -p <task>`. **`--yolo` skips per-action approval prompts**, so `agy` can edit / delete files without confirmation. Same stance as the Gemini exec spec — adjust `src/exec/antigravity.rs` if you want explicit confirmation.
+- Exec spec defaults to `agy --dangerously-skip-permissions --print <task>`. **`--dangerously-skip-permissions` skips per-action approval prompts**, so `agy` can edit / delete files without confirmation. Same stance as the Gemini exec spec — drop the flag in `src/exec/antigravity.rs` if you want explicit confirmation.
 - If `agy`'s non-interactive flag changes, edit the same file.
 - ACP transport is **not yet wired** for `agy` — once Google publishes an `--acp` mode equivalent we'll add it.
 - Auth is OAuth on first run of `agy`. For headless boxes use `agy auth login`.

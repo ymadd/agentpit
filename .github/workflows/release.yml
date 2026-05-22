@@ -94,13 +94,17 @@ jobs:
         if: runner.os != 'Windows'
         run: strip target/${{ matrix.target }}/release/agentpit || true
 
-      - name: Package tarball
+      - name: Package binary (gzip only)
+        # NOTE: We ship .gz (not .tar.gz). self_update detects .gz as
+        # ArchiveKind::Plain(Gz) and streams the decompressed bytes straight
+        # to bin_path_in_archive, bypassing the tar entry-name matching that
+        # broke v0.1.5–v0.1.9 self-updates.
         run: |
           set -euo pipefail
           cd target/${{ matrix.target }}/release
-          tar czf "../../../agentpit-${{ matrix.target }}.tar.gz" agentpit
+          gzip -c agentpit > "../../../agentpit-${{ matrix.target }}.gz"
           cd -
-          shasum -a 256 "agentpit-${{ matrix.target }}.tar.gz" > "agentpit-${{ matrix.target }}.tar.gz.sha256"
+          shasum -a 256 "agentpit-${{ matrix.target }}.gz" > "agentpit-${{ matrix.target }}.gz.sha256"
 
       - name: Upload to draft release
         uses: softprops/action-gh-release@v2
@@ -108,8 +112,8 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.tag }}
           draft: true
           files: |
-            agentpit-${{ matrix.target }}.tar.gz
-            agentpit-${{ matrix.target }}.tar.gz.sha256
+            agentpit-${{ matrix.target }}.gz
+            agentpit-${{ matrix.target }}.gz.sha256
           fail_on_unmatched_files: true
 
   publish:

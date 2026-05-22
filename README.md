@@ -21,13 +21,16 @@ Different coding agents are good at different things: long-context reads on Gemi
 
 ```bash
 # macOS arm64 example — adjust target for your platform
-curl -L https://github.com/ymadd/agentpit/releases/latest/download/agentpit-aarch64-apple-darwin.tar.gz \
-  | tar xz
+curl -L https://github.com/ymadd/agentpit/releases/latest/download/agentpit-aarch64-apple-darwin.gz \
+  | gunzip > agentpit
+chmod +x agentpit
 mv agentpit ~/.local/bin/
 agentpit --version
 ```
 
 Targets published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`.
+
+> Releases ship plain gzipped binaries (not `.tar.gz`) because `self_update`'s tar entry-name matching is fragile across BSD/GNU tar — plain `.gz` lets the library stream decompress straight to the target path. `agentpit update` from v0.1.5 onward works against this format with no changes.
 
 ### From source
 

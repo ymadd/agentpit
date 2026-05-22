@@ -297,7 +297,7 @@ pub fn load_config(override_path: Option<&Path>) -> Result<LoadedConfig> {
 }
 
 pub const DEFAULT_CONFIG_TOML: &str = r#"# agentpit config
-# Backends currently available: gemini, claude, codex (paid plan), opencode
+# Backends currently available: gemini, antigravity (agy), claude, codex (paid plan), opencode
 
 [default]
 backend = "gemini"

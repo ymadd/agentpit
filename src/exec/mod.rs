@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::types::BackendId;
 
 mod base;
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod gemini;

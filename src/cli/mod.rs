@@ -24,7 +24,7 @@ pub(crate) use common::{
 #[command(
     name = "agentpit",
     version,
-    about = "Multi-agent hub CLI for Claude Code, Gemini, Codex, and OpenCode."
+    about = "Multi-agent hub CLI: route work to Gemini / Antigravity (agy) / Claude / Codex / OpenCode."
 )]
 pub struct Cli {
     /// Run a subcommand. Omit to launch the interactive menu.

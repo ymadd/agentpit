@@ -8,12 +8,14 @@ use tokio_util::sync::CancellationToken;
 use crate::acp::{AcpAdapter, opencode::OpencodeAdapter};
 use crate::config::HubConfig;
 use crate::exec::{
-    ExecAdapter, ExecRunOptions, claude::ClaudeExec, codex::CodexExec, gemini::GeminiExec,
+    ExecAdapter, ExecRunOptions, antigravity::AntigravityExec, claude::ClaudeExec,
+    codex::CodexExec, gemini::GeminiExec,
 };
 use crate::types::{BackendId, Transport};
 
 const DEFAULT_TRANSPORTS: &[(BackendId, Transport)] = &[
     (BackendId::Gemini, Transport::Exec),
+    (BackendId::Antigravity, Transport::Exec),
     (BackendId::Claude, Transport::Exec),
     (BackendId::Codex, Transport::Exec),
     (BackendId::Opencode, Transport::Acp),
@@ -48,6 +50,9 @@ pub fn build_registries(config: &HubConfig) -> Registries {
         match (backend, transport) {
             (BackendId::Gemini, Transport::Exec) => {
                 execs.insert(BackendId::Gemini, Box::new(GeminiExec));
+            }
+            (BackendId::Antigravity, Transport::Exec) => {
+                execs.insert(BackendId::Antigravity, Box::new(AntigravityExec));
             }
             (BackendId::Claude, Transport::Exec) => {
                 execs.insert(BackendId::Claude, Box::new(ClaudeExec));

@@ -181,6 +181,7 @@ async fn update_flow() -> Result<()> {
 fn pick_backend(prompt: &str) -> Result<BackendId> {
     cliclack::select(prompt)
         .item(BackendId::Gemini, "gemini", "")
+        .item(BackendId::Antigravity, "antigravity", "agy — Gemini CLI successor")
         .item(BackendId::Claude, "claude", "")
         .item(BackendId::Codex, "codex", "")
         .item(BackendId::Opencode, "opencode", "")

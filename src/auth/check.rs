@@ -70,6 +70,21 @@ async fn check_gemini() -> AuthStatus {
     }
 }
 
+async fn check_antigravity() -> AuthStatus {
+    let creds = home_join(&[".config", "agy", "credentials.json"]);
+    let ok = file_exists(&creds).await;
+    AuthStatus {
+        backend: BackendId::Antigravity,
+        ok,
+        hint: if ok {
+            "Antigravity (agy) OAuth credentials are present.".into()
+        } else {
+            "Antigravity CLI is not authenticated. Run `agy` once to sign in, or `agy auth login` for headless setups.".into()
+        },
+        login_command: "agy auth login".into(),
+    }
+}
+
 async fn check_claude() -> AuthStatus {
     let cfg = home_join(&[".claude.json"]);
     let ok = file_exists(&cfg).await;
@@ -108,6 +123,7 @@ pub async fn check_auth(backend: BackendId) -> AuthStatus {
     match backend {
         BackendId::Codex => check_codex().await,
         BackendId::Gemini => check_gemini().await,
+        BackendId::Antigravity => check_antigravity().await,
         BackendId::Claude => check_claude().await,
         BackendId::Opencode => check_opencode().await,
         other => AuthStatus {

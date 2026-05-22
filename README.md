@@ -50,7 +50,7 @@ agentpit init --scope user
 | Backend | CLI on PATH | Default transport | Auth check |
 |---|---|---|---|
 | `gemini` | `gemini` | exec | `~/.gemini/oauth_creds.json` |
-| `antigravity` (alias `agy`) | `agy` | exec | `~/.config/agy/credentials.json` |
+| `antigravity` (alias `agy`) | `agy` | exec | `~/.gemini/oauth_creds.json` (shared with Gemini CLI) |
 | `claude` | `claude` | exec | `~/.claude.json` |
 | `codex` | `codex` | exec | `codex login status` |
 | `opencode` | `~/.opencode/bin/opencode` | acp | binary present |

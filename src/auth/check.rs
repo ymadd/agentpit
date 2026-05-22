@@ -71,13 +71,16 @@ async fn check_gemini() -> AuthStatus {
 }
 
 async fn check_antigravity() -> AuthStatus {
-    let creds = home_join(&[".config", "agy", "credentials.json"]);
-    let ok = file_exists(&creds).await;
+    // agy is the Gemini CLI successor and reuses Gemini OAuth credentials.
+    // antigravity_state.pbtxt is created once the user has actually launched agy.
+    let creds = home_join(&[".gemini", "oauth_creds.json"]);
+    let state = home_join(&[".gemini", "antigravity", "antigravity_state.pbtxt"]);
+    let ok = file_exists(&creds).await || file_exists(&state).await;
     AuthStatus {
         backend: BackendId::Antigravity,
         ok,
         hint: if ok {
-            "Antigravity (agy) OAuth credentials are present.".into()
+            "Antigravity (agy) credentials are present (shares ~/.gemini/oauth_creds.json with Gemini CLI).".into()
         } else {
             "Antigravity CLI is not authenticated. Run `agy` once to sign in, or `agy auth login` for headless setups.".into()
         },

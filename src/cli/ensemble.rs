@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
+use console::style;
 use tokio_util::sync::CancellationToken;
 
 use super::common::Context;
@@ -68,8 +70,10 @@ async fn run_one_member(
     cancel: CancellationToken,
     regs: Arc<Registries>,
 ) -> MemberOutcome {
+    let started = Instant::now();
     let transport = resolve_transport(backend, &regs);
     if transport.is_none() {
+        report_member_done(backend, started.elapsed().as_secs_f32(), Err("not registered"));
         return MemberOutcome {
             backend,
             transport: None,
@@ -78,20 +82,15 @@ async fn run_one_member(
         };
     }
 
-    let auth = check_auth(backend).await;
-    if !auth.ok {
-        return MemberOutcome {
-            backend,
-            transport: None,
-            output: None,
-            error: Some(format!("auth missing — {}", auth.hint)),
-        };
-    }
-
     let on_chunk = noop_streamer();
     match dispatch(backend, &prompt, &cwd, cancel, on_chunk, &regs).await {
         Ok(res) => {
             if is_auth_failure(&res.output) {
+                report_member_done(
+                    backend,
+                    started.elapsed().as_secs_f32(),
+                    Err("auth failure during execution"),
+                );
                 return MemberOutcome {
                     backend,
                     transport: Some(res.transport),
@@ -99,6 +98,12 @@ async fn run_one_member(
                     error: Some("auth failure during execution".into()),
                 };
             }
+            let chars = res.output.len();
+            report_member_done(
+                backend,
+                started.elapsed().as_secs_f32(),
+                Ok(chars),
+            );
             MemberOutcome {
                 backend,
                 transport: Some(res.transport),
@@ -106,13 +111,70 @@ async fn run_one_member(
                 error: None,
             }
         }
-        Err(err) => MemberOutcome {
-            backend,
-            transport,
-            output: None,
-            error: Some(format!("{err:#}")),
-        },
+        Err(err) => {
+            let msg = format!("{err:#}");
+            report_member_done(backend, started.elapsed().as_secs_f32(), Err(&msg));
+            MemberOutcome {
+                backend,
+                transport,
+                output: None,
+                error: Some(msg),
+            }
+        }
     }
+}
+
+fn report_member_start(backend: BackendId) {
+    eprintln!("{} [{}] running...", style("▶").cyan(), backend);
+}
+
+fn report_member_done(backend: BackendId, elapsed_s: f32, result: Result<usize, &str>) {
+    match result {
+        Ok(chars) => eprintln!(
+            "{} [{}] done in {:.1}s ({} chars)",
+            style("✓").green(),
+            backend,
+            elapsed_s,
+            chars,
+        ),
+        Err(reason) => eprintln!(
+            "{} [{}] failed in {:.1}s: {}",
+            style("✗").red(),
+            backend,
+            elapsed_s,
+            reason,
+        ),
+    }
+}
+
+struct PreflightResult {
+    runnable: Vec<BackendId>,
+    skipped: Vec<(BackendId, String)>,
+}
+
+async fn preflight(members: &[BackendId], regs: &Registries) -> PreflightResult {
+    let mut handles = Vec::with_capacity(members.len());
+    for m in members {
+        let m = *m;
+        let registered = resolve_transport(m, regs).is_some();
+        handles.push(tokio::spawn(async move {
+            if !registered {
+                return (m, false, "not registered".to_string());
+            }
+            let auth = check_auth(m).await;
+            (m, auth.ok, auth.hint)
+        }));
+    }
+    let mut runnable = Vec::new();
+    let mut skipped = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok((m, true, _)) => runnable.push(m),
+            Ok((m, false, hint)) => skipped.push((m, hint)),
+            Err(_) => {}
+        }
+    }
+    PreflightResult { runnable, skipped }
 }
 
 pub async fn run(
@@ -141,8 +203,21 @@ pub async fn run_resolved(
 
     let regs = Arc::new(ctx.regs);
 
+    let pre = preflight(&members, &regs).await;
+    if !pre.skipped.is_empty() {
+        eprintln!("{} skipping {} member(s) with missing auth or transport:", style("⚠").yellow(), pre.skipped.len());
+        for (m, hint) in &pre.skipped {
+            eprintln!("  [{m}] {hint}");
+        }
+    }
+    if pre.runnable.is_empty() {
+        anyhow::bail!("no members are ready (all skipped). Run `agentpit login <backend>` to fix.");
+    }
+    eprintln!("{} members ready: {}", style("→").bold(), pre.runnable.iter().map(BackendId::to_string).collect::<Vec<_>>().join(", "));
+
     let mut handles = Vec::new();
-    for m in members {
+    for m in pre.runnable {
+        report_member_start(m);
         let cwd_c = cwd.clone();
         let cancel_c = cancel.clone();
         let regs_c = regs.clone();
@@ -154,7 +229,15 @@ pub async fn run_resolved(
         handles.push((m, handle));
     }
 
-    let mut outcomes = Vec::with_capacity(handles.len());
+    let mut outcomes: Vec<MemberOutcome> = Vec::with_capacity(handles.len() + pre.skipped.len());
+    for (m, hint) in pre.skipped {
+        outcomes.push(MemberOutcome {
+            backend: m,
+            transport: None,
+            output: None,
+            error: Some(format!("preflight skip — {hint}")),
+        });
+    }
     for (backend, h) in handles {
         match h.await {
             Ok(outcome) => outcomes.push(outcome),
@@ -177,6 +260,7 @@ pub async fn run_resolved(
         }
         let transport = resolve_transport(aggregator_id, &regs);
         if transport.is_none() {
+            eprintln!("{} aggregator [{aggregator_id}] skipped: not registered", style("⚠").yellow());
             println!(
                 "{member_section}\n\n=== aggregator skipped ===\n{aggregator_id} not registered"
             );
@@ -184,6 +268,7 @@ pub async fn run_resolved(
         }
         let auth = check_auth(aggregator_id).await;
         if !auth.ok {
+            eprintln!("{} aggregator [{aggregator_id}] skipped: {}", style("⚠").yellow(), auth.hint);
             println!(
                 "{member_section}\n\n=== aggregator skipped ===\nauth missing for {aggregator_id}: {}",
                 auth.hint
@@ -191,6 +276,8 @@ pub async fn run_resolved(
             return Ok(());
         }
 
+        report_member_start(aggregator_id);
+        let started = Instant::now();
         let agg_prompt = build_aggregator_prompt(&prompt, &outcomes);
         let on_chunk = noop_streamer();
         match dispatch(
@@ -204,6 +291,7 @@ pub async fn run_resolved(
         .await
         {
             Ok(res) => {
+                report_member_done(aggregator_id, started.elapsed().as_secs_f32(), Ok(res.output.len()));
                 println!(
                     "{member_section}\n\n=== aggregator [{aggregator_id}] (transport={}) ===\n{}",
                     res.transport.as_str(),
@@ -211,8 +299,10 @@ pub async fn run_resolved(
                 );
             }
             Err(err) => {
+                let msg = format!("{err:#}");
+                report_member_done(aggregator_id, started.elapsed().as_secs_f32(), Err(&msg));
                 println!(
-                    "{member_section}\n\n=== aggregator failed ===\n{aggregator_id}: {err:#}"
+                    "{member_section}\n\n=== aggregator failed ===\n{aggregator_id}: {msg}"
                 );
                 anyhow::bail!("aggregator failed");
             }

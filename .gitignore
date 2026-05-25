@@ -1,3 +1,4 @@
 /target
+/dashboard/src-tauri/target
 Cargo.lock.bak
 .DS_Store

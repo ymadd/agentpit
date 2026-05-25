@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod dispatch;
+pub mod events;
 pub mod exec;
 pub mod router;
 pub mod types;

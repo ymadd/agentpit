@@ -5,6 +5,7 @@ use crate::types::BackendId;
 
 mod common;
 pub mod config;
+pub mod dashboard;
 pub mod ensemble;
 pub mod explain;
 pub mod init;
@@ -18,7 +19,7 @@ pub mod status;
 pub mod update;
 
 pub(crate) use common::{
-    install_ctrlc_cancel, load_context, noop_streamer, resolve_cwd, stdout_streamer,
+    install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer,
 };
 
 #[derive(Parser, Debug)]
@@ -108,6 +109,9 @@ pub enum Command {
         #[arg(long)]
         cwd: Option<String>,
     },
+
+    /// Launch the live desktop dashboard (separate app).
+    Dashboard,
 
     /// Show config + backend transport + auth state.
     Status {
@@ -199,6 +203,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             aggregator,
             cwd,
         } => ensemble::run(prompt, members, aggregator, cwd).await,
+
+        Command::Dashboard => dashboard::run().await,
 
         Command::Status { backend } => status::run(backend).await,
 

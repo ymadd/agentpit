@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
@@ -7,6 +9,7 @@ use crate::auth::{
 };
 use crate::config::RouteKey;
 use crate::dispatch::{dispatch, resolve_transport};
+use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::router::{RouteRequest, Router};
 use crate::types::BackendId;
 
@@ -21,7 +24,15 @@ pub async fn run(
         let members = ctx.loaded.config.ensemble.rescue_members.clone();
         if !members.is_empty() {
             let aggregator = ctx.loaded.config.ensemble.rescue_aggregator;
-            return super::ensemble::run_resolved(ctx, task, members, aggregator, cwd).await;
+            return super::ensemble::run_resolved(
+                ctx,
+                crate::events::RunKind::Rescue,
+                task,
+                members,
+                aggregator,
+                cwd,
+            )
+            .await;
         }
     }
     run_with_route(task, backend, cwd, auto_login, RouteKey::Rescue).await
@@ -92,12 +103,37 @@ pub async fn run_with_route(
         transport,
         decision.reason.as_str()
     );
-    let on_chunk = stdout_streamer();
+    let kind = match route_key {
+        RouteKey::Rescue => RunKind::Rescue,
+        RouteKey::Review => RunKind::Review,
+        RouteKey::Explain => RunKind::Explain,
+        RouteKey::Refactor => RunKind::Refactor,
+    };
+    let logger = RunLogger::start(kind, &[backend_id], &cwd);
+    logger.member_started(backend_id, false);
+    let started = Instant::now();
+
+    // Tee streamed output to both the terminal and the dashboard's capture file.
+    let to_stdout = stdout_streamer();
+    let to_file = crate::events::output_streamer(logger.run_id(), backend_id, false);
+    let on_chunk: std::sync::Arc<dyn Fn(&str) + Send + Sync> = std::sync::Arc::new(move |c: &str| {
+        to_stdout(c);
+        to_file(c);
+    });
 
     let result = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &ctx.regs).await;
     match result {
         Ok(res) => {
             if is_auth_failure(&res.output) {
+                logger.member_finished(
+                    backend_id,
+                    false,
+                    LegStatus::Error,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                    Some("auth failure during execution".into()),
+                );
+                logger.finished(LegStatus::Error);
                 let mut launch_message = None;
                 if auto_login {
                     let (_, launch) = launch_login(backend_id).await;
@@ -109,6 +145,15 @@ pub async fn run_with_route(
                     launch_message.as_deref()
                 ));
             }
+            logger.member_finished(
+                backend_id,
+                false,
+                LegStatus::Ok,
+                started.elapsed().as_millis() as u64,
+                Some(res.output.len()),
+                None,
+            );
+            logger.finished(LegStatus::Ok);
             if !res.output.ends_with('\n') {
                 println!();
             }
@@ -116,6 +161,15 @@ pub async fn run_with_route(
         }
         Err(err) => {
             let msg = format!("{err:#}");
+            logger.member_finished(
+                backend_id,
+                false,
+                LegStatus::Error,
+                started.elapsed().as_millis() as u64,
+                None,
+                Some(msg.clone()),
+            );
+            logger.finished(LegStatus::Error);
             if is_auth_failure(&msg) {
                 let mut launch_message = None;
                 if auto_login {

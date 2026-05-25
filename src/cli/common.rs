@@ -34,10 +34,6 @@ pub fn stdout_streamer() -> Arc<dyn Fn(&str) + Send + Sync> {
     })
 }
 
-pub fn noop_streamer() -> Arc<dyn Fn(&str) + Send + Sync> {
-    Arc::new(|_chunk: &str| {})
-}
-
 pub fn install_ctrlc_cancel(token: CancellationToken) {
     tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {

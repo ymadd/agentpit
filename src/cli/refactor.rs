@@ -29,7 +29,15 @@ pub async fn run(
         let members = ctx.loaded.config.ensemble.refactor_members.clone();
         if !members.is_empty() {
             let aggregator = ctx.loaded.config.ensemble.refactor_aggregator;
-            return super::ensemble::run_resolved(ctx, prompt, members, aggregator, cwd).await;
+            return super::ensemble::run_resolved(
+                ctx,
+                crate::events::RunKind::Refactor,
+                prompt,
+                members,
+                aggregator,
+                cwd,
+            )
+            .await;
         }
     }
     super::rescue::run_with_route(prompt, backend, cwd, true, RouteKey::Refactor).await

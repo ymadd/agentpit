@@ -1,66 +1,10 @@
 use std::fmt;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
-pub enum BackendId {
-    Claude,
-    Codex,
-    Gemini,
-    Antigravity,
-    Opencode,
-    Goose,
-    Copilot,
-}
-
-impl BackendId {
-    pub const ALL: &'static [BackendId] = &[
-        BackendId::Claude,
-        BackendId::Codex,
-        BackendId::Gemini,
-        BackendId::Antigravity,
-        BackendId::Opencode,
-        BackendId::Goose,
-        BackendId::Copilot,
-    ];
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            BackendId::Claude => "claude",
-            BackendId::Codex => "codex",
-            BackendId::Gemini => "gemini",
-            BackendId::Antigravity => "antigravity",
-            BackendId::Opencode => "opencode",
-            BackendId::Goose => "goose",
-            BackendId::Copilot => "copilot",
-        }
-    }
-}
-
-impl fmt::Display for BackendId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for BackendId {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "claude" => Ok(BackendId::Claude),
-            "codex" => Ok(BackendId::Codex),
-            "gemini" => Ok(BackendId::Gemini),
-            "antigravity" | "agy" => Ok(BackendId::Antigravity),
-            "opencode" => Ok(BackendId::Opencode),
-            "goose" => Ok(BackendId::Goose),
-            "copilot" => Ok(BackendId::Copilot),
-            other => Err(format!("unknown backend: {other}")),
-        }
-    }
-}
+// BackendId is defined in the shared `agentpit-events` crate so the event schema and the
+// CLI agree on one definition. Re-exported here so the CLI keeps using `crate::types::BackendId`.
+pub use agentpit_events::BackendId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

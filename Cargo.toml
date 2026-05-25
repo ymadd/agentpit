@@ -1,6 +1,6 @@
 [package]
 name = "agentpit"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 authors = ["yamato"]
 license = "Apache-2.0"
@@ -8,12 +8,19 @@ description = "Multi-agent hub CLI: route work to Gemini / Antigravity (agy) / C
 repository = "https://github.com/ymadd/agentpit"
 rust-version = "1.88.0"
 
+# The dashboard is intentionally excluded: it pulls Tauri and is built on its own, not
+# as part of `cargo build --release` for the CLI.
+[workspace]
+members = [".", "agentpit-events"]
+exclude = ["dashboard"]
+
 [[bin]]
 name = "agentpit"
 path = "src/main.rs"
 
 [dependencies]
 agent-client-protocol = "0.12"
+agentpit-events = { path = "agentpit-events" }
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 cliclack = "0.5"

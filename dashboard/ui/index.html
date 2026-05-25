@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>agentpit dashboard</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot" id="conn-dot"></span>
+        <strong>agentpit</strong><span class="muted">dashboard</span>
+      </div>
+      <div class="muted small" id="updated">—</div>
+    </header>
+
+    <main>
+      <section>
+        <h2 class="section-title">
+          <span class="live-pip"></span> LIVE
+          <span class="count" id="live-count">0</span>
+        </h2>
+        <div id="live"></div>
+        <div id="live-empty" class="empty">No runs in flight. Fire an
+          <code>agentpit ensemble / review / rescue</code> and it shows up here.</div>
+      </section>
+
+      <section>
+        <h2 class="section-title muted">Recent</h2>
+        <div id="recent"></div>
+        <div id="recent-empty" class="empty small">No finished runs yet.</div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

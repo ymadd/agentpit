@@ -34,5 +34,13 @@ pub async fn run(
     let members =
         members.unwrap_or_else(|| ctx.loaded.config.ensemble.review_members.clone());
     let aggregator = aggregator.or(ctx.loaded.config.ensemble.review_aggregator);
-    super::ensemble::run_resolved(ctx, lines.join("\n"), members, aggregator, cwd).await
+    super::ensemble::run_resolved(
+        ctx,
+        crate::events::RunKind::Review,
+        lines.join("\n"),
+        members,
+        aggregator,
+        cwd,
+    )
+    .await
 }

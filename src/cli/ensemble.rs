@@ -7,9 +7,10 @@ use console::style;
 use tokio_util::sync::CancellationToken;
 
 use super::common::Context;
-use super::{install_ctrlc_cancel, load_context, noop_streamer, resolve_cwd};
+use super::{install_ctrlc_cancel, load_context, resolve_cwd};
 use crate::auth::{check_auth, is_auth_failure};
 use crate::dispatch::{Registries, dispatch, resolve_transport};
+use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::types::{BackendId, Transport};
 
 pub struct MemberOutcome {
@@ -69,11 +70,20 @@ async fn run_one_member(
     cwd: PathBuf,
     cancel: CancellationToken,
     regs: Arc<Registries>,
+    logger: RunLogger,
 ) -> MemberOutcome {
     let started = Instant::now();
     let transport = resolve_transport(backend, &regs);
     if transport.is_none() {
         report_member_done(backend, started.elapsed().as_secs_f32(), Err("not registered"));
+        logger.member_finished(
+            backend,
+            false,
+            LegStatus::Error,
+            started.elapsed().as_millis() as u64,
+            None,
+            Some("not registered".into()),
+        );
         return MemberOutcome {
             backend,
             transport: None,
@@ -82,7 +92,7 @@ async fn run_one_member(
         };
     }
 
-    let on_chunk = noop_streamer();
+    let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
     match dispatch(backend, &prompt, &cwd, cancel, on_chunk, &regs).await {
         Ok(res) => {
             if is_auth_failure(&res.output) {
@@ -90,6 +100,14 @@ async fn run_one_member(
                     backend,
                     started.elapsed().as_secs_f32(),
                     Err("auth failure during execution"),
+                );
+                logger.member_finished(
+                    backend,
+                    false,
+                    LegStatus::Error,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                    Some("auth failure during execution".into()),
                 );
                 return MemberOutcome {
                     backend,
@@ -104,6 +122,14 @@ async fn run_one_member(
                 started.elapsed().as_secs_f32(),
                 Ok(chars),
             );
+            logger.member_finished(
+                backend,
+                false,
+                LegStatus::Ok,
+                started.elapsed().as_millis() as u64,
+                Some(chars),
+                None,
+            );
             MemberOutcome {
                 backend,
                 transport: Some(res.transport),
@@ -114,6 +140,14 @@ async fn run_one_member(
         Err(err) => {
             let msg = format!("{err:#}");
             report_member_done(backend, started.elapsed().as_secs_f32(), Err(&msg));
+            logger.member_finished(
+                backend,
+                false,
+                LegStatus::Error,
+                started.elapsed().as_millis() as u64,
+                None,
+                Some(msg.clone()),
+            );
             MemberOutcome {
                 backend,
                 transport,
@@ -187,11 +221,12 @@ pub async fn run(
     let members =
         members.unwrap_or_else(|| ctx.loaded.config.ensemble.default_members.clone());
     let aggregator = aggregator.or(ctx.loaded.config.ensemble.aggregator);
-    run_resolved(ctx, prompt, members, aggregator, cwd).await
+    run_resolved(ctx, RunKind::Ensemble, prompt, members, aggregator, cwd).await
 }
 
 pub async fn run_resolved(
     ctx: Context,
+    kind: RunKind,
     prompt: String,
     members: Vec<BackendId>,
     aggregator: Option<BackendId>,
@@ -202,15 +237,18 @@ pub async fn run_resolved(
     install_ctrlc_cancel(cancel.clone());
 
     let regs = Arc::new(ctx.regs);
+    let logger = RunLogger::start(kind, &members, &cwd);
 
     let pre = preflight(&members, &regs).await;
     if !pre.skipped.is_empty() {
         eprintln!("{} skipping {} member(s) with missing auth or transport:", style("⚠").yellow(), pre.skipped.len());
         for (m, hint) in &pre.skipped {
             eprintln!("  [{m}] {hint}");
+            logger.member_finished(*m, false, LegStatus::Skipped, 0, None, Some(hint.clone()));
         }
     }
     if pre.runnable.is_empty() {
+        logger.finished(LegStatus::Error);
         anyhow::bail!("no members are ready (all skipped). Run `agentpit login <backend>` to fix.");
     }
     eprintln!("{} members ready: {}", style("→").bold(), pre.runnable.iter().map(BackendId::to_string).collect::<Vec<_>>().join(", "));
@@ -218,13 +256,15 @@ pub async fn run_resolved(
     let mut handles = Vec::new();
     for m in pre.runnable {
         report_member_start(m);
+        logger.member_started(m, false);
         let cwd_c = cwd.clone();
         let cancel_c = cancel.clone();
         let regs_c = regs.clone();
         let prompt_c = prompt.clone();
+        let logger_c = logger.clone();
         let handle =
             tokio::spawn(
-                async move { run_one_member(m, prompt_c, cwd_c, cancel_c, regs_c).await },
+                async move { run_one_member(m, prompt_c, cwd_c, cancel_c, regs_c, logger_c).await },
             );
         handles.push((m, handle));
     }
@@ -256,6 +296,7 @@ pub async fn run_resolved(
     if let Some(aggregator_id) = aggregator {
         if !any_success {
             println!("{member_section}");
+            logger.finished(LegStatus::Error);
             anyhow::bail!("no members succeeded — skipping aggregator");
         }
         let transport = resolve_transport(aggregator_id, &regs);
@@ -264,6 +305,8 @@ pub async fn run_resolved(
             println!(
                 "{member_section}\n\n=== aggregator skipped ===\n{aggregator_id} not registered"
             );
+            logger.member_finished(aggregator_id, true, LegStatus::Skipped, 0, None, Some("not registered".into()));
+            logger.finished(LegStatus::Ok);
             return Ok(());
         }
         let auth = check_auth(aggregator_id).await;
@@ -273,13 +316,16 @@ pub async fn run_resolved(
                 "{member_section}\n\n=== aggregator skipped ===\nauth missing for {aggregator_id}: {}",
                 auth.hint
             );
+            logger.member_finished(aggregator_id, true, LegStatus::Skipped, 0, None, Some(auth.hint.clone()));
+            logger.finished(LegStatus::Ok);
             return Ok(());
         }
 
         report_member_start(aggregator_id);
+        logger.member_started(aggregator_id, true);
         let started = Instant::now();
         let agg_prompt = build_aggregator_prompt(&prompt, &outcomes);
-        let on_chunk = noop_streamer();
+        let on_chunk = crate::events::output_streamer(logger.run_id(), aggregator_id, true);
         match dispatch(
             aggregator_id,
             &agg_prompt,
@@ -292,6 +338,14 @@ pub async fn run_resolved(
         {
             Ok(res) => {
                 report_member_done(aggregator_id, started.elapsed().as_secs_f32(), Ok(res.output.len()));
+                logger.member_finished(
+                    aggregator_id,
+                    true,
+                    LegStatus::Ok,
+                    started.elapsed().as_millis() as u64,
+                    Some(res.output.len()),
+                    None,
+                );
                 println!(
                     "{member_section}\n\n=== aggregator [{aggregator_id}] (transport={}) ===\n{}",
                     res.transport.as_str(),
@@ -301,19 +355,31 @@ pub async fn run_resolved(
             Err(err) => {
                 let msg = format!("{err:#}");
                 report_member_done(aggregator_id, started.elapsed().as_secs_f32(), Err(&msg));
+                logger.member_finished(
+                    aggregator_id,
+                    true,
+                    LegStatus::Error,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                    Some(msg.clone()),
+                );
                 println!(
                     "{member_section}\n\n=== aggregator failed ===\n{aggregator_id}: {msg}"
                 );
+                logger.finished(LegStatus::Error);
                 anyhow::bail!("aggregator failed");
             }
         }
+        logger.finished(LegStatus::Ok);
         return Ok(());
     }
 
     println!("{member_section}");
     if !any_success {
+        logger.finished(LegStatus::Error);
         anyhow::bail!("no members produced output");
     }
+    logger.finished(LegStatus::Ok);
     Ok(())
 }
 

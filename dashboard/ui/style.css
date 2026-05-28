@@ -182,6 +182,13 @@ section { margin-bottom: 22px; }
   font: 11.5px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   white-space: pre-wrap;
   word-break: break-word;
+  /* Let users select/copy log text — selection now survives ticks. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+.output:empty::before {
+  content: "waiting for output…";
+  color: var(--muted);
 }
 
 .recent-row.clickable { cursor: pointer; }

@@ -17,7 +17,7 @@ description: Fan a prompt out to multiple backend agents in parallel, optionally
 agentpit ensemble "<prompt>" [--members <a,b,c>] [--aggregator <id>]
 ```
 
-Defaults come from `~/.config/agentpit/config.toml` — typically `gemini, claude, opencode` with no aggregator.
+Defaults come from `~/.config/agentpit/config.toml` — typically `antigravity, claude, opencode` with no aggregator.
 
 ## Output
 

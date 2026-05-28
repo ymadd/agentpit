@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use crate::types::BackendId;
 
 mod common;
+pub mod adversarial_review;
 pub mod config;
 pub mod dashboard;
 pub mod ensemble;
@@ -51,7 +52,7 @@ pub enum Command {
         no_auto_login: bool,
     },
 
-    /// Run a multi-agent code review (defaults to gemini + opencode).
+    /// Run a multi-agent code review (defaults to antigravity + opencode).
     Review {
         target: String,
         #[arg(long)]
@@ -67,6 +68,20 @@ pub enum Command {
     /// Run a multi-agent security review (OWASP-style checklist, defaults to claude + codex).
     #[command(name = "security-review")]
     SecurityReview {
+        target: String,
+        #[arg(long)]
+        focus: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        members: Option<Vec<BackendId>>,
+        #[arg(long)]
+        aggregator: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+
+    /// Run a multi-agent adversarial review (challenges assumptions, demands evidence; defaults to codex + antigravity).
+    #[command(name = "adversarial-review")]
+    AdversarialReview {
         target: String,
         #[arg(long)]
         focus: Option<String>,
@@ -182,6 +197,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             aggregator,
             cwd,
         } => security_review::run(target, focus, members, aggregator, cwd).await,
+
+        Command::AdversarialReview {
+            target,
+            focus,
+            members,
+            aggregator,
+            cwd,
+        } => adversarial_review::run(target, focus, members, aggregator, cwd).await,
 
         Command::Explain {
             target,

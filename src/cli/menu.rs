@@ -10,6 +10,7 @@ enum MainAction {
     Rescue,
     Review,
     SecurityReview,
+    AdversarialReview,
     Explain,
     Refactor,
     Ensemble,
@@ -37,6 +38,7 @@ pub async fn run_main() -> Result<()> {
         .item(MainAction::Rescue, "rescue", "one-shot task to a backend")
         .item(MainAction::Review, "review", "multi-agent code review")
         .item(MainAction::SecurityReview, "security-review", "OWASP-style multi-agent security review")
+        .item(MainAction::AdversarialReview, "adversarial-review", "challenge assumptions; demand evidence")
         .item(MainAction::Explain, "explain", "explain a target")
         .item(MainAction::Refactor, "refactor", "plan a refactor")
         .item(MainAction::Ensemble, "ensemble", "fan a prompt out to multiple backends")
@@ -52,6 +54,7 @@ pub async fn run_main() -> Result<()> {
         MainAction::Rescue => rescue_flow().await,
         MainAction::Review => review_flow().await,
         MainAction::SecurityReview => security_review_flow().await,
+        MainAction::AdversarialReview => adversarial_review_flow().await,
         MainAction::Explain => explain_flow().await,
         MainAction::Refactor => refactor_flow().await,
         MainAction::Ensemble => ensemble_flow().await,
@@ -152,6 +155,24 @@ async fn security_review_flow() -> Result<()> {
     super::security_review::run(target, focus, None, None, None).await
 }
 
+async fn adversarial_review_flow() -> Result<()> {
+    let target: String = cliclack::input("Target to adversarial-review")
+        .placeholder("file path / diff / 'last commit'")
+        .interact()
+        .map_err(|e| anyhow!("input: {e}"))?;
+    let focus_raw: String = cliclack::input("Optional attack focus (leave blank for full checklist)")
+        .default_input("")
+        .required(false)
+        .interact()
+        .map_err(|e| anyhow!("input: {e}"))?;
+    let focus = if focus_raw.trim().is_empty() {
+        None
+    } else {
+        Some(focus_raw)
+    };
+    super::adversarial_review::run(target, focus, None, None, None).await
+}
+
 async fn explain_flow() -> Result<()> {
     let target: String = cliclack::input("Target to explain")
         .placeholder("file path / symbol")
@@ -201,8 +222,8 @@ async fn update_flow() -> Result<()> {
 
 fn pick_backend(prompt: &str) -> Result<BackendId> {
     cliclack::select(prompt)
-        .item(BackendId::Gemini, "gemini", "")
         .item(BackendId::Antigravity, "antigravity", "agy — Gemini CLI successor")
+        .item(BackendId::Gemini, "gemini", "")
         .item(BackendId::Claude, "claude", "")
         .item(BackendId::Codex, "codex", "")
         .item(BackendId::Opencode, "opencode", "")

@@ -20,7 +20,7 @@ agentpit review "<target>" [--focus <topic>] [--members <a,b,c>] [--aggregator <
 ```
 
 Defaults:
-- members: `gemini, opencode`
+- members: `antigravity, opencode`
 - aggregator: none (members run in parallel and each section is shown separately)
 
 ## Output

@@ -107,7 +107,7 @@ impl Router {
                 .iter()
                 .next()
                 .copied()
-                .unwrap_or(BackendId::Gemini)
+                .unwrap_or(BackendId::Antigravity)
         };
         RouteDecision {
             backend: final_backend,

@@ -1,5 +1,5 @@
 ---
-description: Multi-agent code review (defaults to gemini + opencode in parallel)
+description: Multi-agent code review (defaults to antigravity + opencode in parallel)
 argument-hint: <target> [--focus=<topic>]
 ---
 

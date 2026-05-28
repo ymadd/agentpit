@@ -91,6 +91,10 @@ pub struct EnsembleSection {
     pub security_review_members: Vec<BackendId>,
     #[serde(default)]
     pub security_review_aggregator: Option<BackendId>,
+    #[serde(default = "default_adversarial_review_members")]
+    pub adversarial_review_members: Vec<BackendId>,
+    #[serde(default)]
+    pub adversarial_review_aggregator: Option<BackendId>,
     #[serde(default)]
     pub rescue_members: Vec<BackendId>,
     #[serde(default)]
@@ -110,6 +114,8 @@ impl Default for EnsembleSection {
             review_aggregator: None,
             security_review_members: default_security_review_members(),
             security_review_aggregator: None,
+            adversarial_review_members: default_adversarial_review_members(),
+            adversarial_review_aggregator: None,
             rescue_members: Vec::new(),
             rescue_aggregator: None,
             refactor_members: Vec::new(),
@@ -139,7 +145,7 @@ pub struct HubConfig {
 }
 
 fn default_backend() -> BackendId {
-    BackendId::Gemini
+    BackendId::Antigravity
 }
 fn default_review_backend() -> BackendId {
     BackendId::Claude
@@ -159,19 +165,27 @@ fn default_review_keywords() -> Vec<String> {
     ]
 }
 fn default_ensemble_members() -> Vec<BackendId> {
-    vec![BackendId::Gemini, BackendId::Claude, BackendId::Opencode]
+    vec![
+        BackendId::Antigravity,
+        BackendId::Claude,
+        BackendId::Opencode,
+    ]
 }
 fn default_review_members() -> Vec<BackendId> {
-    vec![BackendId::Gemini, BackendId::Opencode]
+    vec![BackendId::Antigravity, BackendId::Opencode]
 }
 fn default_security_review_members() -> Vec<BackendId> {
     vec![BackendId::Claude, BackendId::Codex]
 }
+fn default_adversarial_review_members() -> Vec<BackendId> {
+    // Codex for adversarial scrutiny; Antigravity's long context for whole-file tracing.
+    vec![BackendId::Codex, BackendId::Antigravity]
+}
 fn default_routes() -> BTreeMap<RouteKey, BackendId> {
     let mut m = BTreeMap::new();
-    m.insert(RouteKey::Rescue, BackendId::Gemini);
+    m.insert(RouteKey::Rescue, BackendId::Antigravity);
     m.insert(RouteKey::Review, BackendId::Claude);
-    m.insert(RouteKey::Explain, BackendId::Gemini);
+    m.insert(RouteKey::Explain, BackendId::Antigravity);
     m.insert(RouteKey::Refactor, BackendId::Claude);
     m
 }
@@ -306,35 +320,35 @@ pub fn load_config(override_path: Option<&Path>) -> Result<LoadedConfig> {
 }
 
 pub const DEFAULT_CONFIG_TOML: &str = r#"# agentpit config
-# Backends currently available: gemini, antigravity (agy), claude, codex (paid plan), opencode
+# Backends currently available: antigravity (agy), gemini, claude, codex (paid plan), opencode
 
 [default]
-backend = "gemini"
+backend = "antigravity"
 auto_route = true
 
 [routes]
-rescue   = "gemini"
+rescue   = "antigravity"
 review   = "claude"
-explain  = "gemini"
+explain  = "antigravity"
 refactor = "claude"
 
 [auto_route]
 long_context_threshold = 100000
-long_context_backend   = "gemini"
+long_context_backend   = "antigravity"
 review_keywords        = ["review", "audit", "critique", "security"]
 review_backend         = "claude"
 
 [ensemble]
 # Generic ensemble members + optional aggregator
-default_members = ["gemini", "claude", "opencode"]
+default_members = ["antigravity", "claude", "opencode"]
 # aggregator = "claude"
 
 # Per-tool overrides
-review_members = ["gemini", "opencode"]
+review_members = ["antigravity", "opencode"]
 # review_aggregator = "claude"
 
 # Per-backend transport override.
-# [backends.gemini]
+# [backends.antigravity]
 # transport = "acp"
 "#;
 
@@ -350,10 +364,10 @@ mod tests {
         let path = dir.path().join("absent.toml");
         let loaded = load_config(Some(&path)).unwrap();
         assert_eq!(loaded.source, ConfigSource::Defaults);
-        assert_eq!(loaded.config.default.backend, BackendId::Gemini);
+        assert_eq!(loaded.config.default.backend, BackendId::Antigravity);
         assert_eq!(
             loaded.config.ensemble.review_members,
-            vec![BackendId::Gemini, BackendId::Opencode]
+            vec![BackendId::Antigravity, BackendId::Opencode]
         );
     }
 

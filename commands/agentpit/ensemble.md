@@ -1,6 +1,6 @@
 ---
 description: Fan a prompt to multiple backends and optionally synthesize results
-argument-hint: <prompt> [--members=gemini,opencode,claude] [--aggregator=claude]
+argument-hint: <prompt> [--members=antigravity,opencode,claude] [--aggregator=claude]
 ---
 
 Parse `$ARGUMENTS`:

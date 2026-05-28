@@ -73,13 +73,16 @@ agentpit                              # interactive menu
 agentpit rescue "list files in src/" # one-shot
 agentpit rescue "..." --backend agy   # force a backend
 
-agentpit review src/lib.rs            # multi-agent review (defaults: gemini + opencode)
-agentpit review src/ --members gemini,antigravity,claude --aggregator claude
+agentpit review src/lib.rs            # multi-agent review (defaults: antigravity + opencode)
+agentpit review src/ --members antigravity,claude,codex --aggregator claude
 
-agentpit explain src/router.rs        # gemini-first by default
+agentpit security-review src/auth.rs  # OWASP-style review (defaults: claude + codex)
+agentpit adversarial-review src/      # hostile, evidence-demanding review (defaults: codex + antigravity)
+
+agentpit explain src/router.rs        # antigravity-first by default
 agentpit refactor src/big.rs "split into modules"
 
-agentpit ensemble "design X" --members gemini,antigravity,claude
+agentpit ensemble "design X" --members antigravity,claude,codex
 
 agentpit status                       # config + per-backend auth state
 agentpit login antigravity            # opens `agy auth login` in a terminal
@@ -92,30 +95,30 @@ agentpit update                       # check + self-replace from GitHub release
 
 ```toml
 [default]
-backend = "gemini"
+backend = "antigravity"
 auto_route = true
 
 [routes]
-rescue   = "gemini"
+rescue   = "antigravity"
 review   = "claude"
-explain  = "gemini"
+explain  = "antigravity"
 refactor = "claude"
 
 [auto_route]
 long_context_threshold = 100000
-long_context_backend   = "gemini"
+long_context_backend   = "antigravity"
 review_keywords        = ["review", "audit", "critique", "security"]
 review_backend         = "claude"
 
 [ensemble]
-default_members = ["gemini", "claude", "opencode"]
+default_members = ["antigravity", "claude", "opencode"]
 # aggregator    = "claude"
 
-review_members  = ["gemini", "opencode"]
+review_members  = ["antigravity", "opencode"]
 # review_aggregator = "claude"
 
 # Per-tool ensembles (split prompts across multiple backends)
-# rescue_members   = ["gemini", "antigravity"]
+# rescue_members   = ["antigravity", "gemini"]
 # refactor_members = ["claude", "antigravity"]
 
 # Per-backend transport override

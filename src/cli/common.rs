@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{LoadedConfig, load_config};
@@ -21,7 +21,14 @@ pub fn load_context() -> Result<Context> {
 
 pub fn resolve_cwd(cwd: Option<String>) -> Result<PathBuf> {
     if let Some(s) = cwd {
-        return Ok(PathBuf::from(s));
+        let raw = PathBuf::from(&s);
+        let canonical = raw
+            .canonicalize()
+            .map_err(|e| anyhow!("cwd {} is not a valid directory: {}", s, e))?;
+        if !canonical.is_dir() {
+            return Err(anyhow!("cwd {} is not a directory", s));
+        }
+        return Ok(canonical);
     }
     Ok(std::env::current_dir()?)
 }

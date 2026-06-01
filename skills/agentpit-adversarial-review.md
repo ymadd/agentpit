@@ -1,6 +1,6 @@
 ---
 name: agentpit-adversarial-review
-description: Run a multi-agent ADVERSARIAL review (challenges assumptions, demands evidence, assumes the code is broken until proven otherwise; defaults to Codex + Gemini in parallel). Invoke when the user wants a hostile / red-team / "rip it apart" / "what am I missing" review, or asks for negative findings on a design or PR.
+description: Run a multi-agent ADVERSARIAL review (challenges assumptions, demands evidence, assumes the code is broken until proven otherwise; defaults to Codex + Antigravity in parallel). Invoke when the user wants a hostile / red-team / "rip it apart" / "what am I missing" review, or asks for negative findings on a design or PR.
 ---
 
 # agentpit:adversarial-review

@@ -212,6 +212,26 @@ pub fn backend_log_path(run_id: &str, backend: &str, aggregator: bool) -> PathBu
     runs_dir().join(run_id).join(name)
 }
 
+/// Validate that `s` is safe to use as a single path component (a run_id or backend name).
+///
+/// Returns `true` only when `s` is non-empty, is neither `"."` nor `".."`, contains no
+/// path-separator characters (`'/'` or `'\\'`), no NUL byte, and every character is ASCII
+/// alphanumeric or one of `'.'`, `'_'`, `'-'`.  This guards every place a caller-supplied
+/// run_id or backend name is joined onto an on-disk path with
+/// [`PathBuf::join`], which does **not** collapse `..` and will replace the entire prefix
+/// when given an absolute component.
+pub fn is_safe_log_component(s: &str) -> bool {
+    if s.is_empty() || s == "." || s == ".." {
+        return false;
+    }
+    s.bytes().all(|b| {
+        b != b'/' && b != b'\\' && b != b'\0' && {
+            let c = b as char;
+            c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+        }
+    })
+}
+
 /// Whether event/output capture is on. Set `AGENTPIT_NO_EVENTS=1` to disable.
 fn events_enabled() -> bool {
     std::env::var("AGENTPIT_NO_EVENTS")
@@ -228,6 +248,10 @@ pub fn output_streamer(
     aggregator: bool,
 ) -> Arc<dyn Fn(&str) + Send + Sync> {
     if !events_enabled() {
+        return Arc::new(|_chunk: &str| {});
+    }
+    // Reject any run_id or backend name that could escape the runs directory.
+    if !is_safe_log_component(run_id) || !is_safe_log_component(backend.as_str()) {
         return Arc::new(|_chunk: &str| {});
     }
     let path = backend_log_path(run_id, backend.as_str(), aggregator);
@@ -456,6 +480,31 @@ fn append_line(event: &Event) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_log_component_accepts_valid_ids() {
+        assert!(is_safe_log_component("1234-5-6"));
+        assert!(is_safe_log_component("claude"));
+        assert!(is_safe_log_component("opencode.agg"));
+        assert!(is_safe_log_component("my_backend-1"));
+    }
+
+    #[test]
+    fn safe_log_component_rejects_traversal_and_separators() {
+        assert!(!is_safe_log_component(".."));
+        assert!(!is_safe_log_component("."));
+        assert!(!is_safe_log_component("../etc"));
+        assert!(!is_safe_log_component("a/b"));
+        assert!(!is_safe_log_component("a\\b"));
+        assert!(!is_safe_log_component("/abs"));
+        assert!(!is_safe_log_component(""));
+    }
+
+    #[test]
+    fn safe_log_component_rejects_nul_byte() {
+        let with_nul = "bad\x00name";
+        assert!(!is_safe_log_component(with_nul));
+    }
 
     // Tests that mutate the process-wide XDG_STATE_HOME must not run concurrently.
     static ENV_LOCK: Mutex<()> = Mutex::new(());

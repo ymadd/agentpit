@@ -76,6 +76,14 @@ struct OutputChunk {
 /// every tick. Multibyte chars split across reads are held back until complete.
 #[tauri::command]
 fn get_output(run_id: String, backend: String, aggregator: bool, offset: u64) -> OutputChunk {
+    // Reject run_id or backend values that could escape the runs directory via path
+    // traversal (e.g. "../.ssh/id_rsa"). PathBuf::join does not sanitise ".." and an
+    // absolute component replaces the entire prefix, so we must validate up front.
+    if !agentpit_events::is_safe_log_component(&run_id)
+        || !agentpit_events::is_safe_log_component(&backend)
+    {
+        return OutputChunk { offset, ..Default::default() };
+    }
     let path = agentpit_events::backend_log_path(&run_id, &backend, aggregator);
     read_delta(&path, offset, MAX_OUTPUT_BYTES)
 }

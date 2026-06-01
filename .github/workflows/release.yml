@@ -35,10 +35,13 @@ jobs:
     steps:
       - name: Resolve tag
         id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           case "${{ github.event_name }}" in
-            workflow_dispatch) name="${{ github.event.inputs.tag }}" ;;
-            release)           name="${{ github.event.release.tag_name }}" ;;
+            workflow_dispatch) name="$INPUT_TAG" ;;
+            release)           name="$RELEASE_TAG" ;;
             *)                 name="${GITHUB_REF#refs/tags/}" ;;
           esac
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -46,10 +49,11 @@ jobs:
       - name: Flip release to draft (if it already exists)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+          REPO: ${{ github.repository }}
         run: |
-          TAG='${{ steps.tag.outputs.name }}'
-          if gh release view "$TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
-            gh release edit "$TAG" --draft --repo ${{ github.repository }}
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" --draft --repo "$REPO"
             echo "Flipped existing release $TAG to draft."
           else
             echo "No existing release for $TAG — will be created by upload step."
@@ -107,7 +111,7 @@ jobs:
           shasum -a 256 "agentpit-${{ matrix.target }}.gz" > "agentpit-${{ matrix.target }}.gz.sha256"
 
       - name: Upload to draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           draft: true
@@ -124,8 +128,10 @@ jobs:
       - name: Flip release to published
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release edit '${{ needs.prepare.outputs.tag }}' \
+          gh release edit "$TAG" \
             --draft=false \
             --latest \
-            --repo ${{ github.repository }}
+            --repo "$REPO"

@@ -20,6 +20,10 @@ pub(crate) const COMMAND_FILES: &[(&str, &str)] = &[
         include_str!("../../commands/agentpit/security-review.md"),
     ),
     (
+        "adversarial-review.md",
+        include_str!("../../commands/agentpit/adversarial-review.md"),
+    ),
+    (
         "explain.md",
         include_str!("../../commands/agentpit/explain.md"),
     ),
@@ -55,6 +59,10 @@ pub(crate) const SKILL_FILES: &[(&str, &str)] = &[
         include_str!("../../skills/agentpit-security-review.md"),
     ),
     (
+        "agentpit-adversarial-review.md",
+        include_str!("../../skills/agentpit-adversarial-review.md"),
+    ),
+    (
         "agentpit-explain.md",
         include_str!("../../skills/agentpit-explain.md"),
     ),
@@ -75,6 +83,12 @@ pub(crate) const SKILL_FILES: &[(&str, &str)] = &[
         include_str!("../../skills/agentpit-login.md"),
     ),
 ];
+
+/// Compile-time assertion: COMMAND_FILES and SKILL_FILES must stay in lockstep.
+const _: () = assert!(
+    COMMAND_FILES.len() == SKILL_FILES.len(),
+    "COMMAND_FILES and SKILL_FILES must have the same number of entries"
+);
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum Scope {
@@ -245,9 +259,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embeds_eight_commands_and_eight_skills() {
-        assert_eq!(COMMAND_FILES.len(), 8);
-        assert_eq!(SKILL_FILES.len(), 8);
+    fn embeds_nine_commands_and_nine_skills() {
+        assert_eq!(COMMAND_FILES.len(), 9);
+        assert_eq!(SKILL_FILES.len(), 9);
         for (name, content) in COMMAND_FILES.iter().chain(SKILL_FILES.iter()) {
             assert!(name.ends_with(".md"), "{name} must be a .md file");
             assert!(!content.is_empty(), "{name} content must be non-empty");

@@ -3,9 +3,10 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
+    ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+    TextContent,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use anyhow::{Result, anyhow};
@@ -59,7 +60,13 @@ pub async fn run_acp_prompt(
             )
             .on_receive_request(
                 async move |request: RequestPermissionRequest, responder, _cx| {
-                    let option_id = request.options.first().map(|opt| opt.option_id.clone());
+                    // Auto-approve only AllowOnce; never silently grant AllowAlways
+                    // or any Reject* kind. If no AllowOnce option is present, cancel.
+                    let option_id = request
+                        .options
+                        .iter()
+                        .find(|opt| opt.kind == PermissionOptionKind::AllowOnce)
+                        .map(|opt| opt.option_id.clone());
                     if let Some(id) = option_id {
                         responder.respond(RequestPermissionResponse::new(
                             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),

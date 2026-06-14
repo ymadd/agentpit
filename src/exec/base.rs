@@ -9,6 +9,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::types::BackendId;
 
+/// Hard cap on how much stdout/stderr we retain in memory per backend run. A wedged or
+/// runaway backend can emit unbounded output; we keep streaming chunks to the caller
+/// (the dashboard does its own windowing) but stop growing the collected buffer past this
+/// so one run can't exhaust hub memory. ~8 MiB is far above any real agent transcript.
+const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
+
+/// Callback invoked with each streamed stdout chunk (e.g. tee to terminal + capture file).
+pub type OutputSink = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+
 #[derive(Debug, Clone)]
 pub struct ExecSpec {
     pub command: String,
@@ -20,7 +29,7 @@ pub struct ExecSpec {
 pub struct ExecRunOptions {
     pub cwd: PathBuf,
     pub cancel: CancellationToken,
-    pub on_stdout: Option<Arc<dyn Fn(&str) + Send + Sync + 'static>>,
+    pub on_stdout: Option<OutputSink>,
 }
 
 pub struct ExecOutcome {
@@ -53,11 +62,11 @@ pub async fn run_spec(
         .spawn()
         .map_err(|e| anyhow!("failed to spawn {}: {e}", spec.command))?;
 
-    if let Some(input) = spec.stdin_input.as_ref() {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(input.as_bytes()).await?;
-            stdin.shutdown().await.ok();
-        }
+    if let Some(input) = spec.stdin_input.as_ref()
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        stdin.write_all(input.as_bytes()).await?;
+        stdin.shutdown().await.ok();
     }
 
     let stdout = child
@@ -73,6 +82,7 @@ pub async fn run_spec(
     let stdout_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         let mut collected = String::new();
+        let mut truncated = false;
         let mut buf = Vec::with_capacity(1024);
         loop {
             buf.clear();
@@ -81,10 +91,18 @@ pub async fn run_spec(
                 break;
             }
             let chunk = String::from_utf8_lossy(&buf).into_owned();
+            // Keep streaming every chunk to the caller, but stop growing the in-memory
+            // buffer once it exceeds the cap so a runaway backend can't OOM the hub. We
+            // still drain to EOF so the child never blocks on a full stdout pipe.
             if let Some(cb) = &on_stdout {
                 cb(&chunk);
             }
-            collected.push_str(&chunk);
+            if collected.len() < MAX_CAPTURED_BYTES {
+                collected.push_str(&chunk);
+            } else if !truncated {
+                truncated = true;
+                collected.push_str("\n[output truncated: exceeded capture limit]\n");
+            }
         }
         Ok::<String, std::io::Error>(collected)
     });
@@ -99,7 +117,9 @@ pub async fn run_spec(
             if n == 0 {
                 break;
             }
-            collected.push_str(&String::from_utf8_lossy(&buf));
+            if collected.len() < MAX_CAPTURED_BYTES {
+                collected.push_str(&String::from_utf8_lossy(&buf));
+            }
         }
         Ok::<String, std::io::Error>(collected)
     });
@@ -126,7 +146,8 @@ pub async fn run_spec(
         return Err(anyhow!(
             "{} exited with code {}{detail}",
             id,
-            code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+            code.map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into())
         ));
     }
 

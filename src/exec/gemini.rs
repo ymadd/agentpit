@@ -1,4 +1,4 @@
-use super::{ExecAdapter, ExecSpec};
+use super::{AutonomyLevel, ExecAdapter, ExecSpec};
 use crate::types::BackendId;
 
 pub struct GeminiExec;
@@ -23,6 +23,11 @@ impl ExecAdapter for GeminiExec {
             stdin_input: None,
         }
     }
+
+    fn autonomy(&self) -> AutonomyLevel {
+        // `--yolo --skip-trust` runs every tool call without confirmation.
+        AutonomyLevel::FullAutonomy
+    }
 }
 
 #[cfg(test)]
@@ -37,5 +42,12 @@ mod tests {
         assert!(spec.args.iter().any(|a| a == "--skip-trust"));
         assert_eq!(spec.args.last().unwrap(), "hello world");
         assert!(spec.stdin_input.is_none());
+    }
+
+    #[test]
+    fn declares_full_autonomy_and_carries_yolo() {
+        assert_eq!(GeminiExec.autonomy(), AutonomyLevel::FullAutonomy);
+        let spec = GeminiExec.build_spec("x");
+        assert!(spec.args.iter().any(|a| a == "--yolo"));
     }
 }

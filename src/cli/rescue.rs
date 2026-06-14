@@ -116,15 +116,16 @@ pub async fn run_with_route(
     // Tee streamed output to both the terminal and the dashboard's capture file.
     let to_stdout = stdout_streamer();
     let to_file = crate::events::output_streamer(logger.run_id(), backend_id, false);
-    let on_chunk: std::sync::Arc<dyn Fn(&str) + Send + Sync> = std::sync::Arc::new(move |c: &str| {
-        to_stdout(c);
-        to_file(c);
-    });
+    let on_chunk: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+        std::sync::Arc::new(move |c: &str| {
+            to_stdout(c);
+            to_file(c);
+        });
 
     let result = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &ctx.regs).await;
     match result {
         Ok(res) => {
-            if is_auth_failure(&res.output) {
+            if res.auth_failed {
                 logger.member_finished(
                     backend_id,
                     false,

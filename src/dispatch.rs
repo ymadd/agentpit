@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::{AcpAdapter, opencode::OpencodeAdapter};
+use crate::auth::is_auth_failure;
 use crate::config::HubConfig;
 use crate::exec::{
     ExecAdapter, ExecRunOptions, antigravity::AntigravityExec, claude::ClaudeExec,
@@ -85,6 +88,48 @@ pub struct DispatchResult {
     pub backend: BackendId,
     pub transport: Transport,
     pub output: String,
+    /// True when the backend's output looks like an auth failure. Detected once here so
+    /// callers act on a typed flag instead of each re-running `is_auth_failure`.
+    pub auth_failed: bool,
+}
+
+/// Safety cap on a single backend dispatch. A wedged backend (produces no output and
+/// never exits) would otherwise hang a run forever when no human is watching to Ctrl-C.
+/// Generous by default — real coding agents can run for many minutes — and overridable
+/// via `AGENTPIT_DISPATCH_TIMEOUT_SECS` (set to `0` to disable the cap entirely).
+const DEFAULT_DISPATCH_TIMEOUT_SECS: u64 = 1800;
+
+fn dispatch_timeout() -> Option<Duration> {
+    let secs = std::env::var("AGENTPIT_DISPATCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DISPATCH_TIMEOUT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Run a backend future under the dispatch timeout. On elapse, cancel only this dispatch's
+/// own `child` token (exec children are also `kill_on_drop`, and the token signals the ACP
+/// path) and surface a clear timeout error rather than hanging. The caller passes a *child*
+/// token so a single member's timeout cannot cancel its concurrent siblings — only the
+/// shared parent (Ctrl-C) cancels everyone.
+async fn with_timeout<T>(
+    backend: BackendId,
+    child: &CancellationToken,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match dispatch_timeout() {
+        None => fut.await,
+        Some(d) => match timeout(d, fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                child.cancel();
+                Err(anyhow!(
+                    "{backend} dispatch timed out after {}s (set AGENTPIT_DISPATCH_TIMEOUT_SECS to adjust)",
+                    d.as_secs()
+                ))
+            }
+        },
+    }
 }
 
 pub async fn dispatch(
@@ -95,24 +140,31 @@ pub async fn dispatch(
     on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
     regs: &Registries,
 ) -> Result<DispatchResult> {
+    // A child of the caller's token: the parent (Ctrl-C) still cancels every member, but a
+    // per-member timeout cancels only this child, leaving concurrent siblings untouched.
+    let child = cancel.child_token();
     if let Some(exec) = regs.execs.get(&backend) {
         let options = ExecRunOptions {
             cwd: cwd.to_path_buf(),
-            cancel: cancel.clone(),
+            cancel: child.clone(),
             on_stdout: Some(on_chunk.clone()),
         };
-        let outcome = crate::exec::run(exec.as_ref(), task, options).await?;
+        let fut = crate::exec::run(exec.as_ref(), task, options);
+        let outcome = with_timeout(backend, &child, fut).await?;
         return Ok(DispatchResult {
             backend,
             transport: Transport::Exec,
+            auth_failed: is_auth_failure(&outcome.output),
             output: outcome.output,
         });
     }
     if let Some(acp) = regs.acps.get(&backend) {
-        let outcome = crate::acp::run(acp.as_ref(), task, cwd, on_chunk, cancel).await?;
+        let fut = crate::acp::run(acp.as_ref(), task, cwd, on_chunk, child.clone());
+        let outcome = with_timeout(backend, &child, fut).await?;
         return Ok(DispatchResult {
             backend,
             transport: Transport::Acp,
+            auth_failed: is_auth_failure(&outcome.output),
             output: outcome.output,
         });
     }
@@ -225,5 +277,21 @@ mod tests {
             acps: HashMap::new(),
         };
         assert!(resolve_transport(BackendId::Goose, &r).is_none());
+    }
+
+    // The dispatch timeout cancels a *child* token so one member's timeout never cancels
+    // its concurrent siblings; only the shared parent (Ctrl-C) cancels everyone. This
+    // pins the token semantics the per-member timeout relies on.
+    #[test]
+    fn child_token_timeout_isolates_siblings() {
+        let parent = CancellationToken::new();
+        let a = parent.child_token();
+        let b = parent.child_token();
+        a.cancel(); // simulate member A's timeout
+        assert!(a.is_cancelled());
+        assert!(!b.is_cancelled(), "sibling must not be cancelled");
+        assert!(!parent.is_cancelled(), "parent must not be cancelled");
+        parent.cancel(); // simulate Ctrl-C
+        assert!(b.is_cancelled(), "parent cancels remaining children");
     }
 }

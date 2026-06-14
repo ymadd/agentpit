@@ -2,18 +2,28 @@ use anyhow::Result;
 
 use crate::types::BackendId;
 
-mod base;
 pub mod antigravity;
+pub mod autonomy;
+mod base;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
 
+pub use autonomy::AutonomyLevel;
 pub use base::{ExecOutcome, ExecRunOptions, ExecSpec, run_spec};
 
 /// Trait implemented by exec-mode backends (direct CLI spawn).
 pub trait ExecAdapter: Send + Sync {
     fn id(&self) -> BackendId;
     fn build_spec(&self, task: &str) -> ExecSpec;
+
+    /// The permission posture this backend is spawned with. Centralised in
+    /// [`autonomy`] so the security decision is auditable in one place rather than
+    /// inferred from each adapter's flags. Defaults to [`AutonomyLevel::FullAutonomy`]
+    /// because every real exec backend runs non-interactively.
+    fn autonomy(&self) -> AutonomyLevel {
+        AutonomyLevel::FullAutonomy
+    }
 }
 
 pub async fn run<A: ExecAdapter + ?Sized>(

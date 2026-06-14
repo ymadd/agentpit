@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::Context;
 use super::{install_ctrlc_cancel, load_context, resolve_cwd};
-use crate::auth::{check_auth, is_auth_failure};
+use crate::auth::check_auth;
 use crate::dispatch::{Registries, dispatch, resolve_transport};
 use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::types::{BackendId, Transport};
@@ -40,6 +40,23 @@ pub fn render_concatenated(outcomes: &[MemberOutcome]) -> String {
     sections.join("\n\n")
 }
 
+/// Per-member cap on how much of each response is embedded in the aggregator prompt. A
+/// verbose member could otherwise blow the aggregator's context window (or cost) on its
+/// own; the tail is dropped with a marker so the synthesis still sees the bulk of it.
+const MAX_MEMBER_PROMPT_BYTES: usize = 48 * 1024;
+
+/// Truncate `s` to at most `max` bytes on a char boundary, appending a marker when cut.
+fn clamp_for_prompt(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated: response exceeded {max} bytes]", &s[..end])
+}
+
 pub fn build_aggregator_prompt(original: &str, outcomes: &[MemberOutcome]) -> String {
     let mut lines = vec![
         "You are aggregating independent responses from multiple coding agents to the user's original task.".to_string(),
@@ -54,11 +71,11 @@ pub fn build_aggregator_prompt(original: &str, outcomes: &[MemberOutcome]) -> St
         if let Some(out) = &o.output {
             lines.push(String::new());
             lines.push(format!("## [{}]", o.backend));
-            lines.push(out.trim().to_string());
+            lines.push(clamp_for_prompt(out.trim(), MAX_MEMBER_PROMPT_BYTES));
         } else if let Some(err) = &o.error {
             lines.push(String::new());
             lines.push(format!("## [{}] (failed)", o.backend));
-            lines.push(err.clone());
+            lines.push(clamp_for_prompt(err, MAX_MEMBER_PROMPT_BYTES));
         }
     }
     lines.join("\n")
@@ -75,7 +92,11 @@ async fn run_one_member(
     let started = Instant::now();
     let transport = resolve_transport(backend, &regs);
     if transport.is_none() {
-        report_member_done(backend, started.elapsed().as_secs_f32(), Err("not registered"));
+        report_member_done(
+            backend,
+            started.elapsed().as_secs_f32(),
+            Err("not registered"),
+        );
         logger.member_finished(
             backend,
             false,
@@ -95,7 +116,7 @@ async fn run_one_member(
     let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
     match dispatch(backend, &prompt, &cwd, cancel, on_chunk, &regs).await {
         Ok(res) => {
-            if is_auth_failure(&res.output) {
+            if res.auth_failed {
                 report_member_done(
                     backend,
                     started.elapsed().as_secs_f32(),
@@ -117,11 +138,7 @@ async fn run_one_member(
                 };
             }
             let chars = res.output.len();
-            report_member_done(
-                backend,
-                started.elapsed().as_secs_f32(),
-                Ok(chars),
-            );
+            report_member_done(backend, started.elapsed().as_secs_f32(), Ok(chars));
             logger.member_finished(
                 backend,
                 false,
@@ -218,8 +235,7 @@ pub async fn run(
     cwd: Option<String>,
 ) -> Result<()> {
     let ctx = load_context()?;
-    let members =
-        members.unwrap_or_else(|| ctx.loaded.config.ensemble.default_members.clone());
+    let members = members.unwrap_or_else(|| ctx.loaded.config.ensemble.default_members.clone());
     let aggregator = aggregator.or(ctx.loaded.config.ensemble.aggregator);
     run_resolved(ctx, RunKind::Ensemble, prompt, members, aggregator, cwd).await
 }
@@ -241,7 +257,11 @@ pub async fn run_resolved(
 
     let pre = preflight(&members, &regs).await;
     if !pre.skipped.is_empty() {
-        eprintln!("{} skipping {} member(s) with missing auth or transport:", style("⚠").yellow(), pre.skipped.len());
+        eprintln!(
+            "{} skipping {} member(s) with missing auth or transport:",
+            style("⚠").yellow(),
+            pre.skipped.len()
+        );
         for (m, hint) in &pre.skipped {
             eprintln!("  [{m}] {hint}");
             logger.member_finished(*m, false, LegStatus::Skipped, 0, None, Some(hint.clone()));
@@ -251,7 +271,15 @@ pub async fn run_resolved(
         logger.finished(LegStatus::Error);
         anyhow::bail!("no members are ready (all skipped). Run `agentpit login <backend>` to fix.");
     }
-    eprintln!("{} members ready: {}", style("→").bold(), pre.runnable.iter().map(BackendId::to_string).collect::<Vec<_>>().join(", "));
+    eprintln!(
+        "{} members ready: {}",
+        style("→").bold(),
+        pre.runnable
+            .iter()
+            .map(BackendId::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let mut handles = Vec::new();
     for m in pre.runnable {
@@ -262,10 +290,9 @@ pub async fn run_resolved(
         let regs_c = regs.clone();
         let prompt_c = prompt.clone();
         let logger_c = logger.clone();
-        let handle =
-            tokio::spawn(
-                async move { run_one_member(m, prompt_c, cwd_c, cancel_c, regs_c, logger_c).await },
-            );
+        let handle = tokio::spawn(async move {
+            run_one_member(m, prompt_c, cwd_c, cancel_c, regs_c, logger_c).await
+        });
         handles.push((m, handle));
     }
 
@@ -301,22 +328,43 @@ pub async fn run_resolved(
         }
         let transport = resolve_transport(aggregator_id, &regs);
         if transport.is_none() {
-            eprintln!("{} aggregator [{aggregator_id}] skipped: not registered", style("⚠").yellow());
+            eprintln!(
+                "{} aggregator [{aggregator_id}] skipped: not registered",
+                style("⚠").yellow()
+            );
             println!(
                 "{member_section}\n\n=== aggregator skipped ===\n{aggregator_id} not registered"
             );
-            logger.member_finished(aggregator_id, true, LegStatus::Skipped, 0, None, Some("not registered".into()));
+            logger.member_finished(
+                aggregator_id,
+                true,
+                LegStatus::Skipped,
+                0,
+                None,
+                Some("not registered".into()),
+            );
             logger.finished(LegStatus::Ok);
             return Ok(());
         }
         let auth = check_auth(aggregator_id).await;
         if !auth.ok {
-            eprintln!("{} aggregator [{aggregator_id}] skipped: {}", style("⚠").yellow(), auth.hint);
+            eprintln!(
+                "{} aggregator [{aggregator_id}] skipped: {}",
+                style("⚠").yellow(),
+                auth.hint
+            );
             println!(
                 "{member_section}\n\n=== aggregator skipped ===\nauth missing for {aggregator_id}: {}",
                 auth.hint
             );
-            logger.member_finished(aggregator_id, true, LegStatus::Skipped, 0, None, Some(auth.hint.clone()));
+            logger.member_finished(
+                aggregator_id,
+                true,
+                LegStatus::Skipped,
+                0,
+                None,
+                Some(auth.hint.clone()),
+            );
             logger.finished(LegStatus::Ok);
             return Ok(());
         }
@@ -337,7 +385,11 @@ pub async fn run_resolved(
         .await
         {
             Ok(res) => {
-                report_member_done(aggregator_id, started.elapsed().as_secs_f32(), Ok(res.output.len()));
+                report_member_done(
+                    aggregator_id,
+                    started.elapsed().as_secs_f32(),
+                    Ok(res.output.len()),
+                );
                 logger.member_finished(
                     aggregator_id,
                     true,
@@ -363,9 +415,7 @@ pub async fn run_resolved(
                     None,
                     Some(msg.clone()),
                 );
-                println!(
-                    "{member_section}\n\n=== aggregator failed ===\n{aggregator_id}: {msg}"
-                );
+                println!("{member_section}\n\n=== aggregator failed ===\n{aggregator_id}: {msg}");
                 logger.finished(LegStatus::Error);
                 anyhow::bail!("aggregator failed");
             }
@@ -437,5 +487,33 @@ mod tests {
         let text = build_aggregator_prompt("review src/", &fixture());
         assert!(text.contains("## [claude] (failed)"));
         assert!(text.contains("auth missing"));
+    }
+
+    #[test]
+    fn clamp_keeps_short_output_verbatim() {
+        assert_eq!(clamp_for_prompt("short", 1024), "short");
+    }
+
+    #[test]
+    fn clamp_truncates_long_output_on_char_boundary() {
+        let big = "あ".repeat(40_000); // 120_000 bytes of 3-byte chars
+        let out = clamp_for_prompt(&big, MAX_MEMBER_PROMPT_BYTES);
+        assert!(out.len() < big.len());
+        assert!(out.contains("[truncated:"));
+        // Truncation must not split a multibyte char (the prefix stays valid UTF-8).
+        assert!(out.starts_with('あ'));
+    }
+
+    #[test]
+    fn aggregator_prompt_bounds_each_member() {
+        let outcomes = vec![MemberOutcome {
+            backend: BackendId::Gemini,
+            transport: Some(Transport::Exec),
+            output: Some("x".repeat(MAX_MEMBER_PROMPT_BYTES * 2)),
+            error: None,
+        }];
+        let text = build_aggregator_prompt("t", &outcomes);
+        assert!(text.contains("[truncated:"));
+        assert!(text.len() < MAX_MEMBER_PROMPT_BYTES * 2);
     }
 }

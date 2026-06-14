@@ -1,4 +1,4 @@
-use super::{ExecAdapter, ExecSpec};
+use super::{AutonomyLevel, ExecAdapter, ExecSpec};
 use crate::types::BackendId;
 
 pub struct ClaudeExec;
@@ -23,6 +23,11 @@ impl ExecAdapter for ClaudeExec {
             stdin_input: None,
         }
     }
+
+    fn autonomy(&self) -> AutonomyLevel {
+        // `--permission-mode acceptEdits` auto-accepts edits without prompting.
+        AutonomyLevel::FullAutonomy
+    }
 }
 
 #[cfg(test)]
@@ -37,5 +42,12 @@ mod tests {
         assert!(spec.args.iter().any(|a| a == "acceptEdits"));
         assert_eq!(spec.args.last().unwrap(), "write a haiku");
         assert!(spec.stdin_input.is_none());
+    }
+
+    #[test]
+    fn declares_full_autonomy_and_accepts_edits() {
+        assert_eq!(ClaudeExec.autonomy(), AutonomyLevel::FullAutonomy);
+        let spec = ClaudeExec.build_spec("x");
+        assert!(spec.args.iter().any(|a| a == "acceptEdits"));
     }
 }

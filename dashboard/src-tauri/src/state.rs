@@ -45,6 +45,12 @@ pub struct Snapshot {
     pub recent: Vec<RunView>,
 }
 
+/// Upper bound on how many runs the tracker keeps in memory. The event log grows for the
+/// life of the machine, so without a cap a long-lived dashboard session would accumulate
+/// every run ever recorded. Far above `RECENT_CAP` (what the UI shows) so scrollback isn't
+/// affected; only the unbounded tail is reclaimed.
+const MAX_TRACKED_RUNS: usize = 500;
+
 /// Incremental reader over the event log. Holds the reconstructed run map and the byte
 /// offset read so far.
 #[derive(Default)]
@@ -126,8 +132,31 @@ impl Tracker {
                     members: Vec::new(),
                 },
             );
+            self.prune();
         }
         self.runs.get_mut(id).unwrap()
+    }
+
+    /// Evict the oldest *finished* runs once we exceed `MAX_TRACKED_RUNS` so memory stays
+    /// bounded over a long-lived session. Live (unfinished) runs are never evicted, and the
+    /// just-inserted run (at the back of `order`) is safe because eviction walks from the
+    /// front (oldest first).
+    fn prune(&mut self) {
+        if self.order.len() <= MAX_TRACKED_RUNS {
+            return;
+        }
+        let mut excess = self.order.len() - MAX_TRACKED_RUNS;
+        let mut kept = Vec::with_capacity(self.order.len());
+        for id in std::mem::take(&mut self.order) {
+            let finished = self.runs.get(&id).map(|r| r.finished).unwrap_or(true);
+            if excess > 0 && finished {
+                self.runs.remove(&id);
+                excess -= 1;
+            } else {
+                kept.push(id);
+            }
+        }
+        self.order = kept;
     }
 
     fn apply(&mut self, ev: Event) {
@@ -147,7 +176,11 @@ impl Tracker {
                 run.started_ts = ts;
                 for b in members {
                     let name = b.as_str().to_string();
-                    if !run.members.iter().any(|m| m.backend == name && !m.aggregator) {
+                    if !run
+                        .members
+                        .iter()
+                        .any(|m| m.backend == name && !m.aggregator)
+                    {
                         run.members.push(MemberView {
                             backend: name,
                             aggregator: false,
@@ -217,8 +250,8 @@ impl Tracker {
                 recent.push(run);
             }
         }
-        live.sort_by(|a, b| b.started_ts.cmp(&a.started_ts));
-        recent.sort_by(|a, b| b.started_ts.cmp(&a.started_ts));
+        live.sort_by_key(|r| std::cmp::Reverse(r.started_ts));
+        recent.sort_by_key(|r| std::cmp::Reverse(r.started_ts));
         recent.truncate(recent_cap);
         Snapshot { live, recent }
     }
@@ -279,7 +312,11 @@ mod tests {
         assert_eq!(run.kind, "ensemble");
         assert_eq!(run.members.len(), 2);
         assert_eq!(
-            run.members.iter().find(|m| m.backend == "gemini").unwrap().status,
+            run.members
+                .iter()
+                .find(|m| m.backend == "gemini")
+                .unwrap()
+                .status,
             "running"
         );
         let claude = run.members.iter().find(|m| m.backend == "claude").unwrap();
@@ -295,14 +332,22 @@ mod tests {
         assert_eq!(snap.recent.len(), 1);
         assert_eq!(snap.recent[0].status.as_deref(), Some("interrupted"));
         assert_eq!(
-            snap.recent[0].members.iter().find(|m| m.backend == "gemini").unwrap().status,
+            snap.recent[0]
+                .members
+                .iter()
+                .find(|m| m.backend == "gemini")
+                .unwrap()
+                .status,
             "interrupted"
         );
     }
 
     #[test]
     fn finished_run_goes_to_recent() {
-        let log = format!("{LOG}{}\n", r#"{"event":"run_finished","ts":400,"run_id":"1-0","status":"ok"}"#);
+        let log = format!(
+            "{LOG}{}\n",
+            r#"{"event":"run_finished","ts":400,"run_id":"1-0","status":"ok"}"#
+        );
         let (t, _f) = tracker_from(&log);
         let snap = t.snapshot(|_| true, 20);
         assert_eq!(snap.live.len(), 0);
@@ -347,11 +392,56 @@ mod tests {
         t.ingest(f.path());
         assert_eq!(t.snapshot(|_| true, 20).live.len(), 1);
         // Complete the partial line.
-        f.write_all(b"arted\",\"ts\":2,\"run_id\":\"r\",\"backend\":\"gemini\"}\n").unwrap();
+        f.write_all(b"arted\",\"ts\":2,\"run_id\":\"r\",\"backend\":\"gemini\"}\n")
+            .unwrap();
         f.flush().unwrap();
         t.ingest(f.path());
         let snap = t.snapshot(|_| true, 20);
         assert_eq!(snap.live[0].members[0].status, "running");
+    }
+
+    #[test]
+    fn finished_runs_are_evicted_past_the_cap() {
+        let n = MAX_TRACKED_RUNS + 50;
+        let mut log = String::new();
+        for i in 0..n {
+            log.push_str(&format!(
+                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/\"}}\n"
+            ));
+            log.push_str(&format!(
+                "{{\"event\":\"run_finished\",\"ts\":{i},\"run_id\":\"r{i}\",\"status\":\"ok\"}}\n"
+            ));
+        }
+        let (t, _f) = tracker_from(&log);
+        assert!(
+            t.runs.len() <= MAX_TRACKED_RUNS,
+            "runs map must stay bounded"
+        );
+        assert_eq!(t.order.len(), t.runs.len(), "order and map stay in sync");
+        // Oldest evicted, newest retained.
+        assert!(!t.runs.contains_key("r0"));
+        assert!(t.runs.contains_key(&format!("r{}", n - 1)));
+    }
+
+    #[test]
+    fn live_runs_are_not_evicted() {
+        // One live run, then enough finished runs to exceed the cap. The live one survives.
+        let mut log = String::from(
+            "{\"event\":\"run_started\",\"ts\":0,\"run_id\":\"live\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/\"}\n",
+        );
+        for i in 1..(MAX_TRACKED_RUNS + 50) {
+            log.push_str(&format!(
+                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/\"}}\n"
+            ));
+            log.push_str(&format!(
+                "{{\"event\":\"run_finished\",\"ts\":{i},\"run_id\":\"r{i}\",\"status\":\"ok\"}}\n"
+            ));
+        }
+        let (t, _f) = tracker_from(&log);
+        assert!(
+            t.runs.contains_key("live"),
+            "unfinished run must not be evicted"
+        );
     }
 
     #[test]

@@ -35,13 +35,12 @@ pub async fn run(tool: RouteKey, backend: Option<BackendId>) -> Result<()> {
             for b in &available {
                 sel = sel.item(*b, b.to_string(), "");
             }
-            if let Some(cur) = loaded.config.routes.get(&tool).copied() {
-                if available.contains(&cur) {
-                    sel = sel.initial_value(cur);
-                }
+            if let Some(cur) = loaded.config.routes.get(&tool).copied()
+                && available.contains(&cur)
+            {
+                sel = sel.initial_value(cur);
             }
-            sel.interact()
-                .map_err(|e| anyhow!("select failed: {e}"))?
+            sel.interact().map_err(|e| anyhow!("select failed: {e}"))?
         }
     };
 

@@ -44,7 +44,10 @@ async fn refresh_managed_files() {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!(
             "warning: skill/command refresh exited with {}",
-            status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into())
         ),
         Err(err) => eprintln!("warning: failed to launch refresh: {err}"),
     }

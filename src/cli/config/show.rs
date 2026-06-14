@@ -9,8 +9,8 @@ pub async fn run() -> Result<()> {
         loaded.source.as_str(),
         loaded.path.display()
     );
-    let raw = toml::to_string_pretty(&loaded.config)
-        .context("failed to serialize config to TOML")?;
+    let raw =
+        toml::to_string_pretty(&loaded.config).context("failed to serialize config to TOML")?;
     print!("{raw}");
     Ok(())
 }

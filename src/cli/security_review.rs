@@ -43,8 +43,8 @@ pub async fn run(
         ));
     }
     let ctx = super::load_context()?;
-    let members = members
-        .unwrap_or_else(|| ctx.loaded.config.ensemble.security_review_members.clone());
+    let members =
+        members.unwrap_or_else(|| ctx.loaded.config.ensemble.security_review_members.clone());
     let aggregator = aggregator.or(ctx.loaded.config.ensemble.security_review_aggregator);
     super::ensemble::run_resolved(
         ctx,

@@ -37,7 +37,10 @@ async fn launch_in_mac_terminal(command: &str) -> LaunchOutcome {
             launched: false,
             message: format!(
                 "osascript exited with code {}",
-                status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into())
             ),
         },
         Err(err) => LaunchOutcome {

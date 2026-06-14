@@ -28,12 +28,12 @@ fn locate() -> Result<PathBuf> {
             return Ok(pb);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join(DASHBOARD_BIN);
-            if cand.is_file() {
-                return Ok(cand);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let cand = dir.join(DASHBOARD_BIN);
+        if cand.is_file() {
+            return Ok(cand);
         }
     }
     if let Some(p) = find_on_path(DASHBOARD_BIN) {

@@ -39,10 +39,7 @@ pub(crate) const COMMAND_FILES: &[(&str, &str)] = &[
         "status.md",
         include_str!("../../commands/agentpit/status.md"),
     ),
-    (
-        "login.md",
-        include_str!("../../commands/agentpit/login.md"),
-    ),
+    ("login.md", include_str!("../../commands/agentpit/login.md")),
 ];
 
 pub(crate) const SKILL_FILES: &[(&str, &str)] = &[
@@ -113,10 +110,7 @@ impl Scope {
 
 pub(crate) fn resolve_dirs(scope: Scope) -> Result<(PathBuf, PathBuf)> {
     let base = scope.base()?;
-    Ok((
-        base.join("commands").join("agentpit"),
-        base.join("skills"),
-    ))
+    Ok((base.join("commands").join("agentpit"), base.join("skills")))
 }
 
 fn prompt_scope() -> Result<Scope> {
@@ -179,8 +173,8 @@ pub async fn refresh_existing_installs() -> Result<()> {
     let mut touched = 0usize;
     for scope in [Scope::Project, Scope::User] {
         let (commands_dir, skills_dir) = resolve_dirs(scope)?;
-        let exists = fs::metadata(&commands_dir).await.is_ok()
-            || fs::metadata(&skills_dir).await.is_ok();
+        let exists =
+            fs::metadata(&commands_dir).await.is_ok() || fs::metadata(&skills_dir).await.is_ok();
         if !exists {
             continue;
         }
@@ -191,7 +185,10 @@ pub async fn refresh_existing_installs() -> Result<()> {
                 "refreshed {} files in {} scope ({})",
                 updated,
                 scope_label(scope),
-                commands_dir.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                commands_dir
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             );
         }
         touched += 1;
@@ -230,12 +227,7 @@ fn scope_label(scope: Scope) -> &'static str {
     }
 }
 
-async fn install_files(
-    dir: &Path,
-    files: &[(&str, &str)],
-    force: bool,
-    label: &str,
-) -> Result<()> {
+async fn install_files(dir: &Path, files: &[(&str, &str)], force: bool, label: &str) -> Result<()> {
     fs::create_dir_all(dir)
         .await
         .with_context(|| format!("failed to create {}", dir.display()))?;

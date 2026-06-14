@@ -258,7 +258,11 @@ pub fn output_streamer(
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let file: Option<File> = OpenOptions::new().create(true).append(true).open(&path).ok();
+    let file: Option<File> = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok();
     let shared = Arc::new(Mutex::new(file));
     Arc::new(move |chunk: &str| {
         if let Ok(mut guard) = shared.lock() {
@@ -291,7 +295,7 @@ pub fn prune_run_outputs(keep: usize) {
     if dirs.len() <= keep {
         return;
     }
-    dirs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0)); // newest first
     for (_, path) in dirs.into_iter().skip(keep) {
         let _ = fs::remove_dir_all(path);
     }

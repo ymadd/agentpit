@@ -59,43 +59,43 @@ impl Router {
     }
 
     pub fn resolve(&self, request: &RouteRequest<'_>) -> RouteDecision {
-        if let Some(explicit) = request.explicit_backend {
-            if self.available.contains(&explicit) {
-                return RouteDecision {
-                    backend: explicit,
-                    reason: RouteReason::Explicit,
-                };
-            }
+        if let Some(explicit) = request.explicit_backend
+            && self.available.contains(&explicit)
+        {
+            return RouteDecision {
+                backend: explicit,
+                reason: RouteReason::Explicit,
+            };
         }
 
-        if let Some(routed) = self.config.routes.get(&request.tool) {
-            if self.available.contains(routed) {
-                return RouteDecision {
-                    backend: *routed,
-                    reason: RouteReason::RouteTable,
-                };
-            }
+        if let Some(routed) = self.config.routes.get(&request.tool)
+            && self.available.contains(routed)
+        {
+            return RouteDecision {
+                backend: *routed,
+                reason: RouteReason::RouteTable,
+            };
         }
 
-        if self.config.default.auto_route {
-            if let Some(task) = request.task {
-                let auto = &self.config.auto_route;
-                if self.available.contains(&auto.long_context_backend)
-                    && estimate_tokens(task) > auto.long_context_threshold
-                {
-                    return RouteDecision {
-                        backend: auto.long_context_backend,
-                        reason: RouteReason::AutoLongContext,
-                    };
-                }
-                if self.available.contains(&auto.review_backend)
-                    && contains_any_lowercased(task, &self.review_keywords_lower)
-                {
-                    return RouteDecision {
-                        backend: auto.review_backend,
-                        reason: RouteReason::AutoKeyword,
-                    };
-                }
+        if self.config.default.auto_route
+            && let Some(task) = request.task
+        {
+            let auto = &self.config.auto_route;
+            if self.available.contains(&auto.long_context_backend)
+                && estimate_tokens(task) > auto.long_context_threshold
+            {
+                return RouteDecision {
+                    backend: auto.long_context_backend,
+                    reason: RouteReason::AutoLongContext,
+                };
+            }
+            if self.available.contains(&auto.review_backend)
+                && contains_any_lowercased(task, &self.review_keywords_lower)
+            {
+                return RouteDecision {
+                    backend: auto.review_backend,
+                    reason: RouteReason::AutoKeyword,
+                };
             }
         }
 

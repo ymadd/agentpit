@@ -31,22 +31,45 @@ enum ConfigMenu {
 }
 
 pub async fn run_main() -> Result<()> {
-    cliclack::intro(style(" agentpit ").on_cyan().black())
-        .map_err(|e| anyhow!("intro: {e}"))?;
+    cliclack::intro(style(" agentpit ").on_cyan().black()).map_err(|e| anyhow!("intro: {e}"))?;
 
     let action = cliclack::select("What do you want to do?")
         .item(MainAction::Rescue, "rescue", "one-shot task to a backend")
         .item(MainAction::Review, "review", "multi-agent code review")
-        .item(MainAction::SecurityReview, "security-review", "OWASP-style multi-agent security review")
-        .item(MainAction::AdversarialReview, "adversarial-review", "challenge assumptions; demand evidence")
+        .item(
+            MainAction::SecurityReview,
+            "security-review",
+            "OWASP-style multi-agent security review",
+        )
+        .item(
+            MainAction::AdversarialReview,
+            "adversarial-review",
+            "challenge assumptions; demand evidence",
+        )
         .item(MainAction::Explain, "explain", "explain a target")
         .item(MainAction::Refactor, "refactor", "plan a refactor")
-        .item(MainAction::Ensemble, "ensemble", "fan a prompt out to multiple backends")
-        .item(MainAction::Config, "config", "modify config (backends / routes / ensemble)")
+        .item(
+            MainAction::Ensemble,
+            "ensemble",
+            "fan a prompt out to multiple backends",
+        )
+        .item(
+            MainAction::Config,
+            "config",
+            "modify config (backends / routes / ensemble)",
+        )
         .item(MainAction::Status, "status", "show transport + auth state")
         .item(MainAction::Login, "login", "authenticate a backend")
-        .item(MainAction::Update, "update", "check for or install a newer release")
-        .item(MainAction::Init, "init", "install commands + skills into .claude/")
+        .item(
+            MainAction::Update,
+            "update",
+            "check for or install a newer release",
+        )
+        .item(
+            MainAction::Init,
+            "init",
+            "install commands + skills into .claude/",
+        )
         .interact()
         .map_err(|e| anyhow!("select: {e}"))?;
 
@@ -73,7 +96,11 @@ pub async fn run_config() -> Result<()> {
     let action = cliclack::select("Config action")
         .item(ConfigMenu::Show, "show", "print current config")
         .item(ConfigMenu::Init, "init", "write defaults to disk")
-        .item(ConfigMenu::Backend, "backend", "set a backend's transport (exec/acp)")
+        .item(
+            ConfigMenu::Backend,
+            "backend",
+            "set a backend's transport (exec/acp)",
+        )
         .item(ConfigMenu::Route, "route", "set default backend for a tool")
         .item(
             ConfigMenu::Ensemble,
@@ -160,11 +187,12 @@ async fn adversarial_review_flow() -> Result<()> {
         .placeholder("file path / diff / 'last commit'")
         .interact()
         .map_err(|e| anyhow!("input: {e}"))?;
-    let focus_raw: String = cliclack::input("Optional attack focus (leave blank for full checklist)")
-        .default_input("")
-        .required(false)
-        .interact()
-        .map_err(|e| anyhow!("input: {e}"))?;
+    let focus_raw: String =
+        cliclack::input("Optional attack focus (leave blank for full checklist)")
+            .default_input("")
+            .required(false)
+            .interact()
+            .map_err(|e| anyhow!("input: {e}"))?;
     let focus = if focus_raw.trim().is_empty() {
         None
     } else {
@@ -222,7 +250,11 @@ async fn update_flow() -> Result<()> {
 
 fn pick_backend(prompt: &str) -> Result<BackendId> {
     cliclack::select(prompt)
-        .item(BackendId::Antigravity, "antigravity", "agy — Gemini CLI successor")
+        .item(
+            BackendId::Antigravity,
+            "antigravity",
+            "agy — Gemini CLI successor",
+        )
         .item(BackendId::Gemini, "gemini", "")
         .item(BackendId::Claude, "claude", "")
         .item(BackendId::Codex, "codex", "")
@@ -243,9 +275,17 @@ fn pick_route_key(prompt: &str) -> Result<RouteKey> {
 
 fn pick_ensemble_target(prompt: &str) -> Result<EnsembleTarget> {
     cliclack::select(prompt)
-        .item(EnsembleTarget::Default, "default", "agentpit ensemble subcommand")
+        .item(
+            EnsembleTarget::Default,
+            "default",
+            "agentpit ensemble subcommand",
+        )
         .item(EnsembleTarget::Review, "review", "agentpit review")
-        .item(EnsembleTarget::SecurityReview, "security-review", "agentpit security-review")
+        .item(
+            EnsembleTarget::SecurityReview,
+            "security-review",
+            "agentpit security-review",
+        )
         .item(EnsembleTarget::Rescue, "rescue", "agentpit rescue")
         .item(EnsembleTarget::Refactor, "refactor", "agentpit refactor")
         .interact()

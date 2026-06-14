@@ -9,7 +9,17 @@ use serde::{Deserialize, Serialize};
 use crate::types::{BackendId, Transport};
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
@@ -230,10 +240,10 @@ pub struct LoadedConfig {
 }
 
 pub fn xdg_config_home() -> PathBuf {
-    if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Ok(dir) = env::var("XDG_CONFIG_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     dirs::home_dir()
         .map(|h| h.join(".config"))
@@ -443,8 +453,7 @@ backend = "${AGENTPIT_TEST_BACKEND}"
 
     #[test]
     fn expand_env_ignores_malformed_placeholders() {
-        let mut value: toml::Value =
-            toml::from_str(r#"v = "no ${closing brace here""#).unwrap();
+        let mut value: toml::Value = toml::from_str(r#"v = "no ${closing brace here""#).unwrap();
         expand_env(&mut value);
         assert_eq!(
             value.get("v").unwrap().as_str().unwrap(),

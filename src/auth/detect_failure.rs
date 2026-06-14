@@ -34,9 +34,7 @@ pub fn format_auth_failure_message(
     launch_message: Option<&str>,
 ) -> String {
     let mut lines = vec![
-        format!(
-            "[{backend}] authentication appears to have failed during execution."
-        ),
+        format!("[{backend}] authentication appears to have failed during execution."),
         format!("Run `{login_command}` to re-authenticate."),
     ];
     if let Some(msg) = launch_message {
@@ -79,8 +77,7 @@ mod tests {
 
     #[test]
     fn formats_message_with_launch_hint() {
-        let msg =
-            format_auth_failure_message(BackendId::Gemini, "gemini", Some("Opened Terminal"));
+        let msg = format_auth_failure_message(BackendId::Gemini, "gemini", Some("Opened Terminal"));
         assert!(msg.contains("[gemini]"));
         assert!(msg.contains("gemini"));
         assert!(msg.contains("Opened Terminal"));

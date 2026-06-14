@@ -44,8 +44,12 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
         ),
     };
 
-    cliclack::intro(style(format!(" ensemble: {} ", target.as_str())).on_cyan().black())
-        .map_err(|e| anyhow!("intro failed: {e}"))?;
+    cliclack::intro(
+        style(format!(" ensemble: {} ", target.as_str()))
+            .on_cyan()
+            .black(),
+    )
+    .map_err(|e| anyhow!("intro failed: {e}"))?;
 
     let initial_members: Vec<BackendId> = current_members
         .iter()
@@ -63,7 +67,11 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
         .map_err(|e| anyhow!("multiselect failed: {e}"))?;
 
     let mut agg_sel = cliclack::select(format!("Aggregator for ensemble.{}", target.as_str()))
-        .item(Aggregator::None, "(none)", "no aggregator; concatenate members");
+        .item(
+            Aggregator::None,
+            "(none)",
+            "no aggregator; concatenate members",
+        );
     for b in &available {
         agg_sel = agg_sel.item(Aggregator::Backend(*b), b.to_string(), "");
     }

@@ -4,9 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::{
     ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    TextContent,
+    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use anyhow::{Result, anyhow};
@@ -46,12 +45,12 @@ pub async fn run_acp_prompt(
             .builder()
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
-                    if let SessionUpdate::AgentMessageChunk(chunk) = notification.update {
-                        if let ContentBlock::Text(TextContent { text, .. }) = chunk.content {
-                            on_chunk_for_notif(&text);
-                            if let Ok(mut buf) = collected_for_notif.lock() {
-                                buf.push_str(&text);
-                            }
+                    if let SessionUpdate::AgentMessageChunk(chunk) = notification.update
+                        && let ContentBlock::Text(TextContent { text, .. }) = chunk.content
+                    {
+                        on_chunk_for_notif(&text);
+                        if let Ok(mut buf) = collected_for_notif.lock() {
+                            buf.push_str(&text);
                         }
                     }
                     Ok(())

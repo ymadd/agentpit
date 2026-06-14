@@ -7,11 +7,7 @@ use crate::types::{BackendId, Transport};
 pub async fn run(id: BackendId) -> Result<()> {
     let mut loaded = load_config(None)?;
 
-    let current = loaded
-        .config
-        .backends
-        .get(&id)
-        .and_then(|o| o.transport);
+    let current = loaded.config.backends.get(&id).and_then(|o| o.transport);
     let current_str = current
         .map(|t| t.as_str().to_string())
         .unwrap_or_else(|| "(default)".into());
@@ -19,13 +15,11 @@ pub async fn run(id: BackendId) -> Result<()> {
     cliclack::intro(style(format!(" backend: {id} ")).on_cyan().black())
         .map_err(|e| anyhow!("intro failed: {e}"))?;
 
-    let transport = cliclack::select(format!(
-        "Transport for {id}  (current: {current_str})"
-    ))
-    .item(Transport::Exec, "exec", "spawn the CLI per request")
-    .item(Transport::Acp, "acp", "persistent ACP session")
-    .interact()
-    .map_err(|e| anyhow!("select failed: {e}"))?;
+    let transport = cliclack::select(format!("Transport for {id}  (current: {current_str})"))
+        .item(Transport::Exec, "exec", "spawn the CLI per request")
+        .item(Transport::Acp, "acp", "persistent ACP session")
+        .interact()
+        .map_err(|e| anyhow!("select failed: {e}"))?;
 
     loaded
         .config

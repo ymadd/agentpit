@@ -23,5 +23,13 @@ pub async fn run<A: AcpAdapter + ?Sized>(
     on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<AcpOutcome> {
-    run_acp_prompt(adapter.id(), adapter.spawn_spec(), task, cwd, on_chunk, cancel).await
+    run_acp_prompt(
+        adapter.id(),
+        adapter.spawn_spec(),
+        task,
+        cwd,
+        on_chunk,
+        cancel,
+    )
+    .await
 }

@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 
 use crate::types::BackendId;
 
-mod common;
 pub mod adversarial_review;
+mod common;
 pub mod config;
 pub mod dashboard;
 pub mod ensemble;
@@ -19,9 +19,7 @@ pub mod security_review;
 pub mod status;
 pub mod update;
 
-pub(crate) use common::{
-    install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer,
-};
+pub(crate) use common::{install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer};
 
 #[derive(Parser, Debug)]
 #[command(

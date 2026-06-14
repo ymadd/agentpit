@@ -20,7 +20,11 @@ pub struct VersionCache {
 }
 
 pub fn cache_path() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("agentpit").join("version_check.json"))
+    Some(
+        dirs::cache_dir()?
+            .join("agentpit")
+            .join("version_check.json"),
+    )
 }
 
 pub fn load_cache() -> Option<VersionCache> {
@@ -71,9 +75,7 @@ pub fn fetch_latest_tag() -> Result<String> {
         .build()
         .map_err(|e| anyhow!("self_update config error: {e}"))?
         .fetch()
-        .map_err(|e| {
-            anyhow!("failed to fetch releases from {REPO_OWNER}/{REPO_NAME}: {e}")
-        })?;
+        .map_err(|e| anyhow!("failed to fetch releases from {REPO_OWNER}/{REPO_NAME}: {e}"))?;
     let latest = releases
         .first()
         .ok_or_else(|| anyhow!("no releases published for {REPO_OWNER}/{REPO_NAME}"))?;
@@ -91,10 +93,10 @@ pub fn refresh_cache() -> Result<VersionCache> {
 }
 
 pub fn ensure_fresh_cache() -> Result<VersionCache> {
-    if let Some(cache) = load_cache() {
-        if is_fresh(&cache) {
-            return Ok(cache);
-        }
+    if let Some(cache) = load_cache()
+        && is_fresh(&cache)
+    {
+        return Ok(cache);
     }
     refresh_cache()
 }

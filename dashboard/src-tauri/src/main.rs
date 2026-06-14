@@ -82,7 +82,10 @@ fn get_output(run_id: String, backend: String, aggregator: bool, offset: u64) ->
     if !agentpit_events::is_safe_log_component(&run_id)
         || !agentpit_events::is_safe_log_component(&backend)
     {
-        return OutputChunk { offset, ..Default::default() };
+        return OutputChunk {
+            offset,
+            ..Default::default()
+        };
     }
     let path = agentpit_events::backend_log_path(&run_id, &backend, aggregator);
     read_delta(&path, offset, MAX_OUTPUT_BYTES)
@@ -94,7 +97,12 @@ fn read_delta(path: &std::path::Path, offset: u64, max: u64) -> OutputChunk {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return OutputChunk { offset, ..Default::default() },
+        Err(_) => {
+            return OutputChunk {
+                offset,
+                ..Default::default()
+            }
+        }
     };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
 
@@ -111,11 +119,19 @@ fn read_delta(path: &std::path::Path, offset: u64, max: u64) -> OutputChunk {
         reset = true;
     }
     if file.seek(SeekFrom::Start(start)).is_err() {
-        return OutputChunk { offset: start, reset, ..Default::default() };
+        return OutputChunk {
+            offset: start,
+            reset,
+            ..Default::default()
+        };
     }
     let mut buf = Vec::new();
     if file.read_to_end(&mut buf).is_err() {
-        return OutputChunk { offset: start, reset, ..Default::default() };
+        return OutputChunk {
+            offset: start,
+            reset,
+            ..Default::default()
+        };
     }
     let (valid_len, text) = match std::str::from_utf8(&buf) {
         Ok(s) => (buf.len(), s.to_string()),
@@ -173,6 +189,20 @@ fn spawn_watcher(app: AppHandle) {
             emit(&app);
         }
     });
+}
+
+fn main() {
+    tauri::Builder::default()
+        .manage(AppState {
+            tracker: Mutex::new(Tracker::new()),
+        })
+        .invoke_handler(tauri::generate_handler![get_snapshot, get_output])
+        .setup(|app| {
+            spawn_watcher(app.handle().clone());
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running agentpit dashboard");
 }
 
 #[cfg(test)]
@@ -251,18 +281,4 @@ mod tests {
         assert_eq!(b.text, "あ");
         assert_eq!(b.offset, 4);
     }
-}
-
-fn main() {
-    tauri::Builder::default()
-        .manage(AppState {
-            tracker: Mutex::new(Tracker::new()),
-        })
-        .invoke_handler(tauri::generate_handler![get_snapshot, get_output])
-        .setup(|app| {
-            spawn_watcher(app.handle().clone());
-            Ok(())
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running agentpit dashboard");
 }

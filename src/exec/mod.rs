@@ -8,9 +8,11 @@ mod base;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod workflow_manager;
 
 pub use autonomy::AutonomyLevel;
 pub use base::{ExecOutcome, ExecRunOptions, ExecSpec, run_spec};
+pub use workflow_manager::{McpConfigGuard, WorkflowManagerExec, is_supported_manager};
 
 /// Trait implemented by exec-mode backends (direct CLI spawn).
 pub trait ExecAdapter: Send + Sync {

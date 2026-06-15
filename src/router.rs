@@ -128,7 +128,9 @@ fn contains_any_lowercased(text: &str, lowercased_keywords: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AutoRouteSection, DefaultSection, EnsembleSection, HubConfig};
+    use crate::config::{
+        AutoRouteSection, DefaultSection, EnsembleSection, HubConfig, WorkflowSection,
+    };
     use std::collections::BTreeMap;
 
     fn base_config() -> HubConfig {
@@ -150,6 +152,7 @@ mod tests {
                 review_backend: BackendId::Claude,
             },
             ensemble: EnsembleSection::default(),
+            workflow: WorkflowSection::default(),
             backends: BTreeMap::new(),
         }
     }

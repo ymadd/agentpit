@@ -97,6 +97,7 @@ pub enum RunKind {
     Explain,
     Refactor,
     Ensemble,
+    Workflow,
 }
 
 impl RunKind {
@@ -109,6 +110,7 @@ impl RunKind {
             RunKind::Explain => "explain",
             RunKind::Refactor => "refactor",
             RunKind::Ensemble => "ensemble",
+            RunKind::Workflow => "workflow",
         }
     }
 }

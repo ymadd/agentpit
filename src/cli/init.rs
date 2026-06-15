@@ -40,6 +40,11 @@ pub(crate) const COMMAND_FILES: &[(&str, &str)] = &[
         include_str!("../../commands/agentpit/status.md"),
     ),
     ("login.md", include_str!("../../commands/agentpit/login.md")),
+    (
+        "workflow.md",
+        include_str!("../../commands/agentpit/workflow.md"),
+    ),
+    ("mcp.md", include_str!("../../commands/agentpit/mcp.md")),
 ];
 
 pub(crate) const SKILL_FILES: &[(&str, &str)] = &[
@@ -78,6 +83,14 @@ pub(crate) const SKILL_FILES: &[(&str, &str)] = &[
     (
         "agentpit-login.md",
         include_str!("../../skills/agentpit-login.md"),
+    ),
+    (
+        "agentpit-workflow.md",
+        include_str!("../../skills/agentpit-workflow.md"),
+    ),
+    (
+        "agentpit-mcp.md",
+        include_str!("../../skills/agentpit-mcp.md"),
     ),
 ];
 
@@ -251,9 +264,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embeds_nine_commands_and_nine_skills() {
-        assert_eq!(COMMAND_FILES.len(), 9);
-        assert_eq!(SKILL_FILES.len(), 9);
+    fn embeds_eleven_commands_and_eleven_skills() {
+        assert_eq!(COMMAND_FILES.len(), 11);
+        assert_eq!(SKILL_FILES.len(), 11);
         for (name, content) in COMMAND_FILES.iter().chain(SKILL_FILES.iter()) {
             assert!(name.ends_with(".md"), "{name} must be a .md file");
             assert!(!content.is_empty(), "{name} content must be non-empty");

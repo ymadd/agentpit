@@ -30,6 +30,15 @@ pub struct Registries {
 }
 
 impl Registries {
+    /// An empty registry with no backends wired. Callers insert the adapters they need —
+    /// e.g. the workflow's one-off manager-only registry, or tests.
+    pub fn empty() -> Self {
+        Registries {
+            execs: HashMap::new(),
+            acps: HashMap::new(),
+        }
+    }
+
     pub fn available(&self) -> std::collections::HashSet<BackendId> {
         let mut set = std::collections::HashSet::new();
         for k in self.execs.keys().chain(self.acps.keys()) {

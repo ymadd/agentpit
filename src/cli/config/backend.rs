@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use console::style;
 
+use crate::cli::cancel::{self, Nav};
 use crate::config::{BackendOverride, load_config, save_config};
 use crate::types::{BackendId, Transport};
 
@@ -15,11 +16,28 @@ pub async fn run(id: BackendId) -> Result<()> {
     cliclack::intro(style(format!(" backend: {id} ")).on_cyan().black())
         .map_err(|e| anyhow!("intro failed: {e}"))?;
 
-    let transport = cliclack::select(format!("Transport for {id}  (current: {current_str})"))
-        .item(Transport::Exec, "exec", "spawn the CLI per request")
-        .item(Transport::Acp, "acp", "persistent ACP session")
-        .interact()
-        .map_err(|e| anyhow!("select failed: {e}"))?;
+    let transport = match cancel::prompt(
+        cliclack::select(format!("Transport for {id}  (current: {current_str})"))
+            .item(Transport::Exec, "exec", "spawn the CLI per request")
+            .item(Transport::Acp, "acp", "persistent ACP session")
+            .interact(),
+    )? {
+        Nav::Value(t) => t,
+        Nav::Back => {
+            cliclack::outro("(cancelled — no changes made)")
+                .map_err(|e| anyhow!("outro failed: {e}"))?;
+            return Ok(());
+        }
+    };
+
+    // Capture the prior value (immutable read) before mutating state.
+    let prior_str = loaded
+        .config
+        .backends
+        .get(&id)
+        .and_then(|o| o.transport)
+        .map(|t| t.as_str().to_string())
+        .unwrap_or_else(|| "(default)".into());
 
     loaded
         .config
@@ -29,10 +47,16 @@ pub async fn run(id: BackendId) -> Result<()> {
         .transport = Some(transport);
 
     let path = save_config(&loaded.config)?;
+
+    cancel::confirm_change(
+        &format!("backend.{id}.transport"),
+        &prior_str,
+        transport.as_str(),
+    );
+
     cliclack::outro(format!(
-        "Set {id} transport={} in {}",
-        style(transport.as_str()).cyan(),
-        path.display()
+        "Saved to {}",
+        style(path.display().to_string()).dim(),
     ))
     .map_err(|e| anyhow!("outro failed: {e}"))?;
     Ok(())

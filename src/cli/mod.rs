@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use crate::types::BackendId;
 
 pub mod adversarial_review;
+pub(crate) mod cancel;
 mod common;
 pub mod config;
 pub mod dashboard;
@@ -14,6 +15,7 @@ pub mod login;
 pub mod mcp_cmd;
 mod menu;
 pub mod refactor;
+pub mod repl;
 pub mod rescue;
 pub mod review;
 pub mod security_review;
@@ -193,12 +195,15 @@ pub enum Command {
         #[command(subcommand)]
         action: mcp_cmd::Action,
     },
+
+    /// Launch the persistent conversational REPL (the default when no subcommand is given).
+    Repl,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
     let command = match cli.command {
         Some(c) => c,
-        None => return menu::run_main().await,
+        None => return repl::run_repl().await,
     };
     match command {
         Command::Rescue {
@@ -282,5 +287,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
 
         Command::Mcp { action } => mcp_cmd::run(action).await,
+
+        Command::Repl => repl::run_repl().await,
     }
 }

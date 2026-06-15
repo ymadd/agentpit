@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,10 +43,11 @@ pub fn render_concatenated(outcomes: &[MemberOutcome]) -> String {
 /// Per-member cap on how much of each response is embedded in the aggregator prompt. A
 /// verbose member could otherwise blow the aggregator's context window (or cost) on its
 /// own; the tail is dropped with a marker so the synthesis still sees the bulk of it.
-const MAX_MEMBER_PROMPT_BYTES: usize = 48 * 1024;
+/// Reused by the MCP tool surface ([`crate::mcp`]) to bound each tool result the same way.
+pub(crate) const MAX_MEMBER_PROMPT_BYTES: usize = 48 * 1024;
 
 /// Truncate `s` to at most `max` bytes on a char boundary, appending a marker when cut.
-fn clamp_for_prompt(s: &str, max: usize) -> String {
+pub(crate) fn clamp_for_prompt(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -81,6 +82,51 @@ pub fn build_aggregator_prompt(original: &str, outcomes: &[MemberOutcome]) -> St
     lines.join("\n")
 }
 
+/// Run one backend dispatch and map the result into a [`MemberOutcome`]: `not registered` when no
+/// transport is wired, an auth-failure marker when the output looks like an auth failure, otherwise
+/// the captured output (or the dispatch error). This is the logger-free core shared by
+/// [`run_one_member`] (which layers on TTY + event reporting) and the MCP `dispatch_task` /
+/// `run_ensemble` tools (which stream nothing) — so the not-registered / auth-failure / error
+/// wording lives in exactly one place.
+pub(crate) async fn dispatch_to_outcome(
+    backend: BackendId,
+    prompt: &str,
+    cwd: &Path,
+    cancel: CancellationToken,
+    on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
+    regs: &Registries,
+) -> MemberOutcome {
+    let transport = resolve_transport(backend, regs);
+    if transport.is_none() {
+        return MemberOutcome {
+            backend,
+            transport: None,
+            output: None,
+            error: Some("not registered".into()),
+        };
+    }
+    match dispatch(backend, prompt, cwd, cancel, on_chunk, regs).await {
+        Ok(res) if res.auth_failed => MemberOutcome {
+            backend,
+            transport: Some(res.transport),
+            output: None,
+            error: Some("auth failure during execution".into()),
+        },
+        Ok(res) => MemberOutcome {
+            backend,
+            transport: Some(res.transport),
+            output: Some(res.output),
+            error: None,
+        },
+        Err(err) => MemberOutcome {
+            backend,
+            transport,
+            output: None,
+            error: Some(format!("{err:#}")),
+        },
+    }
+}
+
 async fn run_one_member(
     backend: BackendId,
     prompt: String,
@@ -90,89 +136,29 @@ async fn run_one_member(
     logger: RunLogger,
 ) -> MemberOutcome {
     let started = Instant::now();
-    let transport = resolve_transport(backend, &regs);
-    if transport.is_none() {
-        report_member_done(
-            backend,
-            started.elapsed().as_secs_f32(),
-            Err("not registered"),
-        );
-        logger.member_finished(
-            backend,
-            false,
-            LegStatus::Error,
-            started.elapsed().as_millis() as u64,
-            None,
-            Some("not registered".into()),
-        );
-        return MemberOutcome {
-            backend,
-            transport: None,
-            output: None,
-            error: Some("not registered".into()),
-        };
-    }
-
     let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
-    match dispatch(backend, &prompt, &cwd, cancel, on_chunk, &regs).await {
-        Ok(res) => {
-            if res.auth_failed {
-                report_member_done(
-                    backend,
-                    started.elapsed().as_secs_f32(),
-                    Err("auth failure during execution"),
-                );
-                logger.member_finished(
-                    backend,
-                    false,
-                    LegStatus::Error,
-                    started.elapsed().as_millis() as u64,
-                    None,
-                    Some("auth failure during execution".into()),
-                );
-                return MemberOutcome {
-                    backend,
-                    transport: Some(res.transport),
-                    output: None,
-                    error: Some("auth failure during execution".into()),
-                };
-            }
-            let chars = res.output.len();
-            report_member_done(backend, started.elapsed().as_secs_f32(), Ok(chars));
-            logger.member_finished(
-                backend,
-                false,
-                LegStatus::Ok,
-                started.elapsed().as_millis() as u64,
-                Some(chars),
-                None,
-            );
-            MemberOutcome {
-                backend,
-                transport: Some(res.transport),
-                output: Some(res.output),
-                error: None,
-            }
+    let outcome = dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs).await;
+    let elapsed_s = started.elapsed().as_secs_f32();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &outcome.error {
+        None => {
+            let chars = outcome.output.as_ref().map(String::len).unwrap_or(0);
+            report_member_done(backend, elapsed_s, Ok(chars));
+            logger.member_finished(backend, false, LegStatus::Ok, elapsed_ms, Some(chars), None);
         }
-        Err(err) => {
-            let msg = format!("{err:#}");
-            report_member_done(backend, started.elapsed().as_secs_f32(), Err(&msg));
+        Some(err) => {
+            report_member_done(backend, elapsed_s, Err(err.as_str()));
             logger.member_finished(
                 backend,
                 false,
                 LegStatus::Error,
-                started.elapsed().as_millis() as u64,
+                elapsed_ms,
                 None,
-                Some(msg.clone()),
+                Some(err.clone()),
             );
-            MemberOutcome {
-                backend,
-                transport,
-                output: None,
-                error: Some(msg),
-            }
         }
     }
+    outcome
 }
 
 fn report_member_start(backend: BackendId) {

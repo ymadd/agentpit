@@ -11,6 +11,7 @@ pub mod ensemble;
 pub mod explain;
 pub mod init;
 pub mod login;
+pub mod mcp_cmd;
 mod menu;
 pub mod refactor;
 pub mod rescue;
@@ -18,6 +19,7 @@ pub mod review;
 pub mod security_review;
 pub mod status;
 pub mod update;
+pub mod workflow;
 
 pub(crate) use common::{install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer};
 
@@ -123,6 +125,26 @@ pub enum Command {
         cwd: Option<String>,
     },
 
+    /// Run a model-driven workflow: a manager backend (claude|codex) orchestrates sub-agents.
+    Workflow {
+        /// High-level goal for the manager to decompose and orchestrate.
+        goal: String,
+        /// Manager backend (claude|codex). Defaults to [workflow].manager_backend or default.backend.
+        #[arg(long)]
+        manager: Option<BackendId>,
+        /// Worker backends the manager may dispatch to (comma-separated). Defaults to all available minus the manager.
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<BackendId>>,
+        /// Hard recursion depth ceiling.
+        #[arg(long)]
+        max_depth: Option<u32>,
+        /// Orchestrate via the MCP channel (claude manager only) instead of shelling out.
+        #[arg(long, default_value_t = false)]
+        use_mcp: bool,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+
     /// Launch the live desktop dashboard (separate app).
     Dashboard,
 
@@ -164,6 +186,12 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         action: Option<config::Action>,
+    },
+
+    /// MCP channel: run a stdio MCP server exposing agentpit's dispatch/ensemble tools.
+    Mcp {
+        #[command(subcommand)]
+        action: mcp_cmd::Action,
     },
 }
 
@@ -225,6 +253,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             cwd,
         } => ensemble::run(prompt, members, aggregator, cwd).await,
 
+        Command::Workflow {
+            goal,
+            manager,
+            agents,
+            max_depth,
+            use_mcp,
+            cwd,
+        } => workflow::run(goal, manager, agents, max_depth, use_mcp, cwd).await,
+
         Command::Dashboard => dashboard::run().await,
 
         Command::Status { backend } => status::run(backend).await,
@@ -243,5 +280,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             Some(a) => config::run(a).await,
             None => menu::run_config().await,
         },
+
+        Command::Mcp { action } => mcp_cmd::run(action).await,
     }
 }

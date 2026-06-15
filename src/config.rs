@@ -134,6 +134,41 @@ impl Default for EnsembleSection {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowSection {
+    #[serde(default)]
+    pub manager_backend: Option<BackendId>,
+    #[serde(default)]
+    pub default_agents: Vec<BackendId>,
+    #[serde(default = "default_workflow_max_depth")]
+    pub max_depth: u32,
+    #[serde(default = "default_workflow_max_calls")]
+    pub max_calls_per_manager: u32,
+    /// Orchestrate via the MCP channel (`agentpit mcp serve`) instead of shelling out.
+    /// Overridden by the `--use-mcp` CLI flag. Only the claude manager supports MCP mode.
+    #[serde(default)]
+    pub use_mcp: bool,
+}
+
+impl Default for WorkflowSection {
+    fn default() -> Self {
+        Self {
+            manager_backend: None,
+            default_agents: Vec::new(),
+            max_depth: 3,
+            max_calls_per_manager: 8,
+            use_mcp: false,
+        }
+    }
+}
+
+fn default_workflow_max_depth() -> u32 {
+    3
+}
+fn default_workflow_max_calls() -> u32 {
+    8
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendOverride {
     #[serde(default)]
@@ -150,6 +185,8 @@ pub struct HubConfig {
     pub auto_route: AutoRouteSection,
     #[serde(default)]
     pub ensemble: EnsembleSection,
+    #[serde(default)]
+    pub workflow: WorkflowSection,
     #[serde(default)]
     pub backends: BTreeMap<BackendId, BackendOverride>,
 }
@@ -357,6 +394,14 @@ default_members = ["antigravity", "claude", "opencode"]
 review_members = ["antigravity", "opencode"]
 # review_aggregator = "claude"
 
+# [workflow]
+# Model-driven workflow: a manager backend (claude|codex) orchestrates sub-agents.
+# manager_backend       = "claude"   # defaults to [default].backend
+# default_agents        = ["gemini", "opencode", "codex"]  # defaults to all available minus the manager
+# max_depth             = 3          # hard recursion ceiling, enforced in Rust; clamped to 1..=32
+# max_calls_per_manager = 8          # advisory sub-dispatch budget surfaced in the prompt
+# use_mcp               = false      # orchestrate via the MCP channel (claude manager only); --use-mcp overrides
+
 # Per-backend transport override.
 # [backends.antigravity]
 # transport = "acp"
@@ -476,6 +521,46 @@ backend = "${AGENTPIT_TEST_BACKEND}"
         unsafe {
             env::remove_var("AGENTPIT_TEST_GREETING");
         }
+    }
+
+    #[test]
+    fn workflow_section_defaults_when_absent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.toml");
+        fs::write(&path, "").unwrap();
+        let loaded = load_config(Some(&path)).unwrap();
+        assert_eq!(loaded.config.workflow.max_depth, 3);
+        assert_eq!(loaded.config.workflow.max_calls_per_manager, 8);
+        assert!(loaded.config.workflow.manager_backend.is_none());
+        assert!(loaded.config.workflow.default_agents.is_empty());
+    }
+
+    #[test]
+    fn workflow_section_parses_overrides() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workflow.toml");
+        fs::write(
+            &path,
+            r#"
+[workflow]
+manager_backend = "codex"
+default_agents = ["gemini", "opencode"]
+max_depth = 5
+max_calls_per_manager = 12
+"#,
+        )
+        .unwrap();
+        let loaded = load_config(Some(&path)).unwrap();
+        assert_eq!(
+            loaded.config.workflow.manager_backend,
+            Some(BackendId::Codex)
+        );
+        assert_eq!(
+            loaded.config.workflow.default_agents,
+            vec![BackendId::Gemini, BackendId::Opencode]
+        );
+        assert_eq!(loaded.config.workflow.max_depth, 5);
+        assert_eq!(loaded.config.workflow.max_calls_per_manager, 12);
     }
 
     #[test]

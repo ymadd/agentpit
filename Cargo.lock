@@ -71,6 +71,7 @@ dependencies = [
  "console 0.15.11",
  "dirs",
  "regex",
+ "rmcp",
  "self_update",
  "serde",
  "serde_json",

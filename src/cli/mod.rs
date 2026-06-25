@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use crate::types::BackendId;
 
 pub mod adversarial_review;
+pub mod ask;
 pub(crate) mod cancel;
 mod common;
 pub mod config;
@@ -198,6 +199,22 @@ pub enum Command {
 
     /// Launch the persistent conversational REPL (the default when no subcommand is given).
     Repl,
+
+    /// Ask the supervising human a question and block for an answer (the CLI back-channel a
+    /// shell-out workflow manager uses; prints the answer or HUMAN_UNAVAILABLE to stdout).
+    Ask {
+        /// The question to put to the human.
+        prompt: String,
+        /// Explicit options the human picks from. Repeat the flag per option.
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// "blocking" (a worker is stalled) or "review" (nothing blocked). Defaults to review.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Seconds to wait before returning HUMAN_UNAVAILABLE (default 180, capped 600).
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -289,5 +306,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Mcp { action } => mcp_cmd::run(action).await,
 
         Command::Repl => repl::run_repl().await,
+
+        Command::Ask {
+            prompt,
+            options,
+            kind,
+            timeout_secs,
+        } => ask::run(prompt, options, kind, timeout_secs).await,
     }
 }

@@ -12,8 +12,18 @@ const DASHBOARD_BIN: &str = "agentpit-dashboard";
 /// (`agentpit-dashboard`); this spawns it detached and returns immediately.
 pub async fn run() -> Result<()> {
     let bin = locate()?;
-    Command::new(&bin)
-        .spawn()
+    let mut cmd = Command::new(&bin);
+    // The dashboard must resolve the SAME state dir (asks/, runs/, events.jsonl) as this CLI, or
+    // the Needs-You inbox would read a different `asks/` than the manager writes. `Command`
+    // already inherits our environment, so a custom XDG_STATE_HOME carries over — set it
+    // explicitly too so the alignment survives any future change to how we spawn. (A GUI/Finder-
+    // launched dashboard under a custom XDG_STATE_HOME can still diverge — a known limitation.)
+    if let Ok(dir) = std::env::var("XDG_STATE_HOME")
+        && !dir.is_empty()
+    {
+        cmd.env("XDG_STATE_HOME", dir);
+    }
+    cmd.spawn()
         .map_err(|e| anyhow::anyhow!("failed to launch {}: {e}", bin.display()))?;
     eprintln!("Launched dashboard ({}).", bin.display());
     eprintln!("It updates live as you run agentpit commands. Close its window to quit.");

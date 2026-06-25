@@ -172,9 +172,39 @@ pub enum Event {
         run_id: String,
         status: LegStatus,
     },
+    /// The manager is asking the supervising human a question and is now blocked on it.
+    /// The durable request/response lives in `asks/<ask_id>.json`; this event is the
+    /// dashboard's notification that a new ask exists (and a best-effort audit line — the
+    /// `asks/` files, not this log entry, are the source of truth, since compaction may
+    /// drop old runs' lines).
+    Ask {
+        ts: u64,
+        run_id: String,
+        ask_id: String,
+        prompt: String,
+        /// "blocking" | "review" (the src side passes `AskKind::as_str()`).
+        kind: String,
+        #[serde(default)]
+        option_count: usize,
+        timeout_secs: u64,
+        /// Pid of the process blocked on the ask, so the dashboard can reap a card whose
+        /// asker has died.
+        #[serde(default)]
+        pid: u32,
+    },
+    /// An ask was resolved — either the human answered or it timed out.
+    AskAnswered {
+        ts: u64,
+        run_id: String,
+        ask_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        answer: Option<String>,
+        #[serde(default)]
+        timed_out: bool,
+    },
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -201,6 +231,25 @@ pub fn events_path() -> PathBuf {
 /// Directory holding per-run captured output, one subdir per run id.
 pub fn runs_dir() -> PathBuf {
     state_dir().join("runs")
+}
+
+/// Per-ask request/response mailbox, a sibling of `runs/`. Files here are deliberately kept
+/// OFF the run-output pruner and OFF the `events.jsonl` compactor so an in-flight ask record
+/// can never vanish mid-poll.
+pub fn asks_dir() -> PathBuf {
+    state_dir().join("asks")
+}
+
+/// Path to an ask's request sidecar (`asks/<ask_id>.json`). `None` unless `ask_id` is a safe
+/// single path component — mirrors [`backend_log_path`]'s validate-before-join discipline.
+pub fn ask_request_path(ask_id: &str) -> Option<PathBuf> {
+    is_safe_log_component(ask_id).then(|| asks_dir().join(format!("{ask_id}.json")))
+}
+
+/// Path to an ask's response sidecar (`asks/<ask_id>.response.json`). `None` unless `ask_id`
+/// is a safe single path component.
+pub fn ask_response_path(ask_id: &str) -> Option<PathBuf> {
+    is_safe_log_component(ask_id).then(|| asks_dir().join(format!("{ask_id}.response.json")))
 }
 
 /// Log file capturing a single backend leg's streamed output within a run. The
@@ -389,6 +438,15 @@ fn next_run_id() -> String {
     format!("{}-{}-{}", process::id(), process_nonce(), n)
 }
 
+/// Generate a globally-unique ask id: `ask-<pid>-<process-nonce>-<counter>`. The `ask-`
+/// prefix keeps it from ever colliding with a run id and guarantees it passes
+/// [`is_safe_log_component`]. Reuses the same pid+nonce uniqueness scheme as [`next_run_id`].
+pub fn next_ask_token() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ask-{}-{}-{}", process::id(), process_nonce(), n)
+}
+
 /// Best-effort emitter scoped to a single run. Cheap to clone (shares the run id).
 #[derive(Debug, Clone)]
 pub struct RunLogger {
@@ -422,6 +480,16 @@ impl RunLogger {
 
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// Attach to an existing run id WITHOUT emitting `RunStarted`. Used by `agentpit ask` and
+    /// the MCP `ask_human` tool, which join the manager's run to emit ask events rather than
+    /// starting a fresh run.
+    pub fn adopt(run_id: String) -> Self {
+        RunLogger {
+            run_id,
+            enabled: events_enabled(),
+        }
     }
 
     pub fn member_started(&self, backend: BackendId, aggregator: bool) {
@@ -459,6 +527,39 @@ impl RunLogger {
             ts: now_ms(),
             run_id: self.run_id.clone(),
             status,
+        });
+    }
+
+    /// Emit an `Ask` — the manager is now blocked waiting on the human.
+    pub fn ask(
+        &self,
+        ask_id: &str,
+        prompt: &str,
+        kind: &str,
+        option_count: usize,
+        timeout_secs: u64,
+        pid: u32,
+    ) {
+        self.emit(Event::Ask {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            ask_id: ask_id.to_string(),
+            prompt: prompt.to_string(),
+            kind: kind.to_string(),
+            option_count,
+            timeout_secs,
+            pid,
+        });
+    }
+
+    /// Emit an `AskAnswered` — the human answered (`Some`) or the ask timed out (`timed_out`).
+    pub fn ask_answered(&self, ask_id: &str, answer: Option<&str>, timed_out: bool) {
+        self.emit(Event::AskAnswered {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            ask_id: ask_id.to_string(),
+            answer: answer.map(|s| s.to_string()),
+            timed_out,
         });
     }
 
@@ -617,5 +718,80 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
         }
+    }
+
+    #[test]
+    fn ask_events_round_trip_through_json() {
+        let ask = Event::Ask {
+            ts: 1,
+            run_id: "r1".into(),
+            ask_id: "ask-1-2-3".into(),
+            prompt: "Proceed?".into(),
+            kind: "blocking".into(),
+            option_count: 2,
+            timeout_secs: 180,
+            pid: 4321,
+        };
+        let json = serde_json::to_string(&ask).unwrap();
+        assert!(json.contains("\"event\":\"ask\""), "got: {json}");
+        assert!(json.contains("\"kind\":\"blocking\""));
+        assert!(matches!(
+            serde_json::from_str::<Event>(&json).unwrap(),
+            Event::Ask {
+                option_count: 2,
+                pid: 4321,
+                ..
+            }
+        ));
+
+        let answered = Event::AskAnswered {
+            ts: 2,
+            run_id: "r1".into(),
+            ask_id: "ask-1-2-3".into(),
+            answer: Some("yes".into()),
+            timed_out: false,
+        };
+        let json = serde_json::to_string(&answered).unwrap();
+        assert!(json.contains("\"event\":\"ask_answered\""), "got: {json}");
+        assert!(json.contains("\"answer\":\"yes\""));
+
+        // A timed-out answer omits the `answer` field entirely.
+        let timed_out = Event::AskAnswered {
+            ts: 3,
+            run_id: "r1".into(),
+            ask_id: "ask-1-2-3".into(),
+            answer: None,
+            timed_out: true,
+        };
+        let json = serde_json::to_string(&timed_out).unwrap();
+        assert!(
+            !json.contains("\"answer\":"),
+            "timed-out answer must omit the answer field: {json}"
+        );
+        assert!(json.contains("\"timed_out\":true"));
+    }
+
+    #[test]
+    fn ask_paths_reject_traversal_and_live_under_asks_dir() {
+        assert!(ask_request_path("..").is_none());
+        assert!(ask_request_path("a/b").is_none());
+        assert!(ask_response_path("/abs").is_none());
+        let req = ask_request_path("ask-1-2-3").unwrap();
+        assert!(req.ends_with("asks/ask-1-2-3.json"), "got: {}", req.display());
+        let resp = ask_response_path("ask-1-2-3").unwrap();
+        assert!(
+            resp.ends_with("asks/ask-1-2-3.response.json"),
+            "got: {}",
+            resp.display()
+        );
+    }
+
+    #[test]
+    fn ask_tokens_are_unique_safe_and_prefixed() {
+        let a = next_ask_token();
+        let b = next_ask_token();
+        assert_ne!(a, b);
+        assert!(a.starts_with("ask-"));
+        assert!(is_safe_log_component(&a), "ask token must be a safe component: {a}");
     }
 }

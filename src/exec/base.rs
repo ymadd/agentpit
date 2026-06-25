@@ -54,6 +54,13 @@ pub async fn run_spec(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    // Worker isolation for the human back-channel: a child spawned here inherits the parent's
+    // full environment (we deliberately never `env_clear`). The workflow manager leg sets
+    // AGENTPIT_ASK_ALLOWED so it alone may reach the human; strip it here so every backend we
+    // spawn — which would otherwise inherit it — cannot. Only a spec that explicitly re-adds it
+    // below (the manager leg) keeps it.
+    cmd.env_remove(crate::ask::ENV_ASK_ALLOWED);
+
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -155,4 +162,68 @@ pub async fn run_spec(
         output: stdout_text,
         exit_code: code,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn echo_ask_allowed_spec(env: Vec<(String, String)>) -> ExecSpec {
+        ExecSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '%s' \"${AGENTPIT_ASK_ALLOWED:-ABSENT}\"".into(),
+            ],
+            env,
+            stdin_input: None,
+        }
+    }
+
+    async fn run_echo(spec: ExecSpec) -> String {
+        run_spec(
+            BackendId::Gemini,
+            spec,
+            ExecRunOptions {
+                cwd: std::env::current_dir().unwrap(),
+                cancel: CancellationToken::new(),
+                on_stdout: None,
+            },
+        )
+        .await
+        .unwrap()
+        .output
+        .trim()
+        .to_string()
+    }
+
+    // R3 worker-isolation fix: the parent (this test process, standing in for the manager) has
+    // AGENTPIT_ASK_ALLOWED set, but a spawned child must NOT inherit it unless its spec re-adds it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ask_allow_token_is_stripped_from_children_unless_respecced() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var(crate::ask::ENV_ASK_ALLOWED, "run-7");
+        }
+
+        // A worker spec (no token in env) must see the inherited token stripped.
+        let worker = run_echo(echo_ask_allowed_spec(vec![])).await;
+        assert_eq!(worker, "ABSENT", "worker must not inherit the allow token");
+
+        // The manager leg re-adds the token in its spec env, so it survives the strip.
+        let manager = run_echo(echo_ask_allowed_spec(vec![(
+            crate::ask::ENV_ASK_ALLOWED.to_string(),
+            "run-7".to_string(),
+        )]))
+        .await;
+        assert_eq!(manager, "run-7", "manager leg keeps the re-added token");
+
+        unsafe {
+            std::env::remove_var(crate::ask::ENV_ASK_ALLOWED);
+        }
+    }
 }

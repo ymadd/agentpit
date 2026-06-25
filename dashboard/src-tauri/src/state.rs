@@ -226,6 +226,9 @@ impl Tracker {
                 run.finished = true;
                 run.status = Some(status.as_str().to_string());
             }
+            // The Needs-You inbox reads asks straight from the asks/ sidecar files (see
+            // `asks.rs`), not the Tracker, so these audit-trail events need no run-view state.
+            Event::Ask { .. } | Event::AskAnswered { .. } => {}
         }
     }
 

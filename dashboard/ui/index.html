@@ -1,37 +1,54 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>agentpit dashboard</title>
+    <title>agentpit</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+JP:wght@300;400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand">
-        <span class="dot" id="conn-dot"></span>
-        <strong>agentpit</strong><span class="muted">dashboard</span>
+    <!-- statusbar: one manager, your presence, the clock -->
+    <div id="statusbar">
+      <div class="sb-left">
+        <span class="orb"><span class="orb-core"></span><span class="orb-halo"></span></span>
+        <span class="sb-brand">agentpit</span>
+        <span class="sb-manager" id="manager-line"></span>
+        <span class="pending-pill hidden" id="pending-pill">
+          <span class="pp-dot"></span><span id="pending-count">0</span>
+        </span>
       </div>
-      <div class="muted small" id="updated">—</div>
-    </header>
+      <div class="sb-right">
+        <button type="button" id="avail-toggle" class="avail">
+          <span class="avail-dot"></span><span class="avail-label">在席中</span>
+        </button>
+        <span class="clock" id="clock">—</span>
+      </div>
+    </div>
 
-    <main>
-      <section>
-        <h2 class="section-title">
-          <span class="live-pip"></span> LIVE
-          <span class="count" id="live-count">0</span>
-        </h2>
-        <div id="live"></div>
-        <div id="live-empty" class="empty">No runs in flight. Fire an
-          <code>agentpit ensemble / review / rescue</code> and it shows up here.</div>
-      </section>
+    <!-- stage: exactly one thing needs you, or nothing does -->
+    <div id="stage">
+      <div id="idle" class="hidden"></div>
+      <div id="decision" class="hidden"></div>
+      <div id="toast" class="hidden"></div>
+    </div>
 
-      <section>
-        <h2 class="section-title muted">Recent</h2>
-        <div id="recent"></div>
-        <div id="recent-empty" class="empty small">No finished runs yet.</div>
-      </section>
-    </main>
+    <!-- footer: the swarm is opt-in -->
+    <div id="footer">
+      <button type="button" id="swarm-toggle" class="footer-btn">
+        <span class="fb-label">群れを見る</span>
+        <span class="fb-count" id="swarm-footer">—</span>
+      </button>
+      <span class="conn" id="conn"><span class="conn-dot"></span><span id="conn-text">接続中…</span></span>
+    </div>
+
+    <!-- swarm glance (opt-in): you don't need to look — the manager is watching -->
+    <div id="swarm" class="hidden"></div>
 
     <script src="app.js"></script>
   </body>

@@ -1,6 +1,7 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod asks;
 mod state;
 
 use std::path::PathBuf;
@@ -196,7 +197,12 @@ fn main() {
         .manage(AppState {
             tracker: Mutex::new(Tracker::new()),
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot, get_output])
+        .invoke_handler(tauri::generate_handler![
+            get_snapshot,
+            get_output,
+            asks::get_pending_asks,
+            asks::answer_ask
+        ])
         .setup(|app| {
             spawn_watcher(app.handle().clone());
             Ok(())

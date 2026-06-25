@@ -148,6 +148,11 @@ pub struct WorkflowSection {
     /// Overridden by the `--use-mcp` CLI flag. Only the claude manager supports MCP mode.
     #[serde(default)]
     pub use_mcp: bool,
+    /// Inject the human back-channel into the manager (the `ask_human` MCP tool / `agentpit ask`
+    /// CLI) and the question-discipline prompt that governs it. Default OFF until dogfooded: with
+    /// it off the manager is never told to call a back-channel that would otherwise 404.
+    #[serde(default)]
+    pub enable_ask_human: bool,
 }
 
 impl Default for WorkflowSection {
@@ -158,6 +163,7 @@ impl Default for WorkflowSection {
             max_depth: 3,
             max_calls_per_manager: 8,
             use_mcp: false,
+            enable_ask_human: false,
         }
     }
 }

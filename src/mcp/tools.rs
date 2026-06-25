@@ -78,6 +78,24 @@ pub struct RunWorkflowRequest {
     pub use_mcp: Option<bool>,
 }
 
+/// Parameters for the `ask_human` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AskHumanRequest {
+    /// The question to put to the human. Pre-frame it as a closed decision.
+    pub prompt: String,
+    /// Optional explicit options the human picks from (e.g. ["A", "B"]).
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// "blocking" (a worker is stalled until answered) or "review" (nothing blocked).
+    /// Anything else defaults to "review".
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Seconds to wait before returning HUMAN_UNAVAILABLE. Omit or 0 for the default (180s),
+    /// capped at 600s.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
 /// The agentpit MCP tool handler. Holds a shared [`Registries`] and the working directory the
 /// dispatched backends run in, plus the generated [`ToolRouter`].
 #[derive(Clone)]
@@ -329,6 +347,36 @@ impl AgentpitTools {
             Err(e) => Ok(tool_error(format!("{e:#}"))),
         }
     }
+
+    /// Ask the supervising human a question and block for an answer. The `cancel` token is
+    /// injected by rmcp from the request context, so a client `CancelledNotification` (or the
+    /// serve loop tearing down) aborts the poll promptly instead of waiting out the timeout.
+    #[tool(
+        name = "ask_human",
+        description = "Ask the supervising HUMAN a question and block for an answer. ONLY the workflow manager may call this — workers cannot. Returns the human's answer, or the sentinel HUMAN_UNAVAILABLE if no one answers before the timeout (then proceed with the safe, conservative, reversible choice and note it). Use SPARINGLY: only at a genuine decision fork or before a destructive / irreversible action."
+    )]
+    async fn ask_human(
+        &self,
+        Parameters(req): Parameters<AskHumanRequest>,
+        cancel: CancellationToken,
+    ) -> Result<CallToolResult, McpError> {
+        let areq = crate::ask::AskRequest {
+            prompt: req.prompt,
+            options: req.options,
+            kind: crate::ask::AskKind::parse_or_default(req.kind.as_deref()),
+            timeout_secs: req.timeout_secs.unwrap_or(0),
+        };
+        match crate::ask::ask(areq, cancel).await {
+            crate::ask::AskOutcome::Answered(a) => Ok(CallToolResult::success(vec![Content::text(
+                clamp_for_prompt(&a, MAX_MEMBER_PROMPT_BYTES),
+            )])),
+            // SUCCESS text, never `tool_error` — a timeout must not look like a failure, or the
+            // manager may abort instead of proceeding with the safe choice on HUMAN_UNAVAILABLE.
+            crate::ask::AskOutcome::Unavailable => Ok(CallToolResult::success(vec![Content::text(
+                crate::ask::HUMAN_UNAVAILABLE.to_string(),
+            )])),
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -337,9 +385,11 @@ impl ServerHandler for AgentpitTools {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "agentpit multi-agent hub. Call list_backends to discover backends, dispatch_task to \
              run one backend on a sub-task, run_ensemble to fan a prompt to several backends in \
-             parallel (with an optional aggregator), and run_workflow to launch a whole \
+             parallel (with an optional aggregator), run_workflow to launch a whole \
              model-driven workflow (a manager decomposes the goal, dispatches sub-tasks to \
-             workers, and returns a final synthesis).",
+             workers, and returns a final synthesis), and ask_human to surface a decision to the \
+             supervising human and block for an answer (use sparingly — only at a genuine fork \
+             or before a destructive action; HUMAN_UNAVAILABLE means proceed with the safe choice).",
         )
     }
 }
@@ -536,5 +586,44 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("unknown agent backend"), "got: {text}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ask_human_times_out_to_sentinel_as_success() {
+        // Serialize against other state-dir tests; isolate writes to a temp XDG_STATE_HOME.
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+        let res = tools()
+            .ask_human(
+                Parameters(AskHumanRequest {
+                    prompt: "Proceed?".into(),
+                    options: vec![],
+                    kind: Some("review".into()),
+                    timeout_secs: Some(1),
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        // A timeout must surface as SUCCESS carrying the sentinel, never an error — else the
+        // manager may abort instead of proceeding with the safe choice.
+        assert_eq!(res.is_error, Some(false));
+        let text = res
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text, "HUMAN_UNAVAILABLE");
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
     }
 }

@@ -9,12 +9,14 @@ pub(crate) mod cancel;
 mod common;
 pub mod config;
 pub mod dashboard;
+pub mod diagnose;
 pub mod ensemble;
 pub mod explain;
 pub mod init;
 pub mod login;
 pub mod mcp_cmd;
 mod menu;
+pub mod profile;
 pub mod refactor;
 pub mod repl;
 pub mod rescue;
@@ -157,6 +159,23 @@ pub enum Command {
         backend: Option<BackendId>,
     },
 
+    /// Inspect or (re)seed the capability profiles in profiles.toml. Omit the sub-action to
+    /// show the matrix.
+    Profile {
+        #[command(subcommand)]
+        action: Option<profile::Action>,
+    },
+
+    /// Dry-run task diagnosis + profile routing (features → category → backend). `--json`
+    /// emits a machine-readable verdict for downstream automation.
+    Diagnose {
+        /// The task to diagnose. Quote multi-word tasks.
+        task: String,
+        /// Emit machine-readable JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Check or launch a backend's login flow.
     Login {
         backend: BackendId,
@@ -287,6 +306,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Dashboard => dashboard::run().await,
 
         Command::Status { backend } => status::run(backend).await,
+
+        Command::Profile { action } => profile::run(action).await,
+
+        Command::Diagnose { task, json } => diagnose::run(task, json).await,
 
         Command::Login { backend, check } => login::run(backend, check).await,
 

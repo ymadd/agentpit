@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
 use crate::config::{HubConfig, RouteKey};
+use crate::diagnose::{self, LLM_ASSIST_CONFIDENCE_THRESHOLD};
+use crate::profile::{ProfileSet, TaskCategory};
 use crate::types::BackendId;
 
 #[derive(Debug, Clone)]
@@ -14,6 +16,10 @@ pub struct RouteRequest<'a> {
 pub enum RouteReason {
     Explicit,
     RouteTable,
+    /// Diagnosed task category routed to the highest-scoring available backend via the
+    /// capability profiles (design §1.6). Carries the category and the winning score for
+    /// observability.
+    Profile { category: TaskCategory, score: u8 },
     AutoLongContext,
     AutoKeyword,
     Default,
@@ -24,6 +30,7 @@ impl RouteReason {
         match self {
             RouteReason::Explicit => "explicit",
             RouteReason::RouteTable => "route_table",
+            RouteReason::Profile { .. } => "profile",
             RouteReason::AutoLongContext => "auto_long_context",
             RouteReason::AutoKeyword => "auto_keyword",
             RouteReason::Default => "default",
@@ -40,11 +47,12 @@ pub struct RouteDecision {
 pub struct Router {
     config: HubConfig,
     available: HashSet<BackendId>,
+    profiles: ProfileSet,
     review_keywords_lower: Vec<String>,
 }
 
 impl Router {
-    pub fn new(config: HubConfig, available: HashSet<BackendId>) -> Self {
+    pub fn new(config: HubConfig, available: HashSet<BackendId>, profiles: ProfileSet) -> Self {
         let review_keywords_lower = config
             .auto_route
             .review_keywords
@@ -54,6 +62,7 @@ impl Router {
         Self {
             config,
             available,
+            profiles,
             review_keywords_lower,
         }
     }
@@ -80,6 +89,26 @@ impl Router {
         if self.config.default.auto_route
             && let Some(task) = request.task
         {
+            // Profile-driven diagnostic routing (design §1.6): diagnose the task, and when the
+            // verdict is confident enough, send it to the highest-scoring available backend for
+            // that category. A shaky diagnosis (low confidence) or a category no available
+            // backend has scored falls through to the legacy long-context / keyword heuristics
+            // and ultimately `default` — we never let an uncertain guess steer work to an odd
+            // backend.
+            let diagnosis = diagnose::diagnose(task);
+            if diagnosis.confidence >= LLM_ASSIST_CONFIDENCE_THRESHOLD
+                && let Some((backend, score)) =
+                    self.profiles.best_for(diagnosis.primary, &self.available)
+            {
+                return RouteDecision {
+                    backend,
+                    reason: RouteReason::Profile {
+                        category: diagnosis.primary,
+                        score: score.value,
+                    },
+                };
+            }
+
             let auto = &self.config.auto_route;
             if self.available.contains(&auto.long_context_backend)
                 && estimate_tokens(task) > auto.long_context_threshold
@@ -131,6 +160,7 @@ mod tests {
     use crate::config::{
         AutoRouteSection, DefaultSection, EnsembleSection, HubConfig, WorkflowSection,
     };
+    use crate::profile::{CapabilityProfile, Score};
     use std::collections::BTreeMap;
 
     fn base_config() -> HubConfig {
@@ -167,7 +197,7 @@ mod tests {
 
     #[test]
     fn honors_explicit_backend_when_registered() {
-        let r = Router::new(base_config(), available());
+        let r = Router::new(base_config(), available(), ProfileSet::default());
         let d = r.resolve(&RouteRequest {
             tool: RouteKey::Rescue,
             explicit_backend: Some(BackendId::Claude),
@@ -181,7 +211,7 @@ mod tests {
     fn ignores_explicit_when_unavailable() {
         let mut only_gemini = HashSet::new();
         only_gemini.insert(BackendId::Gemini);
-        let r = Router::new(base_config(), only_gemini);
+        let r = Router::new(base_config(), only_gemini, ProfileSet::default());
         let d = r.resolve(&RouteRequest {
             tool: RouteKey::Rescue,
             explicit_backend: Some(BackendId::Claude),
@@ -193,7 +223,7 @@ mod tests {
 
     #[test]
     fn uses_route_table_for_tool() {
-        let r = Router::new(base_config(), available());
+        let r = Router::new(base_config(), available(), ProfileSet::default());
         let d = r.resolve(&RouteRequest {
             tool: RouteKey::Review,
             explicit_backend: None,
@@ -207,7 +237,7 @@ mod tests {
     fn auto_routes_long_context() {
         let mut cfg = base_config();
         cfg.routes.clear();
-        let r = Router::new(cfg, available());
+        let r = Router::new(cfg, available(), ProfileSet::default());
         let long = "x".repeat(10_000);
         let d = r.resolve(&RouteRequest {
             tool: RouteKey::Rescue,
@@ -222,7 +252,7 @@ mod tests {
     fn auto_routes_by_keyword() {
         let mut cfg = base_config();
         cfg.routes.clear();
-        let r = Router::new(cfg, available());
+        let r = Router::new(cfg, available(), ProfileSet::default());
         let d = r.resolve(&RouteRequest {
             tool: RouteKey::Rescue,
             explicit_backend: None,
@@ -237,7 +267,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.routes.clear();
         cfg.default.auto_route = false;
-        let r = Router::new(cfg, available());
+        let r = Router::new(cfg, available(), ProfileSet::default());
         let d = r.resolve(&RouteRequest {
             tool: RouteKey::Rescue,
             explicit_backend: None,
@@ -255,7 +285,7 @@ mod tests {
             backend: BackendId::Opencode,
             auto_route: false,
         };
-        let r = Router::new(cfg, available());
+        let r = Router::new(cfg, available(), ProfileSet::default());
         let d = r.resolve(&RouteRequest {
             tool: RouteKey::Rescue,
             explicit_backend: None,
@@ -263,5 +293,111 @@ mod tests {
         });
         assert_eq!(d.backend, BackendId::Opencode);
         assert_eq!(d.reason, RouteReason::Default);
+    }
+
+    fn profile_with(
+        backend: BackendId,
+        category: TaskCategory,
+        value: u8,
+    ) -> CapabilityProfile {
+        let mut p = CapabilityProfile::seeded(backend);
+        p.scores.insert(category, Score::seeded(value));
+        p
+    }
+
+    fn available_with_codex() -> HashSet<BackendId> {
+        let mut s = HashSet::new();
+        s.insert(BackendId::Gemini);
+        s.insert(BackendId::Claude);
+        s.insert(BackendId::Codex);
+        s
+    }
+
+    #[test]
+    fn profile_routes_diagnosed_category_to_argmax_backend() {
+        // No route-table entry for the tool, auto_route on, and a confidently-Coding task:
+        // the profile stage should win and pick the highest-scoring available backend.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Claude, TaskCategory::Coding, 70),
+            profile_with(BackendId::Codex, TaskCategory::Coding, 90),
+            profile_with(BackendId::Gemini, TaskCategory::Coding, 80),
+        ]);
+        let r = Router::new(cfg, available_with_codex(), profiles);
+
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("implement a function to parse the duration feature"),
+        });
+
+        assert_eq!(d.backend, BackendId::Codex);
+        assert_eq!(
+            d.reason,
+            RouteReason::Profile {
+                category: TaskCategory::Coding,
+                score: 90,
+            }
+        );
+        assert_eq!(d.reason.as_str(), "profile");
+    }
+
+    #[test]
+    fn profile_argmax_respects_availability() {
+        // Codex is the global best at Coding but is not registered — Gemini wins among the
+        // available backends, never an offline one.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Claude, TaskCategory::Coding, 70),
+            profile_with(BackendId::Codex, TaskCategory::Coding, 90),
+            profile_with(BackendId::Gemini, TaskCategory::Coding, 80),
+        ]);
+        let r = Router::new(cfg, available(), profiles); // available() has no Codex
+
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("implement a function to parse the duration feature"),
+        });
+
+        assert_eq!(d.backend, BackendId::Gemini);
+        assert_eq!(
+            d.reason,
+            RouteReason::Profile {
+                category: TaskCategory::Coding,
+                score: 80,
+            }
+        );
+    }
+
+    #[test]
+    fn low_confidence_diagnosis_does_not_take_profile_path() {
+        // A signal-free task diagnoses to a low-confidence category. Even though the profiles
+        // do score that category, the confidence gate must keep us off the profile path so a
+        // misclassification can't steer work to an odd backend — we fall through to default.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        cfg.default.backend = BackendId::Opencode;
+        // A profile that would have sent Coding to Codex if the gate let it through.
+        let profiles = ProfileSet::from_profiles([profile_with(
+            BackendId::Codex,
+            TaskCategory::Coding,
+            99,
+        )]);
+        let mut avail = available();
+        avail.insert(BackendId::Codex);
+        let r = Router::new(cfg, avail, profiles);
+
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("alpha beta gamma"),
+        });
+
+        // Profile path skipped (low confidence), no long-context, no keyword → default.
+        assert_eq!(d.reason, RouteReason::Default);
+        assert_eq!(d.backend, BackendId::Opencode);
     }
 }

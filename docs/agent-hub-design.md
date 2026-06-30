@@ -229,8 +229,12 @@ public surface 破壊なし: `agentpit ask` と `ask_human` MCP は human専用�
 
 ### 4.6 未解決の経験的問い（cruxes — gold-bench 行き）
 
-1. statelessでの**反証品質**: 批判をプロンプト注入して再dispatchするのは本物の defense ターンか、
-   それとも in-context 推論状態（session_id, `base.rs:92`）喪失で劣化版か。
+1. ~~statelessでの**反証品質**~~ — **決着（2026-07-01, `agentpit refute-bench`）**: critic=codex /
+   defender=antigravity で3probe（binary_search_bounds / mutable_default_arg / parse_duration）
+   全て before=0.00 → after=1.00（delta margin 0.20 を全probe通過、GATE: PASS）。プロンプト注入
+   再dispatchは劣化版ではなく本物の defense ターンとして機能した。`docs/agent-hub-design.md`
+   §5.1 の境目はこれで実証済み。3probeのみ・1backend-pairのみなので一般化の余地は残る
+   （複数backend-pair・敵対的に難しいprobeでの再測定は今後の回帰ゲート運用に委ねる）。
 2. Event variant を**今作るか dogfood 後か**（形は合意、YAGNI の時期だけ対立）。
 3. durable transcript に明示的 recipient/cursor が**いつか要るか**（群れトポロジが1manager×多leafのままか）。
 4. ④の adjudication 裁定者は **manager 自身か別dispatchの中立群れか**（manager は単一 --print/exec 窓）。
@@ -248,6 +252,9 @@ public surface 破壊なし: `agentpit ask` と `ask_human` MCP は human専用�
 「能力で振り分け・文脈引き継ぎ・反証で立ち直り・出力品質を測れる」の最小条件が成立し、
 gold-bench が回帰ゲートとなりドッグフーディングが安全になる。境目は測定可能な1線（bench green on ④）。
 
+> **境目通過（2026-07-01）**: `agentpit refute-bench` 実装 + ライブ実行で GATE: PASS（§4.6 crux #1
+> 参照）。Phase B 着手可。
+
 ### 5.2 フェーズ
 
 ```
@@ -256,7 +263,8 @@ Phase A — Strata ブートストラップ（外部足場が "自己ビルダ�
   A1  能力プロファイル + 診断ルーティング  … Strata ultra/conduct
   A2  gold-bench ハーネス + profile run   … Strata conduct
   A3  会話層M1（§4.5 の DO）             … Strata conduct（敵対的 verify 必須）
- ───────────────◀ 境目: gold-bench が ④反証でグリーン ───────────────
+  A4  ④反証品質gold-benchゲート（§5.1）  … 通過済み（2026-07-01, GATE: PASS）
+ ───────────────◀ 境目: gold-bench が ④反証でグリーン ─── 通過済み ───────
 Phase B — ドッグフーディング（agentpit が agentpit を作る）
   B1+ DEFER項目、hybrid-judge カテゴリ(Explain/Docs/Planning)、issue→診断ルーティングの
       GitHub Action、events からの継続学習テレメトリ … 全部 `agentpit workflow`(①+④) で駆動、

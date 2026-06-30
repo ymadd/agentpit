@@ -11,7 +11,17 @@ use serde::{Deserialize, Serialize};
 
 /// What kind of work a task is, used to score backends and route diagnostically.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]

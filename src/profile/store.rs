@@ -86,15 +86,16 @@ impl ProfilesFile {
 
     /// Reconstruct a `ProfileSet`, stitching each entry's backend key back into its profile.
     fn into_set(self) -> ProfileSet {
-        let profiles = self.profile.into_iter().map(|(backend, entry)| {
-            CapabilityProfile {
+        let profiles = self
+            .profile
+            .into_iter()
+            .map(|(backend, entry)| CapabilityProfile {
                 backend,
                 scores: entry.scores,
                 telemetry: entry.telemetry,
                 source: entry.source,
                 measured_at: entry.measured_at,
-            }
-        });
+            });
         ProfileSet::from_profiles(profiles)
     }
 }
@@ -149,7 +150,10 @@ pub fn save_profiles(set: &ProfileSet, path: &Path) -> Result<()> {
 /// A temp path next to `path` (same directory → same filesystem → atomic rename). The pid
 /// suffix keeps concurrent writers from colliding on the same temp name.
 fn temp_sibling(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(format!(".tmp.{}", std::process::id()));
     match path.parent() {
         Some(parent) => parent.join(name),

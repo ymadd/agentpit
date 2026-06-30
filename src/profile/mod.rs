@@ -1,6 +1,7 @@
 //! Capability profiles: the backend×`TaskCategory` score matrix that drives diagnostic
 //! routing. A `ProfileSet` answers "which available backend is best at this category?".
 
+pub mod bench;
 pub mod category;
 pub mod model;
 pub mod seed;
@@ -107,7 +108,10 @@ mod tests {
         ]);
 
         let (backend, score) = set
-            .best_for(TaskCategory::Coding, &available(&[BackendId::Claude, BackendId::Codex, BackendId::Gemini]))
+            .best_for(
+                TaskCategory::Coding,
+                &available(&[BackendId::Claude, BackendId::Codex, BackendId::Gemini]),
+            )
             .unwrap();
         assert_eq!(backend, BackendId::Codex);
         assert_eq!(score.value, 90);
@@ -130,21 +134,18 @@ mod tests {
 
     #[test]
     fn best_for_returns_none_when_available_is_empty() {
-        let set = ProfileSet::from_profiles([profile_with(
-            BackendId::Claude,
-            TaskCategory::Coding,
-            70,
-        )]);
-        assert!(set.best_for(TaskCategory::Coding, &available(&[])).is_none());
+        let set =
+            ProfileSet::from_profiles([profile_with(BackendId::Claude, TaskCategory::Coding, 70)]);
+        assert!(
+            set.best_for(TaskCategory::Coding, &available(&[]))
+                .is_none()
+        );
     }
 
     #[test]
     fn best_for_returns_none_when_no_backend_scored_category() {
-        let set = ProfileSet::from_profiles([profile_with(
-            BackendId::Claude,
-            TaskCategory::Coding,
-            70,
-        )]);
+        let set =
+            ProfileSet::from_profiles([profile_with(BackendId::Claude, TaskCategory::Coding, 70)]);
         // Claude is available but has no Debug score.
         assert!(
             set.best_for(TaskCategory::Debug, &available(&[BackendId::Claude]))

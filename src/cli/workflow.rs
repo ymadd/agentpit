@@ -336,6 +336,32 @@ IF UNAVAILABLE: {ask_invocation} may return the literal HUMAN_UNAVAILABLE (no an
     )
 }
 
+/// The manager-facing "conversation layer" block (design ①④): how to RECORD a handoff/board note
+/// onto the run transcript, and how to run ONE refutation pass over a stuck sub-task before
+/// discarding it. Gated on the same `[workflow].enable_ask_human` switch as the question-discipline
+/// block, so the default manager prompt is byte-identical. `note_grammar` / `refute_grammar` are
+/// concrete one-line invocations for this mode (shell-out vs MCP). Returns a block ending in a
+/// blank line so it slots between the question-discipline block and PROCEDURE.
+fn conversation_discipline_block(note_grammar: &str, refute_grammar: &str) -> String {
+    format!(
+        "CONVERSATION LAYER — HANDOFFS & REFUTATION:\n\
+You drive the workflow; workers are one-shot and share no memory. Two durable moves are yours:\n\
+\n\
+  HANDOFF: when one worker's result must seed the next sub-task, RECORD it on the run transcript\n\
+    before the next dispatch, then carry the relevant facts into that dispatch's prompt yourself.\n\
+    Use kind 'handoff' and set --from to the worker that produced it; use kind 'board' for a fact\n\
+    several later sub-tasks will reuse. Recording is fire-and-forget — it does not block.\n\
+    INVOKE:  {note_grammar}\n\
+\n\
+  STUCK SUB-TASK: before you DISCARD a worker's output as a dead end, run ONE refutation pass —\n\
+    an adversarial critic challenges the candidate, then a defender rebuts or fixes it — and then\n\
+    YOU adjudicate: ADOPT the revised candidate, KEEP the original, or DISCARD and re-plan. One\n\
+    pass, never a loop; it is advisory, so a failed leg does not block you.\n\
+    INVOKE:  {refute_grammar}\n\
+\n",
+    )
+}
+
 /// Build the orchestration system-prompt prepended to the user goal.
 ///
 /// Pure and unit-tested: it threads the worker roster, the goal, the depth/budget lines, the
@@ -371,6 +397,19 @@ pub fn build_manager_prompt(
         None => String::new(),
     };
     let discipline = discipline.as_str();
+    // The conversation layer (handoffs + refutation) rides the same enable_ask_human switch, so
+    // the default prompt is unchanged. Shell-out grammar: `<self_path> note …` / `… refute …`.
+    let conversation = if ask.is_some() {
+        conversation_discipline_block(
+            &format!("{self_path} note \"<context>\" --kind handoff [--from <worker>]"),
+            &format!(
+                "{self_path} refute \"<candidate>\" --task \"<sub-task>\" [--critic <id>] [--defender <id>]"
+            ),
+        )
+    } else {
+        String::new()
+    };
+    let conversation = conversation.as_str();
     format!(
         "=== AGENTPIT WORKFLOW ORCHESTRATOR ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
@@ -389,6 +428,7 @@ BUDGET: workflow depth {depth}/{max_depth}; aim for <= {max_calls} sub-dispatch 
   The system REJECTS any nested workflow past the depth ceiling. Plan within budget.\n\
 \n\
 {discipline}\
+{conversation}\
 PROCEDURE:\n\
   1. Briefly state your plan (the sub-tasks).\n\
   2. Dispatch each sub-task; read its output; adjust the remaining plan as needed.\n\
@@ -426,6 +466,17 @@ pub fn build_manager_prompt_mcp(
         None => String::new(),
     };
     let discipline = discipline.as_str();
+    // The conversation layer rides the same switch as the question-discipline block. MCP grammar:
+    // the post_note / refute tools rather than shell commands.
+    let conversation = if ask.is_some() {
+        conversation_discipline_block(
+            "mcp__agentpit__post_note  {\"body\":\"<context>\",\"kind\":\"handoff\",\"from\":\"<worker>\"}",
+            "mcp__agentpit__refute  {\"candidate\":\"<candidate>\",\"task\":\"<sub-task>\"}",
+        )
+    } else {
+        String::new()
+    };
+    let conversation = conversation.as_str();
     format!(
         "=== AGENTPIT WORKFLOW ORCHESTRATOR (MCP MODE) ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
@@ -444,6 +495,7 @@ BUDGET: workflow depth {depth}/{max_depth}; aim for <= {max_calls} sub-dispatch 
   The system REJECTS any nested workflow past the depth ceiling. Plan within budget.\n\
 \n\
 {discipline}\
+{conversation}\
 PROCEDURE:\n\
   1. Briefly state your plan (the sub-tasks).\n\
   2. Call the MCP tools above; read each result; adjust the remaining plan as needed.\n\
@@ -547,11 +599,50 @@ mod tests {
         for text in [&cli, &mcp] {
             assert!(!text.contains("HUMAN BACK-CHANNEL"), "discipline must be omitted when off");
             assert!(!text.contains("HUMAN_UNAVAILABLE"));
+            // The conversation layer (handoffs + refutation) is gated on the same switch.
+            assert!(!text.contains("CONVERSATION LAYER"), "conversation block must be omitted when off");
+            assert!(!text.contains("refute"));
             // The base prompt is intact and still ends with the user goal + synthesis instruction.
             assert!(text.contains("PROCEDURE:"));
             assert!(text.contains("SYNTHESIS"));
             assert!(text.trim_end().ends_with("goal"));
         }
+    }
+
+    #[test]
+    fn conversation_block_teaches_handoff_and_refute_when_enabled() {
+        let agents = [BackendId::Gemini];
+        let cli = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            Some(AskTier::High),
+        );
+        assert!(cli.contains("CONVERSATION LAYER"));
+        // The CLI grammar for both moves is taught.
+        assert!(cli.contains("note \"<context>\" --kind handoff"));
+        assert!(cli.contains("refute \"<candidate>\" --task"));
+        // The adjudication framing — ADOPT / KEEP / DISCARD, one pass.
+        assert!(cli.contains("ADOPT the revised candidate"));
+        assert!(cli.contains("never a loop"));
+        // The block still slots before PROCEDURE, which ends the body (regression guard).
+        assert!(cli.contains("PROCEDURE:"));
+        assert!(cli.trim_end().ends_with("goal"));
+    }
+
+    #[test]
+    fn mcp_conversation_block_points_at_post_note_and_refute_tools() {
+        let agents = [BackendId::Gemini];
+        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", Some(AskTier::High));
+        assert!(mcp.contains("CONVERSATION LAYER"));
+        assert!(mcp.contains("mcp__agentpit__post_note"));
+        assert!(mcp.contains("mcp__agentpit__refute"));
+        // No shell-out note/refute grammar in MCP mode.
+        assert!(!mcp.contains("note \"<context>\""));
     }
 
     #[test]

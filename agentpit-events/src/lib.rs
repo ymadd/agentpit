@@ -202,6 +202,27 @@ pub enum Event {
         #[serde(default)]
         timed_out: bool,
     },
+    /// A durable note appended to the run transcript — the substrate for ① handoff and ③ the
+    /// shared board (design §4.5 "conversation layer M1"). Unlike [`Event::Ask`], a note has no
+    /// recipient field and no per-consumer cursor: the only long-lived consumer is the workflow
+    /// manager, which reads the transcript in order. Notes are append-only, ordered, fire-and-forget
+    /// (no claim/ack), and compaction-bounded exactly like every other event. The manager posts one
+    /// to record a worker→manager handoff or a shared-board entry before it re-seeds or discards
+    /// context. Best-effort and audit-only: the dashboard renders it for context but keeps no
+    /// run-view state for it, and compaction may drop old runs' notes just like any other line.
+    Note {
+        ts: u64,
+        run_id: String,
+        /// Who authored the note: the dispatching worker's backend for a handoff, or the
+        /// manager's own backend for a board entry. Omitted when the poster names no backend.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<BackendId>,
+        /// "handoff" (a 1→1 context pass to the next leg) or "board" (a shared scratch entry).
+        /// Free-form; any other value is treated as a generic note.
+        kind: String,
+        /// The note body — the handed-off context or board entry. Clamped by the caller.
+        body: String,
+    },
 }
 
 pub fn now_ms() -> u64 {
@@ -563,6 +584,19 @@ impl RunLogger {
         });
     }
 
+    /// Emit a `Note` — a durable transcript entry for ① handoff or ③ the shared board. `from`
+    /// is the authoring backend (the handed-off worker, or the manager); `kind` is "handoff" or
+    /// "board". Fire-and-forget: it reuses the same best-effort append path as every other event.
+    pub fn note(&self, from: Option<BackendId>, kind: &str, body: &str) {
+        self.emit(Event::Note {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            from,
+            kind: kind.to_string(),
+            body: body.to_string(),
+        });
+    }
+
     /// Append one event as a JSON line. Silently ignores every failure.
     fn emit(&self, event: Event) {
         if !self.enabled {
@@ -769,6 +803,63 @@ mod tests {
             "timed-out answer must omit the answer field: {json}"
         );
         assert!(json.contains("\"timed_out\":true"));
+    }
+
+    #[test]
+    fn note_event_round_trips_and_omits_absent_author() {
+        let handoff = Event::Note {
+            ts: 7,
+            run_id: "r1".into(),
+            from: Some(BackendId::Codex),
+            kind: "handoff".into(),
+            body: "auth module done; wire the CLI next".into(),
+        };
+        let json = serde_json::to_string(&handoff).unwrap();
+        assert!(json.contains("\"event\":\"note\""), "got: {json}");
+        assert!(json.contains("\"from\":\"codex\""));
+        assert!(json.contains("\"kind\":\"handoff\""));
+        assert!(matches!(
+            serde_json::from_str::<Event>(&json).unwrap(),
+            Event::Note {
+                from: Some(BackendId::Codex),
+                ..
+            }
+        ));
+
+        // A note with no named author omits the `from` field entirely.
+        let board = Event::Note {
+            ts: 8,
+            run_id: "r1".into(),
+            from: None,
+            kind: "board".into(),
+            body: "shared constraint: keep files < 800 lines".into(),
+        };
+        let json = serde_json::to_string(&board).unwrap();
+        assert!(!json.contains("\"from\":"), "absent author must be omitted: {json}");
+        // A legacy/absent `from` deserializes back to None via #[serde(default)].
+        assert!(matches!(
+            serde_json::from_str::<Event>(&json).unwrap(),
+            Event::Note { from: None, .. }
+        ));
+    }
+
+    #[test]
+    fn logger_note_appends_to_event_log() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+        let logger = RunLogger::adopt("run-note".to_string());
+        logger.note(Some(BackendId::Claude), "handoff", "context for the next leg");
+        let contents = std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap();
+        assert!(contents.contains("\"event\":\"note\""), "got: {contents}");
+        assert!(contents.contains("\"run_id\":\"run-note\""));
+        assert!(contents.contains("context for the next leg"));
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
     }
 
     #[test]

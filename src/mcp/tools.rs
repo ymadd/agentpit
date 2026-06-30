@@ -96,6 +96,34 @@ pub struct AskHumanRequest {
     pub timeout_secs: Option<u64>,
 }
 
+/// Parameters for the `post_note` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PostNoteRequest {
+    /// The note body — the context being handed off, or the board entry.
+    pub body: String,
+    /// "handoff" (1→1 context pass, default) or "board" (shared scratch entry).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The backend that authored this note (e.g. the handed-off worker). Omit for a manager post.
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+/// Parameters for the `refute` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RefuteRequest {
+    /// The stuck candidate to put under adversarial scrutiny.
+    pub candidate: String,
+    /// The sub-task the candidate was meant to achieve (the critic/defender's target).
+    pub task: String,
+    /// Backend that produces the critique. Defaults to the adversarial-review primary.
+    #[serde(default)]
+    pub critic: Option<String>,
+    /// Backend that produces the defense. Defaults to a backend distinct from the critic.
+    #[serde(default)]
+    pub defender: Option<String>,
+}
+
 /// The agentpit MCP tool handler. Holds a shared [`Registries`] and the working directory the
 /// dispatched backends run in, plus the generated [`ToolRouter`].
 #[derive(Clone)]
@@ -377,6 +405,92 @@ impl AgentpitTools {
             )])),
         }
     }
+
+    /// Append a durable conversation-layer note (① handoff / ③ shared board) to the run transcript.
+    /// Structurally manager-only: workers have no MCP channel, so — like `ask_human` — no token
+    /// gate is needed. The note is fire-and-forget onto the run's `events.jsonl`; it returns once
+    /// recorded and is never waited on.
+    #[tool(
+        name = "post_note",
+        description = "Record a durable note onto the workflow transcript: a 1→1 handoff (kind=\"handoff\", the default — pass the context the next worker needs, optionally with from=<worker that produced it>) or a shared-board entry (kind=\"board\"). Use a handoff when one worker's result must seed the next sub-task; use the board for a fact several sub-tasks will reuse. Fire-and-forget — it does not block."
+    )]
+    async fn post_note(
+        &self,
+        Parameters(req): Parameters<PostNoteRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let from = match &req.from {
+            Some(f) => match f.parse::<BackendId>() {
+                Ok(b) => Some(b),
+                Err(e) => return Ok(tool_error(format!("unknown backend '{f}': {e}"))),
+            },
+            None => None,
+        };
+        // The note must attach to the manager's run. The workflow sets AGENTPIT_PARENT_RUN_ID on
+        // the manager leg the MCP server runs under; without it there is no transcript to write to.
+        let run_id = std::env::var(crate::workflow::guard::ENV_PARENT_RUN_ID)
+            .ok()
+            .filter(|s| !s.is_empty());
+        let Some(run_id) = run_id else {
+            return Ok(tool_error(
+                "post_note requires a workflow run context (AGENTPIT_PARENT_RUN_ID is unset)".into(),
+            ));
+        };
+        let kind = crate::workflow::converse::normalize_kind(req.kind.as_deref());
+        crate::events::RunLogger::adopt(run_id).note(from, &kind, &req.body);
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "recorded {kind} note ({} bytes)",
+            req.body.len()
+        ))]))
+    }
+
+    /// Run one ④ refutation pass over a stuck candidate: an adversarial critic, then a defender
+    /// carrying that critique, returned together for the manager to adjudicate. Advisory — a failed
+    /// leg is reported in the text, not as a tool error, so it never aborts the manager.
+    #[tool(
+        name = "refute",
+        description = "Stress-test a STUCK sub-task before discarding it: dispatch an adversarial critic at the candidate, then a defender that rebuts/fixes it, and return both for YOU (the manager) to adjudicate — ADOPT the revised candidate, KEEP the original, or DISCARD and re-plan. One depth-guarded pass, not a loop. Run this ONCE on a candidate you are about to throw away."
+    )]
+    async fn refute(
+        &self,
+        Parameters(req): Parameters<RefuteRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let critic = match parse_opt_backend(req.critic.as_deref(), "critic") {
+            Ok(b) => b,
+            Err(msg) => return Ok(tool_error(msg)),
+        };
+        let defender = match parse_opt_backend(req.defender.as_deref(), "defender") {
+            Ok(b) => b,
+            Err(msg) => return Ok(tool_error(msg)),
+        };
+        // Availability comes from the server's live registry; the preferred pairing honors the
+        // user's adversarial-review config (falling back to none if config cannot be read).
+        let available = self.regs.available();
+        let preferred = crate::cli::load_context()
+            .map(|c| c.loaded.config.ensemble.adversarial_review_members.clone())
+            .unwrap_or_default();
+        let (critic, defender) =
+            match crate::workflow::converse::resolve_pair(critic, defender, &available, &preferred) {
+                Ok(pair) => pair,
+                Err(e) => return Ok(tool_error(format!("{e:#}"))),
+            };
+
+        let bundle = crate::workflow::converse::run_refute(
+            &req.task,
+            &req.candidate,
+            critic,
+            defender,
+            &self.cwd,
+            &self.regs,
+            CancellationToken::new(),
+        )
+        .await;
+        Ok(CallToolResult::success(vec![Content::text(
+            clamp_for_prompt(
+                &crate::workflow::converse::render_refute(&bundle),
+                MAX_MEMBER_PROMPT_BYTES,
+            ),
+        )]))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -387,9 +501,11 @@ impl ServerHandler for AgentpitTools {
              run one backend on a sub-task, run_ensemble to fan a prompt to several backends in \
              parallel (with an optional aggregator), run_workflow to launch a whole \
              model-driven workflow (a manager decomposes the goal, dispatches sub-tasks to \
-             workers, and returns a final synthesis), and ask_human to surface a decision to the \
+             workers, and returns a final synthesis), ask_human to surface a decision to the \
              supervising human and block for an answer (use sparingly — only at a genuine fork \
-             or before a destructive action; HUMAN_UNAVAILABLE means proceed with the safe choice).",
+             or before a destructive action; HUMAN_UNAVAILABLE means proceed with the safe choice), \
+             post_note to record a handoff or shared-board entry on the transcript, and refute to \
+             stress-test a stuck sub-task (critic → defender) once before discarding it.",
         )
     }
 }
@@ -404,6 +520,18 @@ fn noop_sink() -> Arc<dyn Fn(&str) + Send + Sync> {
 /// Build a structured tool error result (`is_error: true`) carrying `msg`.
 fn tool_error(msg: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(msg)])
+}
+
+/// Parse an optional backend id, returning a `role`-labelled error message on a typo. `None` maps
+/// to `Ok(None)` so an omitted backend defaults downstream rather than erroring.
+fn parse_opt_backend(value: Option<&str>, role: &str) -> Result<Option<BackendId>, String> {
+    match value {
+        Some(v) => v
+            .parse::<BackendId>()
+            .map(Some)
+            .map_err(|e| format!("unknown {role} backend '{v}': {e}")),
+        None => Ok(None),
+    }
 }
 
 /// Run one backend dispatch and capture it as a [`MemberOutcome`], with no streaming (the MCP path
@@ -625,5 +753,92 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
         }
+    }
+
+    fn text_of(res: &CallToolResult) -> String {
+        res.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn post_note_unknown_from_is_structured_error_not_panic() {
+        let res = tools()
+            .post_note(Parameters(PostNoteRequest {
+                body: "ctx".into(),
+                kind: None,
+                from: Some("imaginary".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(text_of(&res).contains("unknown backend"), "got: {}", text_of(&res));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn post_note_without_run_context_is_error() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::remove_var(crate::workflow::guard::ENV_PARENT_RUN_ID);
+        }
+        let res = tools()
+            .post_note(Parameters(PostNoteRequest {
+                body: "ctx".into(),
+                kind: None,
+                from: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(text_of(&res).contains("requires a workflow run context"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn post_note_records_with_run_context() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+            std::env::set_var(crate::workflow::guard::ENV_PARENT_RUN_ID, "run-mcp-note");
+        }
+        let res = tools()
+            .post_note(Parameters(PostNoteRequest {
+                body: "pass this on".into(),
+                kind: Some("board".into()),
+                from: Some("gemini".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(false), "got: {}", text_of(&res));
+        assert!(text_of(&res).contains("recorded board note"), "got: {}", text_of(&res));
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var(crate::workflow::guard::ENV_PARENT_RUN_ID);
+        }
+    }
+
+    #[tokio::test]
+    async fn refute_unknown_critic_is_structured_error_not_panic() {
+        let res = tools()
+            .refute(Parameters(RefuteRequest {
+                candidate: "x".into(),
+                task: "y".into(),
+                critic: Some("imaginary".into()),
+                defender: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(text_of(&res).contains("unknown critic backend"), "got: {}", text_of(&res));
     }
 }

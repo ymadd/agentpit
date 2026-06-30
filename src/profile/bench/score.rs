@@ -205,8 +205,9 @@ pub fn score_security_review(defects: &[SecurityDefect], output: &str) -> f64 {
     f1(&stats, defects.len())
 }
 
-/// Score an adversarial review: real defects are TPs; reporting near a decoy is a hard FP at
-/// weight 2 (design §2.3-3) ⇒ weighted F1.
+/// Score an adversarial review: a real defect is a TP when a report locates it (±2 lines, closer
+/// to it than to any decoy); reporting near a decoy is a hard FP at weight 2 (design §2.3-3) ⇒
+/// weighted F1. Kind wording is advisory — locating the defect and resisting the decoy is the test.
 pub fn score_adversarial(items: &[AdversarialItem], output: &str) -> f64 {
     let Some(reported) = parse_findings(output) else {
         return 0.0;
@@ -222,7 +223,19 @@ pub fn score_adversarial(items: &[AdversarialItem], output: &str) -> f64 {
     let stats = match_against(
         &reals,
         &reported,
-        |r, e| line_close(r.line, e.line) && norm(&r.kind) == norm(&e.kind),
+        // The load-bearing adversarial signal is *locating* the real defect while resisting the
+        // decoy — not reproducing the gold's free-form `kind` slug verbatim (no model does; e.g.
+        // codex answered "missing positive amount validation" for "missing-amount-validation").
+        // A report credits a real defect when it lands within the ±2 line window AND sits closer
+        // to that defect than to any decoy; a tie favours the decoy, so a report on a decoy
+        // adjacent to the real (both gold ④ tasks place them 2 lines apart) never steals the
+        // real's credit. Kind text is advisory here, unlike the plain Review grader.
+        |r, e| {
+            line_close(r.line, e.line)
+                && !decoys.iter().any(|d| {
+                    line_close(r.line, d.line) && d.line.abs_diff(r.line) <= e.line.abs_diff(r.line)
+                })
+        },
         |r| {
             if decoys.iter().any(|d| line_close(r.line, d.line)) {
                 f64::from(AdversarialKind::DECOY_FP_WEIGHT)
@@ -470,6 +483,25 @@ mod tests {
         );
         // 2*1 / (2*1 + 2 + 0) = 0.5.
         assert!((decoy_score - 0.5).abs() < 1e-9, "got {decoy_score}");
+    }
+
+    #[test]
+    fn adversarial_credits_a_correct_line_despite_a_differently_worded_kind() {
+        // The fix this dogfooding pass surfaced: a model that finds the real defect on the right
+        // line and resists the decoy must score full marks even when its free-form `kind` differs
+        // from the gold slug — codex answered "missing positive amount validation" (bare array, no
+        // fence) for "missing-amount-validation" and was wrongly scored 0 under exact-kind match.
+        let items = [
+            adv(3, "missing-amount-validation", AdversarialKind::Real),
+            adv(1, "comment-claims-safe", AdversarialKind::Decoy),
+        ];
+        let differing_kind = "[{\"line\": 3, \"kind\": \"missing positive amount validation\"}]";
+        assert!((score_adversarial(&items, differing_kind) - 1.0).abs() < 1e-9);
+
+        // A report that falls for the decoy (line 1, within the ±2 window of the real at line 3)
+        // is still penalised, not credited: proximity to the decoy wins over the line tolerance.
+        let only_decoy = "[{\"line\": 1, \"kind\": \"looks validated\"}]";
+        assert!(score_adversarial(&items, only_decoy) < 1e-9);
     }
 
     #[test]

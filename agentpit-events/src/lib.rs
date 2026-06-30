@@ -98,6 +98,9 @@ pub enum RunKind {
     Refactor,
     Ensemble,
     Workflow,
+    /// A `profile run` gold-bench sweep: one backend graded across the suite. Single-member,
+    /// sequential — it shows in the dashboard swarm like any other run rather than staying invisible.
+    Bench,
 }
 
 impl RunKind {
@@ -111,6 +114,7 @@ impl RunKind {
             RunKind::Refactor => "refactor",
             RunKind::Ensemble => "ensemble",
             RunKind::Workflow => "workflow",
+            RunKind::Bench => "bench",
         }
     }
 }
@@ -695,6 +699,27 @@ mod tests {
         let back: Event = serde_json::from_str(&json).unwrap();
         match back {
             Event::MemberFinished { chars, .. } => assert_eq!(chars, Some(1024)),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn bench_run_kind_serializes_as_bench_and_round_trips() {
+        // The dashboard deserializes RunStarted via this crate, so the `bench` wire tag is a
+        // contract: a gold-bench sweep must label its swarm row "bench", not silently fail to parse.
+        assert_eq!(RunKind::Bench.as_str(), "bench");
+        let ev = Event::RunStarted {
+            ts: 1,
+            run_id: "1-0".into(),
+            pid: 7,
+            kind: RunKind::Bench,
+            members: vec![BackendId::Codex],
+            cwd: "/x".into(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"kind\":\"bench\""), "got: {json}");
+        match serde_json::from_str::<Event>(&json).unwrap() {
+            Event::RunStarted { kind, .. } => assert_eq!(kind, RunKind::Bench),
             _ => panic!("wrong variant"),
         }
     }

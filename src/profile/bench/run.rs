@@ -87,9 +87,10 @@ pub fn score_raw(tasks: &[GoldTask], fixture: &RawFixture) -> Result<RawScored> 
 
 /// Dispatch every gold task to `backend` once, capturing its raw output into a [`RawFixture`].
 ///
-/// Each task runs as an independent one-shot exec; output is collected, not streamed. This is the
-/// live, network-touching path — auth is the caller's responsibility (checked before this runs).
-/// A `cancel` trip aborts the in-flight dispatch and propagates the error.
+/// Each task runs as an independent one-shot exec; its chunks are streamed to `on_chunk` (so the
+/// dashboard can tail the sweep live) while the full captured output is what gets graded. This is
+/// the live, network-touching path — auth is the caller's responsibility (checked before this
+/// runs). A `cancel` trip aborts the in-flight dispatch and propagates the error.
 pub async fn run_live(
     backend: BackendId,
     tasks: &[GoldTask],
@@ -97,12 +98,11 @@ pub async fn run_live(
     regs: &Registries,
     measured_at: Option<String>,
     cancel: CancellationToken,
+    on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<RawFixture> {
     let mut outputs = Vec::with_capacity(tasks.len());
     for task in tasks {
-        // Discard streamed chunks — only the final captured output is graded.
-        let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_| {});
-        let res = dispatch(backend, &task.prompt, cwd, cancel.clone(), sink, regs)
+        let res = dispatch(backend, &task.prompt, cwd, cancel.clone(), on_chunk.clone(), regs)
             .await
             .with_context(|| format!("dispatch failed for gold task {}", task.id))?;
         outputs.push(RawOutput {

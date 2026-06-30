@@ -20,6 +20,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -36,6 +37,7 @@ use crate::cli::ensemble::{
     dispatch_to_outcome, render_concatenated,
 };
 use crate::dispatch::{Registries, dispatch, resolve_transport};
+use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::types::BackendId;
 
 /// Parameters for the `dispatch_task` tool.
@@ -204,14 +206,23 @@ impl AgentpitTools {
             }
         };
         let cancel = CancellationToken::new();
-        let outcome = dispatch_member(
+        // Surface single MCP dispatches in the dashboard swarm, like `agentpit rescue` — this is
+        // also how a `--use-mcp` workflow manager's per-worker dispatches become visible.
+        let logger = RunLogger::start(RunKind::Rescue, &[backend], &self.cwd);
+        let outcome = dispatch_member_logged(
             backend,
             req.task,
             self.cwd.clone(),
             cancel,
             self.regs.clone(),
+            logger.clone(),
         )
         .await;
+        logger.finished(if outcome.output.is_some() {
+            LegStatus::Ok
+        } else {
+            LegStatus::Error
+        });
         Ok(outcome_to_result(&outcome))
     }
 
@@ -260,17 +271,21 @@ impl AgentpitTools {
         // this request future is dropped (client disconnect / shutdown) the in-flight backend
         // dispatches are torn down (their child processes are `kill_on_drop`) instead of leaking.
         let cancel = CancellationToken::new();
+        // Surface the fan-out in the dashboard swarm as an `ensemble` run, like the CLI ensemble —
+        // each member streams to the run's capture file. Started before the loop moves `members`.
+        let logger = RunLogger::start(RunKind::Ensemble, &members, &self.cwd);
         let mut set = tokio::task::JoinSet::new();
         for b in members {
             let prompt = req.prompt.clone();
             let cwd = self.cwd.clone();
             let regs = self.regs.clone();
             let cancel = cancel.clone();
-            set.spawn(async move { dispatch_member(b, prompt, cwd, cancel, regs).await });
+            let logger = logger.clone();
+            set.spawn(async move { dispatch_member_logged(b, prompt, cwd, cancel, regs, logger).await });
         }
         let mut outcomes: Vec<MemberOutcome> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
-            // `dispatch_member` is panic-free and maps every failure to a MemberOutcome, so a
+            // `dispatch_member_logged` is panic-free and maps every failure to a MemberOutcome, so a
             // JoinError only arises from a panic/abort; surface the survivors rather than failing.
             if let Ok(o) = joined {
                 outcomes.push(o);
@@ -292,21 +307,58 @@ impl AgentpitTools {
             } else {
                 let agg_prompt = build_aggregator_prompt(&req.prompt, &outcomes);
                 let cancel = CancellationToken::new();
-                match dispatch(agg, &agg_prompt, &self.cwd, cancel, noop_sink(), &self.regs).await {
-                    Ok(res) if res.auth_failed => combined.push_str(&format!(
-                        "\n\n=== aggregator failed ===\n{agg}: auth failure during execution"
-                    )),
-                    Ok(res) => combined.push_str(&format!(
-                        "\n\n=== aggregator [{agg}] (transport={}) ===\n{}",
-                        res.transport.as_str(),
-                        res.output.trim()
-                    )),
+                logger.member_started(agg, true);
+                let started = Instant::now();
+                let on_chunk = crate::events::output_streamer(logger.run_id(), agg, true);
+                match dispatch(agg, &agg_prompt, &self.cwd, cancel, on_chunk, &self.regs).await {
+                    Ok(res) if res.auth_failed => {
+                        logger.member_finished(
+                            agg,
+                            true,
+                            LegStatus::Error,
+                            started.elapsed().as_millis() as u64,
+                            None,
+                            Some("auth failure during execution".into()),
+                        );
+                        combined.push_str(&format!(
+                            "\n\n=== aggregator failed ===\n{agg}: auth failure during execution"
+                        ));
+                    }
+                    Ok(res) => {
+                        logger.member_finished(
+                            agg,
+                            true,
+                            LegStatus::Ok,
+                            started.elapsed().as_millis() as u64,
+                            Some(res.output.len()),
+                            None,
+                        );
+                        combined.push_str(&format!(
+                            "\n\n=== aggregator [{agg}] (transport={}) ===\n{}",
+                            res.transport.as_str(),
+                            res.output.trim()
+                        ));
+                    }
                     Err(err) => {
+                        logger.member_finished(
+                            agg,
+                            true,
+                            LegStatus::Error,
+                            started.elapsed().as_millis() as u64,
+                            None,
+                            Some(format!("{err:#}")),
+                        );
                         combined.push_str(&format!("\n\n=== aggregator failed ===\n{agg}: {err:#}"))
                     }
                 }
             }
         }
+
+        logger.finished(if any_success {
+            LegStatus::Ok
+        } else {
+            LegStatus::Error
+        });
 
         let clamped = clamp_for_prompt(&combined, MAX_MEMBER_PROMPT_BYTES);
         let content = vec![Content::text(clamped)];
@@ -474,6 +526,19 @@ impl AgentpitTools {
                 Err(e) => return Ok(tool_error(format!("{e:#}"))),
             };
 
+        // Surface the refutation in the dashboard swarm as its own adversarial-review run, just like
+        // a manager's shell-out to `agentpit rescue` appears as a distinct run rather than vanishing.
+        let members = if critic == defender {
+            vec![critic]
+        } else {
+            vec![critic, defender]
+        };
+        let logger = crate::events::RunLogger::start(
+            crate::events::RunKind::AdversarialReview,
+            &members,
+            &self.cwd,
+        );
+
         let bundle = crate::workflow::converse::run_refute(
             &req.task,
             &req.candidate,
@@ -482,8 +547,14 @@ impl AgentpitTools {
             &self.cwd,
             &self.regs,
             CancellationToken::new(),
+            Some(&logger),
         )
         .await;
+        logger.finished(if bundle.critique.is_ok() {
+            crate::events::LegStatus::Ok
+        } else {
+            crate::events::LegStatus::Error
+        });
         Ok(CallToolResult::success(vec![Content::text(
             clamp_for_prompt(
                 &crate::workflow::converse::render_refute(&bundle),
@@ -534,17 +605,43 @@ fn parse_opt_backend(value: Option<&str>, role: &str) -> Result<Option<BackendId
     }
 }
 
-/// Run one backend dispatch and capture it as a [`MemberOutcome`], with no streaming (the MCP path
-/// has no TTY). A thin adapter over the shared [`dispatch_to_outcome`] core in `cli::ensemble`, so
-/// the not-registered / auth-failure / error mapping is defined once.
-async fn dispatch_member(
+/// Run one backend dispatch and capture it as a [`MemberOutcome`], bracketing it with
+/// `member_started`/`member_finished` and streaming its chunks to the run's capture file — so an MCP
+/// `dispatch_task` / `run_ensemble` shows in the dashboard swarm exactly like the CLI ensemble,
+/// including the worker dispatches a `--use-mcp` workflow manager makes, which would otherwise run
+/// invisibly. A thin adapter over the shared [`dispatch_to_outcome`] core in `cli::ensemble` (so the
+/// not-registered / auth-failure / error mapping stays defined once), mirroring
+/// `cli::ensemble::run_one_member` minus the TTY reporting the MCP server has no terminal for. A
+/// `not registered` outcome is recorded as `Skipped` (the backend was never dispatched), not an
+/// execution error.
+async fn dispatch_member_logged(
     backend: BackendId,
     prompt: String,
     cwd: PathBuf,
     cancel: CancellationToken,
     regs: Arc<Registries>,
+    logger: RunLogger,
 ) -> MemberOutcome {
-    dispatch_to_outcome(backend, &prompt, &cwd, cancel, noop_sink(), &regs).await
+    logger.member_started(backend, false);
+    let started = Instant::now();
+    let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
+    let outcome = dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &outcome.error {
+        None => {
+            let chars = outcome.output.as_ref().map(String::len).unwrap_or(0);
+            logger.member_finished(backend, false, LegStatus::Ok, elapsed_ms, Some(chars), None);
+        }
+        Some(err) => {
+            let status = if err == "not registered" {
+                LegStatus::Skipped
+            } else {
+                LegStatus::Error
+            };
+            logger.member_finished(backend, false, status, elapsed_ms, None, Some(err.clone()));
+        }
+    }
+    outcome
 }
 
 /// Convert a single member outcome into a tool result: a success carrying the clamped output,
@@ -588,6 +685,38 @@ mod tests {
         AgentpitTools::new(Arc::new(regs), std::env::temp_dir())
     }
 
+    /// RAII guard that isolates a test's event writes into a throwaway `XDG_STATE_HOME`, so a test
+    /// that dispatches a real backend (now routed through a `RunLogger`) can't append phantom runs to
+    /// the developer's real events.jsonl. Mirrors the inline `ask_human` / `post_note` pattern:
+    /// serialize on [`STATE_ENV_LOCK`](crate::ask::STATE_ENV_LOCK), point the state dir at a temp dir,
+    /// and clear it again on drop — all while the lock is still held. Bind it for the whole test
+    /// (`let _g = isolated_state_dir();`); do NOT call it from inside `tools()`, which some tests
+    /// invoke while already holding the lock (re-locking the non-reentrant mutex would deadlock).
+    struct StateDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+    }
+    impl Drop for StateDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: the `_lock` field is still alive (drops after this), so we remove the var while
+            // single-threaded under STATE_ENV_LOCK, exactly as the inline tests do at their end.
+            unsafe {
+                std::env::remove_var("XDG_STATE_HOME");
+            }
+        }
+    }
+    fn isolated_state_dir() -> StateDirGuard {
+        let lock = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK for the guard's lifetime.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+        StateDirGuard { _lock: lock, _tmp: tmp }
+    }
+
     #[tokio::test]
     async fn list_backends_reports_available_set() {
         let res = tools().list_backends().await.unwrap();
@@ -603,7 +732,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn dispatch_task_runs_registered_backend() {
+        // The dispatch now emits run events; isolate them into a throwaway state dir.
+        let _g = isolated_state_dir();
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 backend: "gemini".into(),
@@ -647,9 +779,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn run_ensemble_dedupes_repeated_members() {
         // A client repeating the same backend must not spawn it N times; dedup collapses it to
-        // a single member section.
+        // a single member section. The dispatch emits run events; isolate them into a temp state dir.
+        let _g = isolated_state_dir();
         let res = tools()
             .run_ensemble(Parameters(RunEnsembleRequest {
                 members: vec!["gemini".into(), "gemini".into(), "gemini".into()],

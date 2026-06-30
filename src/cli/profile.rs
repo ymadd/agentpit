@@ -22,6 +22,7 @@ use crate::profile::bench::{
     RawFixture, RawScored, ReplayFixture, all_tasks, merge_into_profiles, run_live, score_fixture,
     score_raw,
 };
+use crate::events::{LegStatus, RunKind, RunLogger, output_streamer};
 use crate::profile::{
     BenchmarkResult, CapabilityProfile, ProfileSet, apply_benchmark, load_profiles, profiles_path,
     save_profiles, seeded_profiles,
@@ -260,7 +261,40 @@ async fn run_live_bench(
         tasks.len(),
         backend
     );
-    let fixture = run_live(backend, &tasks, &cwd, &ctx.regs, None, cancel).await?;
+
+    // Make the sweep visible in the dashboard swarm: a single-member `bench` run whose member
+    // streams every task's output to the run's capture file, so it can be tailed live instead of
+    // running invisibly. The bench is sequential single-backend, so one member is the honest shape.
+    let logger = RunLogger::start(RunKind::Bench, &[backend], &cwd);
+    logger.member_started(backend, false);
+    let started = std::time::Instant::now();
+    let sink = output_streamer(logger.run_id(), backend, false);
+
+    let fixture = match run_live(backend, &tasks, &cwd, &ctx.regs, None, cancel, sink).await {
+        Ok(f) => f,
+        Err(e) => {
+            logger.member_finished(
+                backend,
+                false,
+                LegStatus::Error,
+                started.elapsed().as_millis() as u64,
+                None,
+                Some(format!("{e:#}")),
+            );
+            logger.finished(LegStatus::Error);
+            return Err(e);
+        }
+    };
+    let total_chars: usize = fixture.outputs.iter().map(|o| o.output.len()).sum();
+    logger.member_finished(
+        backend,
+        false,
+        LegStatus::Ok,
+        started.elapsed().as_millis() as u64,
+        Some(total_chars),
+        None,
+    );
+    logger.finished(LegStatus::Ok);
 
     if let Some(out) = save_raw {
         let json = serde_json::to_string_pretty(&fixture)?;

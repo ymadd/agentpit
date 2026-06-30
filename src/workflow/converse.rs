@@ -21,11 +21,13 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::dispatch::{Registries, dispatch};
+use crate::events::{LegStatus, RunLogger};
 use crate::types::BackendId;
 
 /// `kind` tag for a 1→1 handoff note: one leg passing context to the next (design ①).
@@ -179,20 +181,45 @@ pub fn defense_prompt(task: &str, candidate: &str, critique: &str) -> String {
 }
 
 /// Map a single dispatch into `Ok(output)` / `Err(reason)`, treating an auth failure as a leg
-/// failure (not a panic). Each leg runs under `cancel` and inherits the per-dispatch timeout.
+/// failure (not a panic). Each leg runs under `cancel` and inherits the per-dispatch timeout. When
+/// a `logger` is supplied the leg brackets the dispatch with `member_started`/`member_finished`, so
+/// the refutation shows in the dashboard swarm as a live two-member run; without one it is silent
+/// (the pure path the unit tests and any non-observed caller take).
 async fn run_leg(
     backend: BackendId,
     prompt: &str,
     cwd: &Path,
     cancel: CancellationToken,
     regs: &Registries,
+    logger: Option<&RunLogger>,
 ) -> Result<String, String> {
+    if let Some(l) = logger {
+        l.member_started(backend, false);
+    }
+    let started = Instant::now();
     let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_chunk: &str| {});
-    match dispatch(backend, prompt, cwd, cancel, sink, regs).await {
+    let outcome = match dispatch(backend, prompt, cwd, cancel, sink, regs).await {
         Ok(res) if res.auth_failed => Err(format!("{backend}: auth failure during execution")),
         Ok(res) => Ok(res.output.trim().to_string()),
         Err(e) => Err(format!("{backend}: {e:#}")),
+    };
+    if let Some(l) = logger {
+        let elapsed = started.elapsed().as_millis() as u64;
+        match &outcome {
+            Ok(text) => {
+                l.member_finished(backend, false, LegStatus::Ok, elapsed, Some(text.len()), None)
+            }
+            Err(reason) => l.member_finished(
+                backend,
+                false,
+                LegStatus::Error,
+                elapsed,
+                None,
+                Some(reason.clone()),
+            ),
+        }
     }
+    outcome
 }
 
 /// Run the ④ refutation: dispatch the critic (leg 1), then — only if the critique succeeded —
@@ -200,6 +227,7 @@ async fn run_leg(
 /// adjudicate (leg 3). Sequential by design: the defender must read the critique. Never panics and
 /// never aborts the caller's run — a failed leg is reported in the bundle, mirroring the
 /// member-failure tolerance of ensembles, because refutation is advisory.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_refute(
     task: &str,
     candidate: &str,
@@ -208,6 +236,7 @@ pub async fn run_refute(
     cwd: &Path,
     regs: &Registries,
     cancel: CancellationToken,
+    logger: Option<&RunLogger>,
 ) -> RefuteBundle {
     let critique = run_leg(
         critic,
@@ -215,6 +244,7 @@ pub async fn run_refute(
         cwd,
         cancel.clone(),
         regs,
+        logger,
     )
     .await;
 
@@ -226,11 +256,22 @@ pub async fn run_refute(
                 cwd,
                 cancel,
                 regs,
+                logger,
             )
             .await,
         ),
-        // No critique ⇒ nothing to defend against; do not spend the defender leg.
-        Err(_) => None,
+        // No critique ⇒ nothing to defend against; do not spend the defender leg. Mark the
+        // defender skipped so a finished run shows it as skipped rather than perpetually "pending"
+        // — but only when it is a distinct backend, since a self-refute shares one member row whose
+        // critique-failure status must not be overwritten.
+        Err(_) => {
+            if let Some(l) = logger
+                && defender != critic
+            {
+                l.member_finished(defender, false, LegStatus::Skipped, 0, None, None);
+            }
+            None
+        }
     };
 
     RefuteBundle {

@@ -30,9 +30,25 @@ pub enum GradeOutcome {
 /// each [`Grading`] variant onto its scorer. Pure for every variant except the two
 /// sandbox-backed ones, which run hidden tests in an isolated jail.
 pub fn grade(task: &GoldTask, output: &str) -> GradeOutcome {
+    grade_with(&task.grading, output)
+}
+
+/// Grade `output` against the wrapped *inner* grader of a [`Grading::Refute`] probe — the
+/// before/after halves the refute-quality gate ([`super::refute_run`]) compares. `None` for a
+/// task that is not a refute probe.
+pub fn grade_refute_inner(task: &GoldTask, output: &str) -> Option<GradeOutcome> {
     match &task.grading {
+        Grading::Refute { inner, .. } => Some(grade_with(inner, output)),
+        _ => None,
+    }
+}
+
+/// The actual variant dispatch, factored out of [`grade`] so [`Grading::Refute`] can recurse into
+/// its `inner` grader without constructing a synthetic [`GoldTask`].
+fn grade_with(grading: &Grading, output: &str) -> GradeOutcome {
+    match grading {
         Grading::HiddenTests(tests) => outcome_to_grade(run_hidden_tests(tests, output)),
-        Grading::Refactor(grading) => score_refactor(grading, output),
+        Grading::Refactor(g) => score_refactor(g, output),
         Grading::Review { defects } => GradeOutcome::Scored(score_review(defects, output)),
         Grading::SecurityReview { defects } => {
             GradeOutcome::Scored(score_security_review(defects, output))
@@ -41,6 +57,7 @@ pub fn grade(task: &GoldTask, output: &str) -> GradeOutcome {
         Grading::LongContext { needles } => {
             GradeOutcome::Scored(score_long_context(needles, output))
         }
+        Grading::Refute { inner, .. } => grade_with(inner, output),
     }
 }
 
@@ -140,6 +157,70 @@ mod tests {
             },
         };
         assert_eq!(grade(&task, "42"), GradeOutcome::Scored(1.0));
+    }
+
+    #[test]
+    fn grade_recurses_into_a_refute_tasks_inner_grader() {
+        let task = GoldTask {
+            id: "x".to_string(),
+            category: TaskCategory::Coding,
+            prompt: String::new(),
+            grading: Grading::Refute {
+                stuck: "ignored by grade(), only inner matters here".to_string(),
+                inner: Box::new(Grading::LongContext {
+                    needles: vec![Needle {
+                        needle: "n".to_string(),
+                        expected: "42".to_string(),
+                    }],
+                }),
+            },
+        };
+        assert_eq!(grade(&task, "42"), GradeOutcome::Scored(1.0));
+        assert_eq!(grade(&task, "wrong"), GradeOutcome::Scored(0.0));
+    }
+
+    #[test]
+    fn grade_refute_inner_grades_an_arbitrary_candidate_against_the_inner_grader() {
+        let task = GoldTask {
+            id: "x".to_string(),
+            category: TaskCategory::Coding,
+            prompt: String::new(),
+            grading: Grading::Refute {
+                stuck: "stuck answer".to_string(),
+                inner: Box::new(Grading::LongContext {
+                    needles: vec![Needle {
+                        needle: "n".to_string(),
+                        expected: "42".to_string(),
+                    }],
+                }),
+            },
+        };
+        // The "before" half: grading the stuck candidate itself.
+        assert_eq!(
+            grade_refute_inner(&task, "stuck answer"),
+            Some(GradeOutcome::Scored(0.0))
+        );
+        // The "after" half: grading a revised candidate extracted from the defense leg.
+        assert_eq!(
+            grade_refute_inner(&task, "42"),
+            Some(GradeOutcome::Scored(1.0))
+        );
+    }
+
+    #[test]
+    fn grade_refute_inner_is_none_for_a_non_refute_task() {
+        let task = GoldTask {
+            id: "x".to_string(),
+            category: TaskCategory::LongContext,
+            prompt: String::new(),
+            grading: Grading::LongContext {
+                needles: vec![Needle {
+                    needle: "n".to_string(),
+                    expected: "42".to_string(),
+                }],
+            },
+        };
+        assert_eq!(grade_refute_inner(&task, "42"), None);
     }
 
     #[test]

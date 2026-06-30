@@ -172,7 +172,10 @@ pub fn defense_prompt(task: &str, candidate: &str, critique: &str) -> String {
          the critic was wrong) or CONCEDE it.\n\
          2. A REVISED candidate that survives the conceded objections — the smallest change that \
          makes it correct, not a rewrite for its own sake. If no change is warranted, restate the \
-         candidate and explain why the critique does not land.\n\
+         candidate and explain why the critique does not land. Present the REVISED candidate in \
+         the SAME FORMAT as the original candidate (e.g. a single fenced code block of the same \
+         language, if the original was one) as the LAST thing in your response, so it is the one \
+         block a reader — or an automated extractor — should treat as final.\n\
          Be concrete and specific. Do NOT invent agreement or disagreement to seem balanced.",
         task = clamp(task),
         candidate = clamp(candidate),
@@ -337,6 +340,15 @@ mod tests {
         assert!(p.contains("REBUT"));
         assert!(p.contains("CONCEDE"));
         assert!(p.contains("REVISED candidate"));
+    }
+
+    #[test]
+    fn defense_prompt_demands_the_revision_in_the_original_format_as_the_final_block() {
+        // So a bench/manager extractor (e.g. `extract_last_fence`) can reliably pull the revised
+        // candidate out of free-form defense prose instead of guessing which block is final.
+        let p = defense_prompt("goal", "candidate", "critique");
+        assert!(p.contains("SAME FORMAT as the original candidate"));
+        assert!(p.contains("LAST thing in your response"));
     }
 
     #[test]

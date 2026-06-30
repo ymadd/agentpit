@@ -153,6 +153,11 @@ pub enum Grading {
     Adversarial { items: Vec<AdversarialItem> },
     /// LongContext: needle/expected exact-match probes.
     LongContext { needles: Vec<Needle> },
+    /// RefuteQuality: a deliberately broken `stuck` candidate plus the `inner` grader that scores
+    /// it — and, after a live ④ refute pass, the defense leg's revised candidate. Standalone
+    /// go/no-go gate (design §5.1), not a profile capability column: excluded from [`all_tasks`]
+    /// and scored by [`super::refute_run`], not the normal live/raw-replay path.
+    Refute { stuck: String, inner: Box<Grading> },
 }
 
 /// One gold task: a category, a stable unique id, the prompt shown to the candidate backend,
@@ -304,6 +309,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn refute_grading_round_trips_through_json_and_excludes_from_all_tasks() {
+        let grading = Grading::Refute {
+            stuck: "def f(): return 1".to_string(),
+            inner: Box::new(Grading::HiddenTests(HiddenTests {
+                lang: FixtureLang::Python,
+                source: "assert f() == 2".to_string(),
+            })),
+        };
+        let json = serde_json::to_string(&grading).expect("serialize");
+        let back: Grading = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, grading);
+        // It is a standalone gate, not a profile capability column: never present in all_tasks().
+        assert!(
+            all_tasks()
+                .iter()
+                .all(|t| !matches!(t.grading, Grading::Refute { .. }))
+        );
     }
 
     #[test]

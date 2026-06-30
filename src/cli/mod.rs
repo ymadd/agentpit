@@ -20,6 +20,7 @@ pub mod note;
 pub mod profile;
 pub mod refactor;
 pub mod refute;
+pub mod refute_bench;
 pub mod repl;
 pub mod rescue;
 pub mod review;
@@ -269,6 +270,21 @@ pub enum Command {
         #[arg(long)]
         cwd: Option<String>,
     },
+
+    /// Gate ④ refute itself (design §5.1): run the live critique→defense legs against a small set
+    /// of deliberately-broken "stuck" candidates and check whether the defense's revision actually
+    /// scores better than the stuck candidate did, not just that it produced *something*. Green
+    /// only when every probe clears the pass margin.
+    RefuteBench {
+        /// Backend that produces the critique. Defaults to the adversarial-review primary.
+        #[arg(long)]
+        critic: Option<BackendId>,
+        /// Backend that produces the defense. Defaults to a backend distinct from the critic.
+        #[arg(long)]
+        defender: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -381,5 +397,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             defender,
             cwd,
         } => refute::run(candidate, task, critic, defender, cwd).await,
+
+        Command::RefuteBench {
+            critic,
+            defender,
+            cwd,
+        } => refute_bench::run(critic, defender, cwd).await,
     }
 }

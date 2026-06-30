@@ -225,6 +225,16 @@ DEFER（gold-bench の収束タスクでゲート）
  - 常駐 ACP ループ … stateless 3レグが収束品質で劣ると bench が示したら
 ```
 
+> **再評価（2026-07-01, A4 refute-bench データ後）**: 両項目とも**据え置き継続**。
+> - 宛先/topic + カーソル: `Event::Note` の唯一の長命 reader は今も manager のみ
+>   （`agentpit-events/src/lib.rs:209-216` のdoc comment通り）。`note.rs`/`post_note`は書き手のみ、
+>   dashboard側 (`dashboard/src-tauri/src/state.rs:229-233`) は `Event::Note` を no-op 表示専用で
+>   消費しランビューに反映しない。第2の長命 reader はまだ出現していない（§4.6 crux #3 も未決着のまま）。
+> - 常駐 ACPループ: `agentpit refute-bench` のGATE: PASSは**exec-transport**（codex/antigravity、
+>   ACPではない）の stateless 3レグで出た結果。これは「stateless 3レグが収束品質で劣る」という
+>   un-defer条件の**逆方向**の実証であり、常駐ループを今作る根拠にならない。`dispatch.rs:77-78`の
+>   ACP配線も opencode のみのまま変化なし。
+
 public surface 破壊なし: `agentpit ask` と `ask_human` MCP は human専用のまま。すべて加算的。
 
 ### 4.6 未解決の経験的問い（cruxes — gold-bench 行き）

@@ -12,7 +12,7 @@ Different coding agents are good at different things: long-context reads on Gemi
 - **One-shot dispatch** — `agentpit rescue "task"` picks a backend by your routing rules
 - **Ensembles** — `agentpit review <target>` runs Gemini + OpenCode in parallel (configurable) and optionally synthesizes
 - **Auth-aware** — checks each backend's credentials before dispatching; `agentpit login <backend>` triggers the right login flow
-- **Self-updating** — `agentpit update` pulls the latest release from GitHub
+- **Self-updating** — `agentpit update` updates the CLI and an installed desktop dashboard together
 - **CLI version cockpit** — the desktop app inventories and updates installed agent CLIs
 - **Discoverable** — running `agentpit` with no args opens an interactive menu
 
@@ -91,7 +91,7 @@ agentpit ensemble "design X" --members antigravity,claude,codex
 
 agentpit status                       # config + per-backend auth state
 agentpit login antigravity            # opens `agy auth login` in a terminal
-agentpit update                       # check + self-replace from GitHub releases
+agentpit update                       # update the CLI + an installed dashboard together
 ```
 
 ## Configuration

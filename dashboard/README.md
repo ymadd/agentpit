@@ -40,6 +40,9 @@ agentpit dashboard
 Release assets use the name `agentpit-dashboard-<target>.gz`; decompress the matching
 asset and place the executable next to `agentpit`.
 
+After the dashboard is installed, `agentpit update` keeps it on the same release version as
+the CLI. An open dashboard must be restarted after its binary is replaced.
+
 `agentpit dashboard` finds the binary via `AGENTPIT_DASHBOARD_BIN`, then next to the
 `agentpit` executable, then `PATH` — and spawns it detached.
 

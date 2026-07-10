@@ -23,11 +23,35 @@ pub async fn run(check_only: bool) -> Result<()> {
             "agentpit {} is already up to date.",
             outcome.installed_version
         );
-        return Ok(());
+    } else {
+        println!("agentpit updated to {}.", outcome.installed_version);
+        refresh_managed_files().await;
     }
 
-    println!("agentpit updated to {}.", outcome.installed_version);
-    refresh_managed_files().await;
+    match outcome.dashboard {
+        update::DashboardUpdateOutcome::NotInstalled => {
+            println!("agentpit dashboard is not installed; skipped dashboard update.");
+        }
+        update::DashboardUpdateOutcome::UpToDate { path } => {
+            println!("agentpit dashboard is up to date ({}).", path.display());
+        }
+        update::DashboardUpdateOutcome::Updated {
+            path,
+            installed_version,
+        } => {
+            println!(
+                "agentpit dashboard updated to {} ({}). Restart an open dashboard to use it.",
+                installed_version,
+                path.display()
+            );
+        }
+        update::DashboardUpdateOutcome::Failed { path, error } => {
+            eprintln!(
+                "warning: dashboard update failed ({}): {error}. The agentpit CLI remains usable.",
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 

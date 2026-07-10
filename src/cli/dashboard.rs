@@ -12,6 +12,9 @@ const DASHBOARD_BIN: &str = "agentpit-dashboard";
 /// (`agentpit-dashboard`); this spawns it detached and returns immediately.
 pub async fn run() -> Result<()> {
     let bin = locate()?;
+    // Heal a dashboard left non-executable by a pre-0.1.23 co-update (gz release assets
+    // carry no file mode); best-effort — spawn reports the real error if this can't help.
+    let _ = crate::update::ensure_executable(&bin);
     let mut cmd = Command::new(&bin);
     // The dashboard must resolve the SAME state dir (asks/, runs/, events.jsonl) as this CLI, or
     // the Needs-You inbox would read a different `asks/` than the manager writes. `Command`

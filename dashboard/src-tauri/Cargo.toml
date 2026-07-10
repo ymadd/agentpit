@@ -1,6 +1,6 @@
 [package]
 name = "agentpit-dashboard"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2021"
 description = "Live desktop dashboard for agentpit run activity"
 license = "Apache-2.0"

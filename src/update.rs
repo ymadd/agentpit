@@ -299,11 +299,38 @@ fn save_dashboard_marker(version: &str, dashboard_path: &Path) {
     }
 }
 
+/// Ensure the binary at `path` is executable. Gzip release assets carry no file mode, and
+/// `self_update` only restores permissions when replacing the running executable
+/// (`self_replace`); installing to any other path is a plain `Move` that leaves the
+/// extracted file 0644 — spawning it then fails with EACCES.
+#[cfg(not(windows))]
+pub fn ensure_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .permissions();
+    let mode = permissions.mode();
+    if mode & 0o111 != 0o111 {
+        permissions.set_mode(mode | 0o755);
+        std::fs::set_permissions(path, permissions)
+            .with_context(|| format!("chmod +x {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn ensure_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn sync_installed_dashboard(version: &str) -> DashboardUpdateOutcome {
     let Some(path) = locate_dashboard() else {
         return DashboardUpdateOutcome::NotInstalled;
     };
     if dashboard_marker_matches(version, &path) {
+        // Heal a dashboard left non-executable by a pre-0.1.23 co-update (the marker can
+        // match a binary whose executable bit was never set).
+        let _ = ensure_executable(&path);
         return DashboardUpdateOutcome::UpToDate { path };
     }
 
@@ -336,6 +363,12 @@ fn sync_installed_dashboard(version: &str) -> DashboardUpdateOutcome {
     match result {
         Ok(status) => {
             let installed_version = status.version().to_string();
+            if let Err(error) = ensure_executable(&path) {
+                return DashboardUpdateOutcome::Failed {
+                    path,
+                    error: format!("{error:#}"),
+                };
+            }
             save_dashboard_marker(&installed_version, &path);
             DashboardUpdateOutcome::Updated {
                 path,
@@ -451,5 +484,25 @@ mod tests {
     fn version_normalization_accepts_release_tags() {
         assert_eq!(normalized_version("v0.1.21\n"), "0.1.21");
         assert_eq!(normalized_version("0.1.21"), "0.1.21");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_executable_restores_missing_exec_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("dashboard");
+        std::fs::write(&bin, b"bin").unwrap();
+        // Regression: a gz-extracted asset installed via a plain Move lands as 0644.
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_executable(&bin).unwrap();
+        let mode = std::fs::metadata(&bin).unwrap().permissions().mode();
+        assert_eq!(mode & 0o755, 0o755);
+        // Idempotent on an already-executable file.
+        ensure_executable(&bin).unwrap();
+        assert_eq!(
+            std::fs::metadata(&bin).unwrap().permissions().mode() & 0o755,
+            0o755
+        );
     }
 }

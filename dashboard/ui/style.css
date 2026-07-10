@@ -262,9 +262,17 @@ body {
 .cli-state.missing { background: rgba(240,114,107,.08); color: #be716c; }
 .cli-path { margin-top: 5px; overflow: hidden; color: var(--faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .cli-note { margin-top: 5px; color: #a47966; font-size: 10.5px; }
-.cli-version { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
-.cli-version-label { color: var(--faint); font-family: "IBM Plex Mono", monospace; font-size: 8.5px; letter-spacing: .16em; }
-.cli-version strong { max-width: 180px; overflow: hidden; color: #d9dee8; font-size: 11.5px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.cli-version { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.cli-vline { display: flex; align-items: baseline; gap: 8px; }
+.cli-version-label { flex: none; min-width: 58px; color: var(--faint); font-family: "IBM Plex Mono", monospace; font-size: 8.5px; letter-spacing: .16em; }
+.cli-version strong { max-width: 150px; overflow: hidden; color: #d9dee8; font-size: 11.5px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.cli-vline.latest strong { color: var(--muted); }
+.cli-version.state-update .cli-vline.latest strong { color: var(--ac-tx); }
+.cli-upstate { flex: none; padding: 2px 6px; border-radius: 4px; font-family: "IBM Plex Mono", monospace; font-size: 8.5px; letter-spacing: .05em; }
+.cli-upstate.update { border: 1px solid var(--ac-bd); background: var(--ac-soft); color: var(--ac-tx); }
+.cli-upstate.current { background: rgba(78,201,160,.09); color: #69b99e; }
+.cli-upstate.unknown { background: rgba(124,133,149,.1); color: var(--muted-2); }
+.cli-row.has-update { background: linear-gradient(90deg, var(--ac-soft), transparent 62%); }
 .cli-update { padding: 8px 12px; border: 1px solid var(--ac-bd); border-radius: 8px; background: var(--ac-soft); color: var(--ac-tx); cursor: pointer; font-family: inherit; font-size: 11.5px; }
 .cli-update:disabled, .cli-refresh:disabled { cursor: default; filter: grayscale(.55); opacity: .38; }
 .cli-empty { padding: 70px 24px; color: var(--muted); text-align: center; }

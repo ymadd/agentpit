@@ -25,6 +25,7 @@ let agentClis = [];
 let cliLoading = false;
 let cliUpdating = null;
 let cliManagerError = null;
+let cliLatest = {}; // id -> latest version string from the public registry (async, best-effort)
 
 const answered = new Set(); // optimistically-answered ids, hidden until the backend agrees
 const notified = new Set(); // blocking asks we've already notified for
@@ -436,6 +437,47 @@ function buildSwarm(root, runs) {
 }
 
 // ── agent CLI versions ───────────────────────────────────────────────────────
+// Public registry package per CLI id. Ids without an entry (e.g. antigravity, which
+// ships no public npm package) have no upstream to compare against → 不明.
+const CLI_NPM = {
+  claude: "@anthropic-ai/claude-code",
+  codex: "@openai/codex",
+  gemini: "@google/gemini-cli",
+  opencode: "opencode-ai",
+};
+
+// Pull the first semver core out of a raw `--version` line. Handles the real shapes:
+//   '2.1.206 (Claude Code)'→2.1.206  'codex-cli 0.144.1'→0.144.1  '0.43.0'→0.43.0
+//   '1.1.0'→1.1.0  '1.17.13'→1.17.13. Returns null when no semver is present.
+function parseSemver(text) {
+  if (!text) return null;
+  const m = String(text).match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/);
+  return m ? m[0] : null;
+}
+// Compare two extracted semvers by release core, prerelease ranked below its release.
+function cmpSemver(a, b) {
+  const [coreA, preA = ""] = a.split("-");
+  const [coreB, preB = ""] = b.split("-");
+  const na = coreA.split(".").map(Number);
+  const nb = coreB.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const d = (na[i] || 0) - (nb[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  if (preA === preB) return 0;
+  if (!preA) return 1; // release beats prerelease of the same core
+  if (!preB) return -1;
+  return preA < preB ? -1 : 1;
+}
+// One of the three states rendered per row: update (更新あり) / current (最新) / unknown (不明).
+function cliVersionState(cli) {
+  const installed = parseSemver(cli.version);
+  const latest = parseSemver(cliLatest[cli.id]);
+  let state = "unknown";
+  if (installed && latest) state = cmpSemver(installed, latest) < 0 ? "update" : "current";
+  return { installed, latest, state };
+}
+
 let cliSig = null;
 function cliManagerSig() {
   return (
@@ -452,6 +494,7 @@ function cliManagerSig() {
           c.version || "",
           c.canUpdate ? 1 : 0,
           c.updateCommand || "",
+          cliLatest[c.id] || "", // latestVersion — its arrival re-signs → fillCliDynamic only
         ].join("~")
       )
       .join("§")
@@ -550,7 +593,9 @@ function fillCliDynamic(root) {
 
 function cliRow(cli) {
   const meta = modelMeta(cli.id);
-  const row = el("article", `cli-row${cli.installed ? "" : " missing"}`);
+  const { installed: instVer, latest: latestVer, state: upState } = cliVersionState(cli);
+  const highlight = cli.installed && upState === "update";
+  const row = el("article", `cli-row${cli.installed ? "" : " missing"}${highlight ? " has-update" : ""}`);
   const mark = el("span", "cli-mark", meta.mono);
   mark.style.setProperty("--cli-color", meta.color);
 
@@ -559,11 +604,23 @@ function cliRow(cli) {
   nameLine.append(el("span", "cli-name", cli.label));
   const state = el("span", `cli-state ${cli.installed ? "ready" : "missing"}`, cli.installed ? "installed" : "missing");
   nameLine.appendChild(state);
+  // Update-state badge — only meaningful for an installed CLI (missing already reads "missing").
+  if (cli.installed) {
+    const label = upState === "update" ? "更新あり" : upState === "current" ? "最新" : "不明";
+    nameLine.appendChild(el("span", `cli-upstate ${upState}`, label));
+  }
   identity.append(nameLine, el("div", "cli-path mono", cli.path || `${cli.command} is not on PATH`));
   if (cli.note) identity.appendChild(el("div", "cli-note", cli.note));
 
-  const version = el("div", "cli-version");
-  version.append(el("span", "cli-version-label", "VERSION"), el("strong", "mono", cli.version || "—"));
+  const version = el("div", `cli-version state-${upState}`);
+  const instLine = el("div", "cli-vline");
+  instLine.append(
+    el("span", "cli-version-label", "INSTALLED"),
+    el("strong", "mono", instVer || cli.version || "—")
+  );
+  const latestLine = el("div", "cli-vline latest");
+  latestLine.append(el("span", "cli-version-label", "LATEST"), el("strong", "mono", latestVer || "—"));
+  version.append(instLine, latestLine);
 
   const updating = cliUpdating === cli.id;
   const action = el("button", "cli-update", updating ? "更新中…" : "更新");
@@ -713,7 +770,30 @@ async function fetchAgentClis({ preserveError = false } = {}) {
   } finally {
     cliLoading = false;
     updateCliManager();
+    // LATEST is best-effort and arrives after INSTALLED has already rendered, so its
+    // arrival only re-signs the panel (fillCliDynamic) — the shell is never rebuilt.
+    fetchLatestVersions();
   }
+}
+
+// Best-effort upstream check against the public registry. Never sets cliManagerError:
+// a failed lookup simply leaves LATEST as '—' (不明) with no banner.
+async function fetchLatestVersions() {
+  await Promise.allSettled(
+    Object.entries(CLI_NPM).map(async ([id, pkg]) => {
+      try {
+        const res = await fetch(`https://registry.npmjs.org/${pkg}/latest`, {
+          headers: { Accept: "application/json" },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && data.version) cliLatest[id] = data.version;
+      } catch (e) {
+        /* offline / registry down → leave undefined so the row shows '—' (不明) */
+      }
+    })
+  );
+  updateCliManager();
 }
 
 async function updateAgentCli(cli) {

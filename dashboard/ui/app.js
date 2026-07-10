@@ -116,6 +116,20 @@ function renderAll() {
   updateCliManager();
 }
 
+// Coalesce renderAll() calls from fetch/push sources into at most one per
+// animation frame via a dirty flag + requestAnimationFrame. Interactive paths
+// (answer, onKey j/k, toggleAvailable, …) call renderAll() directly for
+// immediate feedback — they still land within the same frame budget.
+let renderScheduled = false;
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    renderAll();
+  });
+}
+
 function updateStatusbar() {
   const counts = swarmCounts();
   const ml = document.getElementById("manager-line");
@@ -422,16 +436,49 @@ function buildSwarm(root, runs) {
 }
 
 // ── agent CLI versions ───────────────────────────────────────────────────────
+let cliSig = null;
+function cliManagerSig() {
+  return (
+    `${cliLoading ? "L" : "-"}|${cliUpdating || "-"}|${cliManagerError || "-"}|` +
+    agentClis
+      .map((c) =>
+        [
+          c.id,
+          c.label,
+          c.installed ? 1 : 0,
+          c.path || "",
+          c.command || "",
+          c.note || "",
+          c.version || "",
+          c.canUpdate ? 1 : 0,
+          c.updateCommand || "",
+        ].join("~")
+      )
+      .join("§")
+  );
+}
+
 function updateCliManager() {
   const root = document.getElementById("cli-manager");
   if (!showCliManager) {
     root.classList.add("hidden");
+    cliSig = null;
     return;
   }
-  buildCliManager(root);
+  const sig = cliManagerSig();
+  if (sig === cliSig) {
+    root.classList.remove("hidden");
+    return;
+  }
+  const firstOpen = cliSig === null;
+  cliSig = sig;
+  if (firstOpen) buildCliManager(root);
+  else fillCliDynamic(root);
   root.classList.remove("hidden");
 }
 
+// Build the shell (scrim + panel + head) once so its entrance animation is not
+// replayed on data changes; the dynamic content is filled by fillCliDynamic.
 function buildCliManager(root) {
   root.innerHTML = "";
   const scrim = el("div", "cli-scrim");
@@ -447,9 +494,8 @@ function buildCliManager(root) {
     el("p", "cli-sub", "agentpit が実際に呼び出す CLI を確認し、各 CLI 公式の更新機能で揃えます。")
   );
   const headActions = el("div", "cli-head-actions");
-  const refresh = el("button", "cli-refresh", cliLoading ? "確認中…" : "再確認");
+  const refresh = el("button", "cli-refresh");
   refresh.type = "button";
-  refresh.disabled = cliLoading || cliUpdating !== null;
   refresh.addEventListener("click", fetchAgentClis);
   const close = el("button", "cli-close", "✕");
   close.type = "button";
@@ -459,27 +505,47 @@ function buildCliManager(root) {
   head.append(intro, headActions);
   panel.appendChild(head);
 
-  const list = el("div", "cli-list");
-  if (cliManagerError) {
-    const error = el("div", "cli-error");
-    error.append(el("strong", null, "更新できませんでした"), el("span", null, cliManagerError));
-    list.appendChild(error);
-  }
-  if (cliLoading && agentClis.length === 0) {
-    list.appendChild(el("div", "cli-empty", "ローカルの CLI を確認しています…"));
-  } else {
-    for (const cli of agentClis) list.appendChild(cliRow(cli));
-  }
-  panel.appendChild(list);
+  panel.appendChild(el("div", "cli-list"));
 
   const foot = el("footer", "cli-foot");
-  const installed = agentClis.filter((cli) => cli.installed).length;
   foot.append(
-    el("span", "cli-summary", `${installed} / ${agentClis.length || 5} installed`),
+    el("span", "cli-summary"),
     el("span", "cli-safety", "更新コマンドは固定されています。任意のシェル入力は実行しません。")
   );
   panel.appendChild(foot);
   root.append(scrim, panel);
+
+  fillCliDynamic(root);
+}
+
+// Replace only the signature-dependent pieces, leaving scrim/panel/head intact.
+function fillCliDynamic(root) {
+  const refresh = root.querySelector(".cli-refresh");
+  if (refresh) {
+    refresh.textContent = cliLoading ? "確認中…" : "再確認";
+    refresh.disabled = cliLoading || cliUpdating !== null;
+  }
+
+  const list = root.querySelector(".cli-list");
+  if (list) {
+    list.innerHTML = "";
+    if (cliManagerError) {
+      const error = el("div", "cli-error");
+      error.append(el("strong", null, "更新できませんでした"), el("span", null, cliManagerError));
+      list.appendChild(error);
+    }
+    if (cliLoading && agentClis.length === 0) {
+      list.appendChild(el("div", "cli-empty", "ローカルの CLI を確認しています…"));
+    } else {
+      for (const cli of agentClis) list.appendChild(cliRow(cli));
+    }
+  }
+
+  const summary = root.querySelector(".cli-summary");
+  if (summary) {
+    const installed = agentClis.filter((cli) => cli.installed).length;
+    summary.textContent = `${installed} / ${agentClis.length || 5} installed`;
+  }
 }
 
 function cliRow(cli) {
@@ -699,7 +765,7 @@ async function fetchAsks() {
   } catch (e) {
     connected = false;
   }
-  renderAll();
+  scheduleRender();
 }
 async function fetchSnapshot() {
   try {
@@ -708,7 +774,7 @@ async function fetchSnapshot() {
   } catch (e) {
     connected = false;
   }
-  renderAll();
+  scheduleRender();
 }
 
 function tickClock() {
@@ -736,7 +802,7 @@ function boot() {
     listen("snapshot", (ev) => {
       snapshot = ev.payload;
       connected = true;
-      renderAll();
+      scheduleRender();
     });
   } catch (e) {
     /* polling still covers it */

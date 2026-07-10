@@ -17,7 +17,7 @@ use anyhow::Result;
 use console::style;
 use serde::Serialize;
 
-use crate::diagnose::{self, Diagnosis, DiagnoseMethod, LLM_ASSIST_CONFIDENCE_THRESHOLD};
+use crate::diagnose::{self, DiagnoseMethod, Diagnosis, LLM_ASSIST_CONFIDENCE_THRESHOLD};
 use crate::profile::{ProfileSet, TaskCategory, load_profiles};
 use crate::types::BackendId;
 

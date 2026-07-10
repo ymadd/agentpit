@@ -139,12 +139,17 @@ pub(crate) async fn run_capture(
     //    gets a variant that drives the workflow via MCP tools instead of the Bash grammar.
     //    The human back-channel + its question-discipline block are injected only when enabled
     //    (default off until dogfooded). The manager is always full-autonomy today → High tier.
-    let ask = config
-        .workflow
-        .enable_ask_human
-        .then_some(AskTier::High);
+    let ask = config.workflow.enable_ask_human.then_some(AskTier::High);
     let prompt = if mcp_mode {
-        build_manager_prompt_mcp(&goal, &agents, depth, max_depth, max_calls, logger.run_id(), ask)
+        build_manager_prompt_mcp(
+            &goal,
+            &agents,
+            depth,
+            max_depth,
+            max_calls,
+            logger.run_id(),
+            ask,
+        )
     } else {
         build_manager_prompt(
             &goal,
@@ -293,21 +298,27 @@ fn agents_csv(agents: &[BackendId]) -> String {
 /// cleanly between the BUDGET and PROCEDURE sections.
 fn question_discipline_block(ask_tier: AskTier, ask_invocation: &str, ask_grammar: &str) -> String {
     let when_to_ask = match ask_tier {
-        AskTier::High => "\
+        AskTier::High => {
+            "\
   - DESTRUCTIVE or IRREVERSIBLE actions a human cannot cheaply undo: deleting or\n\
     force-overwriting non-generated files, `git push --force` / history rewrites,\n\
     dropping data, deploying / releasing, mutating anything outside this repo, or\n\
     spending money / touching production. If unsure whether it is reversible, ask.\n\
   - Nothing else. Resolve ambiguous requirements and A/B forks yourself with the most\n\
-    standard, reversible choice and a one-line 'ASSUMED: <choice> (<reason>)' note.",
-        AskTier::Medium => "\
+    standard, reversible choice and a one-line 'ASSUMED: <choice> (<reason>)' note."
+        }
+        AskTier::Medium => {
+            "\
   - DESTRUCTIVE or IRREVERSIBLE actions a human cannot cheaply undo (as above).\n\
   - A genuinely AMBIGUOUS requirement whose branches diverge materially and that you\n\
-    cannot resolve by re-reading the goal. Otherwise decide and note an 'ASSUMED:' line.",
-        AskTier::Low => "\
+    cannot resolve by re-reading the goal. Otherwise decide and note an 'ASSUMED:' line."
+        }
+        AskTier::Low => {
+            "\
   - DESTRUCTIVE or IRREVERSIBLE actions a human cannot cheaply undo.\n\
   - A genuinely ambiguous requirement with materially diverging branches.\n\
-  - A genuine A/B fork with no clearly safer or more standard default.",
+  - A genuine A/B fork with no clearly safer or more standard default."
+        }
     };
     format!(
         "HUMAN BACK-CHANNEL — QUESTION DISCIPLINE (tier: {tier}):\n\
@@ -597,10 +608,16 @@ mod tests {
         let cli = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None);
         let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None);
         for text in [&cli, &mcp] {
-            assert!(!text.contains("HUMAN BACK-CHANNEL"), "discipline must be omitted when off");
+            assert!(
+                !text.contains("HUMAN BACK-CHANNEL"),
+                "discipline must be omitted when off"
+            );
             assert!(!text.contains("HUMAN_UNAVAILABLE"));
             // The conversation layer (handoffs + refutation) is gated on the same switch.
-            assert!(!text.contains("CONVERSATION LAYER"), "conversation block must be omitted when off");
+            assert!(
+                !text.contains("CONVERSATION LAYER"),
+                "conversation block must be omitted when off"
+            );
             assert!(!text.contains("refute"));
             // The base prompt is intact and still ends with the user goal + synthesis instruction.
             assert!(text.contains("PROCEDURE:"));

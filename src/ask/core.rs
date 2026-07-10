@@ -162,7 +162,11 @@ pub async fn ask(req: AskRequest, cancel: CancellationToken) -> AskOutcome {
 }
 
 /// Poll the response sidecar until it appears, the timeout elapses, or the token is cancelled.
-async fn poll_for_answer(ask_id: &str, timeout_secs: u64, cancel: &CancellationToken) -> AskOutcome {
+async fn poll_for_answer(
+    ask_id: &str,
+    timeout_secs: u64,
+    cancel: &CancellationToken,
+) -> AskOutcome {
     let Some(resp_path) = ask_response_path(ask_id) else {
         return AskOutcome::Unavailable; // unreachable: ask_id is always a safe token
     };
@@ -238,8 +242,14 @@ mod tests {
 
     #[test]
     fn ask_kind_parses_and_defaults_to_review() {
-        assert_eq!(AskKind::parse_or_default(Some("blocking")), AskKind::Blocking);
-        assert_eq!(AskKind::parse_or_default(Some("BLOCKING")), AskKind::Blocking);
+        assert_eq!(
+            AskKind::parse_or_default(Some("blocking")),
+            AskKind::Blocking
+        );
+        assert_eq!(
+            AskKind::parse_or_default(Some("BLOCKING")),
+            AskKind::Blocking
+        );
         assert_eq!(AskKind::parse_or_default(Some("review")), AskKind::Review);
         assert_eq!(AskKind::parse_or_default(Some("garbage")), AskKind::Review);
         assert_eq!(AskKind::parse_or_default(None), AskKind::Review);
@@ -304,12 +314,21 @@ mod tests {
         let start = Instant::now();
         let outcome = ask(req, CancellationToken::new()).await;
         assert_eq!(outcome, AskOutcome::Unavailable);
-        assert!(start.elapsed() < Duration::from_secs(5), "should time out near 1s");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "should time out near 1s"
+        );
 
         let log =
             std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap_or_default();
-        assert!(log.contains("\"event\":\"ask\""), "ask event missing: {log}");
-        assert!(log.contains("\"timed_out\":true"), "timeout not recorded: {log}");
+        assert!(
+            log.contains("\"event\":\"ask\""),
+            "ask event missing: {log}"
+        );
+        assert!(
+            log.contains("\"timed_out\":true"),
+            "timeout not recorded: {log}"
+        );
         clear_temp_state();
     }
 

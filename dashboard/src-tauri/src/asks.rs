@@ -159,9 +159,9 @@ pub fn answer_ask(ask_id: String, value: String) -> AnswerResult {
         return answer_err("already answered");
     }
 
-    let body =
-        serde_json::json!({ "ask_id": ask_id, "answer": value, "ts": now_ms() }).to_string();
-    let tmp = agentpit_events::asks_dir().join(format!("{ask_id}.response.{}.tmp", std::process::id()));
+    let body = serde_json::json!({ "ask_id": ask_id, "answer": value, "ts": now_ms() }).to_string();
+    let tmp =
+        agentpit_events::asks_dir().join(format!("{ask_id}.response.{}.tmp", std::process::id()));
     if std::fs::write(&tmp, body.as_bytes()).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return answer_err("failed to write response");
@@ -218,8 +218,9 @@ mod tests {
         write_request("ask-1-2-3", "blocking", now_ms(), 120, std::process::id());
         let r = answer_ask("ask-1-2-3".into(), "yes".into());
         assert!(r.ok, "answer failed: {:?}", r.error);
-        let resp = std::fs::read_to_string(agentpit_events::ask_response_path("ask-1-2-3").unwrap())
-            .unwrap();
+        let resp =
+            std::fs::read_to_string(agentpit_events::ask_response_path("ask-1-2-3").unwrap())
+                .unwrap();
         assert!(resp.contains("\"answer\":\"yes\""), "got: {resp}");
 
         // Answering again → rejected (response already present).
@@ -248,14 +249,23 @@ mod tests {
 
         let cards = get_pending_asks();
         let ids: Vec<&str> = cards.iter().map(|c| c.ask_id.as_str()).collect();
-        assert_eq!(ids, vec!["ask-1-2-fresh", "ask-1-2-review"], "blocking sorts first; expired-dead reaped");
+        assert_eq!(
+            ids,
+            vec!["ask-1-2-fresh", "ask-1-2-review"],
+            "blocking sorts first; expired-dead reaped"
+        );
         // The reaped request file is gone.
-        assert!(!agentpit_events::ask_request_path("ask-1-2-dead").unwrap().exists());
+        assert!(!agentpit_events::ask_request_path("ask-1-2-dead")
+            .unwrap()
+            .exists());
 
         // Answered asks are hidden.
         answer_ask("ask-1-2-fresh".into(), "yes".into());
         let after = get_pending_asks();
-        assert_eq!(after.iter().map(|c| c.ask_id.as_str()).collect::<Vec<_>>(), vec!["ask-1-2-review"]);
+        assert_eq!(
+            after.iter().map(|c| c.ask_id.as_str()).collect::<Vec<_>>(),
+            vec!["ask-1-2-review"]
+        );
 
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");

@@ -87,7 +87,13 @@ mod tests {
 
     #[test]
     fn ask_tier_derives_from_autonomy() {
-        assert_eq!(AskTier::from_autonomy(AutonomyLevel::FullAutonomy), AskTier::High);
-        assert_eq!(AskTier::from_autonomy(AutonomyLevel::Prompted), AskTier::Low);
+        assert_eq!(
+            AskTier::from_autonomy(AutonomyLevel::FullAutonomy),
+            AskTier::High
+        );
+        assert_eq!(
+            AskTier::from_autonomy(AutonomyLevel::Prompted),
+            AskTier::Low
+        );
     }
 }

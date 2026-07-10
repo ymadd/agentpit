@@ -1,13 +1,9 @@
 [package]
 name = "agentpit-dashboard"
-version = "0.1.0"
+version = "0.1.20"
 edition = "2021"
 description = "Live desktop dashboard for agentpit run activity"
 license = "Apache-2.0"
-
-# Standalone workspace: the dashboard is built on its own, not as part of the CLI's
-# `cargo build --release`. The root workspace excludes this directory.
-[workspace]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

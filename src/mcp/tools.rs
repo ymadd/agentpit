@@ -281,7 +281,9 @@ impl AgentpitTools {
             let regs = self.regs.clone();
             let cancel = cancel.clone();
             let logger = logger.clone();
-            set.spawn(async move { dispatch_member_logged(b, prompt, cwd, cancel, regs, logger).await });
+            set.spawn(
+                async move { dispatch_member_logged(b, prompt, cwd, cancel, regs, logger).await },
+            );
         }
         let mut outcomes: Vec<MemberOutcome> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
@@ -447,14 +449,18 @@ impl AgentpitTools {
             timeout_secs: req.timeout_secs.unwrap_or(0),
         };
         match crate::ask::ask(areq, cancel).await {
-            crate::ask::AskOutcome::Answered(a) => Ok(CallToolResult::success(vec![Content::text(
-                clamp_for_prompt(&a, MAX_MEMBER_PROMPT_BYTES),
-            )])),
+            crate::ask::AskOutcome::Answered(a) => {
+                Ok(CallToolResult::success(vec![Content::text(
+                    clamp_for_prompt(&a, MAX_MEMBER_PROMPT_BYTES),
+                )]))
+            }
             // SUCCESS text, never `tool_error` — a timeout must not look like a failure, or the
             // manager may abort instead of proceeding with the safe choice on HUMAN_UNAVAILABLE.
-            crate::ask::AskOutcome::Unavailable => Ok(CallToolResult::success(vec![Content::text(
-                crate::ask::HUMAN_UNAVAILABLE.to_string(),
-            )])),
+            crate::ask::AskOutcome::Unavailable => {
+                Ok(CallToolResult::success(vec![Content::text(
+                    crate::ask::HUMAN_UNAVAILABLE.to_string(),
+                )]))
+            }
         }
     }
 
@@ -484,7 +490,8 @@ impl AgentpitTools {
             .filter(|s| !s.is_empty());
         let Some(run_id) = run_id else {
             return Ok(tool_error(
-                "post_note requires a workflow run context (AGENTPIT_PARENT_RUN_ID is unset)".into(),
+                "post_note requires a workflow run context (AGENTPIT_PARENT_RUN_ID is unset)"
+                    .into(),
             ));
         };
         let kind = crate::workflow::converse::normalize_kind(req.kind.as_deref());
@@ -521,7 +528,8 @@ impl AgentpitTools {
             .map(|c| c.loaded.config.ensemble.adversarial_review_members.clone())
             .unwrap_or_default();
         let (critic, defender) =
-            match crate::workflow::converse::resolve_pair(critic, defender, &available, &preferred) {
+            match crate::workflow::converse::resolve_pair(critic, defender, &available, &preferred)
+            {
                 Ok(pair) => pair,
                 Err(e) => return Ok(tool_error(format!("{e:#}"))),
             };
@@ -714,7 +722,10 @@ mod tests {
         unsafe {
             std::env::set_var("XDG_STATE_HOME", tmp.path());
         }
-        StateDirGuard { _lock: lock, _tmp: tmp }
+        StateDirGuard {
+            _lock: lock,
+            _tmp: tmp,
+        }
     }
 
     #[tokio::test]
@@ -908,7 +919,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.is_error, Some(true));
-        assert!(text_of(&res).contains("unknown backend"), "got: {}", text_of(&res));
+        assert!(
+            text_of(&res).contains("unknown backend"),
+            "got: {}",
+            text_of(&res)
+        );
     }
 
     #[tokio::test]
@@ -954,7 +969,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.is_error, Some(false), "got: {}", text_of(&res));
-        assert!(text_of(&res).contains("recorded board note"), "got: {}", text_of(&res));
+        assert!(
+            text_of(&res).contains("recorded board note"),
+            "got: {}",
+            text_of(&res)
+        );
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
             std::env::remove_var(crate::workflow::guard::ENV_PARENT_RUN_ID);
@@ -973,6 +992,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.is_error, Some(true));
-        assert!(text_of(&res).contains("unknown critic backend"), "got: {}", text_of(&res));
+        assert!(
+            text_of(&res).contains("unknown critic backend"),
+            "got: {}",
+            text_of(&res)
+        );
     }
 }

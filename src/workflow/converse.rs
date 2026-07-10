@@ -87,7 +87,11 @@ fn pick(
     {
         return Some(b);
     }
-    let mut rest: Vec<BackendId> = available.iter().copied().filter(|b| Some(*b) != skip).collect();
+    let mut rest: Vec<BackendId> = available
+        .iter()
+        .copied()
+        .filter(|b| Some(*b) != skip)
+        .collect();
     rest.sort();
     rest.into_iter().next()
 }
@@ -209,9 +213,14 @@ async fn run_leg(
     if let Some(l) = logger {
         let elapsed = started.elapsed().as_millis() as u64;
         match &outcome {
-            Ok(text) => {
-                l.member_finished(backend, false, LegStatus::Ok, elapsed, Some(text.len()), None)
-            }
+            Ok(text) => l.member_finished(
+                backend,
+                false,
+                LegStatus::Ok,
+                elapsed,
+                Some(text.len()),
+                None,
+            ),
             Err(reason) => l.member_finished(
                 backend,
                 false,
@@ -295,7 +304,9 @@ pub fn render_refute(bundle: &RefuteBundle) -> String {
     let defense = match &bundle.defense {
         Some(Ok(text)) => clamp(text),
         Some(Err(reason)) => format!("(defense leg failed: {reason})"),
-        None => "(defense skipped: the critique leg failed, so there was nothing to defend)".to_string(),
+        None => {
+            "(defense skipped: the critique leg failed, so there was nothing to defend)".to_string()
+        }
     };
     format!(
         "=== REFUTE: critique → defense (adjudicate below) ===\n\

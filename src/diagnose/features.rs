@@ -112,10 +112,7 @@ const VERBS: &[(&str, TaskCategory)] = &[
 
 /// Look up the category a verb signals, if it is a known command verb.
 pub(super) fn verb_category(verb: &str) -> Option<TaskCategory> {
-    VERBS
-        .iter()
-        .find(|(v, _)| *v == verb)
-        .map(|(_, cat)| *cat)
+    VERBS.iter().find(|(v, _)| *v == verb).map(|(_, cat)| *cat)
 }
 
 /// Extract surface features from a task string. Pure: no mutation of inputs, no I/O.

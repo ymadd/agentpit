@@ -19,7 +19,10 @@ pub enum RouteReason {
     /// Diagnosed task category routed to the highest-scoring available backend via the
     /// capability profiles (design §1.6). Carries the category and the winning score for
     /// observability.
-    Profile { category: TaskCategory, score: u8 },
+    Profile {
+        category: TaskCategory,
+        score: u8,
+    },
     AutoLongContext,
     AutoKeyword,
     Default,
@@ -295,11 +298,7 @@ mod tests {
         assert_eq!(d.reason, RouteReason::Default);
     }
 
-    fn profile_with(
-        backend: BackendId,
-        category: TaskCategory,
-        value: u8,
-    ) -> CapabilityProfile {
+    fn profile_with(backend: BackendId, category: TaskCategory, value: u8) -> CapabilityProfile {
         let mut p = CapabilityProfile::seeded(backend);
         p.scores.insert(category, Score::seeded(value));
         p
@@ -381,11 +380,8 @@ mod tests {
         cfg.routes.clear();
         cfg.default.backend = BackendId::Opencode;
         // A profile that would have sent Coding to Codex if the gate let it through.
-        let profiles = ProfileSet::from_profiles([profile_with(
-            BackendId::Codex,
-            TaskCategory::Coding,
-            99,
-        )]);
+        let profiles =
+            ProfileSet::from_profiles([profile_with(BackendId::Codex, TaskCategory::Coding, 99)]);
         let mut avail = available();
         avail.insert(BackendId::Codex);
         let r = Router::new(cfg, avail, profiles);

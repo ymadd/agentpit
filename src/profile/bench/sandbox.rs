@@ -383,12 +383,24 @@ mod tests {
     // ---- live sandbox (skips cleanly when sandbox-exec / python3 are unavailable) --------
 
     fn live_python_available() -> bool {
-        sandbox_exec_available()
+        let binaries_available = sandbox_exec_available()
             && Command::new("python3")
                 .arg("--version")
                 .output()
                 .map(|o| o.status.success())
-                .unwrap_or(false)
+                .unwrap_or(false);
+        binaries_available
+            && matches!(
+                run_in_sandbox(
+                    FixtureLang::Python,
+                    "def smoke():\n    return 1\n",
+                    "from solution import smoke\n\ndef test_smoke():\n    assert smoke() == 1\n",
+                ),
+                Ok(SandboxOutcome::Ran {
+                    passed: 1,
+                    total: 1
+                })
+            )
     }
 
     const ADD_TESTS: &str = "from solution import add\n\n\
@@ -398,7 +410,7 @@ mod tests {
     #[test]
     fn live_correct_python_passes_all() {
         if !live_python_available() {
-            eprintln!("skipping live sandbox test: sandbox-exec or python3 unavailable");
+            eprintln!("skipping live sandbox test: functional Python sandbox unavailable");
             return;
         }
         let tests = HiddenTests {

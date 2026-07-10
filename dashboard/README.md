@@ -17,6 +17,12 @@ Every dispatch emits `run_started → member_started → member_finished → run
 The dashboard ([Tauri](https://tauri.app), WKWebView on macOS) watches that file with
 `notify`, rebuilds run state on each change, and pushes a snapshot to the UI.
 
+The footer's **CLI バージョン** panel also inventories the exact agent executables on
+`PATH` (with common GUI-launch fallback paths), shows their installed versions, and runs
+the fixed self-update command supplied by each CLI. The frontend cannot provide a shell
+command or arguments. Older Gemini builds that do not advertise `gemini update` stay
+read-only so `update` cannot be mistaken for an interactive prompt.
+
 A run is shown as **LIVE** while it has no `run_finished` event *and* its process is
 still alive (checked via `kill(pid, 0)`); if the process dies mid-run it drops to
 **Recent** marked `interrupted`, so nothing hangs in the live list forever.
@@ -31,16 +37,20 @@ Once the `agentpit-dashboard` binary is installed next to `agentpit` (or on `PAT
 agentpit dashboard
 ```
 
+Release assets use the name `agentpit-dashboard-<target>.gz`; decompress the matching
+asset and place the executable next to `agentpit`.
+
 `agentpit dashboard` finds the binary via `AGENTPIT_DASHBOARD_BIN`, then next to the
 `agentpit` executable, then `PATH` — and spawns it detached.
 
-To build/run it directly during development (the frontend is plain static HTML/CSS/JS —
-no build step, no Node — so a bare `cargo run` launches the window, no `tauri-cli`
-required):
+The repository is one Cargo workspace containing `agentpit`, `agentpit-events`, and this
+desktop app. To build/run it directly during development (the frontend is plain static
+HTML/CSS/JS — no build step, no Node — so a package-targeted `cargo run` launches the
+window, no `tauri-cli` required):
 
 ```bash
-cd dashboard/src-tauri
-cargo run            # or: cargo build --release && cp target/release/agentpit-dashboard ~/.local/bin/
+cargo run -p agentpit-dashboard
+# or: cargo build -p agentpit-dashboard --release
 ```
 
 Then, in another terminal (or from Claude Code), drive agentpit and watch it update live:

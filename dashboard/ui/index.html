@@ -40,15 +40,24 @@
 
     <!-- footer: the swarm is opt-in -->
     <div id="footer">
-      <button type="button" id="swarm-toggle" class="footer-btn">
-        <span class="fb-label">群れを見る</span>
-        <span class="fb-count" id="swarm-footer">—</span>
-      </button>
+      <div class="footer-actions">
+        <button type="button" id="swarm-toggle" class="footer-btn">
+          <span class="fb-label">群れを見る</span>
+          <span class="fb-count" id="swarm-footer">—</span>
+        </button>
+        <button type="button" id="cli-toggle" class="footer-btn">
+          <span class="fb-label">CLI バージョン</span>
+          <span class="fb-key">V</span>
+        </button>
+      </div>
       <span class="conn" id="conn"><span class="conn-dot"></span><span id="conn-text">接続中…</span></span>
     </div>
 
     <!-- swarm glance (opt-in): you don't need to look — the manager is watching -->
     <div id="swarm" class="hidden"></div>
+
+    <!-- CLI version rail: inventory and each vendor CLI's own updater -->
+    <div id="cli-manager" class="hidden"></div>
 
     <script src="app.js"></script>
   </body>

@@ -271,6 +271,20 @@ mod tests {
 
     #[test]
     fn score_refute_bundle_grades_stuck_and_extracts_the_revision_from_a_fenced_defense() {
+        if !matches!(
+            crate::profile::bench::sandbox::run_in_sandbox(
+                FixtureLang::Python,
+                "def f():\n    return 2\n",
+                "from solution import f\n\ndef test():\n    assert f() == 2\n",
+            ),
+            Ok(crate::profile::bench::sandbox::SandboxOutcome::Ran {
+                passed: 1,
+                total: 1
+            })
+        ) {
+            eprintln!("skipping refute grading test: functional Python sandbox unavailable");
+            return;
+        }
         let task = refute_task("```python\ndef f():\n    return 1\n```\n");
         let bundle = RefuteBundle {
             critic: BackendId::Codex,

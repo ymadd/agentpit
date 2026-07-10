@@ -860,7 +860,10 @@ mod tests {
             body: "shared constraint: keep files < 800 lines".into(),
         };
         let json = serde_json::to_string(&board).unwrap();
-        assert!(!json.contains("\"from\":"), "absent author must be omitted: {json}");
+        assert!(
+            !json.contains("\"from\":"),
+            "absent author must be omitted: {json}"
+        );
         // A legacy/absent `from` deserializes back to None via #[serde(default)].
         assert!(matches!(
             serde_json::from_str::<Event>(&json).unwrap(),
@@ -877,7 +880,11 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", tmp.path());
         }
         let logger = RunLogger::adopt("run-note".to_string());
-        logger.note(Some(BackendId::Claude), "handoff", "context for the next leg");
+        logger.note(
+            Some(BackendId::Claude),
+            "handoff",
+            "context for the next leg",
+        );
         let contents = std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap();
         assert!(contents.contains("\"event\":\"note\""), "got: {contents}");
         assert!(contents.contains("\"run_id\":\"run-note\""));
@@ -893,7 +900,11 @@ mod tests {
         assert!(ask_request_path("a/b").is_none());
         assert!(ask_response_path("/abs").is_none());
         let req = ask_request_path("ask-1-2-3").unwrap();
-        assert!(req.ends_with("asks/ask-1-2-3.json"), "got: {}", req.display());
+        assert!(
+            req.ends_with("asks/ask-1-2-3.json"),
+            "got: {}",
+            req.display()
+        );
         let resp = ask_response_path("ask-1-2-3").unwrap();
         assert!(
             resp.ends_with("asks/ask-1-2-3.response.json"),
@@ -908,6 +919,9 @@ mod tests {
         let b = next_ask_token();
         assert_ne!(a, b);
         assert!(a.starts_with("ask-"));
-        assert!(is_safe_log_component(&a), "ask token must be a safe component: {a}");
+        assert!(
+            is_safe_log_component(&a),
+            "ask token must be a safe component: {a}"
+        );
     }
 }

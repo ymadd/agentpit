@@ -85,11 +85,7 @@ fn argmax(scores: &BTreeMap<TaskCategory, f32>) -> (TaskCategory, f32) {
         .fold(
             (TaskCategory::Coding, f32::NEG_INFINITY),
             |best, (cat, score)| {
-                if score > best.1 {
-                    (cat, score)
-                } else {
-                    best
-                }
+                if score > best.1 { (cat, score) } else { best }
             },
         )
 }
@@ -99,7 +95,12 @@ fn argmax(scores: &BTreeMap<TaskCategory, f32>) -> (TaskCategory, f32) {
 fn softmax_confidence(scores: &BTreeMap<TaskCategory, f32>, best: TaskCategory) -> f32 {
     let scaled: Vec<(TaskCategory, f32)> = TaskCategory::ALL
         .iter()
-        .map(|cat| (*cat, scores.get(cat).copied().unwrap_or(0.0) * SOFTMAX_SCALE))
+        .map(|cat| {
+            (
+                *cat,
+                scores.get(cat).copied().unwrap_or(0.0) * SOFTMAX_SCALE,
+            )
+        })
         .collect();
 
     let max = scaled
@@ -136,7 +137,9 @@ mod tests {
 
     #[test]
     fn refactor_task_classifies_as_refactor() {
-        let (cat, conf) = classify(&extract("refactor the payment module to remove duplication"));
+        let (cat, conf) = classify(&extract(
+            "refactor the payment module to remove duplication",
+        ));
         assert_eq!(cat, TaskCategory::Refactor);
         assert!(conf > 0.5, "confidence too low: {conf}");
     }

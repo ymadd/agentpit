@@ -102,9 +102,16 @@ pub async fn run_live(
 ) -> Result<RawFixture> {
     let mut outputs = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let res = dispatch(backend, &task.prompt, cwd, cancel.clone(), on_chunk.clone(), regs)
-            .await
-            .with_context(|| format!("dispatch failed for gold task {}", task.id))?;
+        let res = dispatch(
+            backend,
+            &task.prompt,
+            cwd,
+            cancel.clone(),
+            on_chunk.clone(),
+            regs,
+        )
+        .await
+        .with_context(|| format!("dispatch failed for gold task {}", task.id))?;
         outputs.push(RawOutput {
             task_id: task.id.clone(),
             output: res.output,

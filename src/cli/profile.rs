@@ -18,11 +18,11 @@ use clap::Subcommand;
 use console::style;
 use tokio_util::sync::CancellationToken;
 
+use crate::events::{LegStatus, RunKind, RunLogger, output_streamer};
 use crate::profile::bench::{
     RawFixture, RawScored, ReplayFixture, all_tasks, merge_into_profiles, run_live, score_fixture,
     score_raw,
 };
-use crate::events::{LegStatus, RunKind, RunLogger, output_streamer};
 use crate::profile::{
     BenchmarkResult, CapabilityProfile, ProfileSet, apply_benchmark, load_profiles, profiles_path,
     save_profiles, seeded_profiles,

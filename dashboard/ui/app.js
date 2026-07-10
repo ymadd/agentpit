@@ -16,10 +16,15 @@ let asks = []; // pending decisions (camelCase from get_pending_asks)
 let snapshot = { live: [], recent: [] };
 let available = true; // presence toggle (cosmetic — the manager handles real absence via timeout)
 let showSwarm = false;
+let showCliManager = false;
 let projectFilter = null;
 let cursor = 0; // which pending ask is on stage
 let connected = false;
 let toastTimer = null;
+let agentClis = [];
+let cliLoading = false;
+let cliUpdating = null;
+let cliManagerError = null;
 
 const answered = new Set(); // optimistically-answered ids, hidden until the backend agrees
 const notified = new Set(); // blocking asks we've already notified for
@@ -108,6 +113,7 @@ function renderAll() {
   updateStage();
   updateFooter();
   updateSwarm();
+  updateCliManager();
 }
 
 function updateStatusbar() {
@@ -415,6 +421,95 @@ function buildSwarm(root, runs) {
   root.append(scrim, sheet);
 }
 
+// ── agent CLI versions ───────────────────────────────────────────────────────
+function updateCliManager() {
+  const root = document.getElementById("cli-manager");
+  if (!showCliManager) {
+    root.classList.add("hidden");
+    return;
+  }
+  buildCliManager(root);
+  root.classList.remove("hidden");
+}
+
+function buildCliManager(root) {
+  root.innerHTML = "";
+  const scrim = el("div", "cli-scrim");
+  scrim.addEventListener("click", toggleCliManager);
+  const panel = el("section", "cli-panel");
+  panel.setAttribute("aria-label", "Agent CLI バージョン管理");
+
+  const head = el("header", "cli-head");
+  const intro = el("div", "cli-intro");
+  intro.append(
+    el("div", "cli-eyebrow", "TOOLCHAIN / LOCAL"),
+    el("h2", "cli-title", "Agent CLI versions"),
+    el("p", "cli-sub", "agentpit が実際に呼び出す CLI を確認し、各 CLI 公式の更新機能で揃えます。")
+  );
+  const headActions = el("div", "cli-head-actions");
+  const refresh = el("button", "cli-refresh", cliLoading ? "確認中…" : "再確認");
+  refresh.type = "button";
+  refresh.disabled = cliLoading || cliUpdating !== null;
+  refresh.addEventListener("click", fetchAgentClis);
+  const close = el("button", "cli-close", "✕");
+  close.type = "button";
+  close.setAttribute("aria-label", "閉じる");
+  close.addEventListener("click", toggleCliManager);
+  headActions.append(refresh, close);
+  head.append(intro, headActions);
+  panel.appendChild(head);
+
+  const list = el("div", "cli-list");
+  if (cliManagerError) {
+    const error = el("div", "cli-error");
+    error.append(el("strong", null, "更新できませんでした"), el("span", null, cliManagerError));
+    list.appendChild(error);
+  }
+  if (cliLoading && agentClis.length === 0) {
+    list.appendChild(el("div", "cli-empty", "ローカルの CLI を確認しています…"));
+  } else {
+    for (const cli of agentClis) list.appendChild(cliRow(cli));
+  }
+  panel.appendChild(list);
+
+  const foot = el("footer", "cli-foot");
+  const installed = agentClis.filter((cli) => cli.installed).length;
+  foot.append(
+    el("span", "cli-summary", `${installed} / ${agentClis.length || 5} installed`),
+    el("span", "cli-safety", "更新コマンドは固定されています。任意のシェル入力は実行しません。")
+  );
+  panel.appendChild(foot);
+  root.append(scrim, panel);
+}
+
+function cliRow(cli) {
+  const meta = modelMeta(cli.id);
+  const row = el("article", `cli-row${cli.installed ? "" : " missing"}`);
+  const mark = el("span", "cli-mark", meta.mono);
+  mark.style.setProperty("--cli-color", meta.color);
+
+  const identity = el("div", "cli-identity");
+  const nameLine = el("div", "cli-name-line");
+  nameLine.append(el("span", "cli-name", cli.label));
+  const state = el("span", `cli-state ${cli.installed ? "ready" : "missing"}`, cli.installed ? "installed" : "missing");
+  nameLine.appendChild(state);
+  identity.append(nameLine, el("div", "cli-path mono", cli.path || `${cli.command} is not on PATH`));
+  if (cli.note) identity.appendChild(el("div", "cli-note", cli.note));
+
+  const version = el("div", "cli-version");
+  version.append(el("span", "cli-version-label", "VERSION"), el("strong", "mono", cli.version || "—"));
+
+  const updating = cliUpdating === cli.id;
+  const action = el("button", "cli-update", updating ? "更新中…" : "更新");
+  action.type = "button";
+  action.disabled = !cli.canUpdate || cliUpdating !== null;
+  action.title = cli.canUpdate ? cli.updateCommand || "更新" : cli.note || "更新できません";
+  action.addEventListener("click", () => updateAgentCli(cli));
+
+  row.append(mark, identity, version, action);
+  return row;
+}
+
 // ── interaction ──────────────────────────────────────────────────────────────
 function showToast(text, dotColor) {
   const t = document.getElementById("toast");
@@ -472,6 +567,13 @@ function answerKey(k) {
 }
 
 function onKey(e) {
+  if (showCliManager) {
+    if (e.key === "Escape") {
+      toggleCliManager();
+      e.preventDefault();
+    }
+    return;
+  }
   if (showSwarm) {
     if (e.key === "Escape") {
       toggleSwarm();
@@ -503,6 +605,11 @@ function onKey(e) {
   if (e.key === "s" || e.key === "S") {
     toggleSwarm();
     e.preventDefault();
+    return;
+  }
+  if (e.key === "v" || e.key === "V") {
+    toggleCliManager();
+    e.preventDefault();
   }
 }
 
@@ -513,8 +620,53 @@ function toggleAvailable() {
 }
 function toggleSwarm() {
   showSwarm = !showSwarm;
+  if (showSwarm) showCliManager = false;
   swarmSig = null;
   updateSwarm();
+}
+
+function toggleCliManager() {
+  showCliManager = !showCliManager;
+  if (showCliManager) {
+    showSwarm = false;
+    swarmSig = null;
+    updateSwarm();
+    if (agentClis.length === 0) fetchAgentClis();
+  }
+  updateCliManager();
+}
+
+async function fetchAgentClis({ preserveError = false } = {}) {
+  cliLoading = true;
+  if (!preserveError) cliManagerError = null;
+  updateCliManager();
+  try {
+    agentClis = (await invoke("get_agent_clis")) || [];
+  } catch (e) {
+    cliManagerError = String(e);
+  } finally {
+    cliLoading = false;
+    updateCliManager();
+  }
+}
+
+async function updateAgentCli(cli) {
+  if (!cli.canUpdate || cliUpdating !== null) return;
+  cliUpdating = cli.id;
+  cliManagerError = null;
+  updateCliManager();
+  try {
+    const result = await invoke("update_agent_cli", { id: cli.id });
+    agentClis = agentClis.map((item) => (item.id === cli.id ? result.cli : item));
+    showToast(`${cli.label} を ${result.cli.version || "最新版"} に更新しました。`, "#4ec9a0");
+  } catch (e) {
+    const message = String(e);
+    cliManagerError = message;
+    showToast(`${cli.label} の更新に失敗しました。`, "var(--err)");
+  } finally {
+    cliUpdating = null;
+    await fetchAgentClis({ preserveError: cliManagerError !== null });
+  }
 }
 
 // ── notifications (blocking asks only) ───────────────────────────────────────
@@ -568,6 +720,7 @@ function tickClock() {
 function boot() {
   document.getElementById("avail-toggle").addEventListener("click", toggleAvailable);
   document.getElementById("swarm-toggle").addEventListener("click", toggleSwarm);
+  document.getElementById("cli-toggle").addEventListener("click", toggleCliManager);
   window.addEventListener("keydown", onKey);
 
   tickClock();

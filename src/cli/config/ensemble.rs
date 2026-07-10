@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use console::style;
 
 use super::EnsembleTarget;
+use crate::cli::cancel::{self, Nav};
 use crate::config::{load_config, save_config};
 use crate::dispatch::build_registries;
 use crate::types::BackendId;
@@ -21,7 +22,8 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
         anyhow::bail!("no backends registered");
     }
 
-    let (current_members, current_aggregator) = match target {
+    // Capture prior values (immutable read) BEFORE any mutation for before→after display.
+    let (prior_members, prior_aggregator) = match target {
         EnsembleTarget::Default => (
             loaded.config.ensemble.default_members.clone(),
             loaded.config.ensemble.aggregator,
@@ -51,20 +53,29 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
     )
     .map_err(|e| anyhow!("intro failed: {e}"))?;
 
-    let initial_members: Vec<BackendId> = current_members
+    // Pre-select only members that are currently available.
+    let initial_members: Vec<BackendId> = prior_members
         .iter()
         .copied()
         .filter(|b| available.contains(b))
         .collect();
+
     let mut ms = cliclack::multiselect(format!("Members for ensemble.{}", target.as_str()))
         .required(true)
         .initial_values(initial_members);
     for b in &available {
         ms = ms.item(*b, b.to_string(), "");
     }
-    let members: Vec<BackendId> = ms
-        .interact()
-        .map_err(|e| anyhow!("multiselect failed: {e}"))?;
+
+    // Route the multiselect through the cancel helper — Esc → clean return.
+    let members: Vec<BackendId> = match cancel::prompt(ms.interact())? {
+        Nav::Value(v) => v,
+        Nav::Back => {
+            cliclack::outro("(cancelled — no changes made)")
+                .map_err(|e| anyhow!("outro failed: {e}"))?;
+            return Ok(());
+        }
+    };
 
     let mut agg_sel = cliclack::select(format!("Aggregator for ensemble.{}", target.as_str()))
         .item(
@@ -75,19 +86,28 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
     for b in &available {
         agg_sel = agg_sel.item(Aggregator::Backend(*b), b.to_string(), "");
     }
-    let initial = current_aggregator
+    // Pre-select the currently configured aggregator when it is available.
+    let initial_agg = prior_aggregator
         .filter(|b| available.contains(b))
         .map(Aggregator::Backend)
         .unwrap_or(Aggregator::None);
-    agg_sel = agg_sel.initial_value(initial);
-    let aggregator = agg_sel
-        .interact()
-        .map_err(|e| anyhow!("select failed: {e}"))?;
-    let aggregator = match aggregator {
+    agg_sel = agg_sel.initial_value(initial_agg);
+
+    // Route the aggregator select through the cancel helper — Esc → clean return.
+    let aggregator_raw = match cancel::prompt(agg_sel.interact())? {
+        Nav::Value(v) => v,
+        Nav::Back => {
+            cliclack::outro("(cancelled — no changes made)")
+                .map_err(|e| anyhow!("outro failed: {e}"))?;
+            return Ok(());
+        }
+    };
+    let aggregator: Option<BackendId> = match aggregator_raw {
         Aggregator::None => None,
         Aggregator::Backend(b) => Some(b),
     };
 
+    // Apply the mutation.
     match target {
         EnsembleTarget::Default => {
             loaded.config.ensemble.default_members = members.clone();
@@ -112,20 +132,48 @@ pub async fn run(target: EnsembleTarget) -> Result<()> {
     }
 
     let path = save_config(&loaded.config)?;
-    let summary = format!(
-        "members: {}\naggregator: {}",
-        members
+
+    // Uniform before→after confirmations via the shared helper.
+    let prior_members_str = if prior_members.is_empty() {
+        "(none)".into()
+    } else {
+        prior_members
             .iter()
             .map(BackendId::to_string)
             .collect::<Vec<_>>()
-            .join(", "),
-        aggregator
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "(none)".into()),
+            .join(", ")
+    };
+    let new_members_str = members
+        .iter()
+        .map(BackendId::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let prior_agg_str = prior_aggregator
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "(none)".into());
+    let new_agg_str = aggregator
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "(none)".into());
+
+    cancel::confirm_change(
+        &format!("ensemble.{}.members", target.as_str()),
+        &prior_members_str,
+        &new_members_str,
     );
+    cancel::confirm_change(
+        &format!("ensemble.{}.aggregator", target.as_str()),
+        &prior_agg_str,
+        &new_agg_str,
+    );
+
     cliclack::outro_note(
-        format!("Saved ensemble.{} to {}", target.as_str(), path.display()),
-        summary,
+        format!(
+            "Saved ensemble.{} to {}",
+            target.as_str(),
+            style(path.display().to_string()).dim()
+        ),
+        format!("members: {new_members_str}\naggregator: {new_agg_str}"),
     )
     .map_err(|e| anyhow!("outro failed: {e}"))?;
     Ok(())

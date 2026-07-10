@@ -4,16 +4,24 @@ use clap::{Parser, Subcommand};
 use crate::types::BackendId;
 
 pub mod adversarial_review;
+pub mod ask;
+pub(crate) mod cancel;
 mod common;
 pub mod config;
 pub mod dashboard;
+pub mod diagnose;
 pub mod ensemble;
 pub mod explain;
 pub mod init;
 pub mod login;
 pub mod mcp_cmd;
 mod menu;
+pub mod note;
+pub mod profile;
 pub mod refactor;
+pub mod refute;
+pub mod refute_bench;
+pub mod repl;
 pub mod rescue;
 pub mod review;
 pub mod security_review;
@@ -154,6 +162,23 @@ pub enum Command {
         backend: Option<BackendId>,
     },
 
+    /// Inspect or (re)seed the capability profiles in profiles.toml. Omit the sub-action to
+    /// show the matrix.
+    Profile {
+        #[command(subcommand)]
+        action: Option<profile::Action>,
+    },
+
+    /// Dry-run task diagnosis + profile routing (features → category → backend). `--json`
+    /// emits a machine-readable verdict for downstream automation.
+    Diagnose {
+        /// The task to diagnose. Quote multi-word tasks.
+        task: String,
+        /// Emit machine-readable JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Check or launch a backend's login flow.
     Login {
         backend: BackendId,
@@ -193,12 +218,79 @@ pub enum Command {
         #[command(subcommand)]
         action: mcp_cmd::Action,
     },
+
+    /// Launch the persistent conversational REPL (the default when no subcommand is given).
+    Repl,
+
+    /// Ask the supervising human a question and block for an answer (the CLI back-channel a
+    /// shell-out workflow manager uses; prints the answer or HUMAN_UNAVAILABLE to stdout).
+    Ask {
+        /// The question to put to the human.
+        prompt: String,
+        /// Explicit options the human picks from. Repeat the flag per option.
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// "blocking" (a worker is stalled) or "review" (nothing blocked). Defaults to review.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Seconds to wait before returning HUMAN_UNAVAILABLE (default 180, capped 600).
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Append a durable conversation-layer note to the run transcript: a 1→1 handoff or a shared
+    /// board entry (the CLI twin of the MCP `post_note` tool). Manager-only; a worker is a
+    /// silent no-op.
+    Note {
+        /// The note body — the context being handed off, or the board entry.
+        body: String,
+        /// "handoff" (1→1 context pass, default) or "board" (shared scratch entry).
+        #[arg(long)]
+        kind: Option<String>,
+        /// The backend that authored this note (e.g. the handed-off worker). Omit for a manager post.
+        #[arg(long)]
+        from: Option<BackendId>,
+    },
+
+    /// Run a refutation (④): dispatch an adversarial critic at a stuck candidate, then a defender
+    /// carrying that critique, and print both for the manager to adjudicate. One depth-guarded
+    /// pass — not a loop.
+    Refute {
+        /// The stuck candidate to put under adversarial scrutiny.
+        candidate: String,
+        /// The sub-task the candidate was meant to achieve (gives the critic/defender their target).
+        #[arg(long)]
+        task: String,
+        /// Backend that produces the critique. Defaults to the adversarial-review primary.
+        #[arg(long)]
+        critic: Option<BackendId>,
+        /// Backend that produces the defense. Defaults to a backend distinct from the critic.
+        #[arg(long)]
+        defender: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+
+    /// Gate ④ refute itself (design §5.1): run the live critique→defense legs against a small set
+    /// of deliberately-broken "stuck" candidates and check whether the defense's revision actually
+    /// scores better than the stuck candidate did, not just that it produced *something*. Green
+    /// only when every probe clears the pass margin.
+    RefuteBench {
+        /// Backend that produces the critique. Defaults to the adversarial-review primary.
+        #[arg(long)]
+        critic: Option<BackendId>,
+        /// Backend that produces the defense. Defaults to a backend distinct from the critic.
+        #[arg(long)]
+        defender: Option<BackendId>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
     let command = match cli.command {
         Some(c) => c,
-        None => return menu::run_main().await,
+        None => return repl::run_repl().await,
     };
     match command {
         Command::Rescue {
@@ -266,6 +358,10 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Command::Status { backend } => status::run(backend).await,
 
+        Command::Profile { action } => profile::run(action).await,
+
+        Command::Diagnose { task, json } => diagnose::run(task, json).await,
+
         Command::Login { backend, check } => login::run(backend, check).await,
 
         Command::Init {
@@ -282,5 +378,30 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
 
         Command::Mcp { action } => mcp_cmd::run(action).await,
+
+        Command::Repl => repl::run_repl().await,
+
+        Command::Ask {
+            prompt,
+            options,
+            kind,
+            timeout_secs,
+        } => ask::run(prompt, options, kind, timeout_secs).await,
+
+        Command::Note { body, kind, from } => note::run(body, kind, from).await,
+
+        Command::Refute {
+            candidate,
+            task,
+            critic,
+            defender,
+            cwd,
+        } => refute::run(candidate, task, critic, defender, cwd).await,
+
+        Command::RefuteBench {
+            critic,
+            defender,
+            cwd,
+        } => refute_bench::run(critic, defender, cwd).await,
     }
 }

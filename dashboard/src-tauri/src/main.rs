@@ -1,6 +1,8 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod asks;
+mod cli_versions;
 mod state;
 
 use std::path::PathBuf;
@@ -57,6 +59,20 @@ fn refresh(state: &AppState) -> Snapshot {
 #[tauri::command]
 fn get_snapshot(state: State<AppState>) -> Snapshot {
     refresh(&state)
+}
+
+#[tauri::command]
+async fn get_agent_clis() -> Result<Vec<cli_versions::AgentCliInfo>, String> {
+    tauri::async_runtime::spawn_blocking(cli_versions::list)
+        .await
+        .map_err(|error| format!("agent CLI scan failed: {error}"))
+}
+
+#[tauri::command]
+async fn update_agent_cli(id: String) -> Result<cli_versions::AgentCliUpdate, String> {
+    tauri::async_runtime::spawn_blocking(move || cli_versions::update(&id))
+        .await
+        .map_err(|error| format!("agent CLI update failed: {error}"))?
 }
 
 /// A delta of a backend leg's captured output: only the bytes appended since `offset`.
@@ -196,7 +212,14 @@ fn main() {
         .manage(AppState {
             tracker: Mutex::new(Tracker::new()),
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot, get_output])
+        .invoke_handler(tauri::generate_handler![
+            get_snapshot,
+            get_agent_clis,
+            update_agent_cli,
+            get_output,
+            asks::get_pending_asks,
+            asks::answer_ask
+        ])
         .setup(|app| {
             spawn_watcher(app.handle().clone());
             Ok(())

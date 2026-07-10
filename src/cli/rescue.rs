@@ -47,7 +47,11 @@ pub async fn run_with_route(
 ) -> Result<()> {
     let ctx = load_context()?;
     let available = ctx.regs.available();
-    let router = Router::new(ctx.loaded.config.clone(), available.clone());
+    // Machine-generated capability matrix drives diagnostic routing. A missing file yields
+    // seeded priors; a corrupt one degrades gracefully to the legacy heuristics rather than
+    // breaking routing.
+    let profiles = crate::profile::load_profiles(None).unwrap_or_default();
+    let router = Router::new(ctx.loaded.config.clone(), available.clone(), profiles);
 
     let decision = router.resolve(&RouteRequest {
         tool: route_key,

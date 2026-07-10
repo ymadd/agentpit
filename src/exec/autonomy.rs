@@ -34,6 +34,40 @@ impl AutonomyLevel {
     }
 }
 
+/// How readily the workflow MANAGER escalates a decision to the supervising human via the
+/// `ask_human` back-channel. **Orthogonal to [`AutonomyLevel`]**: that gates the file/tool
+/// PERMISSIONS a backend is spawned with; this gates the FREQUENCY of human questions. They
+/// are deliberately separate concepts — a full-autonomy manager can still be configured to
+/// ask only on destructive actions (High) vs at every fork (Low).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskTier {
+    /// Ask only before destructive / irreversible actions. The conservative default.
+    High,
+    /// Also ask on a genuinely ambiguous requirement with materially diverging branches.
+    Medium,
+    /// Also ask on a genuine A/B fork with no safe default. Maps to [`AutonomyLevel::Prompted`].
+    Low,
+}
+
+impl AskTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AskTier::High => "high",
+            AskTier::Medium => "medium",
+            AskTier::Low => "low",
+        }
+    }
+
+    /// Derive an ask tier from a backend's permission posture. Today every exec backend is
+    /// `FullAutonomy` → `High`; a future `Prompted` "safe mode" maps to `Low` (ask often).
+    pub fn from_autonomy(level: AutonomyLevel) -> Self {
+        match level {
+            AutonomyLevel::FullAutonomy => AskTier::High,
+            AutonomyLevel::Prompted => AskTier::Low,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,5 +76,24 @@ mod tests {
     fn level_str_is_stable() {
         assert_eq!(AutonomyLevel::FullAutonomy.as_str(), "full-autonomy");
         assert_eq!(AutonomyLevel::Prompted.as_str(), "prompted");
+    }
+
+    #[test]
+    fn ask_tier_str_is_stable() {
+        assert_eq!(AskTier::High.as_str(), "high");
+        assert_eq!(AskTier::Medium.as_str(), "medium");
+        assert_eq!(AskTier::Low.as_str(), "low");
+    }
+
+    #[test]
+    fn ask_tier_derives_from_autonomy() {
+        assert_eq!(
+            AskTier::from_autonomy(AutonomyLevel::FullAutonomy),
+            AskTier::High
+        );
+        assert_eq!(
+            AskTier::from_autonomy(AutonomyLevel::Prompted),
+            AskTier::Low
+        );
     }
 }

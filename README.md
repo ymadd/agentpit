@@ -13,6 +13,7 @@ Different coding agents are good at different things: long-context reads on Gemi
 - **Ensembles** — `agentpit review <target>` runs Gemini + OpenCode in parallel (configurable) and optionally synthesizes
 - **Auth-aware** — checks each backend's credentials before dispatching; `agentpit login <backend>` triggers the right login flow
 - **Self-updating** — `agentpit update` pulls the latest release from GitHub
+- **CLI version cockpit** — the desktop app inventories and updates installed agent CLIs
 - **Discoverable** — running `agentpit` with no args opens an interactive menu
 
 ## Install
@@ -29,6 +30,10 @@ agentpit --version
 ```
 
 Targets published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`.
+
+The same release also publishes `agentpit-dashboard-<target>.gz`. Install the
+decompressed `agentpit-dashboard` binary next to `agentpit` (or anywhere on `PATH`) to
+enable `agentpit dashboard` and the Agent CLI version manager.
 
 > Releases ship plain gzipped binaries (not `.tar.gz`) because `self_update`'s tar entry-name matching is fragile across BSD/GNU tar — plain `.gz` lets the library stream decompress straight to the target path. `agentpit update` from v0.1.5 onward works against this format with no changes.
 
@@ -169,6 +174,19 @@ When `default.auto_route = true` (the default), `agentpit`:
 3. Else, if the prompt is huge (`> long_context_threshold` chars), sends it to `long_context_backend`
 4. Else, if the prompt contains a review keyword, sends it to `review_backend`
 5. Else, falls back to `default.backend`
+
+## Workspace
+
+The CLI, shared event schema, and Tauri desktop app share one Cargo workspace and root
+`Cargo.lock`:
+
+```bash
+cargo build -p agentpit --release
+cargo run -p agentpit-dashboard
+```
+
+The workspace's default members remain the CLI and shared crate, so a plain `cargo build`
+does not pull the desktop/Tauri dependency graph.
 
 ## License
 

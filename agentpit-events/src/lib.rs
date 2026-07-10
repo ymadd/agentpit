@@ -98,6 +98,9 @@ pub enum RunKind {
     Refactor,
     Ensemble,
     Workflow,
+    /// A `profile run` gold-bench sweep: one backend graded across the suite. Single-member,
+    /// sequential — it shows in the dashboard swarm like any other run rather than staying invisible.
+    Bench,
 }
 
 impl RunKind {
@@ -111,6 +114,7 @@ impl RunKind {
             RunKind::Refactor => "refactor",
             RunKind::Ensemble => "ensemble",
             RunKind::Workflow => "workflow",
+            RunKind::Bench => "bench",
         }
     }
 }
@@ -172,9 +176,60 @@ pub enum Event {
         run_id: String,
         status: LegStatus,
     },
+    /// The manager is asking the supervising human a question and is now blocked on it.
+    /// The durable request/response lives in `asks/<ask_id>.json`; this event is the
+    /// dashboard's notification that a new ask exists (and a best-effort audit line — the
+    /// `asks/` files, not this log entry, are the source of truth, since compaction may
+    /// drop old runs' lines).
+    Ask {
+        ts: u64,
+        run_id: String,
+        ask_id: String,
+        prompt: String,
+        /// "blocking" | "review" (the src side passes `AskKind::as_str()`).
+        kind: String,
+        #[serde(default)]
+        option_count: usize,
+        timeout_secs: u64,
+        /// Pid of the process blocked on the ask, so the dashboard can reap a card whose
+        /// asker has died.
+        #[serde(default)]
+        pid: u32,
+    },
+    /// An ask was resolved — either the human answered or it timed out.
+    AskAnswered {
+        ts: u64,
+        run_id: String,
+        ask_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        answer: Option<String>,
+        #[serde(default)]
+        timed_out: bool,
+    },
+    /// A durable note appended to the run transcript — the substrate for ① handoff and ③ the
+    /// shared board (design §4.5 "conversation layer M1"). Unlike [`Event::Ask`], a note has no
+    /// recipient field and no per-consumer cursor: the only long-lived consumer is the workflow
+    /// manager, which reads the transcript in order. Notes are append-only, ordered, fire-and-forget
+    /// (no claim/ack), and compaction-bounded exactly like every other event. The manager posts one
+    /// to record a worker→manager handoff or a shared-board entry before it re-seeds or discards
+    /// context. Best-effort and audit-only: the dashboard renders it for context but keeps no
+    /// run-view state for it, and compaction may drop old runs' notes just like any other line.
+    Note {
+        ts: u64,
+        run_id: String,
+        /// Who authored the note: the dispatching worker's backend for a handoff, or the
+        /// manager's own backend for a board entry. Omitted when the poster names no backend.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<BackendId>,
+        /// "handoff" (a 1→1 context pass to the next leg) or "board" (a shared scratch entry).
+        /// Free-form; any other value is treated as a generic note.
+        kind: String,
+        /// The note body — the handed-off context or board entry. Clamped by the caller.
+        body: String,
+    },
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -201,6 +256,25 @@ pub fn events_path() -> PathBuf {
 /// Directory holding per-run captured output, one subdir per run id.
 pub fn runs_dir() -> PathBuf {
     state_dir().join("runs")
+}
+
+/// Per-ask request/response mailbox, a sibling of `runs/`. Files here are deliberately kept
+/// OFF the run-output pruner and OFF the `events.jsonl` compactor so an in-flight ask record
+/// can never vanish mid-poll.
+pub fn asks_dir() -> PathBuf {
+    state_dir().join("asks")
+}
+
+/// Path to an ask's request sidecar (`asks/<ask_id>.json`). `None` unless `ask_id` is a safe
+/// single path component — mirrors [`backend_log_path`]'s validate-before-join discipline.
+pub fn ask_request_path(ask_id: &str) -> Option<PathBuf> {
+    is_safe_log_component(ask_id).then(|| asks_dir().join(format!("{ask_id}.json")))
+}
+
+/// Path to an ask's response sidecar (`asks/<ask_id>.response.json`). `None` unless `ask_id`
+/// is a safe single path component.
+pub fn ask_response_path(ask_id: &str) -> Option<PathBuf> {
+    is_safe_log_component(ask_id).then(|| asks_dir().join(format!("{ask_id}.response.json")))
 }
 
 /// Log file capturing a single backend leg's streamed output within a run. The
@@ -389,6 +463,15 @@ fn next_run_id() -> String {
     format!("{}-{}-{}", process::id(), process_nonce(), n)
 }
 
+/// Generate a globally-unique ask id: `ask-<pid>-<process-nonce>-<counter>`. The `ask-`
+/// prefix keeps it from ever colliding with a run id and guarantees it passes
+/// [`is_safe_log_component`]. Reuses the same pid+nonce uniqueness scheme as [`next_run_id`].
+pub fn next_ask_token() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ask-{}-{}-{}", process::id(), process_nonce(), n)
+}
+
 /// Best-effort emitter scoped to a single run. Cheap to clone (shares the run id).
 #[derive(Debug, Clone)]
 pub struct RunLogger {
@@ -422,6 +505,16 @@ impl RunLogger {
 
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// Attach to an existing run id WITHOUT emitting `RunStarted`. Used by `agentpit ask` and
+    /// the MCP `ask_human` tool, which join the manager's run to emit ask events rather than
+    /// starting a fresh run.
+    pub fn adopt(run_id: String) -> Self {
+        RunLogger {
+            run_id,
+            enabled: events_enabled(),
+        }
     }
 
     pub fn member_started(&self, backend: BackendId, aggregator: bool) {
@@ -459,6 +552,52 @@ impl RunLogger {
             ts: now_ms(),
             run_id: self.run_id.clone(),
             status,
+        });
+    }
+
+    /// Emit an `Ask` — the manager is now blocked waiting on the human.
+    pub fn ask(
+        &self,
+        ask_id: &str,
+        prompt: &str,
+        kind: &str,
+        option_count: usize,
+        timeout_secs: u64,
+        pid: u32,
+    ) {
+        self.emit(Event::Ask {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            ask_id: ask_id.to_string(),
+            prompt: prompt.to_string(),
+            kind: kind.to_string(),
+            option_count,
+            timeout_secs,
+            pid,
+        });
+    }
+
+    /// Emit an `AskAnswered` — the human answered (`Some`) or the ask timed out (`timed_out`).
+    pub fn ask_answered(&self, ask_id: &str, answer: Option<&str>, timed_out: bool) {
+        self.emit(Event::AskAnswered {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            ask_id: ask_id.to_string(),
+            answer: answer.map(|s| s.to_string()),
+            timed_out,
+        });
+    }
+
+    /// Emit a `Note` — a durable transcript entry for ① handoff or ③ the shared board. `from`
+    /// is the authoring backend (the handed-off worker, or the manager); `kind` is "handoff" or
+    /// "board". Fire-and-forget: it reuses the same best-effort append path as every other event.
+    pub fn note(&self, from: Option<BackendId>, kind: &str, body: &str) {
+        self.emit(Event::Note {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            from,
+            kind: kind.to_string(),
+            body: body.to_string(),
         });
     }
 
@@ -565,6 +704,27 @@ mod tests {
     }
 
     #[test]
+    fn bench_run_kind_serializes_as_bench_and_round_trips() {
+        // The dashboard deserializes RunStarted via this crate, so the `bench` wire tag is a
+        // contract: a gold-bench sweep must label its swarm row "bench", not silently fail to parse.
+        assert_eq!(RunKind::Bench.as_str(), "bench");
+        let ev = Event::RunStarted {
+            ts: 1,
+            run_id: "1-0".into(),
+            pid: 7,
+            kind: RunKind::Bench,
+            members: vec![BackendId::Codex],
+            cwd: "/x".into(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"kind\":\"bench\""), "got: {json}");
+        match serde_json::from_str::<Event>(&json).unwrap() {
+            Event::RunStarted { kind, .. } => assert_eq!(kind, RunKind::Bench),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn writes_to_temp_state_dir() {
         let _env = lock_env();
         let tmp = tempfile::tempdir().unwrap();
@@ -617,5 +777,151 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
         }
+    }
+
+    #[test]
+    fn ask_events_round_trip_through_json() {
+        let ask = Event::Ask {
+            ts: 1,
+            run_id: "r1".into(),
+            ask_id: "ask-1-2-3".into(),
+            prompt: "Proceed?".into(),
+            kind: "blocking".into(),
+            option_count: 2,
+            timeout_secs: 180,
+            pid: 4321,
+        };
+        let json = serde_json::to_string(&ask).unwrap();
+        assert!(json.contains("\"event\":\"ask\""), "got: {json}");
+        assert!(json.contains("\"kind\":\"blocking\""));
+        assert!(matches!(
+            serde_json::from_str::<Event>(&json).unwrap(),
+            Event::Ask {
+                option_count: 2,
+                pid: 4321,
+                ..
+            }
+        ));
+
+        let answered = Event::AskAnswered {
+            ts: 2,
+            run_id: "r1".into(),
+            ask_id: "ask-1-2-3".into(),
+            answer: Some("yes".into()),
+            timed_out: false,
+        };
+        let json = serde_json::to_string(&answered).unwrap();
+        assert!(json.contains("\"event\":\"ask_answered\""), "got: {json}");
+        assert!(json.contains("\"answer\":\"yes\""));
+
+        // A timed-out answer omits the `answer` field entirely.
+        let timed_out = Event::AskAnswered {
+            ts: 3,
+            run_id: "r1".into(),
+            ask_id: "ask-1-2-3".into(),
+            answer: None,
+            timed_out: true,
+        };
+        let json = serde_json::to_string(&timed_out).unwrap();
+        assert!(
+            !json.contains("\"answer\":"),
+            "timed-out answer must omit the answer field: {json}"
+        );
+        assert!(json.contains("\"timed_out\":true"));
+    }
+
+    #[test]
+    fn note_event_round_trips_and_omits_absent_author() {
+        let handoff = Event::Note {
+            ts: 7,
+            run_id: "r1".into(),
+            from: Some(BackendId::Codex),
+            kind: "handoff".into(),
+            body: "auth module done; wire the CLI next".into(),
+        };
+        let json = serde_json::to_string(&handoff).unwrap();
+        assert!(json.contains("\"event\":\"note\""), "got: {json}");
+        assert!(json.contains("\"from\":\"codex\""));
+        assert!(json.contains("\"kind\":\"handoff\""));
+        assert!(matches!(
+            serde_json::from_str::<Event>(&json).unwrap(),
+            Event::Note {
+                from: Some(BackendId::Codex),
+                ..
+            }
+        ));
+
+        // A note with no named author omits the `from` field entirely.
+        let board = Event::Note {
+            ts: 8,
+            run_id: "r1".into(),
+            from: None,
+            kind: "board".into(),
+            body: "shared constraint: keep files < 800 lines".into(),
+        };
+        let json = serde_json::to_string(&board).unwrap();
+        assert!(
+            !json.contains("\"from\":"),
+            "absent author must be omitted: {json}"
+        );
+        // A legacy/absent `from` deserializes back to None via #[serde(default)].
+        assert!(matches!(
+            serde_json::from_str::<Event>(&json).unwrap(),
+            Event::Note { from: None, .. }
+        ));
+    }
+
+    #[test]
+    fn logger_note_appends_to_event_log() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+        let logger = RunLogger::adopt("run-note".to_string());
+        logger.note(
+            Some(BackendId::Claude),
+            "handoff",
+            "context for the next leg",
+        );
+        let contents = std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap();
+        assert!(contents.contains("\"event\":\"note\""), "got: {contents}");
+        assert!(contents.contains("\"run_id\":\"run-note\""));
+        assert!(contents.contains("context for the next leg"));
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    #[test]
+    fn ask_paths_reject_traversal_and_live_under_asks_dir() {
+        assert!(ask_request_path("..").is_none());
+        assert!(ask_request_path("a/b").is_none());
+        assert!(ask_response_path("/abs").is_none());
+        let req = ask_request_path("ask-1-2-3").unwrap();
+        assert!(
+            req.ends_with("asks/ask-1-2-3.json"),
+            "got: {}",
+            req.display()
+        );
+        let resp = ask_response_path("ask-1-2-3").unwrap();
+        assert!(
+            resp.ends_with("asks/ask-1-2-3.response.json"),
+            "got: {}",
+            resp.display()
+        );
+    }
+
+    #[test]
+    fn ask_tokens_are_unique_safe_and_prefixed() {
+        let a = next_ask_token();
+        let b = next_ask_token();
+        assert_ne!(a, b);
+        assert!(a.starts_with("ask-"));
+        assert!(
+            is_safe_log_component(&a),
+            "ask token must be a safe component: {a}"
+        );
     }
 }

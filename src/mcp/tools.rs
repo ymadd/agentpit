@@ -20,6 +20,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -36,6 +37,7 @@ use crate::cli::ensemble::{
     dispatch_to_outcome, render_concatenated,
 };
 use crate::dispatch::{Registries, dispatch, resolve_transport};
+use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::types::BackendId;
 
 /// Parameters for the `dispatch_task` tool.
@@ -76,6 +78,52 @@ pub struct RunWorkflowRequest {
     /// Route the manager through the MCP channel instead of shell-out (claude only).
     #[serde(default)]
     pub use_mcp: Option<bool>,
+}
+
+/// Parameters for the `ask_human` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AskHumanRequest {
+    /// The question to put to the human. Pre-frame it as a closed decision.
+    pub prompt: String,
+    /// Optional explicit options the human picks from (e.g. ["A", "B"]).
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// "blocking" (a worker is stalled until answered) or "review" (nothing blocked).
+    /// Anything else defaults to "review".
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Seconds to wait before returning HUMAN_UNAVAILABLE. Omit or 0 for the default (180s),
+    /// capped at 600s.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Parameters for the `post_note` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PostNoteRequest {
+    /// The note body — the context being handed off, or the board entry.
+    pub body: String,
+    /// "handoff" (1→1 context pass, default) or "board" (shared scratch entry).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The backend that authored this note (e.g. the handed-off worker). Omit for a manager post.
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+/// Parameters for the `refute` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RefuteRequest {
+    /// The stuck candidate to put under adversarial scrutiny.
+    pub candidate: String,
+    /// The sub-task the candidate was meant to achieve (the critic/defender's target).
+    pub task: String,
+    /// Backend that produces the critique. Defaults to the adversarial-review primary.
+    #[serde(default)]
+    pub critic: Option<String>,
+    /// Backend that produces the defense. Defaults to a backend distinct from the critic.
+    #[serde(default)]
+    pub defender: Option<String>,
 }
 
 /// The agentpit MCP tool handler. Holds a shared [`Registries`] and the working directory the
@@ -158,14 +206,23 @@ impl AgentpitTools {
             }
         };
         let cancel = CancellationToken::new();
-        let outcome = dispatch_member(
+        // Surface single MCP dispatches in the dashboard swarm, like `agentpit rescue` — this is
+        // also how a `--use-mcp` workflow manager's per-worker dispatches become visible.
+        let logger = RunLogger::start(RunKind::Rescue, &[backend], &self.cwd);
+        let outcome = dispatch_member_logged(
             backend,
             req.task,
             self.cwd.clone(),
             cancel,
             self.regs.clone(),
+            logger.clone(),
         )
         .await;
+        logger.finished(if outcome.output.is_some() {
+            LegStatus::Ok
+        } else {
+            LegStatus::Error
+        });
         Ok(outcome_to_result(&outcome))
     }
 
@@ -214,17 +271,23 @@ impl AgentpitTools {
         // this request future is dropped (client disconnect / shutdown) the in-flight backend
         // dispatches are torn down (their child processes are `kill_on_drop`) instead of leaking.
         let cancel = CancellationToken::new();
+        // Surface the fan-out in the dashboard swarm as an `ensemble` run, like the CLI ensemble —
+        // each member streams to the run's capture file. Started before the loop moves `members`.
+        let logger = RunLogger::start(RunKind::Ensemble, &members, &self.cwd);
         let mut set = tokio::task::JoinSet::new();
         for b in members {
             let prompt = req.prompt.clone();
             let cwd = self.cwd.clone();
             let regs = self.regs.clone();
             let cancel = cancel.clone();
-            set.spawn(async move { dispatch_member(b, prompt, cwd, cancel, regs).await });
+            let logger = logger.clone();
+            set.spawn(
+                async move { dispatch_member_logged(b, prompt, cwd, cancel, regs, logger).await },
+            );
         }
         let mut outcomes: Vec<MemberOutcome> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
-            // `dispatch_member` is panic-free and maps every failure to a MemberOutcome, so a
+            // `dispatch_member_logged` is panic-free and maps every failure to a MemberOutcome, so a
             // JoinError only arises from a panic/abort; surface the survivors rather than failing.
             if let Ok(o) = joined {
                 outcomes.push(o);
@@ -246,21 +309,58 @@ impl AgentpitTools {
             } else {
                 let agg_prompt = build_aggregator_prompt(&req.prompt, &outcomes);
                 let cancel = CancellationToken::new();
-                match dispatch(agg, &agg_prompt, &self.cwd, cancel, noop_sink(), &self.regs).await {
-                    Ok(res) if res.auth_failed => combined.push_str(&format!(
-                        "\n\n=== aggregator failed ===\n{agg}: auth failure during execution"
-                    )),
-                    Ok(res) => combined.push_str(&format!(
-                        "\n\n=== aggregator [{agg}] (transport={}) ===\n{}",
-                        res.transport.as_str(),
-                        res.output.trim()
-                    )),
+                logger.member_started(agg, true);
+                let started = Instant::now();
+                let on_chunk = crate::events::output_streamer(logger.run_id(), agg, true);
+                match dispatch(agg, &agg_prompt, &self.cwd, cancel, on_chunk, &self.regs).await {
+                    Ok(res) if res.auth_failed => {
+                        logger.member_finished(
+                            agg,
+                            true,
+                            LegStatus::Error,
+                            started.elapsed().as_millis() as u64,
+                            None,
+                            Some("auth failure during execution".into()),
+                        );
+                        combined.push_str(&format!(
+                            "\n\n=== aggregator failed ===\n{agg}: auth failure during execution"
+                        ));
+                    }
+                    Ok(res) => {
+                        logger.member_finished(
+                            agg,
+                            true,
+                            LegStatus::Ok,
+                            started.elapsed().as_millis() as u64,
+                            Some(res.output.len()),
+                            None,
+                        );
+                        combined.push_str(&format!(
+                            "\n\n=== aggregator [{agg}] (transport={}) ===\n{}",
+                            res.transport.as_str(),
+                            res.output.trim()
+                        ));
+                    }
                     Err(err) => {
+                        logger.member_finished(
+                            agg,
+                            true,
+                            LegStatus::Error,
+                            started.elapsed().as_millis() as u64,
+                            None,
+                            Some(format!("{err:#}")),
+                        );
                         combined.push_str(&format!("\n\n=== aggregator failed ===\n{agg}: {err:#}"))
                     }
                 }
             }
         }
+
+        logger.finished(if any_success {
+            LegStatus::Ok
+        } else {
+            LegStatus::Error
+        });
 
         let clamped = clamp_for_prompt(&combined, MAX_MEMBER_PROMPT_BYTES);
         let content = vec![Content::text(clamped)];
@@ -329,6 +429,147 @@ impl AgentpitTools {
             Err(e) => Ok(tool_error(format!("{e:#}"))),
         }
     }
+
+    /// Ask the supervising human a question and block for an answer. The `cancel` token is
+    /// injected by rmcp from the request context, so a client `CancelledNotification` (or the
+    /// serve loop tearing down) aborts the poll promptly instead of waiting out the timeout.
+    #[tool(
+        name = "ask_human",
+        description = "Ask the supervising HUMAN a question and block for an answer. ONLY the workflow manager may call this — workers cannot. Returns the human's answer, or the sentinel HUMAN_UNAVAILABLE if no one answers before the timeout (then proceed with the safe, conservative, reversible choice and note it). Use SPARINGLY: only at a genuine decision fork or before a destructive / irreversible action."
+    )]
+    async fn ask_human(
+        &self,
+        Parameters(req): Parameters<AskHumanRequest>,
+        cancel: CancellationToken,
+    ) -> Result<CallToolResult, McpError> {
+        let areq = crate::ask::AskRequest {
+            prompt: req.prompt,
+            options: req.options,
+            kind: crate::ask::AskKind::parse_or_default(req.kind.as_deref()),
+            timeout_secs: req.timeout_secs.unwrap_or(0),
+        };
+        match crate::ask::ask(areq, cancel).await {
+            crate::ask::AskOutcome::Answered(a) => {
+                Ok(CallToolResult::success(vec![Content::text(
+                    clamp_for_prompt(&a, MAX_MEMBER_PROMPT_BYTES),
+                )]))
+            }
+            // SUCCESS text, never `tool_error` — a timeout must not look like a failure, or the
+            // manager may abort instead of proceeding with the safe choice on HUMAN_UNAVAILABLE.
+            crate::ask::AskOutcome::Unavailable => {
+                Ok(CallToolResult::success(vec![Content::text(
+                    crate::ask::HUMAN_UNAVAILABLE.to_string(),
+                )]))
+            }
+        }
+    }
+
+    /// Append a durable conversation-layer note (① handoff / ③ shared board) to the run transcript.
+    /// Structurally manager-only: workers have no MCP channel, so — like `ask_human` — no token
+    /// gate is needed. The note is fire-and-forget onto the run's `events.jsonl`; it returns once
+    /// recorded and is never waited on.
+    #[tool(
+        name = "post_note",
+        description = "Record a durable note onto the workflow transcript: a 1→1 handoff (kind=\"handoff\", the default — pass the context the next worker needs, optionally with from=<worker that produced it>) or a shared-board entry (kind=\"board\"). Use a handoff when one worker's result must seed the next sub-task; use the board for a fact several sub-tasks will reuse. Fire-and-forget — it does not block."
+    )]
+    async fn post_note(
+        &self,
+        Parameters(req): Parameters<PostNoteRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let from = match &req.from {
+            Some(f) => match f.parse::<BackendId>() {
+                Ok(b) => Some(b),
+                Err(e) => return Ok(tool_error(format!("unknown backend '{f}': {e}"))),
+            },
+            None => None,
+        };
+        // The note must attach to the manager's run. The workflow sets AGENTPIT_PARENT_RUN_ID on
+        // the manager leg the MCP server runs under; without it there is no transcript to write to.
+        let run_id = std::env::var(crate::workflow::guard::ENV_PARENT_RUN_ID)
+            .ok()
+            .filter(|s| !s.is_empty());
+        let Some(run_id) = run_id else {
+            return Ok(tool_error(
+                "post_note requires a workflow run context (AGENTPIT_PARENT_RUN_ID is unset)"
+                    .into(),
+            ));
+        };
+        let kind = crate::workflow::converse::normalize_kind(req.kind.as_deref());
+        crate::events::RunLogger::adopt(run_id).note(from, &kind, &req.body);
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "recorded {kind} note ({} bytes)",
+            req.body.len()
+        ))]))
+    }
+
+    /// Run one ④ refutation pass over a stuck candidate: an adversarial critic, then a defender
+    /// carrying that critique, returned together for the manager to adjudicate. Advisory — a failed
+    /// leg is reported in the text, not as a tool error, so it never aborts the manager.
+    #[tool(
+        name = "refute",
+        description = "Stress-test a STUCK sub-task before discarding it: dispatch an adversarial critic at the candidate, then a defender that rebuts/fixes it, and return both for YOU (the manager) to adjudicate — ADOPT the revised candidate, KEEP the original, or DISCARD and re-plan. One depth-guarded pass, not a loop. Run this ONCE on a candidate you are about to throw away."
+    )]
+    async fn refute(
+        &self,
+        Parameters(req): Parameters<RefuteRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let critic = match parse_opt_backend(req.critic.as_deref(), "critic") {
+            Ok(b) => b,
+            Err(msg) => return Ok(tool_error(msg)),
+        };
+        let defender = match parse_opt_backend(req.defender.as_deref(), "defender") {
+            Ok(b) => b,
+            Err(msg) => return Ok(tool_error(msg)),
+        };
+        // Availability comes from the server's live registry; the preferred pairing honors the
+        // user's adversarial-review config (falling back to none if config cannot be read).
+        let available = self.regs.available();
+        let preferred = crate::cli::load_context()
+            .map(|c| c.loaded.config.ensemble.adversarial_review_members.clone())
+            .unwrap_or_default();
+        let (critic, defender) =
+            match crate::workflow::converse::resolve_pair(critic, defender, &available, &preferred)
+            {
+                Ok(pair) => pair,
+                Err(e) => return Ok(tool_error(format!("{e:#}"))),
+            };
+
+        // Surface the refutation in the dashboard swarm as its own adversarial-review run, just like
+        // a manager's shell-out to `agentpit rescue` appears as a distinct run rather than vanishing.
+        let members = if critic == defender {
+            vec![critic]
+        } else {
+            vec![critic, defender]
+        };
+        let logger = crate::events::RunLogger::start(
+            crate::events::RunKind::AdversarialReview,
+            &members,
+            &self.cwd,
+        );
+
+        let bundle = crate::workflow::converse::run_refute(
+            &req.task,
+            &req.candidate,
+            critic,
+            defender,
+            &self.cwd,
+            &self.regs,
+            CancellationToken::new(),
+            Some(&logger),
+        )
+        .await;
+        logger.finished(if bundle.critique.is_ok() {
+            crate::events::LegStatus::Ok
+        } else {
+            crate::events::LegStatus::Error
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            clamp_for_prompt(
+                &crate::workflow::converse::render_refute(&bundle),
+                MAX_MEMBER_PROMPT_BYTES,
+            ),
+        )]))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -337,9 +578,13 @@ impl ServerHandler for AgentpitTools {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "agentpit multi-agent hub. Call list_backends to discover backends, dispatch_task to \
              run one backend on a sub-task, run_ensemble to fan a prompt to several backends in \
-             parallel (with an optional aggregator), and run_workflow to launch a whole \
+             parallel (with an optional aggregator), run_workflow to launch a whole \
              model-driven workflow (a manager decomposes the goal, dispatches sub-tasks to \
-             workers, and returns a final synthesis).",
+             workers, and returns a final synthesis), ask_human to surface a decision to the \
+             supervising human and block for an answer (use sparingly — only at a genuine fork \
+             or before a destructive action; HUMAN_UNAVAILABLE means proceed with the safe choice), \
+             post_note to record a handoff or shared-board entry on the transcript, and refute to \
+             stress-test a stuck sub-task (critic → defender) once before discarding it.",
         )
     }
 }
@@ -356,17 +601,55 @@ fn tool_error(msg: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(msg)])
 }
 
-/// Run one backend dispatch and capture it as a [`MemberOutcome`], with no streaming (the MCP path
-/// has no TTY). A thin adapter over the shared [`dispatch_to_outcome`] core in `cli::ensemble`, so
-/// the not-registered / auth-failure / error mapping is defined once.
-async fn dispatch_member(
+/// Parse an optional backend id, returning a `role`-labelled error message on a typo. `None` maps
+/// to `Ok(None)` so an omitted backend defaults downstream rather than erroring.
+fn parse_opt_backend(value: Option<&str>, role: &str) -> Result<Option<BackendId>, String> {
+    match value {
+        Some(v) => v
+            .parse::<BackendId>()
+            .map(Some)
+            .map_err(|e| format!("unknown {role} backend '{v}': {e}")),
+        None => Ok(None),
+    }
+}
+
+/// Run one backend dispatch and capture it as a [`MemberOutcome`], bracketing it with
+/// `member_started`/`member_finished` and streaming its chunks to the run's capture file — so an MCP
+/// `dispatch_task` / `run_ensemble` shows in the dashboard swarm exactly like the CLI ensemble,
+/// including the worker dispatches a `--use-mcp` workflow manager makes, which would otherwise run
+/// invisibly. A thin adapter over the shared [`dispatch_to_outcome`] core in `cli::ensemble` (so the
+/// not-registered / auth-failure / error mapping stays defined once), mirroring
+/// `cli::ensemble::run_one_member` minus the TTY reporting the MCP server has no terminal for. A
+/// `not registered` outcome is recorded as `Skipped` (the backend was never dispatched), not an
+/// execution error.
+async fn dispatch_member_logged(
     backend: BackendId,
     prompt: String,
     cwd: PathBuf,
     cancel: CancellationToken,
     regs: Arc<Registries>,
+    logger: RunLogger,
 ) -> MemberOutcome {
-    dispatch_to_outcome(backend, &prompt, &cwd, cancel, noop_sink(), &regs).await
+    logger.member_started(backend, false);
+    let started = Instant::now();
+    let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
+    let outcome = dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &outcome.error {
+        None => {
+            let chars = outcome.output.as_ref().map(String::len).unwrap_or(0);
+            logger.member_finished(backend, false, LegStatus::Ok, elapsed_ms, Some(chars), None);
+        }
+        Some(err) => {
+            let status = if err == "not registered" {
+                LegStatus::Skipped
+            } else {
+                LegStatus::Error
+            };
+            logger.member_finished(backend, false, status, elapsed_ms, None, Some(err.clone()));
+        }
+    }
+    outcome
 }
 
 /// Convert a single member outcome into a tool result: a success carrying the clamped output,
@@ -410,6 +693,41 @@ mod tests {
         AgentpitTools::new(Arc::new(regs), std::env::temp_dir())
     }
 
+    /// RAII guard that isolates a test's event writes into a throwaway `XDG_STATE_HOME`, so a test
+    /// that dispatches a real backend (now routed through a `RunLogger`) can't append phantom runs to
+    /// the developer's real events.jsonl. Mirrors the inline `ask_human` / `post_note` pattern:
+    /// serialize on [`STATE_ENV_LOCK`](crate::ask::STATE_ENV_LOCK), point the state dir at a temp dir,
+    /// and clear it again on drop — all while the lock is still held. Bind it for the whole test
+    /// (`let _g = isolated_state_dir();`); do NOT call it from inside `tools()`, which some tests
+    /// invoke while already holding the lock (re-locking the non-reentrant mutex would deadlock).
+    struct StateDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+    }
+    impl Drop for StateDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: the `_lock` field is still alive (drops after this), so we remove the var while
+            // single-threaded under STATE_ENV_LOCK, exactly as the inline tests do at their end.
+            unsafe {
+                std::env::remove_var("XDG_STATE_HOME");
+            }
+        }
+    }
+    fn isolated_state_dir() -> StateDirGuard {
+        let lock = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK for the guard's lifetime.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+        StateDirGuard {
+            _lock: lock,
+            _tmp: tmp,
+        }
+    }
+
     #[tokio::test]
     async fn list_backends_reports_available_set() {
         let res = tools().list_backends().await.unwrap();
@@ -425,7 +743,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn dispatch_task_runs_registered_backend() {
+        // The dispatch now emits run events; isolate them into a throwaway state dir.
+        let _g = isolated_state_dir();
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 backend: "gemini".into(),
@@ -469,9 +790,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn run_ensemble_dedupes_repeated_members() {
         // A client repeating the same backend must not spawn it N times; dedup collapses it to
-        // a single member section.
+        // a single member section. The dispatch emits run events; isolate them into a temp state dir.
+        let _g = isolated_state_dir();
         let res = tools()
             .run_ensemble(Parameters(RunEnsembleRequest {
                 members: vec!["gemini".into(), "gemini".into(), "gemini".into()],
@@ -536,5 +859,143 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("unknown agent backend"), "got: {text}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ask_human_times_out_to_sentinel_as_success() {
+        // Serialize against other state-dir tests; isolate writes to a temp XDG_STATE_HOME.
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+        let res = tools()
+            .ask_human(
+                Parameters(AskHumanRequest {
+                    prompt: "Proceed?".into(),
+                    options: vec![],
+                    kind: Some("review".into()),
+                    timeout_secs: Some(1),
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        // A timeout must surface as SUCCESS carrying the sentinel, never an error — else the
+        // manager may abort instead of proceeding with the safe choice.
+        assert_eq!(res.is_error, Some(false));
+        let text = res
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text, "HUMAN_UNAVAILABLE");
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    fn text_of(res: &CallToolResult) -> String {
+        res.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn post_note_unknown_from_is_structured_error_not_panic() {
+        let res = tools()
+            .post_note(Parameters(PostNoteRequest {
+                body: "ctx".into(),
+                kind: None,
+                from: Some("imaginary".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            text_of(&res).contains("unknown backend"),
+            "got: {}",
+            text_of(&res)
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn post_note_without_run_context_is_error() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::remove_var(crate::workflow::guard::ENV_PARENT_RUN_ID);
+        }
+        let res = tools()
+            .post_note(Parameters(PostNoteRequest {
+                body: "ctx".into(),
+                kind: None,
+                from: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(text_of(&res).contains("requires a workflow run context"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn post_note_records_with_run_context() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+            std::env::set_var(crate::workflow::guard::ENV_PARENT_RUN_ID, "run-mcp-note");
+        }
+        let res = tools()
+            .post_note(Parameters(PostNoteRequest {
+                body: "pass this on".into(),
+                kind: Some("board".into()),
+                from: Some("gemini".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(false), "got: {}", text_of(&res));
+        assert!(
+            text_of(&res).contains("recorded board note"),
+            "got: {}",
+            text_of(&res)
+        );
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var(crate::workflow::guard::ENV_PARENT_RUN_ID);
+        }
+    }
+
+    #[tokio::test]
+    async fn refute_unknown_critic_is_structured_error_not_panic() {
+        let res = tools()
+            .refute(Parameters(RefuteRequest {
+                candidate: "x".into(),
+                task: "y".into(),
+                critic: Some("imaginary".into()),
+                defender: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            text_of(&res).contains("unknown critic backend"),
+            "got: {}",
+            text_of(&res)
+        );
     }
 }

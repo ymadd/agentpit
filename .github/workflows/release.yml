@@ -78,9 +78,21 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.0
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install Tauri system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -91,12 +103,16 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} --locked
+      - name: Build release binaries
+        run: |
+          cargo build -p agentpit --release --target ${{ matrix.target }} --locked
+          cargo build -p agentpit-dashboard --release --target ${{ matrix.target }} --locked
 
       - name: Strip binary
         if: runner.os != 'Windows'
-        run: strip target/${{ matrix.target }}/release/agentpit || true
+        run: |
+          strip target/${{ matrix.target }}/release/agentpit || true
+          strip target/${{ matrix.target }}/release/agentpit-dashboard || true
 
       - name: Package binary (gzip only)
         # NOTE: We ship .gz (not .tar.gz). self_update detects .gz as
@@ -107,8 +123,10 @@ jobs:
           set -euo pipefail
           cd target/${{ matrix.target }}/release
           gzip -c agentpit > "../../../agentpit-${{ matrix.target }}.gz"
+          gzip -c agentpit-dashboard > "../../../agentpit-dashboard-${{ matrix.target }}.gz"
           cd -
           shasum -a 256 "agentpit-${{ matrix.target }}.gz" > "agentpit-${{ matrix.target }}.gz.sha256"
+          shasum -a 256 "agentpit-dashboard-${{ matrix.target }}.gz" > "agentpit-dashboard-${{ matrix.target }}.gz.sha256"
 
       - name: Upload to draft release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
@@ -118,6 +136,8 @@ jobs:
           files: |
             agentpit-${{ matrix.target }}.gz
             agentpit-${{ matrix.target }}.gz.sha256
+            agentpit-dashboard-${{ matrix.target }}.gz
+            agentpit-dashboard-${{ matrix.target }}.gz.sha256
           fail_on_unmatched_files: true
 
   publish:

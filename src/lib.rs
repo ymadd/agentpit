@@ -1,11 +1,14 @@
 pub mod acp;
+pub mod ask;
 pub mod auth;
 pub mod cli;
 pub mod config;
+pub mod diagnose;
 pub mod dispatch;
 pub mod events;
 pub mod exec;
 pub mod mcp;
+pub mod profile;
 pub mod router;
 pub mod types;
 pub mod update;

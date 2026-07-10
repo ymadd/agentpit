@@ -22,3 +22,36 @@ agentpit workflow "<goal>" [--manager claude|codex] [--agents a,b,c] [--max-dept
 The manager decomposes the goal, dispatches sub-tasks to worker backends, and ends with a
 labelled SYNTHESIS section. The CLI streams the manager's output to stdout.
 Relay verbatim.
+
+## Roles (optional casting)
+
+`[workflow.roles.*]` fixes which backend plays which persona (config, not LLM whim), while the
+manager keeps improvising the decomposition. When at least one worker role is configured, the
+`workflow` manager's roster becomes `AVAILABLE ROLES` and it dispatches by role name (`--agents`
+is then ignored with a warning); the same roles are also dispatchable directly via `rescue
+--role`. With zero roles configured the legacy flat `--agents` roster applies and the manager
+prompt is byte-identical to before roles existed.
+
+```toml
+[workflow.roles.manager]
+backends = ["claude"]              # first SUPPORTED manager (claude|codex) in the list wins
+prompt   = "Prefer small, verifiable steps."
+
+[workflow.roles.implementer]
+backends = ["claude", "codex"]     # preference order; first AVAILABLE backend wins
+prompt   = "You are the implementer. Write the smallest correct change with tests."
+
+[workflow.roles.reviewer]
+backends = ["codex", "antigravity"]
+prompt   = "You are a strict reviewer. Critique only; do not rewrite."
+```
+
+Dispatch grammar for a configured worker role: `agentpit rescue --role <name> "<sub-task>"`
+(`--role` and `--backend` are mutually exclusive), or over MCP
+`mcp__agentpit__dispatch_task {"role":"<name>","task":"<sub-task>"}` (`role`/`backend` exclusive
+there too). With at least one worker role configured, the workflow manager's roster becomes
+AVAILABLE ROLES and it dispatches by role name; `--agents` is ignored with a warning. The
+reserved `manager` role is never a dispatch target (`--role manager` is a hard error); manager
+resolution is `--manager` > `[workflow.roles.manager]` (first claude|codex) >
+`[workflow].manager_backend` > `[default].backend`, and its `prompt` is injected into the
+orchestrator prompt as a MANAGER PERSONA block.

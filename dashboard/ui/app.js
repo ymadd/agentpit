@@ -17,6 +17,7 @@ let snapshot = { live: [], recent: [] };
 let available = true; // presence toggle (cosmetic — the manager handles real absence via timeout)
 let showSwarm = false;
 let showCliManager = false;
+let showSettings = false;
 let projectFilter = null;
 let cursor = 0; // which pending ask is on stage
 let connected = false;
@@ -26,6 +27,14 @@ let cliLoading = false;
 let cliUpdating = null;
 let cliManagerError = null;
 let cliLatest = {}; // id -> latest version string from the public registry (async, best-effort)
+
+// settings (workflow tuning + role roster) — see settings_get/settings_save contract below.
+let settingsLoading = false;
+let settingsSaving = false;
+let settingsError = null; // load error (settings_get rejected)
+let settingsData = null; // last-fetched raw payload: { config_path, exists, workflow, roles, known_backends }
+let settingsDraft = null; // editable working copy built from settingsData — see draftFromSettings()
+let roleKeySeq = 0; // stable client-side key for role cards (name may be edited before save)
 
 const answered = new Set(); // optimistically-answered ids, hidden until the backend agrees
 const notified = new Set(); // blocking asks we've already notified for
@@ -115,6 +124,7 @@ function renderAll() {
   updateFooter();
   updateSwarm();
   updateCliManager();
+  updateSettings();
 }
 
 // Coalesce renderAll() calls from fetch/push sources into at most one per
@@ -633,6 +643,469 @@ function cliRow(cli) {
   return row;
 }
 
+// ── settings (workflow tuning + role roster) ────────────────────────────────
+// Contract (implemented on the Tauri side in parallel — coded against exactly):
+//   invoke('settings_get') -> { config_path, exists,
+//     workflow: { manager_backend, default_agents, max_depth, max_calls_per_manager,
+//                 use_mcp, enable_ask_human },
+//     roles: [{ name, backends, prompt }], known_backends: [...] }
+//   invoke('settings_save', { payload: { workflow: {...}, roles: [...] } }) -> resolves/rejects(string)
+//
+// Unlike the swarm/CLI panels (read-only displays rebuilt from a signature), this panel holds
+// live text inputs — it must NEVER be rebuilt by the generic poll-driven renderAll() cycle, or a
+// keystroke mid-edit would be wiped out. So updateSettings() (called every renderAll tick) only
+// toggles visibility; all content builds happen explicitly from user actions and fetch/save
+// completions via renderSettingsBody().
+
+const ROLE_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
+
+function draftFromSettings(data) {
+  const wf = data.workflow || {};
+  return {
+    known_backends: data.known_backends || [],
+    workflow: {
+      manager_backend: wf.manager_backend || "",
+      default_agents: wf.default_agents || [],
+      max_depth: wf.max_depth,
+      max_calls_per_manager: wf.max_calls_per_manager,
+      use_mcp: !!wf.use_mcp,
+      enable_ask_human: !!wf.enable_ask_human,
+    },
+    roles: (data.roles || []).map((r) => ({
+      _key: roleKeySeq++,
+      name: r.name,
+      backends: [...(r.backends || [])],
+      prompt: r.prompt || "",
+      isNew: false,
+    })),
+  };
+}
+
+// Mirrors the backend validation rules: ^[a-z0-9][a-z0-9_-]*$, no duplicate names.
+function roleNameError(name, allRoles, selfKey) {
+  if (!name) return "名前を入力してください";
+  if (!ROLE_NAME_RE.test(name)) return "使える文字は小文字英数字・-・_ のみ（先頭は英数字）";
+  if (allRoles.some((r) => r._key !== selfKey && r.name === name)) return "この名前は既に使われています";
+  return null;
+}
+
+function validateSettings(draft) {
+  const errors = {};
+  let ok = true;
+  for (const r of draft.roles) {
+    const msg = roleNameError(r.name, draft.roles, r._key);
+    if (msg) {
+      errors[r._key] = msg;
+      ok = false;
+    }
+  }
+  return { ok, errors };
+}
+
+function updateRoleNameError(role) {
+  const errEl = document.getElementById(`role-name-err-${role._key}`);
+  if (!errEl || !settingsDraft) return;
+  const msg = roleNameError(role.name, settingsDraft.roles, role._key);
+  errEl.textContent = msg || "";
+  errEl.classList.toggle("hidden", !msg);
+}
+
+function updateSaveEnabled() {
+  const btn = document.getElementById("set-save-btn");
+  if (!btn || !settingsDraft) return;
+  const { ok } = validateSettings(settingsDraft);
+  btn.disabled = !ok || settingsSaving;
+}
+
+function numberField(id, label, value, onChange) {
+  const wrap = el("div", "set-field");
+  const l = el("label", null, label);
+  l.setAttribute("for", id);
+  const input = el("input");
+  input.type = "number";
+  input.id = id;
+  input.min = "0";
+  input.step = "1";
+  input.value = value == null ? "" : String(value);
+  input.addEventListener("input", () => {
+    const n = parseInt(input.value, 10);
+    onChange(Number.isFinite(n) ? n : 0);
+  });
+  wrap.append(l, input);
+  return wrap;
+}
+
+function checkField(id, label, checked, onChange) {
+  const wrap = el("div", "set-field set-check");
+  const input = el("input");
+  input.type = "checkbox";
+  input.id = id;
+  input.checked = !!checked;
+  input.addEventListener("change", () => onChange(input.checked));
+  const l = el("label", null, label);
+  l.setAttribute("for", id);
+  wrap.append(input, l);
+  return wrap;
+}
+
+function buildWorkflowSection(draft) {
+  const section = el("div", "set-section");
+  const head = el("div", "set-section-head");
+  head.appendChild(el("span", "set-section-title", "WORKFLOW"));
+  section.appendChild(head);
+
+  const grid = el("div", "set-grid");
+
+  const mbWrap = el("div", "set-field");
+  const mbLabel = el("label", null, "manager backend");
+  mbLabel.setAttribute("for", "wf-manager-backend");
+  const mbSel = el("select");
+  mbSel.id = "wf-manager-backend";
+  const emptyOpt = el("option", null, "（デフォルト）");
+  emptyOpt.value = "";
+  mbSel.appendChild(emptyOpt);
+  for (const kb of draft.known_backends) {
+    const o = el("option", null, kb);
+    o.value = kb;
+    mbSel.appendChild(o);
+  }
+  mbSel.value = draft.workflow.manager_backend || "";
+  mbSel.addEventListener("change", () => {
+    draft.workflow.manager_backend = mbSel.value;
+  });
+  mbWrap.append(mbLabel, mbSel);
+  grid.appendChild(mbWrap);
+
+  grid.appendChild(
+    numberField("wf-max-depth", "max depth", draft.workflow.max_depth, (v) => {
+      draft.workflow.max_depth = v;
+    })
+  );
+  grid.appendChild(
+    numberField("wf-max-calls", "max calls / manager", draft.workflow.max_calls_per_manager, (v) => {
+      draft.workflow.max_calls_per_manager = v;
+    })
+  );
+  grid.appendChild(
+    checkField("wf-use-mcp", "MCP 経由で実行する (use_mcp)", draft.workflow.use_mcp, (v) => {
+      draft.workflow.use_mcp = v;
+    })
+  );
+  grid.appendChild(
+    checkField("wf-ask-human", "人への確認を有効化 (enable_ask_human)", draft.workflow.enable_ask_human, (v) => {
+      draft.workflow.enable_ask_human = v;
+    })
+  );
+
+  section.appendChild(grid);
+  return section;
+}
+
+function buildBackendRow(role, draft, i) {
+  const row = el("div", "set-backend-row");
+  const sel = el("select");
+  sel.setAttribute("aria-label", `${role.name || "role"} backend ${i + 1}`);
+  for (const kb of draft.known_backends) {
+    const opt = el("option", null, kb);
+    opt.value = kb;
+    if (kb === role.backends[i]) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener("change", () => {
+    role.backends[i] = sel.value;
+  });
+
+  const up = el("button", "set-mini-btn", "↑");
+  up.type = "button";
+  up.title = "上へ";
+  up.setAttribute("aria-label", `backend ${i + 1} を上へ`);
+  up.disabled = i === 0;
+  up.addEventListener("click", () => {
+    [role.backends[i - 1], role.backends[i]] = [role.backends[i], role.backends[i - 1]];
+    renderSettingsBody();
+  });
+
+  const down = el("button", "set-mini-btn", "↓");
+  down.type = "button";
+  down.title = "下へ";
+  down.setAttribute("aria-label", `backend ${i + 1} を下へ`);
+  down.disabled = i === role.backends.length - 1;
+  down.addEventListener("click", () => {
+    [role.backends[i + 1], role.backends[i]] = [role.backends[i], role.backends[i + 1]];
+    renderSettingsBody();
+  });
+
+  const rm = el("button", "set-mini-btn", "✕");
+  rm.type = "button";
+  rm.title = "削除";
+  rm.setAttribute("aria-label", `backend ${i + 1} を削除`);
+  rm.addEventListener("click", () => {
+    role.backends.splice(i, 1);
+    renderSettingsBody();
+  });
+
+  row.append(sel, up, down, rm);
+  return row;
+}
+
+function buildRoleCard(role, draft) {
+  const isManager = role.name === "manager";
+  const card = el("article", "set-role" + (isManager ? " is-manager" : ""));
+
+  const head = el("div", "set-role-head");
+  const nameWrap = el("div", "set-role-name");
+  const nameLabel = el("label", null, "役割名");
+  nameLabel.setAttribute("for", `role-name-${role._key}`);
+  const nameInput = el("input");
+  nameInput.type = "text";
+  nameInput.id = `role-name-${role._key}`;
+  nameInput.value = role.name;
+  nameInput.placeholder = "role-name";
+  // Immutable after create: only a freshly-added (unsaved) role's name is editable — an
+  // existing role must be deleted and re-added to rename it.
+  nameInput.disabled = !role.isNew;
+  nameInput.addEventListener("input", () => {
+    role.name = nameInput.value.trim();
+    updateRoleNameError(role);
+    updateSaveEnabled();
+  });
+  const err = el("p", "set-err hidden");
+  err.id = `role-name-err-${role._key}`;
+  nameWrap.append(nameLabel, nameInput, err);
+  head.appendChild(nameWrap);
+  if (isManager) head.appendChild(el("span", "set-role-badge", "MANAGER"));
+  const del = el("button", "set-role-del", "削除");
+  del.type = "button";
+  del.addEventListener("click", () => {
+    settingsDraft.roles = settingsDraft.roles.filter((r) => r._key !== role._key);
+    renderSettingsBody();
+  });
+  head.appendChild(del);
+  card.appendChild(head);
+
+  if (isManager) {
+    card.appendChild(
+      el("p", "set-hint", "オーケストレーター役割：リスト内で最初に選ばれた claude / codex が管理を担当します。")
+    );
+  }
+
+  card.appendChild(el("div", "set-section-title", "BACKENDS（優先順）"));
+  const list = el("div", "set-backends");
+  role.backends.forEach((_, i) => list.appendChild(buildBackendRow(role, draft, i)));
+  card.appendChild(list);
+
+  const addBackend = el("button", "set-add-backend", "+ backend を追加");
+  addBackend.type = "button";
+  addBackend.disabled = draft.known_backends.length === 0;
+  addBackend.addEventListener("click", () => {
+    const first = draft.known_backends[0];
+    if (first) role.backends.push(first);
+    renderSettingsBody();
+  });
+  card.appendChild(addBackend);
+
+  const promptWrap = el("div", "set-field set-role-prompt");
+  const promptLabel = el("label", null, "プロンプト（persona）");
+  promptLabel.setAttribute("for", `role-prompt-${role._key}`);
+  const prompt = el("textarea");
+  prompt.id = `role-prompt-${role._key}`;
+  prompt.value = role.prompt || "";
+  prompt.addEventListener("input", () => {
+    role.prompt = prompt.value;
+  });
+  promptWrap.append(promptLabel, prompt);
+  card.appendChild(promptWrap);
+
+  return card;
+}
+
+function buildRolesSection(draft) {
+  const section = el("div", "set-section");
+  const head = el("div", "set-section-head");
+  head.appendChild(el("span", "set-section-title", "ROLES"));
+  section.appendChild(head);
+
+  // Display only: the reserved 'manager' role is pinned first. Underlying draft.roles order
+  // (what gets saved) is untouched.
+  const sorted = [...draft.roles].sort((a, b) => {
+    if (a.name === "manager") return -1;
+    if (b.name === "manager") return 1;
+    return 0;
+  });
+  if (sorted.length === 0) section.appendChild(el("p", "set-hint", "まだ役割がありません。"));
+  for (const role of sorted) section.appendChild(buildRoleCard(role, draft));
+
+  const addBtn = el("button", "set-add-role", "+ role を追加");
+  addBtn.type = "button";
+  addBtn.addEventListener("click", () => {
+    settingsDraft.roles.push({ _key: roleKeySeq++, name: "", backends: [], prompt: "", isNew: true });
+    renderSettingsBody();
+  });
+  section.appendChild(addBtn);
+  return section;
+}
+
+function setSettingsStatus(text, cls) {
+  const s = document.querySelector("#settings .set-status");
+  if (!s) return;
+  s.textContent = text || "";
+  s.className = "set-status" + (cls ? ` ${cls}` : "");
+}
+
+// Build the shell (scrim + panel + head + empty body + foot) once so its entrance animation is
+// not replayed and typed text is never lost. Content is filled by renderSettingsBody().
+function buildSettingsShell() {
+  const root = document.getElementById("settings");
+  if (root.dataset.built === "1") return;
+  root.innerHTML = "";
+  const scrim = el("div", "set-scrim");
+  scrim.addEventListener("click", toggleSettings);
+  const panel = el("section", "set-panel");
+  panel.setAttribute("aria-label", "設定");
+
+  const head = el("header", "set-head");
+  const intro = el("div");
+  intro.append(
+    el("div", "set-eyebrow", "CONFIGURATION"),
+    el("h2", "set-title", "Settings"),
+    el("p", "set-sub", "ワークフローの挙動と役割（roles）の割り当てを編集します。")
+  );
+  const close = el("button", "set-close", "✕");
+  close.type = "button";
+  close.setAttribute("aria-label", "閉じる");
+  close.addEventListener("click", toggleSettings);
+  head.append(intro, close);
+  panel.appendChild(head);
+
+  panel.appendChild(el("div", "set-body"));
+
+  const foot = el("footer", "set-foot");
+  const row = el("div", "set-foot-row");
+  const saveBtn = el("button", "set-save", "保存");
+  saveBtn.type = "button";
+  saveBtn.id = "set-save-btn";
+  saveBtn.disabled = true;
+  saveBtn.addEventListener("click", saveSettings);
+  const status = el("span", "set-status");
+  row.append(saveBtn, status);
+  const path = el("div", "set-path");
+  foot.append(row, path);
+  panel.appendChild(foot);
+
+  root.append(scrim, panel);
+  root.dataset.built = "1";
+}
+
+// Rebuilds the body (workflow fields + role cards) from settingsDraft. Called after a fetch
+// completes and after any structural edit (add/remove role or backend, reorder) — never from
+// the generic poll-driven renderAll() cycle.
+function renderSettingsBody() {
+  const root = document.getElementById("settings");
+  if (!root || root.dataset.built !== "1") return;
+  const body = root.querySelector(".set-body");
+  const pathEl = root.querySelector(".set-path");
+  const saveBtn = root.querySelector("#set-save-btn");
+  body.innerHTML = "";
+
+  if (settingsLoading && !settingsDraft) {
+    body.appendChild(el("div", "set-empty", "設定を読み込んでいます…"));
+    saveBtn.disabled = true;
+    pathEl.textContent = "";
+    return;
+  }
+  if (settingsError && !settingsDraft) {
+    const wrap = el("div", "set-empty");
+    wrap.append(el("div", null, "設定を読み込めませんでした。"), el("p", "set-err", settingsError));
+    body.appendChild(wrap);
+    saveBtn.disabled = true;
+    pathEl.textContent = "";
+    return;
+  }
+  if (!settingsDraft) return;
+
+  body.appendChild(buildWorkflowSection(settingsDraft));
+  body.appendChild(buildRolesSection(settingsDraft));
+
+  pathEl.textContent = settingsData && settingsData.config_path
+    ? settingsData.config_path + (settingsData.exists ? "" : "（未作成）")
+    : "";
+
+  updateSaveEnabled();
+}
+
+function updateSettings() {
+  const root = document.getElementById("settings");
+  root.classList.toggle("hidden", !showSettings);
+}
+
+function toggleSettings() {
+  showSettings = !showSettings;
+  if (showSettings) {
+    showSwarm = false;
+    showCliManager = false;
+    swarmSig = null;
+    cliSig = null;
+    updateSwarm();
+    updateCliManager();
+    buildSettingsShell();
+    if (settingsDraft) renderSettingsBody();
+    else fetchSettings();
+  }
+  updateSettings();
+}
+
+async function fetchSettings() {
+  settingsLoading = true;
+  settingsError = null;
+  renderSettingsBody();
+  try {
+    const data = await invoke("settings_get");
+    settingsData = data;
+    settingsDraft = draftFromSettings(data);
+  } catch (e) {
+    settingsError = String(e);
+  } finally {
+    settingsLoading = false;
+    renderSettingsBody();
+  }
+}
+
+async function saveSettings() {
+  if (!settingsDraft || settingsSaving) return;
+  for (const role of settingsDraft.roles) updateRoleNameError(role);
+  const { ok } = validateSettings(settingsDraft);
+  if (!ok) {
+    setSettingsStatus("入力内容を確認してください。", "err");
+    return;
+  }
+  settingsSaving = true;
+  setSettingsStatus("保存しています…", "");
+  const saveBtn = document.getElementById("set-save-btn");
+  if (saveBtn) saveBtn.disabled = true;
+  try {
+    const payload = {
+      workflow: {
+        manager_backend: settingsDraft.workflow.manager_backend || null,
+        default_agents: settingsDraft.workflow.default_agents,
+        max_depth: settingsDraft.workflow.max_depth,
+        max_calls_per_manager: settingsDraft.workflow.max_calls_per_manager,
+        use_mcp: settingsDraft.workflow.use_mcp,
+        enable_ask_human: settingsDraft.workflow.enable_ask_human,
+      },
+      roles: settingsDraft.roles.map((r) => ({ name: r.name, backends: r.backends, prompt: r.prompt })),
+    };
+    await invoke("settings_save", { payload });
+    setSettingsStatus("保存しました。", "ok");
+    showToast("設定を保存しました。", "#4ec9a0");
+    await fetchSettings();
+  } catch (e) {
+    setSettingsStatus(String(e), "err");
+  } finally {
+    settingsSaving = false;
+    updateSaveEnabled();
+  }
+}
+
 // ── interaction ──────────────────────────────────────────────────────────────
 function showToast(text, dotColor) {
   const t = document.getElementById("toast");
@@ -690,6 +1163,13 @@ function answerKey(k) {
 }
 
 function onKey(e) {
+  if (showSettings) {
+    if (e.key === "Escape") {
+      toggleSettings();
+      e.preventDefault();
+    }
+    return;
+  }
   if (showCliManager) {
     if (e.key === "Escape") {
       toggleCliManager();
@@ -743,7 +1223,11 @@ function toggleAvailable() {
 }
 function toggleSwarm() {
   showSwarm = !showSwarm;
-  if (showSwarm) showCliManager = false;
+  if (showSwarm) {
+    showCliManager = false;
+    showSettings = false;
+    updateSettings();
+  }
   swarmSig = null;
   updateSwarm();
 }
@@ -752,8 +1236,10 @@ function toggleCliManager() {
   showCliManager = !showCliManager;
   if (showCliManager) {
     showSwarm = false;
+    showSettings = false;
     swarmSig = null;
     updateSwarm();
+    updateSettings();
     if (agentClis.length === 0) fetchAgentClis();
   }
   updateCliManager();
@@ -867,6 +1353,7 @@ function boot() {
   document.getElementById("avail-toggle").addEventListener("click", toggleAvailable);
   document.getElementById("swarm-toggle").addEventListener("click", toggleSwarm);
   document.getElementById("cli-toggle").addEventListener("click", toggleCliManager);
+  document.getElementById("settings-toggle").addEventListener("click", toggleSettings);
   window.addEventListener("keydown", onKey);
 
   tickClock();

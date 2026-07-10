@@ -9,5 +9,6 @@ use crate::cli::{load_context, resolve_cwd};
 pub async fn run() -> Result<()> {
     let ctx = load_context()?;
     let cwd = resolve_cwd(None)?;
-    super::server::run_stdio(ctx.regs, cwd).await
+    let roles = ctx.loaded.config.workflow.roles.clone();
+    super::server::run_stdio(ctx.regs, cwd, roles).await
 }

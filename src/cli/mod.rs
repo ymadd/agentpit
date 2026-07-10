@@ -49,6 +49,11 @@ pub enum Command {
     Rescue {
         /// Task description (positional). Quote multi-word tasks.
         task: String,
+        /// Dispatch to a configured `[workflow.roles.<name>]` persona instead of an explicit
+        /// backend. Mutually exclusive with --backend (role dispatch is always single-backend:
+        /// the role itself resolves which backend plays it).
+        #[arg(long)]
+        role: Option<String>,
         /// Override target backend.
         #[arg(long)]
         backend: Option<BackendId>,
@@ -295,10 +300,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     match command {
         Command::Rescue {
             task,
+            role,
             backend,
             cwd,
             no_auto_login,
-        } => rescue::run(task, backend, cwd, !no_auto_login).await,
+        } => rescue::run_with_role(task, role, backend, cwd, !no_auto_login).await,
 
         Command::Review {
             target,

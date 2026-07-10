@@ -13,29 +13,92 @@ use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::router::{RouteRequest, Router};
 use crate::types::BackendId;
 
+/// Pure dispatch-plan decision for `agentpit rescue`: whether this invocation targets a named
+/// `--role` persona or a direct (possibly ensemble-eligible) `--backend`/default dispatch.
+/// `--role` and `--backend` together is a hard error — role dispatch is always single-backend
+/// (the role itself resolves which backend plays it), so mixing the two would leave it
+/// ambiguous which one wins.
+#[derive(Debug, Clone, PartialEq)]
+enum DispatchPlan {
+    Role(String),
+    Direct(Option<BackendId>),
+}
+
+fn plan_dispatch(role: Option<String>, backend: Option<BackendId>) -> Result<DispatchPlan> {
+    match (role, backend) {
+        (Some(_), Some(_)) => anyhow::bail!("--role and --backend are mutually exclusive"),
+        (Some(r), None) => Ok(DispatchPlan::Role(r)),
+        (None, b) => Ok(DispatchPlan::Direct(b)),
+    }
+}
+
+/// Legacy 4-arg entry point (no `--role` support): kept byte-identical in signature for callers
+/// that predate `--role` (e.g. the interactive menu's free-text rescue prompt). Delegates to
+/// [`run_with_role`] with `role: None`, which is exactly the old behavior.
 pub async fn run(
     task: String,
     backend: Option<BackendId>,
     cwd: Option<String>,
     auto_login: bool,
 ) -> Result<()> {
-    if backend.is_none() {
-        let ctx = super::load_context()?;
-        let members = ctx.loaded.config.ensemble.rescue_members.clone();
-        if !members.is_empty() {
-            let aggregator = ctx.loaded.config.ensemble.rescue_aggregator;
-            return super::ensemble::run_resolved(
-                ctx,
-                crate::events::RunKind::Rescue,
-                task,
-                members,
-                aggregator,
+    run_with_role(task, None, backend, cwd, auto_login).await
+}
+
+/// `agentpit rescue` entry point used by the CLI command dispatcher, with `--role` support.
+pub async fn run_with_role(
+    task: String,
+    role: Option<String>,
+    backend: Option<BackendId>,
+    cwd: Option<String>,
+    auto_login: bool,
+) -> Result<()> {
+    match plan_dispatch(role, backend)? {
+        DispatchPlan::Role(role_name) => {
+            // One context load to resolve the role against configured `[workflow.roles.<name>]`
+            // entries and the currently available backends; `run_with_route_inner` (reused
+            // unchanged below) loads its own context to resolve auth/transport/router state, the
+            // same double-load shape the rescue_members ensemble shortcut below already has.
+            let ctx = super::load_context()?;
+            let available: Vec<BackendId> = ctx.regs.available().into_iter().collect();
+            let resolved = crate::workflow::roles::resolve_role(
+                &role_name,
+                &ctx.loaded.config.workflow.roles,
+                &available,
+            )?;
+            let wrapped_task =
+                crate::workflow::roles::persona_task(&resolved.name, resolved.prompt.as_deref(), &task);
+            // A role dispatch is always single-backend: skip the rescue_members ensemble
+            // shortcut entirely and go straight to the resolved backend's explicit route.
+            run_with_route_inner(
+                wrapped_task,
+                Some(resolved.backend),
                 cwd,
+                auto_login,
+                RouteKey::Rescue,
+                Some(resolved.name.as_str()),
             )
-            .await;
+            .await
+        }
+        DispatchPlan::Direct(backend) => {
+            if backend.is_none() {
+                let ctx = super::load_context()?;
+                let members = ctx.loaded.config.ensemble.rescue_members.clone();
+                if !members.is_empty() {
+                    let aggregator = ctx.loaded.config.ensemble.rescue_aggregator;
+                    return super::ensemble::run_resolved(
+                        ctx,
+                        crate::events::RunKind::Rescue,
+                        task,
+                        members,
+                        aggregator,
+                        cwd,
+                    )
+                    .await;
+                }
+            }
+            run_with_route(task, backend, cwd, auto_login, RouteKey::Rescue).await
         }
     }
-    run_with_route(task, backend, cwd, auto_login, RouteKey::Rescue).await
 }
 
 pub async fn run_with_route(
@@ -44,6 +107,22 @@ pub async fn run_with_route(
     cwd: Option<String>,
     auto_login: bool,
     route_key: RouteKey,
+) -> Result<()> {
+    run_with_route_inner(task, backend, cwd, auto_login, route_key, None).await
+}
+
+/// Shared implementation behind [`run_with_route`]. `role_label`, when set, is a resolved
+/// `--role` name to surface in the leader line as `route=role:<name>` instead of the router's
+/// own reason string — the backend was pinned by role resolution, not the router, so the
+/// printed route should say so. `None` keeps the original `route=<reason>` format byte-identical
+/// (explain/refactor and the plain `rescue --backend` path all go through this branch).
+async fn run_with_route_inner(
+    task: String,
+    backend: Option<BackendId>,
+    cwd: Option<String>,
+    auto_login: bool,
+    route_key: RouteKey,
+    role_label: Option<&str>,
 ) -> Result<()> {
     let ctx = load_context()?;
     let available = ctx.regs.available();
@@ -101,12 +180,15 @@ pub async fn run_with_route(
     let transport = resolve_transport(backend_id, &ctx.regs)
         .map(|t| t.as_str())
         .unwrap_or("none");
-    println!(
-        "[backend={} transport={} route={}]",
-        backend_id,
-        transport,
-        decision.reason.as_str()
-    );
+    match role_label {
+        Some(role) => println!("[backend={backend_id} transport={transport} route=role:{role}]"),
+        None => println!(
+            "[backend={} transport={} route={}]",
+            backend_id,
+            transport,
+            decision.reason.as_str()
+        ),
+    }
     let kind = match route_key {
         RouteKey::Rescue => RunKind::Rescue,
         RouteKey::Review => RunKind::Review,
@@ -189,5 +271,42 @@ pub async fn run_with_route(
             }
             Err(err)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_role_no_backend_plans_a_direct_default_dispatch() {
+        assert_eq!(
+            plan_dispatch(None, None).unwrap(),
+            DispatchPlan::Direct(None)
+        );
+    }
+
+    #[test]
+    fn backend_only_plans_a_direct_explicit_dispatch() {
+        assert_eq!(
+            plan_dispatch(None, Some(BackendId::Codex)).unwrap(),
+            DispatchPlan::Direct(Some(BackendId::Codex))
+        );
+    }
+
+    #[test]
+    fn role_only_plans_a_role_dispatch() {
+        assert_eq!(
+            plan_dispatch(Some("reviewer".to_string()), None).unwrap(),
+            DispatchPlan::Role("reviewer".to_string())
+        );
+    }
+
+    #[test]
+    fn role_and_backend_together_is_a_hard_error() {
+        let err = plan_dispatch(Some("reviewer".to_string()), Some(BackendId::Codex))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "--role and --backend are mutually exclusive");
     }
 }

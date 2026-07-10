@@ -3,6 +3,7 @@
 
 mod asks;
 mod cli_versions;
+mod settings;
 mod state;
 
 use std::path::PathBuf;
@@ -218,7 +219,9 @@ fn main() {
             update_agent_cli,
             get_output,
             asks::get_pending_asks,
-            asks::answer_ask
+            asks::answer_ask,
+            settings::settings_get,
+            settings::settings_save
         ])
         .setup(|app| {
             spawn_watcher(app.handle().clone());

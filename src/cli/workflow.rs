@@ -13,14 +13,16 @@ use std::time::Instant;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+use std::collections::BTreeMap;
+
 use super::{install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer};
 use crate::auth::check_auth;
-use crate::config::HubConfig;
+use crate::config::{HubConfig, RoleConfig};
 use crate::dispatch::{Registries, dispatch};
 use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::exec::{AskTier, McpConfigGuard, WorkflowManagerExec, is_supported_manager};
 use crate::types::BackendId;
-use crate::workflow::guard;
+use crate::workflow::{guard, roles};
 
 /// `agentpit workflow "<goal>"` — the CLI entry point. A thin wrapper over [`run_capture`] that
 /// resolves the cwd, installs Ctrl-C cancellation, prints the leader line, streams the manager's
@@ -87,10 +89,15 @@ pub(crate) async fn run_capture(
     let ctx = load_context()?;
     let config = &ctx.loaded.config;
 
-    // 1. Resolve the manager: explicit arg → config → default backend.
-    let manager = manager
-        .or(config.workflow.manager_backend)
-        .unwrap_or(config.default.backend);
+    // 1. Resolve the manager: explicit arg → [workflow.roles.manager] → [workflow].manager_backend
+    //    → default backend. The manager role's persona applies whenever the role exists, even
+    //    when the backend itself came from an earlier step in the chain.
+    let (manager, manager_persona) = resolve_manager_backend(
+        manager,
+        &config.workflow.roles,
+        config.workflow.manager_backend,
+        config.default.backend,
+    )?;
     if !is_supported_manager(manager) {
         anyhow::bail!("supported workflow managers: claude, codex (got: {manager})");
     }
@@ -105,8 +112,26 @@ pub(crate) async fn run_capture(
         );
     }
 
-    // 2. Resolve the worker roster: explicit → config → all available minus the manager.
-    let agents = resolve_agents(agents, config, manager, &ctx.regs);
+    // 2. Resolve the worker roster. With `[workflow.roles.*]` worker roles configured the
+    //    roster is ROLES (casting is config-driven); otherwise the legacy flat backend list:
+    //    explicit → config → all available minus the manager.
+    let available: Vec<BackendId> = ctx.regs.available().into_iter().collect();
+    let roster = build_role_roster(&config.workflow.roles, &available)?;
+    if let Some(r) = &roster {
+        for (name, reason) in &r.skipped {
+            eprintln!("warning: workflow role '{name}' skipped: {reason}");
+        }
+        if agents.is_some() {
+            eprintln!(
+                "warning: --agents is ignored because [workflow.roles] is configured; roles win."
+            );
+        }
+    }
+    let agents = if roster.is_some() {
+        Vec::new()
+    } else {
+        resolve_agents(agents, config, manager, &ctx.regs)
+    };
 
     // 3. Resolve the depth ceiling: arg → config (default 3), clamped to a hard upper bound so a
     //    hostile `--max-depth` can never push the inherited depth toward `u32::MAX` and wrap.
@@ -140,6 +165,10 @@ pub(crate) async fn run_capture(
     //    The human back-channel + its question-discipline block are injected only when enabled
     //    (default off until dogfooded). The manager is always full-autonomy today → High tier.
     let ask = config.workflow.enable_ask_human.then_some(AskTier::High);
+    let prompt_roles = PromptRoles {
+        roster: roster.as_ref().map(|r| r.lines.as_str()),
+        persona: manager_persona.as_deref(),
+    };
     let prompt = if mcp_mode {
         build_manager_prompt_mcp(
             &goal,
@@ -149,6 +178,7 @@ pub(crate) async fn run_capture(
             max_calls,
             logger.run_id(),
             ask,
+            &prompt_roles,
         )
     } else {
         build_manager_prompt(
@@ -160,6 +190,7 @@ pub(crate) async fn run_capture(
             max_calls,
             logger.run_id(),
             ask,
+            &prompt_roles,
         )
     };
 
@@ -197,9 +228,12 @@ pub(crate) async fn run_capture(
     // here would write to process stdout unconditionally and corrupt the JSON-RPC framing when
     // `run_workflow` runs inside `agentpit mcp serve` (see `mcp::server::run_stdio`). It is also
     // kept out of the returned capture string so the MCP tool's synthesis stays clean.
+    let cast = match &roster {
+        Some(r) => format!("roles={}", r.names.join(", ")),
+        None => format!("agents={}", agents_csv(&agents)),
+    };
     terminal_sink(&format!(
-        "[workflow manager={manager} depth={depth}/{max_depth} mcp={mcp_mode} agents={}]\n",
-        agents_csv(&agents)
+        "[workflow manager={manager} depth={depth}/{max_depth} mcp={mcp_mode} {cast}]\n"
     ));
 
     // Tee streamed output to the caller's terminal sink AND the dashboard's capture file (mirror
@@ -291,6 +325,100 @@ fn agents_csv(agents: &[BackendId]) -> String {
         .join(", ")
 }
 
+/// Resolve the manager backend and its optional persona. Resolution order for the backend:
+/// explicit CLI arg → `[workflow.roles.manager]` (first claude|codex in its list) →
+/// `[workflow].manager_backend` → the default backend. The persona applies whenever the manager
+/// role exists — a persona-only role (empty `backends`) still colors a legacy-resolved manager.
+/// Pure and unit-tested; the `is_supported_manager` check on the final choice stays in
+/// `run_capture` (an explicit arg may still name an unsupported backend).
+fn resolve_manager_backend(
+    explicit: Option<BackendId>,
+    role_map: &BTreeMap<String, RoleConfig>,
+    manager_backend: Option<BackendId>,
+    default_backend: BackendId,
+) -> Result<(BackendId, Option<String>)> {
+    let manager_role = roles::resolve_manager(role_map, is_supported_manager)?;
+    let backend = explicit
+        .or(manager_role.as_ref().and_then(|m| m.backend))
+        .or(manager_backend)
+        .unwrap_or(default_backend);
+    Ok((backend, manager_role.and_then(|m| m.prompt)))
+}
+
+/// The rendered role roster for a run: the manager-facing block plus the resolved role names
+/// for the leader line, and the roles that could not be resolved (warned, then skipped).
+#[derive(Debug, Clone, PartialEq)]
+struct RoleRoster {
+    /// Pre-rendered roster lines: `  <name> (<backend>): <persona summary>` joined by newline.
+    lines: String,
+    names: Vec<String>,
+    skipped: Vec<(String, String)>,
+}
+
+/// Build the role roster when worker roles are configured. `Ok(None)` = no worker roles (legacy
+/// flat-backend roster applies). Roles whose backends are all unavailable are collected into
+/// `skipped` rather than aborting the run — but if EVERY worker role fails to resolve the
+/// workflow cannot dispatch anywhere, which is a hard error.
+fn build_role_roster(
+    role_map: &BTreeMap<String, RoleConfig>,
+    available: &[BackendId],
+) -> Result<Option<RoleRoster>> {
+    if roles::worker_roles(role_map).next().is_none() {
+        return Ok(None);
+    }
+    let mut lines = Vec::new();
+    let mut names = Vec::new();
+    let mut skipped = Vec::new();
+    for (name, role) in roles::worker_roles(role_map) {
+        match roles::resolve_role(name, role_map, available) {
+            Ok(resolved) => {
+                lines.push(format!(
+                    "  {name} ({backend}): {summary}",
+                    backend = resolved.backend,
+                    summary = roles::summary_line(role)
+                ));
+                names.push(name.clone());
+            }
+            Err(err) => skipped.push((name.clone(), format!("{err:#}"))),
+        }
+    }
+    if names.is_empty() {
+        let detail = skipped
+            .iter()
+            .map(|(n, e)| format!("{n}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("no configured worker role could be resolved ({detail})");
+    }
+    Ok(Some(RoleRoster {
+        lines: lines.join("\n"),
+        names,
+        skipped,
+    }))
+}
+
+/// Role-mode additions to the manager prompt. The `Default` (both `None`) keeps the legacy
+/// flat-backend prompt BYTE-IDENTICAL — pinned by the `legacy_prompt_is_byte_identical_*`
+/// regression tests below, so prompt drift for existing users is a test failure, not a surprise.
+#[derive(Debug, Default, Clone)]
+pub struct PromptRoles<'a> {
+    /// Pre-rendered roster lines (`  <name> (<backend>): <summary>` joined by newline).
+    pub roster: Option<&'a str>,
+    /// Manager persona from `[workflow.roles.manager]`.
+    pub persona: Option<&'a str>,
+}
+
+/// The manager-persona block injected right below the orchestrator header, or empty.
+fn persona_block(persona: Option<&str>) -> String {
+    match persona {
+        None => String::new(),
+        Some(p) => format!(
+            "MANAGER PERSONA (from [workflow.roles.manager]):\n{p}\n\n",
+            p = p.trim()
+        ),
+    }
+}
+
 /// The manager-facing "question discipline" block, gated on the [`AskTier`]. Injected into the
 /// manager prompt ONLY when `[workflow].enable_ask_human` is on. `ask_invocation` is the prose
 /// name of the back-channel in this mode (e.g. "the `agentpit ask` command"); `ask_grammar` is
@@ -378,7 +506,9 @@ You drive the workflow; workers are one-shot and share no memory. Two durable mo
 /// Pure and unit-tested: it threads the worker roster, the goal, the depth/budget lines, the
 /// self path, the dispatch grammar, the optional human-back-channel discipline block, and the
 /// instruction to END with a synthesis section. `ask = Some(tier)` injects the discipline block
-/// (and teaches the `agentpit ask` grammar); `None` omits it entirely.
+/// (and teaches the `agentpit ask` grammar); `None` omits it entirely. `roles` switches the
+/// roster + dispatch grammar to role mode and/or injects the manager persona; the default
+/// (both `None`) is byte-identical to the pre-roles prompt.
 #[allow(clippy::too_many_arguments)]
 pub fn build_manager_prompt(
     goal: &str,
@@ -389,6 +519,7 @@ pub fn build_manager_prompt(
     max_calls: u32,
     parent_run_id: &str,
     ask: Option<AskTier>,
+    roles: &PromptRoles<'_>,
 ) -> String {
     let agents_csv = agents_csv(agents);
     // The model embeds `self_path` directly into Bash commands; single-quote it so a binary path
@@ -421,19 +552,50 @@ pub fn build_manager_prompt(
         String::new()
     };
     let conversation = conversation.as_str();
+    // Roster + dispatch-grammar blocks: role mode teaches `rescue --role`, legacy mode keeps the
+    // flat backend grammar. Composed as blocks so the legacy assembly stays byte-identical.
+    let (roster_block, grammar_block) = match roles.roster {
+        Some(lines) => (
+            format!(
+                "AVAILABLE ROLES (dispatch to a role; it resolves to the backend in parentheses):\n\
+                 {lines}\n\
+                 \x20 Dispatch only to a ROLE above; do NOT invent role names; do NOT dispatch to yourself.\n"
+            ),
+            format!(
+                "DISPATCH GRAMMAR (use your Bash tool):\n\
+                 \x20 One role:      {self_path} rescue --role <name> \"<sub-task>\"\n\
+                 \x20 Parallel fan:  {self_path} ensemble <id> <id> ... \"<prompt>\" [--aggregator <id>]\n\
+                 \x20 --role is REQUIRED for rescue; the backends in parentheses are informational \
+                 (ensemble still takes backend ids). Quote sub-tasks. For multi-line, use a bash heredoc.\n"
+            ),
+        ),
+        // NB: the legacy branch reproduces the PRE-ROLES prompt byte-for-byte, including the
+        // flush-left continuation lines (`\<newline>` strips leading whitespace) — pinned by
+        // `legacy_prompt_is_byte_identical_without_roles`.
+        None => (
+            format!(
+                "AVAILABLE WORKER BACKENDS: {agents_csv}\n\
+                 Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch to yourself.\n"
+            ),
+            format!(
+                "DISPATCH GRAMMAR (use your Bash tool):\n\
+                 One backend:   {self_path} rescue --backend <id> \"<sub-task>\"\n\
+                 Parallel fan:  {self_path} ensemble <id> <id> ... \"<prompt>\" [--aggregator <id>]\n\
+                 --backend is REQUIRED for rescue. Quote sub-tasks. For multi-line, use a bash heredoc.\n"
+            ),
+        ),
+    };
+    let persona = persona_block(roles.persona);
     format!(
         "=== AGENTPIT WORKFLOW ORCHESTRATOR ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
 sub-tasks, dispatch each to the best worker backend, read results, and write a final\n\
 synthesis. Your LAST message MUST be the synthesis — do not stop after the last dispatch.\n\
 \n\
-AVAILABLE WORKER BACKENDS: {agents_csv}\n\
-  Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch to yourself.\n\
+{persona}\
+{roster_block}\
 \n\
-DISPATCH GRAMMAR (use your Bash tool):\n\
-  One backend:   {self_path} rescue --backend <id> \"<sub-task>\"\n\
-  Parallel fan:  {self_path} ensemble <id> <id> ... \"<prompt>\" [--aggregator <id>]\n\
-  --backend is REQUIRED for rescue. Quote sub-tasks. For multi-line, use a bash heredoc.\n\
+{grammar_block}\
 \n\
 BUDGET: workflow depth {depth}/{max_depth}; aim for <= {max_calls} sub-dispatch calls.\n\
   The system REJECTS any nested workflow past the depth ceiling. Plan within budget.\n\
@@ -457,6 +619,7 @@ PARENT RUN ID: {parent_run_id}   (correlation only; do not modify)\n\
 ///
 /// Instructs the manager to orchestrate via the `mcp__agentpit__*` MCP tools rather than shelling
 /// out to the `agentpit` binary, so it carries no Bash dispatch grammar and needs no self path.
+#[allow(clippy::too_many_arguments)]
 pub fn build_manager_prompt_mcp(
     goal: &str,
     agents: &[BackendId],
@@ -465,6 +628,7 @@ pub fn build_manager_prompt_mcp(
     max_calls: u32,
     parent_run_id: &str,
     ask: Option<AskTier>,
+    roles: &PromptRoles<'_>,
 ) -> String {
     let agents_csv = agents_csv(agents);
     // The MCP manager reaches the human via the ask_human tool rather than a shell command.
@@ -488,19 +652,48 @@ pub fn build_manager_prompt_mcp(
         String::new()
     };
     let conversation = conversation.as_str();
+    // Roster + tools blocks: role mode teaches `dispatch_task {{"role": ...}}`, legacy mode the
+    // flat backend argument. Composed as blocks so the legacy assembly stays byte-identical.
+    let (roster_block, tools_block) = match roles.roster {
+        Some(lines) => (
+            format!(
+                "AVAILABLE ROLES (dispatch to a role; it resolves to the backend in parentheses):\n\
+                 {lines}\n\
+                 \x20 Dispatch only to a ROLE above; do NOT invent role names; do NOT dispatch to yourself.\n"
+            ),
+            "ORCHESTRATION TOOLS (use these MCP tools; do NOT shell out to agentpit):\n\
+             \x20 mcp__agentpit__list_backends  — list available backends + their auth/transport state.\n\
+             \x20 mcp__agentpit__dispatch_task  — run ONE role. Args: {\"role\":\"<name>\",\"task\":\"<sub-task>\"} \
+             ({\"backend\":\"<id>\"} is the legacy alternative; never pass both).\n\
+             \x20 mcp__agentpit__run_ensemble   — fan out in parallel. Args: {\"members\":[\"<id>\",...],\"prompt\":\"<prompt>\",\"aggregator\":\"<id>\"} (aggregator optional).\n"
+                .to_string(),
+        ),
+        // NB: the legacy branch reproduces the PRE-ROLES prompt byte-for-byte, including the
+        // flush-left continuation lines (`\<newline>` strips leading whitespace) — pinned by
+        // `legacy_mcp_prompt_is_byte_identical_without_roles`.
+        None => (
+            format!(
+                "AVAILABLE WORKER BACKENDS: {agents_csv}\n\
+                 Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch to yourself.\n"
+            ),
+            "ORCHESTRATION TOOLS (use these MCP tools; do NOT shell out to agentpit):\n\
+             mcp__agentpit__list_backends  — list available backends + their auth/transport state.\n\
+             mcp__agentpit__dispatch_task  — run ONE backend. Args: {\"backend\":\"<id>\",\"task\":\"<sub-task>\"}.\n\
+             mcp__agentpit__run_ensemble   — fan out in parallel. Args: {\"members\":[\"<id>\",...],\"prompt\":\"<prompt>\",\"aggregator\":\"<id>\"} (aggregator optional).\n"
+                .to_string(),
+        ),
+    };
+    let persona = persona_block(roles.persona);
     format!(
         "=== AGENTPIT WORKFLOW ORCHESTRATOR (MCP MODE) ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
 sub-tasks, dispatch each to the best worker backend, read results, and write a final\n\
 synthesis. Your LAST message MUST be the synthesis — do not stop after the last dispatch.\n\
 \n\
-AVAILABLE WORKER BACKENDS: {agents_csv}\n\
-  Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch to yourself.\n\
+{persona}\
+{roster_block}\
 \n\
-ORCHESTRATION TOOLS (use these MCP tools; do NOT shell out to agentpit):\n\
-  mcp__agentpit__list_backends  — list available backends + their auth/transport state.\n\
-  mcp__agentpit__dispatch_task  — run ONE backend. Args: {{\"backend\":\"<id>\",\"task\":\"<sub-task>\"}}.\n\
-  mcp__agentpit__run_ensemble   — fan out in parallel. Args: {{\"members\":[\"<id>\",...],\"prompt\":\"<prompt>\",\"aggregator\":\"<id>\"}} (aggregator optional).\n\
+{tools_block}\
 \n\
 BUDGET: workflow depth {depth}/{max_depth}; aim for <= {max_calls} sub-dispatch calls.\n\
   The system REJECTS any nested workflow past the depth ceiling. Plan within budget.\n\
@@ -535,8 +728,7 @@ mod tests {
             3,
             8,
             "run-42",
-            None,
-        );
+            None, &PromptRoles::default());
         // Each agent id appears.
         assert!(text.contains("gemini"));
         assert!(text.contains("opencode"));
@@ -566,8 +758,7 @@ mod tests {
             3,
             8,
             "run-1",
-            None,
-        );
+            None, &PromptRoles::default());
         // The path is single-quoted so it survives word-splitting in the model's Bash commands.
         assert!(text.contains("'/Users/a b/bin/agentpit' rescue --backend"));
         assert!(text.contains("'/Users/a b/bin/agentpit' ensemble"));
@@ -576,7 +767,7 @@ mod tests {
     #[test]
     fn mcp_prompt_uses_mcp_tools_and_omits_bash_grammar() {
         let agents = [BackendId::Gemini, BackendId::Codex];
-        let text = build_manager_prompt_mcp("ship the feature", &agents, 1, 3, 8, "run-9", None);
+        let text = build_manager_prompt_mcp("ship the feature", &agents, 1, 3, 8, "run-9", None, &PromptRoles::default());
         // The MCP tool names are present.
         assert!(text.contains("mcp__agentpit__list_backends"));
         assert!(text.contains("mcp__agentpit__dispatch_task"));
@@ -598,15 +789,15 @@ mod tests {
     fn cli_prompt_has_no_mcp_tool_names() {
         // The CLI variant must stay free of the MCP tool surface.
         let agents = [BackendId::Gemini];
-        let text = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None);
+        let text = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &PromptRoles::default());
         assert!(!text.contains("mcp__agentpit__"));
     }
 
     #[test]
     fn discipline_block_absent_when_ask_disabled() {
         let agents = [BackendId::Gemini];
-        let cli = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None);
-        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None);
+        let cli = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &PromptRoles::default());
+        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &PromptRoles::default());
         for text in [&cli, &mcp] {
             assert!(
                 !text.contains("HUMAN BACK-CHANNEL"),
@@ -637,8 +828,7 @@ mod tests {
             3,
             8,
             "run-1",
-            Some(AskTier::High),
-        );
+            Some(AskTier::High), &PromptRoles::default());
         assert!(cli.contains("CONVERSATION LAYER"));
         // The CLI grammar for both moves is taught.
         assert!(cli.contains("note \"<context>\" --kind handoff"));
@@ -654,7 +844,7 @@ mod tests {
     #[test]
     fn mcp_conversation_block_points_at_post_note_and_refute_tools() {
         let agents = [BackendId::Gemini];
-        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", Some(AskTier::High));
+        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", Some(AskTier::High), &PromptRoles::default());
         assert!(mcp.contains("CONVERSATION LAYER"));
         assert!(mcp.contains("mcp__agentpit__post_note"));
         assert!(mcp.contains("mcp__agentpit__refute"));
@@ -673,8 +863,7 @@ mod tests {
             3,
             8,
             "run-1",
-            Some(AskTier::High),
-        );
+            Some(AskTier::High), &PromptRoles::default());
         assert!(text.contains("HUMAN BACK-CHANNEL"));
         assert!(text.contains("tier: high"));
         assert!(text.contains("DESTRUCTIVE or IRREVERSIBLE"));
@@ -701,8 +890,7 @@ mod tests {
             3,
             8,
             "run-1",
-            Some(AskTier::Low),
-        );
+            Some(AskTier::Low), &PromptRoles::default());
         assert!(text.contains("tier: low"));
         assert!(text.contains("A genuine A/B fork"));
     }
@@ -710,10 +898,250 @@ mod tests {
     #[test]
     fn mcp_discipline_points_at_ask_human_tool() {
         let agents = [BackendId::Gemini];
-        let text = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", Some(AskTier::High));
+        let text = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", Some(AskTier::High), &PromptRoles::default());
         assert!(text.contains("HUMAN BACK-CHANNEL"));
         assert!(text.contains("mcp__agentpit__ask_human"));
         // No shell-out ask grammar in MCP mode.
         assert!(!text.contains("agentpit ask \"<question>\""));
+    }
+
+    // ---- roles: byte-identical legacy regression pins ----
+
+    /// GOLDEN: with no roles configured the shell-mode prompt must stay EXACTLY what it was
+    /// before the roles layer landed. If this test fails, existing users' manager prompts
+    /// drifted — treat as a bug, not a test to update casually.
+    #[test]
+    fn legacy_prompt_is_byte_identical_without_roles() {
+        let agents = [BackendId::Gemini];
+        let text = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &PromptRoles::default());
+        let expected = "=== AGENTPIT WORKFLOW ORCHESTRATOR ===\n\
+You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
+sub-tasks, dispatch each to the best worker backend, read results, and write a final\n\
+synthesis. Your LAST message MUST be the synthesis — do not stop after the last dispatch.\n\
+\n\
+AVAILABLE WORKER BACKENDS: gemini\n\
+Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch to yourself.\n\
+\n\
+DISPATCH GRAMMAR (use your Bash tool):\n\
+One backend:   '/bin/agentpit' rescue --backend <id> \"<sub-task>\"\n\
+Parallel fan:  '/bin/agentpit' ensemble <id> <id> ... \"<prompt>\" [--aggregator <id>]\n\
+--backend is REQUIRED for rescue. Quote sub-tasks. For multi-line, use a bash heredoc.\n\
+\n\
+BUDGET: workflow depth 1/3; aim for <= 8 sub-dispatch calls.\n\
+The system REJECTS any nested workflow past the depth ceiling. Plan within budget.\n\
+\n\
+PROCEDURE:\n\
+1. Briefly state your plan (the sub-tasks).\n\
+2. Dispatch each sub-task; read its output; adjust the remaining plan as needed.\n\
+3. If a worker exits non-zero, note it inline and continue — do not abort the whole run.\n\
+4. End with a clearly-labelled SYNTHESIS section integrating all results.\n\
+\n\
+PARENT RUN ID: run-1   (correlation only; do not modify)\n\
+\n\
+=== USER GOAL ===\n\
+goal\n";
+        assert_eq!(text, expected);
+    }
+
+    /// GOLDEN: the MCP-mode twin of the byte-identical pin above.
+    #[test]
+    fn legacy_mcp_prompt_is_byte_identical_without_roles() {
+        let agents = [BackendId::Gemini];
+        let text = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &PromptRoles::default());
+        let expected = "=== AGENTPIT WORKFLOW ORCHESTRATOR (MCP MODE) ===\n\
+You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
+sub-tasks, dispatch each to the best worker backend, read results, and write a final\n\
+synthesis. Your LAST message MUST be the synthesis — do not stop after the last dispatch.\n\
+\n\
+AVAILABLE WORKER BACKENDS: gemini\n\
+Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch to yourself.\n\
+\n\
+ORCHESTRATION TOOLS (use these MCP tools; do NOT shell out to agentpit):\n\
+mcp__agentpit__list_backends  — list available backends + their auth/transport state.\n\
+mcp__agentpit__dispatch_task  — run ONE backend. Args: {\"backend\":\"<id>\",\"task\":\"<sub-task>\"}.\n\
+mcp__agentpit__run_ensemble   — fan out in parallel. Args: {\"members\":[\"<id>\",...],\"prompt\":\"<prompt>\",\"aggregator\":\"<id>\"} (aggregator optional).\n\
+\n\
+BUDGET: workflow depth 1/3; aim for <= 8 sub-dispatch calls.\n\
+The system REJECTS any nested workflow past the depth ceiling. Plan within budget.\n\
+\n\
+PROCEDURE:\n\
+1. Briefly state your plan (the sub-tasks).\n\
+2. Call the MCP tools above; read each result; adjust the remaining plan as needed.\n\
+3. If a worker fails, note it inline and continue — do not abort the whole run.\n\
+4. End with a clearly-labelled SYNTHESIS section integrating all results.\n\
+\n\
+PARENT RUN ID: run-1   (correlation only; do not modify)\n\
+\n\
+=== USER GOAL ===\n\
+goal\n";
+        assert_eq!(text, expected);
+    }
+
+    // ---- roles: role-mode prompts ----
+
+    fn sample_roster() -> PromptRoles<'static> {
+        PromptRoles {
+            roster: Some(
+                "  implementer (claude): You implement.\n  reviewer (codex): You review.",
+            ),
+            persona: None,
+        }
+    }
+
+    #[test]
+    fn role_mode_shell_prompt_teaches_rescue_role_grammar() {
+        let agents: [BackendId; 0] = [];
+        let text = build_manager_prompt(
+            "goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &sample_roster());
+        assert!(text.contains("AVAILABLE ROLES"));
+        assert!(text.contains("implementer (claude): You implement."));
+        assert!(text.contains("reviewer (codex): You review."));
+        assert!(text.contains("'/bin/agentpit' rescue --role <name> \"<sub-task>\""));
+        assert!(text.contains("do NOT invent role names"));
+        // The flat-backend roster and grammar are gone.
+        assert!(!text.contains("AVAILABLE WORKER BACKENDS"));
+        assert!(!text.contains("rescue --backend <id>"));
+        // Ensemble stays available (backend ids are informational, in parentheses).
+        assert!(text.contains("ensemble <id> <id>"));
+        // Structure is intact.
+        assert!(text.contains("PROCEDURE:"));
+        assert!(text.trim_end().ends_with("goal"));
+    }
+
+    #[test]
+    fn role_mode_mcp_prompt_teaches_dispatch_task_role_arg() {
+        let agents: [BackendId; 0] = [];
+        let text =
+            build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &sample_roster());
+        assert!(text.contains("AVAILABLE ROLES"));
+        assert!(text.contains("{\"role\":\"<name>\",\"task\":\"<sub-task>\"}"));
+        assert!(text.contains("never pass both"));
+        assert!(!text.contains("AVAILABLE WORKER BACKENDS"));
+        assert!(!text.contains("run ONE backend"));
+        // list_backends / run_ensemble remain.
+        assert!(text.contains("mcp__agentpit__list_backends"));
+        assert!(text.contains("mcp__agentpit__run_ensemble"));
+    }
+
+    #[test]
+    fn manager_persona_block_is_injected_in_both_modes() {
+        let agents = [BackendId::Gemini];
+        let roles = PromptRoles {
+            roster: None,
+            persona: Some("Prefer small, verifiable steps.\n"),
+        };
+        let shell = build_manager_prompt(
+            "goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &roles);
+        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &roles);
+        for text in [&shell, &mcp] {
+            assert!(text.contains("MANAGER PERSONA (from [workflow.roles.manager]):"));
+            assert!(text.contains("Prefer small, verifiable steps."));
+            // Persona composes with the legacy roster (persona-only manager role).
+            assert!(text.contains("AVAILABLE WORKER BACKENDS: gemini"));
+        }
+    }
+
+    // ---- roles: roster + manager resolution helpers ----
+
+    fn role_map(entries: &[(&str, &[BackendId], Option<&str>)]) -> BTreeMap<String, RoleConfig> {
+        entries
+            .iter()
+            .map(|(name, backends, prompt)| {
+                (
+                    name.to_string(),
+                    RoleConfig {
+                        backends: backends.to_vec(),
+                        prompt: prompt.map(str::to_string),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn roster_is_none_without_worker_roles() {
+        assert_eq!(build_role_roster(&BTreeMap::new(), &[]).unwrap(), None);
+        // A manager-only config is still legacy mode for the roster.
+        let manager_only = role_map(&[("manager", &[BackendId::Claude], None)]);
+        assert_eq!(
+            build_role_roster(&manager_only, &[BackendId::Claude]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn roster_renders_resolved_roles_and_skips_unresolvable_ones() {
+        let roles = role_map(&[
+            ("implementer", &[BackendId::Claude], Some("You implement.")),
+            ("reviewer", &[BackendId::Codex], Some("You review.")),
+        ]);
+        // Codex unavailable → reviewer is skipped with a reason, implementer survives.
+        let roster = build_role_roster(&roles, &[BackendId::Claude]).unwrap().unwrap();
+        assert_eq!(roster.names, vec!["implementer"]);
+        assert!(roster.lines.contains("implementer (claude): You implement."));
+        assert_eq!(roster.skipped.len(), 1);
+        assert_eq!(roster.skipped[0].0, "reviewer");
+        assert!(roster.skipped[0].1.contains("codex"));
+    }
+
+    #[test]
+    fn roster_errors_when_every_worker_role_is_unresolvable() {
+        let roles = role_map(&[("reviewer", &[BackendId::Codex], None)]);
+        let err = build_role_roster(&roles, &[]).unwrap_err().to_string();
+        assert!(err.contains("no configured worker role could be resolved"));
+        assert!(err.contains("reviewer"));
+    }
+
+    #[test]
+    fn manager_resolution_order_explicit_then_role_then_config_then_default() {
+        let roles = role_map(&[(
+            "manager",
+            &[BackendId::Codex],
+            Some("plan tightly"),
+        )]);
+        // Explicit CLI arg wins over the role; the persona still applies.
+        let (backend, persona) = resolve_manager_backend(
+            Some(BackendId::Claude),
+            &roles,
+            Some(BackendId::Claude),
+            BackendId::Antigravity,
+        )
+        .unwrap();
+        assert_eq!(backend, BackendId::Claude);
+        assert_eq!(persona.as_deref(), Some("plan tightly"));
+        // The role wins over [workflow].manager_backend.
+        let (backend, _) =
+            resolve_manager_backend(None, &roles, Some(BackendId::Claude), BackendId::Antigravity)
+                .unwrap();
+        assert_eq!(backend, BackendId::Codex);
+        // No role → config → default.
+        let empty = BTreeMap::new();
+        let (backend, persona) =
+            resolve_manager_backend(None, &empty, Some(BackendId::Claude), BackendId::Antigravity)
+                .unwrap();
+        assert_eq!(backend, BackendId::Claude);
+        assert_eq!(persona, None);
+        let (backend, _) =
+            resolve_manager_backend(None, &empty, None, BackendId::Antigravity).unwrap();
+        assert_eq!(backend, BackendId::Antigravity);
+    }
+
+    #[test]
+    fn persona_only_manager_role_keeps_legacy_backend_but_carries_persona() {
+        let roles = role_map(&[("manager", &[], Some("persona only"))]);
+        let (backend, persona) =
+            resolve_manager_backend(None, &roles, Some(BackendId::Codex), BackendId::Antigravity)
+                .unwrap();
+        assert_eq!(backend, BackendId::Codex);
+        assert_eq!(persona.as_deref(), Some("persona only"));
+    }
+
+    #[test]
+    fn manager_role_with_unsupported_backends_propagates_the_error() {
+        // Gemini cannot manage (is_supported_manager: claude|codex only).
+        let roles = role_map(&[("manager", &[BackendId::Gemini], None)]);
+        assert!(
+            resolve_manager_backend(None, &roles, None, BackendId::Antigravity).is_err()
+        );
     }
 }

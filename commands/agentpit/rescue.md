@@ -10,8 +10,12 @@ Parse `$ARGUMENTS`:
 Run the `agentpit` CLI via Bash:
 
 ```
-agentpit rescue "<task>" [--backend <id>]
+agentpit rescue "<task>" [--backend <id>] [--role <name>]
 ```
+
+`--role <name>` dispatches to a configured `[workflow.roles.<name>]` persona instead of an
+explicit backend — the role itself resolves which backend plays it. `--role` and `--backend`
+are mutually exclusive; passing both is a hard error.
 
 Relay the streamed output back to the user verbatim. If the command exits non-zero,
 surface the error — it likely indicates an auth issue and agentpit will have already

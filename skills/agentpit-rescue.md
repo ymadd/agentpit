@@ -23,8 +23,17 @@ agentpit rescue "<task description>" [--backend gemini|claude|codex|opencode]
 
 Omit `--backend` to let agentpit pick via its routing config (long-context heuristics, review keywords, etc.).
 
+To dispatch to a configured persona instead of an explicit backend, use `--role <name>`
+(resolves against `[workflow.roles.<name>]`; the role itself picks which backend plays it):
+
+```bash
+agentpit rescue "<task description>" --role reviewer
+```
+
+`--role` and `--backend` are mutually exclusive — passing both is a hard error.
+
 ## Output
 
-The CLI prints a header line `[backend=... transport=... route=...]` then streams the agent's reply to stdout.
+The CLI prints a header line `[backend=... transport=... route=...]` then streams the agent's reply to stdout. When dispatched via `--role`, the route segment reads `route=role:<name>` instead of the router's reason string.
 
 If the chosen backend is not authenticated, the CLI exits non-zero with an auth hint and (on macOS) opens a Terminal window for the OAuth flow. Surface that to the user and re-run after they log in.

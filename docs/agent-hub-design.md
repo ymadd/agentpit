@@ -168,6 +168,95 @@ best fit な worker に動的ディスパッチ（`rescue`/`ensemble`）。静�
 | コスト爆発 | ❌ | workflow全体の累積トークン/コール予算（env継承） |
 | 重複発見 | ❌ | ボス側 findings dedup |
 
+### 3.4 ロール（キャスティング設定）
+
+**ロールが固定するのは CAST であって SCRIPT ではない**: manager は相変わらず分解・順序を
+その場で即興する。固定したいのは「どのバックエンドがどのペルソナを演じるか」だけで、
+それを LLM の気分から config に移す（`src/workflow/roles.rs`）。実装済みの経路は3本:
+(1) 呼び出し側の明示ディスパッチ `agentpit rescue --role <name>`、(2) `agentpit workflow`
+の manager が受け取るロール名ロスター（ワーカーロールが1つでもあれば AVAILABLE ROLES +
+`rescue --role` / `dispatch_task {"role"}` 文法に切替わる）、(3) MCP `dispatch_task` の
+`role` 引数。manager 自身の解決順にも `roles.manager` が組み込まれている（下記）。
+
+#### スキーマ（`[workflow.roles.<name>]`）
+
+```toml
+[workflow.roles.<name>]
+backends = ["claude", "codex"]   # 優先順（先頭から利用可能なものが勝つ）。空 = 任意
+prompt   = "…persona…"           # ディスパッチのたびに前置されるペルソナ文（任意）
+```
+
+解決ロジックは `converse::pick` と同じ「優先順 → 決定的な利用可能フォールバック」形を踏襲し、
+バックエンド選定を再現可能に保つ。
+
+#### 予約ロール `manager` と resolve_manager
+
+`manager` という名前はワーカーではなく**オーケストレータ自身**を設定する予約ロールで、
+`workflow::roles::resolve_manager` が解決ロジックを持つ:
+
+```
+[workflow.roles.manager].backends の先頭 SUPPORTED（claude|codex）項目
+  > backends が空なら None（persona だけが乗り、バックエンド選定は呼び出し側に委ねる）
+```
+
+`manager` ロールへ `rescue --role manager` でディスパッチするのは `resolve_role`側で
+ハードエラーになる — オーケストレータ自身をワーカーとして呼び出すのは意味がない
+（`resolve_role` は名前が `manager` なら即 bail する）。
+
+#### workflow への配線（実装済み）
+
+`agentpit workflow`（`src/cli/workflow.rs`）の manager バックエンド解決順は:
+
+```
+--manager フラグ > [workflow.roles.manager]（claude|codex の先頭）
+  > [workflow].manager_backend > [default].backend
+```
+
+manager ロールの persona は、バックエンドがどの段で決まったかに関わらず（persona-only の
+manager ロールでも）オーケストレータプロンプトに `MANAGER PERSONA` ブロックとして注入
+される。ワーカーロールが1つでも設定されていれば、manager プロンプトのロスターは
+`AVAILABLE ROLES:`（`<name> (<解決済みbackend>): <persona 1行要約>`）に切替わり、
+ディスパッチ文法も shell モードは `rescue --role <name>`、MCP モードは
+`dispatch_task {"role":"<name>", ...}` を教える。解決できないロールは warning 付きで
+ロスターから除外され、**全ワーカーロールが解決不能なら起動時にハードエラー**。roles 設定
+時に `--agents` を渡すと warning の上で無視される（roles が勝つ）。
+
+#### ゼロロール = 完全後方互換
+
+`[workflow.roles.*]` が一つも無ければ manager プロンプトは従来のフラット backend ロスター
+のまま **バイト単位で同一**（`legacy_prompt_is_byte_identical_without_roles` /
+`legacy_mcp_prompt_is_byte_identical_without_roles` がゴールデン文字列でピン）。既存
+ユーザーの `agentpit workflow` 挙動は一切変わらない。
+
+#### ワーカーディスパッチ文法
+
+```
+CLI:  agentpit rescue --role <name> "<sub-task>"
+MCP:  mcp__agentpit__dispatch_task {"role":"<name>","task":"<sub-task>"}
+```
+
+`--role` と `--backend`（MCP では `role` と `backend`）は排他 — 両方/どちらも無しは
+構造化エラー。`role_name` は `[workflow.roles.<name>]`（`manager` を除く）に対して解決
+され、persona がタスクに前置された上で解決先バックエンドへディスパッチされる。dashboard
+のイベントは解決済み backend 名で記録されるので swarm 表示は従来と同形。
+
+#### 解決セマンティクス
+
+1. 優先順リスト（`backends`）を先頭から走査し、**現在利用可能**な最初のバックエンドを採用
+   （利用可能性より config の優先順が勝つ）。
+2. `backends` が空なら、利用可能集合をソートした先頭（`converse::pick` と同じ決定的
+   フォールバック）。
+3. 未知のロール名、および利用可能なバックエンドが1つも無いロールは**ハードエラー**
+   （黙って別 backend に差し替えると「config でキャスティングを固定する」意味が消える）。
+
+#### dashboard Settings パネル
+
+`[workflow.roles.*]` はデスクトップ dashboard の Settings パネルからも編集できる
+（`dashboard/src-tauri/src/settings.rs`）。書き込みは `toml_edit` 経由（`toml::to_string`
+によるファイル全体の再シリアライズではない）でコメントと整形を保持したまま該当キーだけを
+更新する — ユーザーが手書きした他セクションのコメントを潰さない。ロール名は
+`^[a-z0-9][a-z0-9_-]*$` にバリデートされ、重複名は拒否される。
+
 ---
 
 ## 4. 群れ間コミュニケーション層

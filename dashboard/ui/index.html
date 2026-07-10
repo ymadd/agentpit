@@ -27,6 +27,9 @@
         <button type="button" id="avail-toggle" class="avail">
           <span class="avail-dot"></span><span class="avail-label">在席中</span>
         </button>
+        <button type="button" id="settings-toggle" class="icon-btn" aria-label="設定を開く" title="設定">
+          <span class="gear">⚙</span>
+        </button>
         <span class="clock" id="clock">—</span>
       </div>
     </div>
@@ -58,6 +61,9 @@
 
     <!-- CLI version rail: inventory and each vendor CLI's own updater -->
     <div id="cli-manager" class="hidden"></div>
+
+    <!-- Settings: workflow tuning + role roster (manager/worker persona CRUD) -->
+    <div id="settings" class="hidden"></div>
 
     <script src="app.js"></script>
   </body>

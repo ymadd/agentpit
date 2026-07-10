@@ -134,12 +134,29 @@ impl Default for EnsembleSection {
     }
 }
 
+/// One named workflow role: a persona the manager dispatches to, bound to a backend
+/// preference list. The reserved name `manager` (see `workflow::roles::MANAGER_ROLE`)
+/// configures the orchestrator itself; every other role is a worker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleConfig {
+    /// Backend preference order; the first available one wins. Empty = any available backend.
+    #[serde(default)]
+    pub backends: Vec<BackendId>,
+    /// Persona preamble prepended to every task dispatched to this role (appended to the
+    /// orchestrator prompt for the `manager` role).
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowSection {
     #[serde(default)]
     pub manager_backend: Option<BackendId>,
     #[serde(default)]
     pub default_agents: Vec<BackendId>,
+    /// Named roles (`[workflow.roles.<name>]`). Empty = legacy flat-backend roster.
+    #[serde(default)]
+    pub roles: BTreeMap<String, RoleConfig>,
     #[serde(default = "default_workflow_max_depth")]
     pub max_depth: u32,
     #[serde(default = "default_workflow_max_calls")]
@@ -160,6 +177,7 @@ impl Default for WorkflowSection {
         Self {
             manager_backend: None,
             default_agents: Vec::new(),
+            roles: BTreeMap::new(),
             max_depth: 3,
             max_calls_per_manager: 8,
             use_mcp: false,
@@ -408,6 +426,20 @@ review_members = ["antigravity", "opencode"]
 # max_calls_per_manager = 8          # advisory sub-dispatch budget surfaced in the prompt
 # use_mcp               = false      # orchestrate via the MCP channel (claude manager only); --use-mcp overrides
 
+# Named workflow roles: the manager dispatches to ROLES instead of raw backends when any
+# worker role is defined. The reserved role "manager" configures the orchestrator itself.
+# [workflow.roles.manager]
+# backends = ["claude"]              # first supported manager (claude|codex) in the list wins
+# prompt   = "Prefer small, verifiable steps."
+#
+# [workflow.roles.implementer]
+# backends = ["claude", "codex"]     # preference order; first AVAILABLE backend wins
+# prompt   = "You are the implementer. Write the smallest correct change with tests."
+#
+# [workflow.roles.reviewer]
+# backends = ["codex", "antigravity"]
+# prompt   = "You are a strict reviewer. Critique only; do not rewrite."
+
 # Per-backend transport override.
 # [backends.antigravity]
 # transport = "acp"
@@ -567,6 +599,68 @@ max_calls_per_manager = 12
         );
         assert_eq!(loaded.config.workflow.max_depth, 5);
         assert_eq!(loaded.config.workflow.max_calls_per_manager, 12);
+    }
+
+    #[test]
+    fn workflow_roles_default_empty_and_parse_tables() {
+        let dir = tempdir().unwrap();
+        let empty = dir.path().join("empty.toml");
+        fs::write(&empty, "").unwrap();
+        assert!(
+            load_config(Some(&empty))
+                .unwrap()
+                .config
+                .workflow
+                .roles
+                .is_empty()
+        );
+
+        let path = dir.path().join("roles.toml");
+        fs::write(
+            &path,
+            r#"
+[workflow.roles.manager]
+backends = ["claude"]
+prompt = "Prefer small steps."
+
+[workflow.roles.reviewer]
+backends = ["codex", "antigravity"]
+
+[workflow.roles.researcher]
+prompt = "You research."
+"#,
+        )
+        .unwrap();
+        let roles = load_config(Some(&path)).unwrap().config.workflow.roles;
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles["manager"].backends, vec![BackendId::Claude]);
+        assert_eq!(roles["manager"].prompt.as_deref(), Some("Prefer small steps."));
+        assert_eq!(
+            roles["reviewer"].backends,
+            vec![BackendId::Codex, BackendId::Antigravity]
+        );
+        assert!(roles["reviewer"].prompt.is_none());
+        // A role may omit backends entirely (any available backend qualifies).
+        assert!(roles["researcher"].backends.is_empty());
+    }
+
+    #[test]
+    fn sample_config_roles_example_parses_when_uncommented() {
+        // The commented [workflow.roles.*] example in DEFAULT_CONFIG_TOML must stay valid TOML
+        // when a user uncomments it. Extract the example block (from the first roles table to
+        // the end of the commented run) and strip the comment markers.
+        let block: String = DEFAULT_CONFIG_TOML
+            .lines()
+            .skip_while(|l| !l.starts_with("# [workflow.roles.manager]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| l.strip_prefix("# ").or_else(|| l.strip_prefix("#")).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!block.is_empty(), "roles example block not found in sample config");
+        let parsed: HubConfig = toml::from_str(&block).expect("uncommented roles example parses");
+        assert!(parsed.workflow.roles.contains_key("manager"));
+        assert!(parsed.workflow.roles.contains_key("implementer"));
+        assert!(parsed.workflow.roles.contains_key("reviewer"));
     }
 
     #[test]

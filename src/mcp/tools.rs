@@ -43,8 +43,14 @@ use crate::types::BackendId;
 /// Parameters for the `dispatch_task` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DispatchTaskRequest {
-    /// Backend id to run (claude | codex | gemini | antigravity | opencode).
-    pub backend: String,
+    /// Backend id to run (claude | codex | gemini | antigravity | opencode). Exactly one of
+    /// `backend` or `role` must be provided.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Configured `[workflow.roles.<name>]` role to dispatch to; the role resolves which backend
+    /// plays it and prepends its persona to the task. Exactly one of `backend` or `role`.
+    #[serde(default)]
+    pub role: Option<String>,
     /// The task / prompt to give the backend.
     pub task: String,
 }
@@ -126,23 +132,36 @@ pub struct RefuteRequest {
     pub defender: Option<String>,
 }
 
-/// The agentpit MCP tool handler. Holds a shared [`Registries`] and the working directory the
-/// dispatched backends run in, plus the generated [`ToolRouter`].
+/// The agentpit MCP tool handler. Holds a shared [`Registries`], the working directory the
+/// dispatched backends run in, the configured `[workflow.roles.*]` map (for `dispatch_task`'s
+/// `role` argument), plus the generated [`ToolRouter`].
 #[derive(Clone)]
 pub struct AgentpitTools {
     regs: Arc<Registries>,
     cwd: PathBuf,
+    roles: Arc<std::collections::BTreeMap<String, crate::config::RoleConfig>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl AgentpitTools {
-    /// Build the tool handler over a shared registry set and working directory.
+    /// Build the tool handler over a shared registry set and working directory, with no roles
+    /// configured (role dispatches then fail with "no worker roles are configured").
     pub fn new(regs: Arc<Registries>, cwd: PathBuf) -> Self {
         Self {
             regs,
             cwd,
+            roles: Arc::new(std::collections::BTreeMap::new()),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Attach the configured `[workflow.roles.*]` map so `dispatch_task {role}` can resolve.
+    pub fn with_roles(
+        mut self,
+        roles: std::collections::BTreeMap<String, crate::config::RoleConfig>,
+    ) -> Self {
+        self.roles = Arc::new(roles);
+        self
     }
 }
 
@@ -187,31 +206,55 @@ impl AgentpitTools {
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
-    /// Run ONE backend on a task and return its output (or a structured error).
+    /// Run ONE backend (or configured role) on a task and return its output.
     #[tool(
         name = "dispatch_task",
-        description = "Run ONE backend agent on a task and return its output."
+        description = "Run ONE backend agent on a task and return its output. Address it either by backend id ({\"backend\":\"<id>\"}) or by a configured workflow role ({\"role\":\"<name>\"} — the role resolves its backend and prepends its persona); exactly one of the two, never both."
     )]
     async fn dispatch_task(
         &self,
         Parameters(req): Parameters<DispatchTaskRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let backend = match req.backend.parse::<BackendId>() {
-            Ok(b) => b,
-            Err(e) => {
-                return Ok(tool_error(format!(
-                    "unknown backend '{}': {e}",
-                    req.backend
-                )));
+        // Exactly one of backend|role addresses the dispatch; both or neither is ambiguous and a
+        // structured error, mirroring the CLI's `--role`/`--backend` mutual exclusion.
+        let (backend, task) = match (&req.backend, &req.role) {
+            (Some(_), Some(_)) => {
+                return Ok(tool_error(
+                    "'backend' and 'role' are mutually exclusive; pass exactly one".to_string(),
+                ));
+            }
+            (None, None) => {
+                return Ok(tool_error(
+                    "dispatch_task requires either 'backend' or 'role'".to_string(),
+                ));
+            }
+            (Some(b), None) => match b.parse::<BackendId>() {
+                Ok(b) => (b, req.task),
+                Err(e) => return Ok(tool_error(format!("unknown backend '{b}': {e}"))),
+            },
+            (None, Some(role_name)) => {
+                let available: Vec<BackendId> = self.regs.available().into_iter().collect();
+                match crate::workflow::roles::resolve_role(role_name, &self.roles, &available) {
+                    Ok(resolved) => {
+                        let wrapped = crate::workflow::roles::persona_task(
+                            &resolved.name,
+                            resolved.prompt.as_deref(),
+                            &req.task,
+                        );
+                        (resolved.backend, wrapped)
+                    }
+                    Err(e) => return Ok(tool_error(format!("{e:#}"))),
+                }
             }
         };
         let cancel = CancellationToken::new();
         // Surface single MCP dispatches in the dashboard swarm, like `agentpit rescue` — this is
-        // also how a `--use-mcp` workflow manager's per-worker dispatches become visible.
+        // also how a `--use-mcp` workflow manager's per-worker dispatches become visible. A role
+        // dispatch logs under its RESOLVED backend, so dashboard events look identical.
         let logger = RunLogger::start(RunKind::Rescue, &[backend], &self.cwd);
         let outcome = dispatch_member_logged(
             backend,
-            req.task,
+            task,
             self.cwd.clone(),
             cancel,
             self.regs.clone(),
@@ -749,7 +792,8 @@ mod tests {
         let _g = isolated_state_dir();
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
-                backend: "gemini".into(),
+                backend: Some("gemini".into()),
+                role: None,
                 task: "noop".into(),
             }))
             .await
@@ -761,7 +805,8 @@ mod tests {
     async fn dispatch_task_unknown_backend_is_structured_error_not_panic() {
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
-                backend: "imaginary".into(),
+                backend: Some("imaginary".into()),
+                role: None,
                 task: "noop".into(),
             }))
             .await
@@ -774,6 +819,94 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("unknown backend"), "got: {text}");
+    }
+
+    fn tools_with_reviewer_role() -> AgentpitTools {
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(
+            "reviewer".to_string(),
+            crate::config::RoleConfig {
+                backends: vec![BackendId::Gemini],
+                prompt: Some("You review.".into()),
+            },
+        );
+        tools().with_roles(roles)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dispatch_task_role_runs_resolved_backend() {
+        let _g = isolated_state_dir();
+        let res = tools_with_reviewer_role()
+            .dispatch_task(Parameters(DispatchTaskRequest {
+                backend: None,
+                role: Some("reviewer".into()),
+                task: "noop".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(false), "expected success, got: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_unknown_role_is_structured_error() {
+        let res = tools_with_reviewer_role()
+            .dispatch_task(Parameters(DispatchTaskRequest {
+                backend: None,
+                role: Some("ghost".into()),
+                task: "noop".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = res
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("unknown role 'ghost'"), "got: {text}");
+        assert!(text.contains("reviewer"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_backend_and_role_together_is_structured_error() {
+        let res = tools_with_reviewer_role()
+            .dispatch_task(Parameters(DispatchTaskRequest {
+                backend: Some("gemini".into()),
+                role: Some("reviewer".into()),
+                task: "noop".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = res
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("mutually exclusive"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_neither_backend_nor_role_is_structured_error() {
+        let res = tools()
+            .dispatch_task(Parameters(DispatchTaskRequest {
+                backend: None,
+                role: None,
+                task: "noop".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = res
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("either 'backend' or 'role'"), "got: {text}");
     }
 
     #[tokio::test]

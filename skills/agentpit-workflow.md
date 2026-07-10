@@ -27,6 +27,44 @@ agentpit workflow "<goal>" [--manager claude|codex] [--agents a,b,c] [--max-dept
   and scoped to the `mcp__agentpit__*` tools (`dispatch_task` / `list_backends` / `run_ensemble`).
   A codex manager warns and falls back to CLI shell-out. Also settable via `[workflow].use_mcp`.
 
+## Roles (optional casting)
+
+`[workflow.roles.*]` fixes the CAST, not the SCRIPT: which backend plays a persona moves from
+LLM whim into config, while the manager keeps improvising the decomposition. When at least one
+worker role is configured, the manager's roster becomes `AVAILABLE ROLES` (name, resolved
+backend, one-line persona summary) and its dispatch grammar switches to `rescue --role <name>`
+(shell mode) / `dispatch_task {"role":"<name>"}` (MCP mode); `--agents` is then ignored with a
+warning. With zero roles configured the legacy flat-backend roster applies and the manager
+prompt is byte-identical to before roles existed.
+
+```toml
+[workflow.roles.manager]
+backends = ["claude"]              # first SUPPORTED manager (claude|codex) in the list wins
+prompt   = "Prefer small, verifiable steps."
+
+[workflow.roles.implementer]
+backends = ["claude", "codex"]     # preference order; first AVAILABLE backend wins
+prompt   = "You are the implementer. Write the smallest correct change with tests."
+
+[workflow.roles.reviewer]
+backends = ["codex", "antigravity"]
+prompt   = "You are a strict reviewer. Critique only; do not rewrite."
+```
+
+The reserved `manager` role configures the orchestrator itself and is never a worker dispatch
+target (`--role manager` is a hard error). Manager resolution order is `--manager` >
+`[workflow.roles.manager]` (first claude|codex in its list) > `[workflow].manager_backend` >
+`[default].backend`; the manager role's `prompt`, when present, is injected into the
+orchestrator prompt as a MANAGER PERSONA block regardless of where the backend came from.
+
+For every other role, dispatch by name with `agentpit rescue --role <name> "<sub-task>"`
+(`--role` and `--backend` are mutually exclusive — the role resolves the backend). Resolution
+walks the role's `backends` preference list for the first currently-available entry (empty list
+= any available backend, chosen deterministically); an unknown role name or a role with no
+available backend is a hard error rather than a silent substitution. The MCP equivalent is
+`mcp__agentpit__dispatch_task {"role":"<name>","task":"<sub-task>"}` (`role` and `backend` are
+mutually exclusive there too), so a `--use-mcp` workflow targets roles by name the same way.
+
 ## MCP channel
 
 `agentpit mcp serve` is a standalone stdio MCP server exposing `dispatch_task`, `list_backends`,

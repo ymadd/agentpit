@@ -46,6 +46,276 @@ function el(tag, cls, text) {
   if (text != null) e.textContent = text;
   return e;
 }
+// ── i18n (English source strings are the keys; `ja` overrides, missing → English) ──
+const LANG_KEY = "agentpit.lang";
+function detectLang() {
+  try { const s = localStorage.getItem(LANG_KEY); if (s === "ja" || s === "en") return s; } catch (e) {}
+  return (navigator.language || "en").toLowerCase().startsWith("ja") ? "ja" : "en";
+}
+let LANG = detectLang();
+// English source → Japanese. Keep keys byte-identical to the English rendered in the UI.
+const JA = {
+  // statusbar
+  "Away — the swarm continues on the safe side": "離席中 — スワームは安全側で継続します",
+  "The swarm is quiet": "スワームは静かです",
+  "One manager overseeing {n} project(s)": "{n} 件のプロジェクトを1人のマネージャーが統括中",
+  "Available": "対応可能",
+  "Away": "離席中",
+  // footer
+  "{projects} projects · {total} agents": "{projects} プロジェクト · {total} エージェント",
+  "Connecting…": "接続中…",
+  "Connected": "接続済み",
+  "Disconnected": "切断",
+  // idle stage
+  "INBOX ZERO": "インボックス ゼロ",
+  "AWAY": "離席中",
+  "Nothing is waiting on your decision.": "あなたの判断を待っているものはありません。",
+  "You are away. The swarm keeps going.": "離席中です。スワームは動き続けます。",
+  "{running} agents are working quietly across {projects} projects. When something only a human can decide comes up, exactly one thing appears here. Until then, you are free to step away.": "{running} 体のエージェントが {projects} 件のプロジェクトで静かに稼働中です。人間にしか判断できないことが起きたときだけ、ここにひとつだけ表示されます。それまでは離席していて構いません。",
+  "Even while you are away, the swarm keeps moving on the safe side. Anything only a human can decide waits, and is reported together when you return.": "離席中でも、スワームは安全側で動き続けます。人間にしか判断できないことは保留され、戻ったときにまとめて報告されます。",
+  "one window": "ひとつの窓",
+  "never stalls": "止まらない",
+  // decision card
+  "action": "アクション",
+  "review": "レビュー",
+  "A worker is stopped, waiting on your decision.": "ワーカーが停止し、あなたの判断を待っています。",
+  "There is a decision to confirm.": "確認したい判断があります。",
+  "{id}  ·  proceeds on the safe side if no answer in {secs}s": "{id}  ·  {secs}秒以内に応答がなければ安全側で進みます",
+  "Yes": "はい",
+  "No": "いいえ",
+  "Reversible work keeps going while you decide": "判断中も、取り消せる作業は進み続けます",
+  "Reversible work continues · next: {proj}": "取り消せる作業は継続 · 次: {proj}",
+  // swarm glance
+  "Swarm": "スワーム",
+  "{running} running / {total} agents": "{running} 稼働 / {total} エージェント",
+  "{projects} projects · {running} running / {total} total": "{projects} プロジェクト · {running} 稼働 / {total} 合計",
+  "You do not need to watch this — the manager is.": "これを見張る必要はありません — マネージャーが見ています。",
+  "Close": "閉じる",
+  "PROJECTS": "プロジェクト",
+  "All": "すべて",
+  "No swarm is running right now.": "現在、稼働中のスワームはありません。",
+  "{running} / {total} running": "{running} / {total} 稼働",
+  "up": "稼働",
+  "done": "完了",
+  "failed": "失敗",
+  "idle": "待機",
+  // kind labels
+  "rescue": "レスキュー",
+  "security": "セキュリティ",
+  "adversarial": "敵対的",
+  "explain": "解説",
+  "refactor": "リファクタ",
+  "ensemble": "アンサンブル",
+  "workflow": "ワークフロー",
+  "run": "実行",
+  // CLI versions panel
+  "TOOLCHAIN / LOCAL": "ツールチェーン / ローカル",
+  "Agent CLI versions": "エージェント CLI バージョン",
+  "Agent CLI version management": "エージェント CLI バージョン管理",
+  "Check the CLIs agentpit actually calls, and update each with its own official updater.": "agentpit が実際に呼び出す CLI を確認し、それぞれ公式アップデーターで更新します。",
+  "Update commands are fixed. No arbitrary shell input is run.": "更新コマンドは固定です。任意のシェル入力は実行しません。",
+  "Checking…": "確認中…",
+  "Recheck": "再確認",
+  "Update failed": "更新に失敗しました",
+  "Checking local CLIs…": "ローカルの CLI を確認中…",
+  "{installed} / {total} installed": "{installed} / {total} インストール済み",
+  "installed": "インストール済み",
+  "missing": "未検出",
+  "update": "更新あり",
+  "current": "最新",
+  "unknown": "不明",
+  "{command} is not on PATH": "{command} は PATH にありません",
+  "INSTALLED": "インストール済み",
+  "LATEST": "最新",
+  "Updating…": "更新中…",
+  "Update": "更新",
+  "Cannot update": "更新できません",
+  "not on PATH": "PATH にありません",
+  // validation
+  "Enter a name": "名前を入力してください",
+  "Only lowercase letters, digits, - and _ (must start alphanumeric)": "英小文字・数字・- ・_ のみ（先頭は英数字）",
+  "This name is already in use": "この名前は既に使われています",
+  "'{name}' is reserved (used by the workflow generate/list commands)": "'{name}' は予約語です（workflow の generate/list コマンドで使用）",
+  // generate modal
+  "GENERATE": "生成",
+  "Generate a workflow": "ワークフローを生成",
+  "Describe the workflow you want. An agent drafts roles, personas, and steps as an editable draft.": "作りたいワークフローを記述してください。エージェントがロール・ペルソナ・ステップを編集可能なドラフトとして起草します。",
+  "e.g. A workflow that strictly reviews PRs and hardens security & edge cases with refutation": "例: PR を厳密にレビューし、反証でセキュリティとエッジケースを固めるワークフロー",
+  "Cancel": "キャンセル",
+  "Generate": "生成",
+  "Enter a description.": "説明を入力してください。",
+  "Generating…": "生成中…",
+  "Workflow generated. Review it, then save.": "ワークフローを生成しました。確認してから保存してください。",
+  "Invalid generation result.": "生成結果が不正です。",
+  // studio topbar
+  "Settings /": "設定 /",
+  "(default) workflow": "(デフォルト) ワークフロー",
+  "(unnamed)": "(名称未設定)",
+  "+ New workflow": "+ 新しいワークフロー",
+  "BLUEPRINT": "ブループリント",
+  "The canvas is a blueprint the runtime grows. Steps are not saved to config (only the cast and workflow settings are).": "キャンバスは実行時に育つブループリントです。ステップは設定に保存されません（保存されるのはキャストとワークフロー設定のみ）。",
+  "✨ Generate": "✨ 生成",
+  "Generate a workflow from a description": "説明からワークフローを生成",
+  "grows to {n}–N steps at runtime": "実行時に {n}–N ステップへ拡張",
+  "Fit": "フィット",
+  "Save": "保存",
+  "Saving…": "保存中…",
+  "Load failed": "読み込み失敗",
+  "Unsaved changes": "未保存の変更",
+  "not created": "未作成",
+  "Saved": "保存済み",
+  // studio canvas hints / nodes
+  "drag = pan": "ドラッグ = パン",
+  "header = move": "ヘッダー = 移動",
+  "drop a CLI/role on a step": "CLI/ロールをステップにドロップ",
+  "WORKFLOW": "ワークフロー",
+  "(default)": "(デフォルト)",
+  "⟳ self-spawn": "⟳ 自己生成",
+  "fixed": "固定",
+  "manager ·": "マネージャー ·",
+  "ask ✓": "確認 ✓",
+  "BEHAVIOR / DIRECTIVE": "挙動 / 指示",
+  "worker": "ワーカー",
+  "drop a CLI/role": "CLI/ロールをドロップ",
+  "GENERATED": "生成",
+  "runtime": "実行時",
+  "DYNAMIC": "動的",
+  "spawns at runtime<br />(add manually too)": "実行時に生成<br />(手動追加も可)",
+  // edge labels
+  "goal in": "ゴール投入",
+  "auto-spawn": "自動生成",
+  "integrate": "統合",
+  "dynamic": "動的",
+  "handoff": "受け渡し",
+  // palette
+  "LIBRARY": "ライブラリ",
+  "Agents & cast": "エージェント & キャスト",
+  "Drag onto a step to assign a worker. The cast and settings save to config.": "ステップにドラッグしてワーカーを割り当てます。キャストと設定は設定ファイルに保存されます。",
+  "AGENT CLI": "エージェント CLI",
+  "Roles / cast": "ロール / キャスト",
+  "Add a role": "ロールを追加",
+  "No roles yet. Add one with +.": "ロールはまだありません。+ で追加します。",
+  "+ Add step": "+ ステップを追加",
+  "{steps} steps · {roles} roles": "{steps} ステップ · {roles} ロール",
+  // inspector — step
+  "This step is a blueprint (draft). Only the cast and workflow settings save; the manager improvises the decomposition at runtime.": "このステップはブループリント（ドラフト）です。保存されるのはキャストとワークフロー設定のみで、分解は実行時にマネージャーが即興で行います。",
+  "Step name / phase": "ステップ名 / フェーズ",
+  "manager backend (launching agent, illustrative)": "マネージャーバックエンド（起動エージェント・例示）",
+  "PERSONA (viewpoint)": "ペルソナ（視点）",
+  "BEHAVIOR / DIRECTIVE (the manager's instruction)": "挙動 / 指示（マネージャーへの指示）",
+  "Workers (roles / CLIs this step runs)": "ワーカー（このステップが実行するロール / CLI）",
+  "+ Add worker": "+ ワーカーを追加",
+  "Role: {name}": "ロール: {name}",
+  "CLI: {label}": "CLI: {label}",
+  "Allow dynamic spawn (sub-workflow generation)": "動的生成を許可（サブワークフロー生成）",
+  "Allow asking a human (ask_human)": "人間への確認を許可 (ask_human)",
+  "fan-out limit ": "ファンアウト上限 ",
+  "Delete this step": "このステップを削除",
+  "Workflow step (draft)": "ワークフローステップ（ドラフト）",
+  // inspector — role
+  "INSPECTOR": "インスペクター",
+  "Nothing selected": "未選択",
+  "Role name": "ロール名",
+  "Lowercase letters, digits, -, _ (start alphanumeric).": "英小文字・数字・-・_（先頭は英数字）。",
+  "A saved role name cannot be changed (delete and re-create).": "保存済みのロール名は変更できません（削除して作り直してください）。",
+  "Reserved role: the first claude / codex in the list becomes the orchestrator.": "予約ロール: リストの先頭にある claude / codex がオーケストレーターになります。",
+  "BACKENDS (preference order — first wins)": "バックエンド（優先順 — 先頭が優先）",
+  "+ Add backend": "+ バックエンドを追加",
+  "Prompt (persona)": "プロンプト（ペルソナ）",
+  "Model (optional)": "モデル（任意）",
+  "e.g. opus / gpt-5-codex (empty = backend default)": "例: opus / gpt-5-codex（空欄 = バックエンド既定）",
+  "Delete this role": "このロールを削除",
+  "(unnamed role)": "(名称未設定のロール)",
+  "role / cast": "ロール / キャスト",
+  // inspector — CLI
+  "command": "コマンド",
+  "version": "バージョン",
+  "transport": "トランスポート",
+  "state": "状態",
+  "path": "パス",
+  "Assign it to a step's manager or workers. Manage versions from 'CLI versions' in the footer.": "ステップのマネージャーまたはワーカーに割り当てます。バージョンはフッターの「CLI versions」から管理します。",
+  "agent CLI": "エージェント CLI",
+  // inspector — generated step
+  "An illustration of a step spawned at runtime. Not editable in the blueprint (spawning is controlled by the parent step's dynamic spawn).": "実行時に生成されるステップの例示です。ブループリントでは編集できません（生成は親ステップの動的生成で制御されます）。",
+  "phase": "フェーズ",
+  "backend": "バックエンド",
+  "source": "ソース",
+  "review → refute": "レビュー → 反証",
+  "auto-generated step": "自動生成ステップ",
+  // inspector — base workflow
+  "Loading workflow settings…": "ワークフロー設定を読み込み中…",
+  "Workflow": "ワークフロー",
+  "The default workflow ([workflow]). The runtime goal is interpreted by agentpit, so it is not entered here. Named workflows come from the selector above or ✨ Generate.": "デフォルトのワークフロー（[workflow]）。実行時のゴールは agentpit が解釈するため、ここでは入力しません。名前付きワークフローは上のセレクターまたは ✨ 生成 から作成します。",
+  "INVOKE": "呼び出し",
+  "manager backend (default orchestrator)": "マネージャーバックエンド（既定のオーケストレーター）",
+  "roles.manager takes precedence if set.": "roles.manager が設定されていればそちらが優先されます。",
+  "max depth (recursion ceiling)": "最大深度（再帰の上限）",
+  "max calls / manager (per-manager dispatch budget)": "最大呼び出し / マネージャー（マネージャーごとのディスパッチ上限）",
+  "Run via MCP (use_mcp)": "MCP 経由で実行 (use_mcp)",
+  "Enable asking a human (enable_ask_human)": "人間への確認を有効化 (enable_ask_human)",
+  "base [workflow]": "ベース [workflow]",
+  // inspector — workflow type
+  "Workflow name (type)": "ワークフロー名（type）",
+  "Lowercase letters, digits, -, _. Invoke with agentpit workflow <name> \"<goal>\".": "英小文字・数字・-・_。agentpit workflow <name> \"<goal>\" で呼び出します。",
+  "A saved name cannot be changed (delete and re-create).": "保存済みの名前は変更できません（削除して作り直してください）。",
+  "Display name (optional)": "表示名（任意）",
+  "Strict code review": "厳密なコードレビュー",
+  "BRIEF (the manager instruction for this workflow)": "ブリーフ（このワークフローへのマネージャー指示）",
+  "Roles used (none selected = all worker roles)": "使用するロール（未選択 = すべてのワーカーロール）",
+  "Add roles (the cast) in the palette first.": "先にパレットでロール（キャスト）を追加してください。",
+  "— overrides below (empty / inherit = fall back to base [workflow]) —": "— 以下は上書き設定（空欄 / 継承 = ベース [workflow] にフォールバック）—",
+  "manager backend": "マネージャーバックエンド",
+  "max depth": "最大深度",
+  "max calls / manager": "最大呼び出し / マネージャー",
+  "Via MCP (use_mcp)": "MCP 経由 (use_mcp)",
+  "Ask a human (enable_ask_human)": "人間に確認 (enable_ask_human)",
+  "Delete this workflow": "このワークフローを削除",
+  "(unnamed workflow)": "(名称未設定のワークフロー)",
+  "named workflow / type": "名前付きワークフロー / type",
+  // tri-state / select options
+  "inherit": "継承",
+  "on": "オン",
+  "off": "オフ",
+  // notifications
+  "One decision, please": "確認をお願いします",
+  "{n} decisions waiting": "{n} 件の確認待ち",
+  // toasts
+  "Sent \"{value}\". Applying to the swarm.": "「{value}」を送信しました。スワームに反映します。",
+  "Settings saved.": "設定を保存しました。",
+  "Updated {label} to {version}.": "{label} を {version} に更新しました。",
+  "the latest": "最新版",
+  "Failed to update {label}.": "{label} の更新に失敗しました。",
+  "Welcome back.": "おかえりなさい。",
+  "Going away. The swarm continues on the safe side.": "離席します。スワームは安全側で継続します。",
+  // static HTML
+  "Settings": "設定",
+  "Open settings": "設定を開く",
+  "CLI versions": "CLI バージョン",
+};
+// Translate `s` (an English source string). `vars` fills {name} placeholders in either language.
+function t(s, vars) {
+  let out = (LANG === "ja" && JA[s] != null) ? JA[s] : s;
+  if (vars) for (const k in vars) out = out.split("{" + k + "}").join(vars[k]);
+  return out;
+}
+function setLang(lang) {
+  LANG = lang === "ja" ? "ja" : "en";
+  try { localStorage.setItem(LANG_KEY, LANG); } catch (e) {}
+  applyLang();
+}
+function applyStaticI18n() {
+  document.querySelectorAll("[data-i18n]").forEach((n) => { n.textContent = t(n.dataset.i18n); });
+  document.querySelectorAll("[data-i18n-title]").forEach((n) => { n.title = t(n.dataset.i18nTitle); });
+  document.querySelectorAll("[data-i18n-aria]").forEach((n) => { n.setAttribute("aria-label", t(n.dataset.i18nAria)); });
+}
+// Re-render every surface in the current language. Called on language switch.
+function applyLang() {
+  document.documentElement.lang = LANG;
+  applyStaticI18n();
+  stageSig = null; swarmSig = null; cliSig = null; // bust render caches so surfaces rebuild
+  renderAll();
+  if (studioBuilt) renderStudio();
+}
 function basename(p) {
   if (!p) return "";
   const parts = p.replace(/\/+$/, "").split("/");
@@ -82,7 +352,7 @@ const KIND = {
   workflow: "workflow",
 };
 function kindLabel(k) {
-  return KIND[k] || k || "run";
+  return t(KIND[k] || k || "run");
 }
 function fmtChars(n) {
   if (n == null) return "—";
@@ -90,7 +360,7 @@ function fmtChars(n) {
 }
 function fmtElapsed(runTs, m) {
   const ts = (m && m.started_ts) || runTs;
-  if (!ts) return "up";
+  if (!ts) return t("up");
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m`;
 }
@@ -144,9 +414,9 @@ function scheduleRender() {
 function updateStatusbar() {
   const counts = swarmCounts();
   const ml = document.getElementById("manager-line");
-  if (!available) ml.textContent = "Away — the swarm continues on the safe side";
-  else if (counts.projects === 0) ml.textContent = "The swarm is quiet";
-  else ml.textContent = `One manager overseeing ${counts.projects} project(s)`;
+  if (!available) ml.textContent = t("Away — the swarm continues on the safe side");
+  else if (counts.projects === 0) ml.textContent = t("The swarm is quiet");
+  else ml.textContent = t("One manager overseeing {n} project(s)", { n: counts.projects });
 
   const list = visibleAsks();
   document.getElementById("pending-count").textContent = list.length;
@@ -154,15 +424,15 @@ function updateStatusbar() {
 
   const at = document.getElementById("avail-toggle");
   at.classList.toggle("away", !available);
-  at.querySelector(".avail-label").textContent = available ? "Available" : "Away";
+  at.querySelector(".avail-label").textContent = available ? t("Available") : t("Away");
 }
 
 function updateFooter() {
   const counts = swarmCounts();
-  document.getElementById("swarm-footer").textContent = `${counts.projects} projects · ${counts.total} agents`;
+  document.getElementById("swarm-footer").textContent = t("{projects} projects · {total} agents", { projects: counts.projects, total: counts.total });
   const conn = document.getElementById("conn");
   conn.classList.toggle("live", connected);
-  document.getElementById("conn-text").textContent = connected ? "Connected" : "Disconnected";
+  document.getElementById("conn-text").textContent = connected ? t("Connected") : t("Disconnected");
 }
 
 // stage = idle (inbox zero) OR exactly one decision card
@@ -205,26 +475,26 @@ function buildIdle(root, counts) {
   breathe.style.background = dotColor;
   orb.append(core, breathe);
 
-  const eyebrow = el("div", "idle-eyebrow", available ? "INBOX ZERO" : "AWAY");
+  const eyebrow = el("div", "idle-eyebrow", available ? t("INBOX ZERO") : t("AWAY"));
   eyebrow.style.color = available ? "#3a8a55" : "#6b7484";
 
   const h = el(
     "h1",
     "idle-headline",
-    available ? "Nothing is waiting on your decision." : "You are away. The swarm keeps going."
+    available ? t("Nothing is waiting on your decision.") : t("You are away. The swarm keeps going.")
   );
   const sub = el(
     "p",
     "idle-sub",
     available
-      ? `${counts.running} agents are working quietly across ${counts.projects} projects. When something only a human can decide comes up, exactly one thing appears here. Until then, you are free to step away.`
-      : "Even while you are away, the swarm keeps moving on the safe side. Anything only a human can decide waits, and is reported together when you return."
+      ? t("{running} agents are working quietly across {projects} projects. When something only a human can decide comes up, exactly one thing appears here. Until then, you are free to step away.", { running: counts.running, projects: counts.projects })
+      : t("Even while you are away, the swarm keeps moving on the safe side. Anything only a human can decide waits, and is reported together when you return.")
   );
   wrap.append(orb, eyebrow, h, sub);
 
   if (available) {
     const chips = el("div", "chips");
-    for (const t of ["O(1)", "one window", "never stalls"]) chips.appendChild(el("span", "chip", t));
+    for (const c of ["O(1)", t("one window"), t("never stalls")]) chips.appendChild(el("span", "chip", c));
     wrap.appendChild(chips);
   }
   root.appendChild(wrap);
@@ -250,7 +520,7 @@ function buildDecision(root, a, list) {
   const hr = el("div", "dec-head-r");
   if (list.length > 1) hr.appendChild(el("span", "dec-queue", `${cursor + 1} / ${list.length}`));
   const badge = el("div", "dec-badge " + (blocking ? "blocking" : "review"));
-  badge.append(el("span", "d"), el("span", "l", blocking ? "action" : "review"));
+  badge.append(el("span", "d"), el("span", "l", blocking ? t("action") : t("review")));
   hr.appendChild(badge);
   head.append(hl, hr);
   wrap.appendChild(head);
@@ -259,10 +529,10 @@ function buildDecision(root, a, list) {
   const card = el("div", "dec-card");
   card.appendChild(el("h2", "dec-title", a.prompt));
   card.appendChild(
-    el("p", "dec-reason", blocking ? "A worker is stopped, waiting on your decision." : "There is a decision to confirm.")
+    el("p", "dec-reason", blocking ? t("A worker is stopped, waiting on your decision.") : t("There is a decision to confirm."))
   );
   const shortId = (a.askId || "").replace(/^ask-/, "").slice(0, 14);
-  card.appendChild(el("div", "dec-context", `${shortId}  ·  proceeds on the safe side if no answer in ${a.timeoutSecs}s`));
+  card.appendChild(el("div", "dec-context", t("{id}  ·  proceeds on the safe side if no answer in {secs}s", { id: shortId, secs: a.timeoutSecs })));
 
   const actions = el("div", "dec-actions");
   const opts = a.options && a.options.length ? a.options : ["yes", "no"];
@@ -271,7 +541,7 @@ function buildDecision(root, a, list) {
     const btn = el("button", "dec-btn " + (i === 0 ? "approve" : "neutral"));
     btn.type = "button";
     const key = isYesNo ? (i === 0 ? "Y" : "N") : String(i + 1);
-    const label = isYesNo ? (i === 0 ? "Yes" : "No") : opt;
+    const label = isYesNo ? (i === 0 ? t("Yes") : t("No")) : opt;
     btn.append(el("span", "key", key), el("span", "lab", label));
     btn.addEventListener("click", () => answer(a.askId, opt));
     actions.appendChild(btn);
@@ -281,12 +551,12 @@ function buildDecision(root, a, list) {
 
   // reassurance
   const foot = el("div", "dec-foot");
-  let reassure = "Reversible work keeps going while you decide";
+  let reassure = t("Reversible work keeps going while you decide");
   if (list.length > 1) {
     const next = list[(cursor + 1) % list.length];
     const nextRun = runIndex()[next.runId];
     const nextProj = (nextRun && basename(nextRun.cwd)) || next.runId;
-    reassure = `Reversible work continues · next: ${nextProj}`;
+    reassure = t("Reversible work continues · next: {proj}", { proj: nextProj });
   }
   foot.appendChild(el("span", "reassure", reassure));
   wrap.appendChild(foot);
@@ -354,15 +624,15 @@ function workerRow(run, m) {
     sd.style.background = "var(--ac)";
     sd.style.animation = "ap-pulse 2.2s ease-in-out infinite";
   } else if (m.status === "ok") {
-    sl.textContent = "done";
+    sl.textContent = t("done");
     sl.style.color = "#3f8f6f";
     sd.style.background = "#3f8f6f";
   } else if (m.status === "error" || m.status === "interrupted") {
-    sl.textContent = "failed";
+    sl.textContent = t("failed");
     sl.style.color = "var(--err)";
     sd.style.background = "var(--err)";
   } else {
-    sl.textContent = m.status || "idle";
+    sl.textContent = m.status || t("idle");
     sl.style.color = "var(--muted-2)";
     sd.style.background = "var(--muted-2)";
   }
@@ -396,16 +666,16 @@ function buildSwarm(root, runs) {
   const head = el("div", "swarm-head");
   const ht = el("div");
   const title = el("div", "swarm-title");
-  title.appendChild(el("span", "t", "Swarm"));
+  title.appendChild(el("span", "t", t("Swarm")));
   const filteredItems = projectFilter ? groups.get(projectFilter) || [] : null;
   const headCount = projectFilter
-    ? `${filteredItems.filter((x) => x.m.status === "running").length} running / ${filteredItems.length} agents`
-    : `${projects.length} projects · ${runningAll} running / ${totalAll} total`;
+    ? t("{running} running / {total} agents", { running: filteredItems.filter((x) => x.m.status === "running").length, total: filteredItems.length })
+    : t("{projects} projects · {running} running / {total} total", { projects: projects.length, running: runningAll, total: totalAll });
   title.appendChild(el("span", "c", headCount));
-  ht.append(title, el("div", "swarm-sub", "You do not need to watch this — the manager is."));
+  ht.append(title, el("div", "swarm-sub", t("You do not need to watch this — the manager is.")));
   const close = el("button", "swarm-close");
   close.type = "button";
-  close.append(el("span", "l", "Close"), el("span", "x", "✕"));
+  close.append(el("span", "l", t("Close")), el("span", "x", "✕"));
   close.addEventListener("click", toggleSwarm);
   head.append(ht, close);
   sheet.appendChild(head);
@@ -413,9 +683,9 @@ function buildSwarm(root, runs) {
   // body: rail + main
   const body = el("div", "swarm-body");
   const rail = el("div", "swarm-rail");
-  rail.appendChild(el("div", "rail-head", "PROJECTS"));
+  rail.appendChild(el("div", "rail-head", t("PROJECTS")));
   const railList = el("div", "rail-list");
-  railList.appendChild(railItem("All", null, totalAll, projectFilter === null));
+  railList.appendChild(railItem(t("All"), null, totalAll, projectFilter === null));
   for (const p of projects) railList.appendChild(railItem(p, p, (groups.get(p) || []).length, projectFilter === p));
   rail.append(railList);
   body.appendChild(rail);
@@ -423,7 +693,7 @@ function buildSwarm(root, runs) {
   const main = el("div", "swarm-main");
   const scroll = el("div", "swarm-scroll");
   const showProjects = projectFilter ? projects.filter((p) => p === projectFilter) : projects;
-  if (showProjects.length === 0) scroll.appendChild(el("div", "swarm-empty", "No swarm is running right now."));
+  if (showProjects.length === 0) scroll.appendChild(el("div", "swarm-empty", t("No swarm is running right now.")));
   for (const p of showProjects) {
     const items = groups.get(p) || [];
     const g = el("div", "swarm-group");
@@ -433,7 +703,7 @@ function buildSwarm(root, runs) {
     gh.append(
       gd,
       el("span", "name", p),
-      el("span", "meta", `${items.filter((x) => x.m.status === "running").length} / ${items.length} running`)
+      el("span", "meta", t("{running} / {total} running", { running: items.filter((x) => x.m.status === "running").length, total: items.length }))
     );
     g.appendChild(gh);
     for (const { run, m } of items) g.appendChild(workerRow(run, m));
@@ -537,14 +807,14 @@ function buildCliManager(root) {
   const scrim = el("div", "cli-scrim");
   scrim.addEventListener("click", toggleCliManager);
   const panel = el("section", "cli-panel");
-  panel.setAttribute("aria-label", "Agent CLI version management");
+  panel.setAttribute("aria-label", t("Agent CLI version management"));
 
   const head = el("header", "cli-head");
   const intro = el("div", "cli-intro");
   intro.append(
-    el("div", "cli-eyebrow", "TOOLCHAIN / LOCAL"),
-    el("h2", "cli-title", "Agent CLI versions"),
-    el("p", "cli-sub", "Check the CLIs agentpit actually calls, and update each with its own official updater.")
+    el("div", "cli-eyebrow", t("TOOLCHAIN / LOCAL")),
+    el("h2", "cli-title", t("Agent CLI versions")),
+    el("p", "cli-sub", t("Check the CLIs agentpit actually calls, and update each with its own official updater."))
   );
   const headActions = el("div", "cli-head-actions");
   const refresh = el("button", "cli-refresh");
@@ -552,7 +822,7 @@ function buildCliManager(root) {
   refresh.addEventListener("click", fetchAgentClis);
   const close = el("button", "cli-close", "✕");
   close.type = "button";
-  close.setAttribute("aria-label", "Close");
+  close.setAttribute("aria-label", t("Close"));
   close.addEventListener("click", toggleCliManager);
   headActions.append(refresh, close);
   head.append(intro, headActions);
@@ -563,7 +833,7 @@ function buildCliManager(root) {
   const foot = el("footer", "cli-foot");
   foot.append(
     el("span", "cli-summary"),
-    el("span", "cli-safety", "Update commands are fixed. No arbitrary shell input is run.")
+    el("span", "cli-safety", t("Update commands are fixed. No arbitrary shell input is run."))
   );
   panel.appendChild(foot);
   root.append(scrim, panel);
@@ -575,7 +845,7 @@ function buildCliManager(root) {
 function fillCliDynamic(root) {
   const refresh = root.querySelector(".cli-refresh");
   if (refresh) {
-    refresh.textContent = cliLoading ? "Checking…" : "Recheck";
+    refresh.textContent = cliLoading ? t("Checking…") : t("Recheck");
     refresh.disabled = cliLoading || cliUpdating !== null;
   }
 
@@ -584,11 +854,11 @@ function fillCliDynamic(root) {
     list.innerHTML = "";
     if (cliManagerError) {
       const error = el("div", "cli-error");
-      error.append(el("strong", null, "Update failed"), el("span", null, cliManagerError));
+      error.append(el("strong", null, t("Update failed")), el("span", null, cliManagerError));
       list.appendChild(error);
     }
     if (cliLoading && agentClis.length === 0) {
-      list.appendChild(el("div", "cli-empty", "Checking local CLIs…"));
+      list.appendChild(el("div", "cli-empty", t("Checking local CLIs…")));
     } else {
       for (const cli of agentClis) list.appendChild(cliRow(cli));
     }
@@ -597,7 +867,7 @@ function fillCliDynamic(root) {
   const summary = root.querySelector(".cli-summary");
   if (summary) {
     const installed = agentClis.filter((cli) => cli.installed).length;
-    summary.textContent = `${installed} / ${agentClis.length || 5} installed`;
+    summary.textContent = t("{installed} / {total} installed", { installed, total: agentClis.length || 5 });
   }
 }
 
@@ -612,31 +882,31 @@ function cliRow(cli) {
   const identity = el("div", "cli-identity");
   const nameLine = el("div", "cli-name-line");
   nameLine.append(el("span", "cli-name", cli.label));
-  const state = el("span", `cli-state ${cli.installed ? "ready" : "missing"}`, cli.installed ? "installed" : "missing");
+  const state = el("span", `cli-state ${cli.installed ? "ready" : "missing"}`, cli.installed ? t("installed") : t("missing"));
   nameLine.appendChild(state);
   // Update-state badge — only meaningful for an installed CLI (missing already reads "missing").
   if (cli.installed) {
-    const label = upState === "update" ? "update" : upState === "current" ? "current" : "unknown";
+    const label = upState === "update" ? t("update") : upState === "current" ? t("current") : t("unknown");
     nameLine.appendChild(el("span", `cli-upstate ${upState}`, label));
   }
-  identity.append(nameLine, el("div", "cli-path mono", cli.path || `${cli.command} is not on PATH`));
+  identity.append(nameLine, el("div", "cli-path mono", cli.path || t("{command} is not on PATH", { command: cli.command })));
   if (cli.note) identity.appendChild(el("div", "cli-note", cli.note));
 
   const version = el("div", `cli-version state-${upState}`);
   const instLine = el("div", "cli-vline");
   instLine.append(
-    el("span", "cli-version-label", "INSTALLED"),
+    el("span", "cli-version-label", t("INSTALLED")),
     el("strong", "mono", instVer || cli.version || "—")
   );
   const latestLine = el("div", "cli-vline latest");
-  latestLine.append(el("span", "cli-version-label", "LATEST"), el("strong", "mono", latestVer || "—"));
+  latestLine.append(el("span", "cli-version-label", t("LATEST")), el("strong", "mono", latestVer || "—"));
   version.append(instLine, latestLine);
 
   const updating = cliUpdating === cli.id;
-  const action = el("button", "cli-update", updating ? "Updating…" : "Update");
+  const action = el("button", "cli-update", updating ? t("Updating…") : t("Update"));
   action.type = "button";
   action.disabled = !cli.canUpdate || cliUpdating !== null;
-  action.title = cli.canUpdate ? cli.updateCommand || "Update" : cli.note || "Cannot update";
+  action.title = cli.canUpdate ? cli.updateCommand || t("Update") : cli.note || t("Cannot update");
   action.addEventListener("click", () => updateAgentCli(cli));
 
   row.append(mark, identity, version, action);
@@ -734,9 +1004,9 @@ function workerRoleNames() {
 
 // Mirrors the backend validation rules: ^[a-z0-9][a-z0-9_-]*$, no duplicate names.
 function roleNameError(name, allRoles, selfKey) {
-  if (!name) return "Enter a name";
-  if (!ROLE_NAME_RE.test(name)) return "Only lowercase letters, digits, - and _ (must start alphanumeric)";
-  if (allRoles.some((r) => r._key !== selfKey && r.name === name)) return "This name is already in use";
+  if (!name) return t("Enter a name");
+  if (!ROLE_NAME_RE.test(name)) return t("Only lowercase letters, digits, - and _ (must start alphanumeric)");
+  if (allRoles.some((r) => r._key !== selfKey && r.name === name)) return t("This name is already in use");
   return null;
 }
 function validateSettings(draft) {
@@ -1123,11 +1393,11 @@ function updateRoleNameErr(role) {
 // name. The reserved set (`new`/`list`) is shipped in the payload (reserved_type_names) so this
 // client hint can't drift from the settings.rs gate that actually rejects the save.
 function typeNameError(name, selfKey) {
-  if (!name) return "Enter a name";
+  if (!name) return t("Enter a name");
   const reserved = (settingsDraft && settingsDraft.reserved_type_names) || ["new", "list"];
-  if (reserved.includes(name)) return `'${name}' is reserved (used by the workflow generate/list commands)`;
-  if (!ROLE_NAME_RE.test(name)) return "Only lowercase letters, digits, - and _ (must start alphanumeric)";
-  if (settingsDraft.types.some((t) => t._key !== selfKey && t.name === name)) return "This name is already in use";
+  if (reserved.includes(name)) return t("'{name}' is reserved (used by the workflow generate/list commands)", { name });
+  if (!ROLE_NAME_RE.test(name)) return t("Only lowercase letters, digits, - and _ (must start alphanumeric)");
+  if (settingsDraft.types.some((ty) => ty._key !== selfKey && ty.name === name)) return t("This name is already in use");
   return null;
 }
 function setTypeField(key, field, val, render) {
@@ -1191,19 +1461,19 @@ function openGenerateModal() {
   const overlay = el("div", "ws-gen-modal");
   const card = el("div", "ws-gen-card");
   card.append(
-    el("div", "ws-eyebrow", "GENERATE"),
-    el("div", "ws-gen-title", "Generate a workflow"),
-    el("p", "ws-gen-sub", "Describe the workflow you want. An agent drafts roles, personas, and steps as an editable draft.")
+    el("div", "ws-eyebrow", t("GENERATE")),
+    el("div", "ws-gen-title", t("Generate a workflow")),
+    el("p", "ws-gen-sub", t("Describe the workflow you want. An agent drafts roles, personas, and steps as an editable draft."))
   );
   const ta = el("textarea", "ws-gen-input");
-  ta.placeholder = "e.g. A workflow that strictly reviews PRs and hardens security & edge cases with refutation";
+  ta.placeholder = t("e.g. A workflow that strictly reviews PRs and hardens security & edge cases with refutation");
   card.appendChild(ta);
   const err = el("p", "ws-gen-err hidden");
   card.appendChild(err);
   const actions = el("div", "ws-gen-actions");
-  const cancel = el("button", "ws-btn", "Cancel");
+  const cancel = el("button", "ws-btn", t("Cancel"));
   cancel.type = "button";
-  const go = el("button", "ws-save", "Generate");
+  const go = el("button", "ws-save", t("Generate"));
   go.type = "button";
   const close = () => overlay.remove();
   cancel.addEventListener("click", close);
@@ -1213,27 +1483,27 @@ function openGenerateModal() {
   go.addEventListener("click", async () => {
     const desc = ta.value.trim();
     if (!desc) {
-      err.textContent = "Enter a description.";
+      err.textContent = t("Enter a description.");
       err.classList.remove("hidden");
       return;
     }
     if (generating) return;
     generating = true;
     err.classList.add("hidden");
-    go.textContent = "Generating…";
+    go.textContent = t("Generating…");
     go.disabled = true;
     cancel.disabled = true;
     try {
       const proposal = await invoke("workflow_generate", { description: desc });
       applyProposal(proposal);
       close();
-      showToast("Workflow generated. Review it, then save.", "#4ec9a0");
+      showToast(t("Workflow generated. Review it, then save."), "#4ec9a0");
     } catch (e2) {
       err.textContent = String(e2);
       err.classList.remove("hidden");
     } finally {
       generating = false;
-      go.textContent = "Generate";
+      go.textContent = t("Generate");
       go.disabled = false;
       cancel.disabled = false;
     }
@@ -1247,7 +1517,7 @@ function openGenerateModal() {
 // Apply a generated proposal as an UNSAVED draft: merge its roles into the shared cast, add a new
 // type, and seed the blueprint from the proposed steps. The user reviews, edits, then saves.
 function applyProposal(p) {
-  if (!p || !p.type) throw new Error("Invalid generation result.");
+  if (!p || !p.type) throw new Error(t("Invalid generation result."));
   // 1. Merge roles: add missing ones; only fill blanks on existing roles (keep hand edits).
   for (const r of p.roles || []) {
     if (!r || !r.name) continue;
@@ -1262,8 +1532,8 @@ function applyProposal(p) {
   // 2. A uniquely-named type.
   let name = p.type;
   let n = 2;
-  while (settingsDraft.types.some((t) => t.name === name)) name = `${p.type}-${n++}`;
-  const t = {
+  while (settingsDraft.types.some((ty) => ty.name === name)) name = `${p.type}-${n++}`;
+  const newType = {
     _key: typeKeySeq++, name, title: p.title || "", prompt: p.brief || "",
     roles: [...(p.uses_roles || [])],
     manager_backend: p.manager_backend || "",
@@ -1273,9 +1543,9 @@ function applyProposal(p) {
     enable_ask_human: p.enable_ask_human == null ? null : !!p.enable_ask_human,
     isNew: true,
   };
-  settingsDraft.types.push(t);
+  settingsDraft.types.push(newType);
   // 3. Blueprint from the proposed steps (illustrative; falls back to the seed if none).
-  studio.currentType = t._key;
+  studio.currentType = newType._key;
   const steps = (p.steps || []).map((s, i) => ({
     id: "st-" + (i + 1),
     index: (i + 1 < 10 ? "0" : "") + (i + 1),
@@ -1424,7 +1694,7 @@ function buildStudioShell() {
   const layer = el("div", "ws-layer");
   canvas.appendChild(layer);
   const hint = el("div", "ws-hint");
-  hint.append(el("span", null, "drag = pan"), el("span", null, "header = move"), el("span", null, "drop a CLI/role on a step"));
+  hint.append(el("span", null, t("drag = pan")), el("span", null, t("header = move")), el("span", null, t("drop a CLI/role on a step")));
   canvas.appendChild(hint);
   canvas.addEventListener("pointerdown", (e) => { if (e.target === canvas || e.target === layer) beginPan(e); });
   body.appendChild(canvas);
@@ -1459,15 +1729,15 @@ function renderTopbar() {
   const left = el("div", "ws-top-l");
   const live = el("span", "ws-live");
   live.append(el("span", "core"), el("span", "halo"));
-  left.append(live, el("span", "ws-brand", "agentpit"), el("span", "ws-crumb", "Settings /"));
+  left.append(live, el("span", "ws-brand", "agentpit"), el("span", "ws-crumb", t("Settings /")));
 
   // Workflow switcher: base [workflow] + each named type + "+ new". Changing it swaps the canvas.
   const sw = el("select", "ws-switch");
-  const base = el("option", null, "(default) workflow"); base.value = "base"; sw.appendChild(base);
-  for (const t of settingsDraft ? settingsDraft.types : []) {
-    const o = el("option", null, t.title || t.name || "(unnamed)"); o.value = "t" + t._key; sw.appendChild(o);
+  const base = el("option", null, t("(default) workflow")); base.value = "base"; sw.appendChild(base);
+  for (const ty of settingsDraft ? settingsDraft.types : []) {
+    const o = el("option", null, ty.title || ty.name || t("(unnamed)")); o.value = "t" + ty._key; sw.appendChild(o);
   }
-  const addOpt = el("option", null, "+ New workflow"); addOpt.value = "__new"; sw.appendChild(addOpt);
+  const addOpt = el("option", null, t("+ New workflow")); addOpt.value = "__new"; sw.appendChild(addOpt);
   sw.value = studio.currentType == null ? "base" : "t" + studio.currentType;
   sw.addEventListener("change", () => {
     if (sw.value === "__new") { addType(); return; }
@@ -1475,24 +1745,33 @@ function renderTopbar() {
   });
   left.appendChild(sw);
 
-  const badge = el("span", "ws-badge", "BLUEPRINT");
-  badge.title = "The canvas is a blueprint the runtime grows. Steps are not saved to config (only the cast and workflow settings are).";
+  const badge = el("span", "ws-badge", t("BLUEPRINT"));
+  badge.title = t("The canvas is a blueprint the runtime grows. Steps are not saved to config (only the cast and workflow settings are).");
   left.appendChild(badge);
 
+  const lang = el("div", "ws-lang");
+  for (const [code, lbl] of [["en", "EN"], ["ja", "日本語"]]) {
+    const b = el("button", "ws-lang-btn" + (LANG === code ? " on" : ""), lbl);
+    b.type = "button";
+    b.addEventListener("click", () => { if (LANG !== code) setLang(code); });
+    lang.appendChild(b);
+  }
+  left.appendChild(lang);
+
   const right = el("div", "ws-top-r");
-  const gen = el("button", "ws-gen-btn", "✨ Generate"); gen.type = "button";
-  gen.title = "Generate a workflow from a description";
+  const gen = el("button", "ws-gen-btn", t("✨ Generate")); gen.type = "button";
+  gen.title = t("Generate a workflow from a description");
   gen.addEventListener("click", openGenerateModal);
   right.appendChild(gen);
   const nSteps = studio.steps.length;
-  right.appendChild(el("span", "ws-grow", `grows to ${nSteps}–N steps at runtime`));
+  right.appendChild(el("span", "ws-grow", t("grows to {n}–N steps at runtime", { n: nSteps })));
   const zoom = el("div", "ws-zoom");
   const zo = el("button", null, "−"); zo.type = "button"; zo.addEventListener("click", () => zoomBy(-0.1));
   const zp = el("span", "pct", Math.round(studio.zoom * 100) + "%");
   const zi = el("button", null, "+"); zi.type = "button"; zi.addEventListener("click", () => zoomBy(0.1));
   zoom.append(zo, zp, zi);
   right.appendChild(zoom);
-  const fit = el("button", "ws-btn", "Fit"); fit.type = "button"; fit.addEventListener("click", fitToView);
+  const fit = el("button", "ws-btn", t("Fit")); fit.type = "button"; fit.addEventListener("click", fitToView);
   right.appendChild(fit);
   right.appendChild(el("span", "ws-div"));
 
@@ -1501,12 +1780,12 @@ function renderTopbar() {
   // a value-only keystroke can update it via markDirty() without rebuilding the whole bar.
   const saved = el("span", "ws-saved");
   right.appendChild(saved);
-  const save = el("button", "ws-save", "Save"); save.type = "button";
+  const save = el("button", "ws-save", t("Save")); save.type = "button";
   save.addEventListener("click", saveSettings);
   right.appendChild(save);
 
   const close = el("button", "ws-close", "✕"); close.type = "button";
-  close.setAttribute("aria-label", "Close");
+  close.setAttribute("aria-label", t("Close"));
   close.addEventListener("click", toggleSettings);
   right.appendChild(close);
 
@@ -1526,10 +1805,10 @@ function refreshSaveState() {
   const { ok } = validateSettings(settingsDraft || { roles: [] });
   let savedText;
   saved.classList.remove("dirty");
-  if (settingsSaving) savedText = "Saving…";
-  else if (settingsError && !settingsDraft) savedText = "Load failed";
-  else if (settingsDirty) { saved.classList.add("dirty"); savedText = "Unsaved changes"; }
-  else savedText = settingsData && settingsData.exists === false ? "not created" : "Saved";
+  if (settingsSaving) savedText = t("Saving…");
+  else if (settingsError && !settingsDraft) savedText = t("Load failed");
+  else if (settingsDirty) { saved.classList.add("dirty"); savedText = t("Unsaved changes"); }
+  else savedText = settingsData && settingsData.exists === false ? t("not created") : t("Saved");
   saved.replaceChildren(el("span", "dot"), el("span", null, savedText));
   save.disabled = !settingsDraft || !ok || !settingsDirty || settingsSaving;
 }
@@ -1612,7 +1891,7 @@ function redrawEdges() {
   const layer = svg.parentElement;
   layer.querySelectorAll(".ws-elabel").forEach((n) => n.remove());
   for (const l of labels) {
-    const d = el("div", "ws-elabel", l.label);
+    const d = el("div", "ws-elabel", t(l.label));
     d.style.left = l.x + "px"; d.style.top = l.y + "px"; d.style.color = l.color;
     layer.appendChild(d);
   }
@@ -1653,9 +1932,9 @@ function buildGoalNode() {
   const wrap = nodeWrap("goal", g.x, g.y, g.w, studio.selectedId === "goal");
   const card = el("div", "ws-goal");
   // The root node is the WORKFLOW itself (base or a named type), not a goal input.
-  const t = currentTypeObj();
-  const label = t ? t.name || "(unnamed)" : "(default)";
-  card.append(el("div", "eyebrow", "WORKFLOW"), el("div", "txt", label));
+  const ty = currentTypeObj();
+  const label = ty ? ty.name || t("(unnamed)") : t("(default)");
+  card.append(el("div", "eyebrow", t("WORKFLOW")), el("div", "txt", label));
   card.append(portEl("r"));
   card.addEventListener("click", (e) => { e.stopPropagation(); selectNode("goal"); });
   card.addEventListener("pointerdown", (e) => e.stopPropagation());
@@ -1676,25 +1955,25 @@ function buildStepNode(st) {
   const hd = el("div", "ws-step-hd");
   hd.addEventListener("pointerdown", (e) => beginNodeDrag(st.id, e));
   hd.append(el("span", "ws-idx", st.index), el("span", "ws-step-name", st.name));
-  const dyn = el("span", "ws-dyn " + (st.dynamic ? "on" : "off"), st.dynamic ? "⟳ self-spawn" : "fixed");
+  const dyn = el("span", "ws-dyn " + (st.dynamic ? "on" : "off"), st.dynamic ? t("⟳ self-spawn") : t("fixed"));
   hd.appendChild(dyn);
   card.appendChild(hd);
 
   const bd = el("div", "ws-step-bd");
   const mm = metaFor(st.manager);
   const mgr = el("div", "ws-mgr");
-  mgr.append(mono(mm.mono, mm.color), el("span", "ws-mgr-tag", "manager ·"), el("span", "ws-mgr-label", mm.label));
-  const ask = el("span", "ws-ask", st.ask ? "ask ✓" : "");
+  mgr.append(mono(mm.mono, mm.color), el("span", "ws-mgr-tag", t("manager ·")), el("span", "ws-mgr-label", mm.label));
+  const ask = el("span", "ws-ask", st.ask ? t("ask ✓") : "");
   ask.style.color = st.ask ? "var(--ac-tx)" : "var(--faint)";
   mgr.appendChild(ask);
   bd.appendChild(mgr);
   if (st.persona) bd.appendChild(el("div", "ws-persona", st.persona));
   const dir = el("div", "ws-directive");
-  dir.append(el("div", "lb", "BEHAVIOR / DIRECTIVE"), el("div", "bd", st.behavior || "—"));
+  dir.append(el("div", "lb", t("BEHAVIOR / DIRECTIVE")), el("div", "bd", st.behavior || "—"));
   bd.appendChild(dir);
 
   const workers = el("div", "ws-workers");
-  workers.appendChild(el("span", "ws-worklabel", "worker"));
+  workers.appendChild(el("span", "ws-worklabel", t("worker")));
   (st.workers || []).forEach((w, i) => {
     const rw = resolveWorker(w);
     const chip = el("span", "ws-chip" + (rw.known ? "" : " unknown"));
@@ -1708,7 +1987,7 @@ function buildStepNode(st) {
     chip.appendChild(x);
     workers.appendChild(chip);
   });
-  if (!(st.workers || []).length) workers.appendChild(el("span", "ws-drophint", "drop a CLI/role"));
+  if (!(st.workers || []).length) workers.appendChild(el("span", "ws-drophint", t("drop a CLI/role")));
   bd.appendChild(workers);
   card.appendChild(bd);
 
@@ -1721,7 +2000,7 @@ function buildGenNode(g) {
   const wrap = nodeWrap(g.id, g.x, g.y, g.w, studio.selectedId === g.id);
   const card = el("div", "ws-gen");
   const hd = el("div", "ws-gen-hd");
-  hd.append(el("span", "g", "GENERATED"), el("span", "r", "runtime"));
+  hd.append(el("span", "g", t("GENERATED")), el("span", "r", t("runtime")));
   card.appendChild(hd);
   const mm = metaFor(g.backend);
   const bd = el("div", "ws-gen-bd");
@@ -1739,8 +2018,8 @@ function buildGhostNode() {
   wrap.style.boxShadow = "none";
   const btn = el("button", "ws-ghost");
   btn.type = "button";
-  btn.append(el("div", "g", "DYNAMIC"), el("div", "plus", "+"));
-  const cap = el("div", "cap"); cap.innerHTML = "spawns at runtime<br />(add manually too)";
+  btn.append(el("div", "g", t("DYNAMIC")), el("div", "plus", "+"));
+  const cap = el("div", "cap"); cap.innerHTML = t("spawns at runtime<br />(add manually too)");
   btn.appendChild(cap);
   btn.appendChild(portEl("l"));
   btn.addEventListener("click", (e) => { e.stopPropagation(); addStep(); });
@@ -1771,30 +2050,30 @@ function renderPalette() {
   const hd = el("div", "ws-pal-hd");
   const row = el("div", "ws-pal-hd-row");
   const col = el("div");
-  col.append(el("div", "ws-eyebrow", "LIBRARY"), el("div", "ws-pal-title", "Agents & cast"));
+  col.append(el("div", "ws-eyebrow", t("LIBRARY")), el("div", "ws-pal-title", t("Agents & cast")));
   const collapse = el("button", "ws-collapse", "«"); collapse.type = "button"; collapse.addEventListener("click", togglePalette);
   row.append(col, collapse);
   hd.appendChild(row);
-  hd.appendChild(el("div", "ws-pal-hint", "Drag onto a step to assign a worker. The cast and settings save to config."));
+  hd.appendChild(el("div", "ws-pal-hint", t("Drag onto a step to assign a worker. The cast and settings save to config.")));
   pal.appendChild(hd);
 
   const list = el("div", "ws-pal-list");
-  const sec1 = el("div", "ws-pal-sec first"); sec1.appendChild(el("span", null, "AGENT CLI"));
+  const sec1 = el("div", "ws-pal-sec first"); sec1.appendChild(el("span", null, t("AGENT CLI")));
   list.appendChild(sec1);
   for (const c of cliInventory()) list.appendChild(paletteCli(c));
 
   const sec2 = el("div", "ws-pal-sec");
-  sec2.appendChild(el("span", null, "Roles / cast"));
-  const add = el("button", "ws-pal-add", "+"); add.type = "button"; add.title = "Add a role"; add.addEventListener("click", addRole);
+  sec2.appendChild(el("span", null, t("Roles / cast")));
+  const add = el("button", "ws-pal-add", "+"); add.type = "button"; add.title = t("Add a role"); add.addEventListener("click", addRole);
   sec2.appendChild(add);
   list.appendChild(sec2);
   const roles = castRoles();
-  if (!roles.length) list.appendChild(el("div", "ws-pal-hint", "No roles yet. Add one with +."));
+  if (!roles.length) list.appendChild(el("div", "ws-pal-hint", t("No roles yet. Add one with +.")));
   for (const r of roles) list.appendChild(paletteRole(r));
   pal.appendChild(list);
 
   const foot = el("div", "ws-pal-foot");
-  const addStepBtn = el("button", "ws-pal-addstep", "+ Add step"); addStepBtn.type = "button"; addStepBtn.addEventListener("click", addStep);
+  const addStepBtn = el("button", "ws-pal-addstep", t("+ Add step")); addStepBtn.type = "button"; addStepBtn.addEventListener("click", addStep);
   foot.appendChild(addStepBtn);
   pal.appendChild(foot);
   holder.appendChild(pal);
@@ -1805,7 +2084,7 @@ function paletteCli(c) {
   item.appendChild(mono(m.mono, m.color));
   const col = el("div", "col");
   col.appendChild(el("div", "nm", c.label));
-  col.appendChild(el("div", "sub" + (c.installed ? "" : " miss"), `${c.version} · ${c.transport}${c.installed ? "" : " · missing"}`));
+  col.appendChild(el("div", "sub" + (c.installed ? "" : " miss"), `${c.version} · ${c.transport}${c.installed ? "" : " · " + t("missing")}`));
   item.appendChild(col);
   item.addEventListener("pointerdown", (e) => beginPaletteDrag("cli", c.id, e));
   item.addEventListener("click", () => selectNode("cli:" + c.id));
@@ -1817,7 +2096,7 @@ function paletteRole(r) {
   const sw = el("span", "swatch"); sw.style.background = primary.color;
   item.appendChild(sw);
   const col = el("div", "col");
-  col.appendChild(el("div", "nm", r.name || "(unnamed)"));
+  col.appendChild(el("div", "nm", r.name || t("(unnamed)")));
   col.appendChild(el("div", "sub", (r.backends || []).join(" › ") || "—"));
   item.appendChild(col);
   if (r.name === "manager") { const b = el("span", "ws-badge", "MGR"); item.appendChild(b); }
@@ -1833,13 +2112,13 @@ function renderStatus() {
   const legend = el("div", "ws-legend");
   const mk = (style, label) => { const s = el("span"); const i = el("i"); i.style.cssText = style; s.append(i, document.createTextNode(label)); return s; };
   legend.append(
-    mk("border-top:1.8px solid var(--muted);", "handoff"),
-    mk("border-top:1.8px dashed var(--ac);", "auto-spawn"),
-    mk("border-top:1.8px dashed var(--ac-tx);", "integrate")
+    mk("border-top:1.8px solid var(--muted);", t("handoff")),
+    mk("border-top:1.8px dashed var(--ac);", t("auto-spawn")),
+    mk("border-top:1.8px dashed var(--ac-tx);", t("integrate"))
   );
   bar.appendChild(legend);
   const nRoles = castRoles().length;
-  bar.appendChild(el("span", "ws-counts", `${studio.steps.length} steps · ${nRoles} roles`));
+  bar.appendChild(el("span", "ws-counts", t("{steps} steps · {roles} roles", { steps: studio.steps.length, roles: nRoles })));
 }
 
 // ── inspector (5 forms) ──────────────────────────────────────────────────────
@@ -1853,7 +2132,7 @@ function renderInspector() {
   const insp = el("div", "ws-insp");
   const hd = el("div", "ws-insp-hd");
   const col = el("div", "col");
-  const eyebrow = el("div", "ws-eyebrow", "INSPECTOR");
+  const eyebrow = el("div", "ws-eyebrow", t("INSPECTOR"));
   const title = el("div", "ws-insp-title");
   const sub = el("div", "ws-insp-sub");
   col.append(eyebrow, title, sub);
@@ -1862,7 +2141,7 @@ function renderInspector() {
   insp.appendChild(hd);
 
   const bd = el("div", "ws-insp-bd");
-  let meta = { title: "Nothing selected", sub: "" };
+  let meta = { title: t("Nothing selected"), sub: "" };
   if (sel === "goal") meta = inspGoal(bd);
   else if (sel.indexOf("cli:") === 0) meta = inspCli(bd, sel.slice(4));
   else if (sel.indexOf("role:") === 0) meta = inspRole(bd, parseInt(sel.slice(5), 10));
@@ -1908,7 +2187,7 @@ function textArea(value, onInput, onChange, opts) {
 }
 function backendSelect(value, onChange, known, withEmpty) {
   const sel = el("select");
-  if (withEmpty) { const o = el("option", null, "(default)"); o.value = ""; sel.appendChild(o); }
+  if (withEmpty) { const o = el("option", null, t("(default)")); o.value = ""; sel.appendChild(o); }
   for (const kb of known) { const o = el("option", null, kb); o.value = kb; sel.appendChild(o); }
   sel.value = value || "";
   sel.addEventListener("change", () => onChange(sel.value));
@@ -1918,15 +2197,15 @@ function backendSelect(value, onChange, known, withEmpty) {
 function inspStep(bd, st) {
   const form = el("div", "ws-form");
   const known = (settingsDraft && settingsDraft.known_backends) || Object.keys(CLI_NAME);
-  form.appendChild(el("p", "ws-note", "This step is a blueprint (draft). Only the cast and workflow settings save; the manager improvises the decomposition at runtime."));
-  form.appendChild(field("Step name / phase", textInput(st.name, (v) => setStepField(st.id, "name", v, false), (v) => setStepField(st.id, "name", v, true))));
-  form.appendChild(field("manager backend (launching agent, illustrative)", backendSelect(st.manager, (v) => setStepField(st.id, "manager", v, true), known)));
-  form.appendChild(field("PERSONA (viewpoint)", textArea(st.persona, (v) => setStepField(st.id, "persona", v, false), (v) => setStepField(st.id, "persona", v, true))));
-  form.appendChild(field("BEHAVIOR / DIRECTIVE (the manager's instruction)", textArea(st.behavior, (v) => setStepField(st.id, "behavior", v, false), (v) => setStepField(st.id, "behavior", v, true), { ac: true }), { ac: true }));
+  form.appendChild(el("p", "ws-note", t("This step is a blueprint (draft). Only the cast and workflow settings save; the manager improvises the decomposition at runtime.")));
+  form.appendChild(field(t("Step name / phase"), textInput(st.name, (v) => setStepField(st.id, "name", v, false), (v) => setStepField(st.id, "name", v, true))));
+  form.appendChild(field(t("manager backend (launching agent, illustrative)"), backendSelect(st.manager, (v) => setStepField(st.id, "manager", v, true), known)));
+  form.appendChild(field(t("PERSONA (viewpoint)"), textArea(st.persona, (v) => setStepField(st.id, "persona", v, false), (v) => setStepField(st.id, "persona", v, true))));
+  form.appendChild(field(t("BEHAVIOR / DIRECTIVE (the manager's instruction)"), textArea(st.behavior, (v) => setStepField(st.id, "behavior", v, false), (v) => setStepField(st.id, "behavior", v, true), { ac: true }), { ac: true }));
 
   // workers
   const wf = el("div", "ws-field");
-  wf.appendChild(el("label", null, "Workers (roles / CLIs this step runs)"));
+  wf.appendChild(el("label", null, t("Workers (roles / CLIs this step runs)")));
   (st.workers || []).forEach((w, i) => {
     const rw = resolveWorker(w);
     const row = el("div", "ws-row");
@@ -1939,29 +2218,29 @@ function inspStep(bd, st) {
     wf.appendChild(row);
   });
   const addSel = el("select", "ws-add-sel");
-  const o0 = el("option", null, "+ Add worker"); o0.value = ""; addSel.appendChild(o0);
-  for (const r of castRoles()) if (r.name) { const o = el("option", null, "Role: " + r.name); o.value = "role:" + r.name; addSel.appendChild(o); }
-  for (const c of cliInventory()) { const o = el("option", null, "CLI: " + c.label); o.value = "cli:" + c.id; addSel.appendChild(o); }
+  const o0 = el("option", null, t("+ Add worker")); o0.value = ""; addSel.appendChild(o0);
+  for (const r of castRoles()) if (r.name) { const o = el("option", null, t("Role: {name}", { name: r.name })); o.value = "role:" + r.name; addSel.appendChild(o); }
+  for (const c of cliInventory()) { const o = el("option", null, t("CLI: {label}", { label: c.label })); o.value = "cli:" + c.id; addSel.appendChild(o); }
   addSel.addEventListener("change", () => { const v = addSel.value; addSel.value = ""; if (!v) return; const [k, id] = v.split(":"); addWorker(st.id, { type: k, id }); });
   wf.appendChild(addSel);
   form.appendChild(wf);
 
   // toggles
   const tg = el("div", "ws-toggles");
-  tg.appendChild(checkRow("Allow dynamic spawn (sub-workflow generation)", st.dynamic, (v) => setStepField(st.id, "dynamic", v, true)));
-  tg.appendChild(checkRow("Allow asking a human (ask_human)", st.ask, (v) => setStepField(st.id, "ask", v, true)));
+  tg.appendChild(checkRow(t("Allow dynamic spawn (sub-workflow generation)"), st.dynamic, (v) => setStepField(st.id, "dynamic", v, true)));
+  tg.appendChild(checkRow(t("Allow asking a human (ask_human)"), st.ask, (v) => setStepField(st.id, "ask", v, true)));
   const rr = el("div", "ws-range-row");
-  const rl = el("label"); rl.append(document.createTextNode("fan-out limit "), el("span", null, String(st.fanout || 1)));
+  const rl = el("label"); rl.append(document.createTextNode(t("fan-out limit ")), el("span", null, String(st.fanout || 1)));
   const range = el("input"); range.type = "range"; range.min = "1"; range.max = "8"; range.value = String(st.fanout || 1);
   range.addEventListener("input", () => { rl.querySelector("span").textContent = range.value; setStepField(st.id, "fanout", parseInt(range.value, 10), false); });
   rr.append(rl, range);
   tg.appendChild(rr);
   form.appendChild(tg);
 
-  const del = el("button", "ws-del", "Delete this step"); del.type = "button"; del.addEventListener("click", () => deleteStep(st.id));
+  const del = el("button", "ws-del", t("Delete this step")); del.type = "button"; del.addEventListener("click", () => deleteStep(st.id));
   form.appendChild(del);
   bd.appendChild(form);
-  return { title: st.index + " · " + st.name, sub: "Workflow step (draft)" };
+  return { title: st.index + " · " + st.name, sub: t("Workflow step (draft)") };
 }
 function checkRow(label, checked, onChange) {
   const l = el("label", "ws-check");
@@ -1973,21 +2252,21 @@ function checkRow(label, checked, onChange) {
 
 function inspRole(bd, key) {
   const r = roleByKey(key);
-  if (!r) return { title: "Nothing selected", sub: "" };
+  if (!r) return { title: t("Nothing selected"), sub: "" };
   const form = el("div", "ws-form");
   const known = (settingsDraft && settingsDraft.known_backends) || Object.keys(CLI_NAME);
   const isManager = r.name === "manager";
 
   const nameInput = textInput(r.name, (v) => setRoleField(key, "name", v.trim(), false), (v) => setRoleField(key, "name", v.trim(), true), { placeholder: "role-name", disabled: !r.isNew });
-  const nameField = field("Role name", nameInput, { mono: true, hint: r.isNew ? "Lowercase letters, digits, -, _ (start alphanumeric)." : "A saved role name cannot be changed (delete and re-create)." });
+  const nameField = field(t("Role name"), nameInput, { mono: true, hint: r.isNew ? t("Lowercase letters, digits, -, _ (start alphanumeric).") : t("A saved role name cannot be changed (delete and re-create).") });
   nameField.classList.add("mono");
   const err = el("p", "ws-fhint err hidden"); err.id = `ws-role-err-${key}`;
   nameField.appendChild(err);
   form.appendChild(nameField);
-  if (isManager) form.appendChild(el("p", "ws-fhint", "Reserved role: the first claude / codex in the list becomes the orchestrator."));
+  if (isManager) form.appendChild(el("p", "ws-fhint", t("Reserved role: the first claude / codex in the list becomes the orchestrator.")));
 
   const bkField = el("div", "ws-field");
-  bkField.appendChild(el("label", null, "BACKENDS (preference order — first wins)"));
+  bkField.appendChild(el("label", null, t("BACKENDS (preference order — first wins)")));
   (r.backends || []).forEach((bid, i) => {
     const m = metaFor(bid);
     const row = el("div", "ws-row");
@@ -2000,20 +2279,20 @@ function inspRole(bd, key) {
     bkField.appendChild(row);
   });
   const addSel = el("select", "ws-add-sel");
-  const o0 = el("option", null, "+ Add backend"); o0.value = ""; addSel.appendChild(o0);
+  const o0 = el("option", null, t("+ Add backend")); o0.value = ""; addSel.appendChild(o0);
   for (const kb of known) { const o = el("option", null, kb); o.value = kb; addSel.appendChild(o); }
   addSel.addEventListener("change", () => { const v = addSel.value; addSel.value = ""; if (v) addBackendTo(key, v); });
   bkField.appendChild(addSel);
   form.appendChild(bkField);
 
-  form.appendChild(field("Prompt (persona)", textArea(r.prompt, (v) => setRoleField(key, "prompt", v, false), null)));
-  form.appendChild(field("Model (optional)", textInput(r.model, (v) => setRoleField(key, "model", v, false), null, { placeholder: "e.g. opus / gpt-5-codex (empty = backend default)" }), { mono: true }));
+  form.appendChild(field(t("Prompt (persona)"), textArea(r.prompt, (v) => setRoleField(key, "prompt", v, false), null)));
+  form.appendChild(field(t("Model (optional)"), textInput(r.model, (v) => setRoleField(key, "model", v, false), null, { placeholder: t("e.g. opus / gpt-5-codex (empty = backend default)") }), { mono: true }));
 
-  const del = el("button", "ws-del", "Delete this role"); del.type = "button"; del.addEventListener("click", () => deleteRole(key));
+  const del = el("button", "ws-del", t("Delete this role")); del.type = "button"; del.addEventListener("click", () => deleteRole(key));
   form.appendChild(del);
   bd.appendChild(form);
   requestAnimationFrame(() => updateRoleNameErr(r));
-  return { title: r.name || "(unnamed role)", sub: "role / cast" };
+  return { title: r.name || t("(unnamed role)"), sub: t("role / cast") };
 }
 
 // A read-only key/value table (`.ws-kv`) from [key, value] pairs — the inspector's fact list.
@@ -2034,116 +2313,116 @@ function inspCli(bd, id) {
   const idRow = el("div", "ws-cli-id");
   idRow.appendChild(mono(m.mono, m.color));
   const col = el("div");
-  col.append(el("div", "nm", inv.label), el("div", "note", inv.note || (inv.installed ? "installed" : "not on PATH")));
+  col.append(el("div", "nm", inv.label), el("div", "note", inv.note || (inv.installed ? t("installed") : t("not on PATH"))));
   idRow.appendChild(col);
   form.appendChild(idRow);
   const pairs = [
-    ["command", inv.command],
-    ["version", inv.version],
-    ["transport", inv.transport],
-    ["state", inv.installed ? "installed" : "missing"],
+    [t("command"), inv.command],
+    [t("version"), inv.version],
+    [t("transport"), inv.transport],
+    [t("state"), inv.installed ? t("installed") : t("missing")],
   ];
-  if (inv.path) pairs.push(["path", inv.path]);
+  if (inv.path) pairs.push([t("path"), inv.path]);
   form.appendChild(kvList(pairs));
-  form.appendChild(el("p", "ws-fhint", "Assign it to a step's manager or workers. Manage versions from 'CLI versions' in the footer."));
+  form.appendChild(el("p", "ws-fhint", t("Assign it to a step's manager or workers. Manage versions from 'CLI versions' in the footer.")));
   bd.appendChild(form);
-  return { title: inv.label, sub: "agent CLI" };
+  return { title: inv.label, sub: t("agent CLI") };
 }
 function inspGen(bd, g) {
   const form = el("div", "ws-form");
-  form.appendChild(el("p", "ws-note", "An illustration of a step spawned at runtime. Not editable in the blueprint (spawning is controlled by the parent step's dynamic spawn)."));
+  form.appendChild(el("p", "ws-note", t("An illustration of a step spawned at runtime. Not editable in the blueprint (spawning is controlled by the parent step's dynamic spawn).")));
   form.appendChild(kvList([
-    ["phase", g.name],
-    ["backend", metaFor(g.backend).label],
-    ["source", "review → refute"],
+    [t("phase"), g.name],
+    [t("backend"), metaFor(g.backend).label],
+    [t("source"), t("review → refute")],
   ]));
   bd.appendChild(form);
-  return { title: g.name, sub: "auto-generated step" };
+  return { title: g.name, sub: t("auto-generated step") };
 }
 // The workflow (root) inspector — edits the CURRENT workflow: the base [workflow] or a named type.
 // The runtime GOAL is not an input here (agentpit interprets it at run time); what this edits is
 // the reusable configuration + (for a type) which roles it casts and its manager brief.
 function inspGoal(bd) {
   if (!settingsDraft) {
-    bd.appendChild(el("p", "ws-fhint", "Loading workflow settings…"));
-    return { title: "Workflow", sub: "" };
+    bd.appendChild(el("p", "ws-fhint", t("Loading workflow settings…")));
+    return { title: t("Workflow"), sub: "" };
   }
-  const t = currentTypeObj();
-  return t ? inspWorkflowType(bd, t) : inspWorkflowBase(bd);
+  const ty = currentTypeObj();
+  return ty ? inspWorkflowType(bd, ty) : inspWorkflowBase(bd);
 }
 function inspWorkflowBase(bd) {
   const form = el("div", "ws-form");
-  form.appendChild(el("p", "ws-note", "The default workflow ([workflow]). The runtime goal is interpreted by agentpit, so it is not entered here. Named workflows come from the selector above or ✨ Generate."));
+  form.appendChild(el("p", "ws-note", t("The default workflow ([workflow]). The runtime goal is interpreted by agentpit, so it is not entered here. Named workflows come from the selector above or ✨ Generate.")));
   const invoke = el("div", "ws-field");
-  invoke.appendChild(el("label", null, "INVOKE"));
+  invoke.appendChild(el("label", null, t("INVOKE")));
   invoke.appendChild(el("div", "ws-code", 'agentpit workflow "<goal>"'));
   form.appendChild(invoke);
   const known = settingsDraft.known_backends || Object.keys(CLI_NAME);
-  form.appendChild(field("manager backend (default orchestrator)", backendSelect(settingsDraft.workflow.manager_backend, (v) => setWorkflowField("manager_backend", v), known, true), { hint: "roles.manager takes precedence if set." }));
-  form.appendChild(numRow("max depth (recursion ceiling)", settingsDraft.workflow.max_depth, (v) => setWorkflowField("max_depth", v)));
-  form.appendChild(numRow("max calls / manager (per-manager dispatch budget)", settingsDraft.workflow.max_calls_per_manager, (v) => setWorkflowField("max_calls_per_manager", v)));
+  form.appendChild(field(t("manager backend (default orchestrator)"), backendSelect(settingsDraft.workflow.manager_backend, (v) => setWorkflowField("manager_backend", v), known, true), { hint: t("roles.manager takes precedence if set.") }));
+  form.appendChild(numRow(t("max depth (recursion ceiling)"), settingsDraft.workflow.max_depth, (v) => setWorkflowField("max_depth", v)));
+  form.appendChild(numRow(t("max calls / manager (per-manager dispatch budget)"), settingsDraft.workflow.max_calls_per_manager, (v) => setWorkflowField("max_calls_per_manager", v)));
   const tg = el("div", "ws-toggles");
-  tg.appendChild(checkRow("Run via MCP (use_mcp)", settingsDraft.workflow.use_mcp, (v) => setWorkflowField("use_mcp", v)));
-  tg.appendChild(checkRow("Enable asking a human (enable_ask_human)", settingsDraft.workflow.enable_ask_human, (v) => setWorkflowField("enable_ask_human", v)));
+  tg.appendChild(checkRow(t("Run via MCP (use_mcp)"), settingsDraft.workflow.use_mcp, (v) => setWorkflowField("use_mcp", v)));
+  tg.appendChild(checkRow(t("Enable asking a human (enable_ask_human)"), settingsDraft.workflow.enable_ask_human, (v) => setWorkflowField("enable_ask_human", v)));
   form.appendChild(tg);
   bd.appendChild(form);
-  return { title: "(default) workflow", sub: "base [workflow]" };
+  return { title: t("(default) workflow"), sub: t("base [workflow]") };
 }
-function inspWorkflowType(bd, t) {
+function inspWorkflowType(bd, ty) {
   const form = el("div", "ws-form");
   const known = settingsDraft.known_backends || Object.keys(CLI_NAME);
 
   const nameInput = textInput(
-    t.name,
-    (v) => setTypeField(t._key, "name", v.trim(), false),
-    (v) => setTypeField(t._key, "name", v.trim(), true),
-    { placeholder: "workflow-name", disabled: !t.isNew }
+    ty.name,
+    (v) => setTypeField(ty._key, "name", v.trim(), false),
+    (v) => setTypeField(ty._key, "name", v.trim(), true),
+    { placeholder: "workflow-name", disabled: !ty.isNew }
   );
-  const nameField = field("Workflow name (type)", nameInput, {
+  const nameField = field(t("Workflow name (type)"), nameInput, {
     mono: true,
-    hint: t.isNew
-      ? "Lowercase letters, digits, -, _. Invoke with agentpit workflow <name> \"<goal>\"."
-      : "A saved name cannot be changed (delete and re-create).",
+    hint: ty.isNew
+      ? t("Lowercase letters, digits, -, _. Invoke with agentpit workflow <name> \"<goal>\".")
+      : t("A saved name cannot be changed (delete and re-create)."),
   });
   const err = el("p", "ws-fhint err hidden");
-  err.id = `ws-type-err-${t._key}`;
+  err.id = `ws-type-err-${ty._key}`;
   nameField.appendChild(err);
   form.appendChild(nameField);
 
   const invoke = el("div", "ws-field");
-  invoke.appendChild(el("label", null, "INVOKE"));
-  invoke.appendChild(el("div", "ws-code", `agentpit workflow ${t.name || "<name>"} "<goal>"`));
+  invoke.appendChild(el("label", null, t("INVOKE")));
+  invoke.appendChild(el("div", "ws-code", `agentpit workflow ${ty.name || "<name>"} "<goal>"`));
   form.appendChild(invoke);
 
-  form.appendChild(field("Display name (optional)", textInput(t.title, (v) => setTypeField(t._key, "title", v, false), null, { placeholder: "Strict code review" })));
-  form.appendChild(field("BRIEF (the manager instruction for this workflow)", textArea(t.prompt, (v) => setTypeField(t._key, "prompt", v, false), null, { ac: true }), { ac: true }));
+  form.appendChild(field(t("Display name (optional)"), textInput(ty.title, (v) => setTypeField(ty._key, "title", v, false), null, { placeholder: t("Strict code review") })));
+  form.appendChild(field(t("BRIEF (the manager instruction for this workflow)"), textArea(ty.prompt, (v) => setTypeField(ty._key, "prompt", v, false), null, { ac: true }), { ac: true }));
 
   const rolesField = el("div", "ws-field");
-  rolesField.appendChild(el("label", null, "Roles used (none selected = all worker roles)"));
+  rolesField.appendChild(el("label", null, t("Roles used (none selected = all worker roles)")));
   const pool = workerRoleNames();
   if (!pool.length) {
-    rolesField.appendChild(el("p", "ws-fhint", "Add roles (the cast) in the palette first."));
+    rolesField.appendChild(el("p", "ws-fhint", t("Add roles (the cast) in the palette first.")));
   } else {
     const box = el("div", "ws-toggles");
-    for (const rn of pool) box.appendChild(checkRow(rn, t.roles.includes(rn), (on) => toggleTypeRole(t._key, rn, on)));
+    for (const rn of pool) box.appendChild(checkRow(rn, ty.roles.includes(rn), (on) => toggleTypeRole(ty._key, rn, on)));
     rolesField.appendChild(box);
   }
   form.appendChild(rolesField);
 
-  form.appendChild(el("p", "ws-fhint", "— overrides below (empty / inherit = fall back to base [workflow]) —"));
-  form.appendChild(field("manager backend", backendSelect(t.manager_backend, (v) => setTypeField(t._key, "manager_backend", v, false), known, true)));
-  form.appendChild(numRowNullable("max depth", t.max_depth, (v) => setTypeField(t._key, "max_depth", v, false)));
-  form.appendChild(numRowNullable("max calls / manager", t.max_calls_per_manager, (v) => setTypeField(t._key, "max_calls_per_manager", v, false)));
-  form.appendChild(triStateRow("Via MCP (use_mcp)", t.use_mcp, (v) => setTypeField(t._key, "use_mcp", v, false)));
-  form.appendChild(triStateRow("Ask a human (enable_ask_human)", t.enable_ask_human, (v) => setTypeField(t._key, "enable_ask_human", v, false)));
+  form.appendChild(el("p", "ws-fhint", t("— overrides below (empty / inherit = fall back to base [workflow]) —")));
+  form.appendChild(field(t("manager backend"), backendSelect(ty.manager_backend, (v) => setTypeField(ty._key, "manager_backend", v, false), known, true)));
+  form.appendChild(numRowNullable(t("max depth"), ty.max_depth, (v) => setTypeField(ty._key, "max_depth", v, false)));
+  form.appendChild(numRowNullable(t("max calls / manager"), ty.max_calls_per_manager, (v) => setTypeField(ty._key, "max_calls_per_manager", v, false)));
+  form.appendChild(triStateRow(t("Via MCP (use_mcp)"), ty.use_mcp, (v) => setTypeField(ty._key, "use_mcp", v, false)));
+  form.appendChild(triStateRow(t("Ask a human (enable_ask_human)"), ty.enable_ask_human, (v) => setTypeField(ty._key, "enable_ask_human", v, false)));
 
-  const del = el("button", "ws-del", "Delete this workflow");
+  const del = el("button", "ws-del", t("Delete this workflow"));
   del.type = "button";
-  del.addEventListener("click", () => deleteType(t._key));
+  del.addEventListener("click", () => deleteType(ty._key));
   form.appendChild(del);
   bd.appendChild(form);
-  requestAnimationFrame(() => updateTypeNameErr(t));
-  return { title: t.title || t.name || "(unnamed workflow)", sub: "named workflow / type" };
+  requestAnimationFrame(() => updateTypeNameErr(ty));
+  return { title: ty.title || ty.name || t("(unnamed workflow)"), sub: t("named workflow / type") };
 }
 function numRow(label, value, onChange) {
   const i = el("input"); i.type = "number"; i.min = "0"; i.step = "1"; i.value = value == null ? "" : String(value);
@@ -2154,7 +2433,7 @@ function numRow(label, value, onChange) {
 function numRowNullable(label, value, onChange) {
   const i = el("input"); i.type = "number"; i.min = "0"; i.step = "1";
   i.value = value == null ? "" : String(value);
-  i.placeholder = "inherit";
+  i.placeholder = t("inherit");
   i.addEventListener("input", () => {
     const s = i.value.trim();
     if (s === "") return onChange(null);
@@ -2166,7 +2445,7 @@ function numRowNullable(label, value, onChange) {
 // Tri-state boolean for per-type overrides: inherit(null) / on(true) / off(false).
 function triStateRow(label, value, onChange) {
   const sel = el("select");
-  for (const [v, l] of [["", "inherit"], ["true", "on"], ["false", "off"]]) {
+  for (const [v, l] of [["", t("inherit")], ["true", t("on")], ["false", t("off")]]) {
     const o = el("option", null, l); o.value = v; sel.appendChild(o);
   }
   sel.value = value == null ? "" : value ? "true" : "false";
@@ -2249,7 +2528,7 @@ async function saveSettings() {
       })),
     };
     await invoke("settings_save", { payload });
-    showToast("Settings saved.", "#4ec9a0");
+    showToast(t("Settings saved."), "#4ec9a0");
     await fetchSettings();
   } catch (e) {
     settingsError = String(e);
@@ -2276,7 +2555,7 @@ async function answer(askId, value) {
   // Optimistic: drop the card immediately so the keystroke feels instant.
   answered.add(askId);
   asks = asks.filter((a) => a.askId !== askId);
-  showToast(`Sent "${value}". Applying to the swarm.`, "#4ec9a0");
+  showToast(t('Sent "{value}". Applying to the swarm.', { value }), "#4ec9a0");
   renderAll();
   try {
     await invoke("answer_ask", { askId, value });
@@ -2372,7 +2651,7 @@ function onKey(e) {
 
 function toggleAvailable() {
   available = !available;
-  showToast(available ? "Welcome back." : "Going away. The swarm continues on the safe side.", "var(--ac)");
+  showToast(available ? t("Welcome back.") : t("Going away. The swarm continues on the safe side."), "var(--ac)");
   renderAll();
 }
 function toggleSwarm() {
@@ -2445,11 +2724,11 @@ async function updateAgentCli(cli) {
   try {
     const result = await invoke("update_agent_cli", { id: cli.id });
     agentClis = agentClis.map((item) => (item.id === cli.id ? result.cli : item));
-    showToast(`Updated ${cli.label} to ${result.cli.version || "the latest"}.`, "#4ec9a0");
+    showToast(t("Updated {label} to {version}.", { label: cli.label, version: result.cli.version || t("the latest") }), "#4ec9a0");
   } catch (e) {
     const message = String(e);
     cliManagerError = message;
-    showToast(`Failed to update ${cli.label}.`, "var(--err)");
+    showToast(t("Failed to update {label}.", { label: cli.label }), "var(--err)");
   } finally {
     cliUpdating = null;
     await fetchAgentClis({ preserveError: cliManagerError !== null });
@@ -2465,7 +2744,7 @@ function maybeNotify(list) {
   try {
     if (typeof Notification === "undefined") return;
     const fire = () => {
-      const title = fresh.length === 1 ? "One decision, please" : `${fresh.length} decisions waiting`;
+      const title = fresh.length === 1 ? t("One decision, please") : t("{n} decisions waiting", { n: fresh.length });
       new Notification(title, { body: fresh[0].prompt.slice(0, 120) });
     };
     if (Notification.permission === "granted") fire();
@@ -2505,6 +2784,8 @@ function tickClock() {
 }
 
 function boot() {
+  document.documentElement.lang = LANG;
+  applyStaticI18n();
   document.getElementById("avail-toggle").addEventListener("click", toggleAvailable);
   document.getElementById("swarm-toggle").addEventListener("click", toggleSwarm);
   document.getElementById("cli-toggle").addEventListener("click", toggleCliManager);

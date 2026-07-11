@@ -163,6 +163,11 @@ pub struct WorkflowType {
     /// Human-readable label for dashboards/UX (the config key is the machine name).
     #[serde(default)]
     pub title: Option<String>,
+    /// When-to-use description: a short human/agent-facing summary of what this workflow is for and
+    /// when it is effective, to aid selecting the right type. Surfaced by `workflow list`; unlike
+    /// `prompt` (the manager's runtime instruction), this is documentation, not a directive.
+    #[serde(default)]
+    pub description: Option<String>,
     /// The workflow BRIEF: high-level instructions for the manager in this type, injected as a
     /// dedicated block above the roster. Composes with any `[workflow.roles.manager]` persona.
     #[serde(default)]
@@ -488,10 +493,12 @@ review_members = ["antigravity", "opencode"]
 
 # Named workflow presets: `agentpit workflow <type> "<goal>"` selects one. A type is a PRESET
 # over [workflow] and the shared cast above — it picks which roles to use, gives the manager a
-# brief, and may override knobs. Omitting the type runs the base [workflow]. `new` is reserved
-# (`agentpit workflow new "<description>"` generates a type). Roles are never duplicated here.
+# brief, and may override knobs. Omitting the type runs the base [workflow]. The names `new`,
+# `list`, and `describe` are reserved (they are `agentpit workflow` subcommands). Roles are never
+# duplicated here.
 # [workflow.types.review]
 # title    = "Strict code review"
+# description = "Use when a change needs a strict, security-focused review."  # when-to-use (shown by `workflow list`)
 # prompt   = "Run a strict review: find spec violations, boundary bugs, and security issues."
 # roles    = ["reviewer", "security"]   # subset of the shared cast; empty/omitted = all worker roles
 # manager_backend = "claude"            # optional per-type override

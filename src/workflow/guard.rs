@@ -11,7 +11,9 @@ use anyhow::{Result, bail};
 
 /// Env var carrying the current workflow recursion depth into spawned `agentpit` processes.
 pub const ENV_DEPTH: &str = "AGENTPIT_WORKFLOW_DEPTH";
-/// Env var carrying the parent run id for correlation (Phase 3 will use it for nesting).
+/// Env var carrying the parent run id. A spawned `agentpit` reads it in `RunLogger::start` and
+/// emits it as `RunStarted.parent_run_id`, so the dashboard can nest a manager's sub-agents into a
+/// live execution tree (it also correlates asks/notes back to the manager run).
 pub const ENV_PARENT_RUN_ID: &str = "AGENTPIT_PARENT_RUN_ID";
 /// Env var carrying the path to the agentpit binary the manager should re-invoke.
 pub const ENV_SELF: &str = "AGENTPIT_SELF";

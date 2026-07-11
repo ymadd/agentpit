@@ -216,7 +216,7 @@ async fn run_with_route_inner(
         RouteKey::Explain => RunKind::Explain,
         RouteKey::Refactor => RunKind::Refactor,
     };
-    let logger = RunLogger::start(kind, &[backend_id], &cwd);
+    let logger = RunLogger::start_with_role(kind, &[backend_id], &cwd, role_label);
     logger.member_started(backend_id, false);
     let started = Instant::now();
 

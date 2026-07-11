@@ -35,6 +35,15 @@ pub struct RunView {
     /// Run-level outcome once finished, or "interrupted" if the process died mid-run.
     pub status: Option<String>,
     pub members: Vec<MemberView>,
+    /// The run this one was dispatched from (a workflow manager), for the live execution tree.
+    /// `None` = top-level. Populated from `RunStarted.parent_run_id`.
+    pub parent_run_id: Option<String>,
+    /// Absolute workflow recursion depth (0 = top-level manager). Emitted for log consumers /
+    /// future use; the live tree derives indentation from the parent chain (so an orphan whose
+    /// manager was pruned still renders shallow), not from this field.
+    pub depth: u32,
+    /// The workflow role this run plays (e.g. "reviewer"), when dispatched by role.
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -130,6 +139,9 @@ impl Tracker {
                     finished: false,
                     status: None,
                     members: Vec::new(),
+                    parent_run_id: None,
+                    depth: 0,
+                    role: None,
                 },
             );
             self.prune();
@@ -168,12 +180,18 @@ impl Tracker {
                 kind,
                 members,
                 cwd,
+                parent_run_id,
+                depth,
+                role,
             } => {
                 let run = self.ensure(&run_id);
                 run.pid = pid;
                 run.kind = kind.as_str().to_string();
                 run.cwd = cwd;
                 run.started_ts = ts;
+                run.parent_run_id = parent_run_id;
+                run.depth = depth;
+                run.role = role;
                 for b in members {
                     let name = b.as_str().to_string();
                     if !run
@@ -464,5 +482,25 @@ mod tests {
         let snap = t.snapshot(|_| true, 20);
         assert_eq!(snap.live.len(), 1);
         assert_eq!(snap.live[0].run_id, "z");
+    }
+
+    #[test]
+    fn run_started_carries_parent_depth_and_role_for_the_tree() {
+        // A workflow manager run (r0, top-level) and a role-dispatched sub-run (r1) under it.
+        // r0's line omits the new keys (old-format compat) and must still parse as None/0.
+        let log = concat!(
+            "{\"event\":\"run_started\",\"ts\":1,\"run_id\":\"r0\",\"pid\":1,\"kind\":\"workflow\",\"members\":[\"claude\"],\"cwd\":\"/x\"}\n",
+            "{\"event\":\"run_started\",\"ts\":2,\"run_id\":\"r1\",\"pid\":2,\"kind\":\"rescue\",\"members\":[\"codex\"],\"cwd\":\"/x\",\"parent_run_id\":\"r0\",\"depth\":1,\"role\":\"reviewer\"}\n",
+        );
+        let (t, _f) = tracker_from(log);
+        let snap = t.snapshot(|_| true, 20);
+        let r0 = snap.live.iter().find(|r| r.run_id == "r0").unwrap();
+        assert_eq!(r0.parent_run_id, None);
+        assert_eq!(r0.depth, 0);
+        assert_eq!(r0.role, None);
+        let r1 = snap.live.iter().find(|r| r.run_id == "r1").unwrap();
+        assert_eq!(r1.parent_run_id.as_deref(), Some("r0"));
+        assert_eq!(r1.depth, 1);
+        assert_eq!(r1.role.as_deref(), Some("reviewer"));
     }
 }

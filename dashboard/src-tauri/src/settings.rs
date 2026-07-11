@@ -86,6 +86,8 @@ pub struct WorkflowTypeEntry {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
     pub roles: Vec<String>,
@@ -131,7 +133,7 @@ fn known_backends() -> Vec<String> {
 /// generator, `list` prints the catalog), so a `[workflow.types.*]` cannot use them. Shipped to
 /// the UI in the payload so its client-side validator can never drift from this gate.
 fn reserved_type_names() -> Vec<String> {
-    vec!["new".to_string(), "list".to_string()]
+    vec!["new".to_string(), "list".to_string(), "describe".to_string()]
 }
 
 /// Read `[workflow]` / `[workflow.roles]` from `path`, tolerantly: a missing file, an
@@ -203,6 +205,7 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
                 types.push(WorkflowTypeEntry {
                     name: name.to_string(),
                     title: item.get("title").and_then(Item::as_str).map(str::to_string),
+                    description: item.get("description").and_then(Item::as_str).map(str::to_string),
                     prompt: item.get("prompt").and_then(Item::as_str).map(str::to_string),
                     roles,
                     manager_backend: item
@@ -284,10 +287,12 @@ fn validate(payload: &SettingsSave) -> Result<(), String> {
                 t.name
             ));
         }
-        if reserved_type_names().iter().any(|r| r == &t.name) {
+        let reserved = reserved_type_names();
+        if reserved.iter().any(|r| r == &t.name) {
             return Err(format!(
-                "workflow type name '{}' is reserved ('new' launches the generator, 'list' prints the catalog)",
-                t.name
+                "workflow type name '{}' is reserved (used by the `agentpit workflow` subcommands {})",
+                t.name,
+                reserved.join("/")
             ));
         }
         if !seen_types.insert(t.name.as_str()) {
@@ -387,6 +392,11 @@ fn apply_workflow(doc: &mut DocumentMut, payload: &SettingsSave) {
         if let Some(v) = &t.title {
             if !v.trim().is_empty() {
                 tt["title"] = value(v.clone());
+            }
+        }
+        if let Some(v) = &t.description {
+            if !v.trim().is_empty() {
+                tt["description"] = value(v.clone());
             }
         }
         if let Some(v) = &t.prompt {
@@ -697,6 +707,7 @@ max_depth = 5
                 WorkflowTypeEntry {
                     name: "review".into(),
                     title: Some("Strict review".into()),
+                    description: Some("Use for strict, security-focused reviews.".into()),
                     prompt: Some("Run a strict review.".into()),
                     roles: vec!["reviewer".into(), "security".into()],
                     manager_backend: Some("claude".into()),
@@ -709,6 +720,7 @@ max_depth = 5
                 WorkflowTypeEntry {
                     name: "research".into(),
                     title: None,
+                    description: None,
                     prompt: Some("Research only.".into()),
                     roles: vec![],
                     manager_backend: None,
@@ -727,6 +739,10 @@ max_depth = 5
         assert!(raw.contains("[workflow.types.review]"), "got: {raw}");
         assert!(raw.contains("roles = [\"reviewer\", \"security\"]"), "got: {raw}");
         assert!(raw.contains("enable_ask_human = true"), "got: {raw}");
+        assert!(
+            raw.contains("description = \"Use for strict, security-focused reviews.\""),
+            "got: {raw}"
+        );
         assert!(raw.contains("[workflow.types.research]"), "got: {raw}");
         // The minimal type must not be padded with empty overrides.
         let research_block = raw
@@ -735,6 +751,7 @@ max_depth = 5
             .unwrap_or_default();
         assert!(!research_block.contains("roles ="), "no empty roles: {research_block}");
         assert!(!research_block.contains("manager_backend"), "no empty backend: {research_block}");
+        assert!(!research_block.contains("description"), "no empty description: {research_block}");
 
         let payload = settings_get_at(&path);
         assert_eq!(payload.types.len(), 2);
@@ -743,6 +760,10 @@ max_depth = 5
         assert_eq!(review.manager_backend.as_deref(), Some("claude"));
         assert_eq!(review.max_depth, Some(2));
         assert_eq!(review.enable_ask_human, Some(true));
+        assert_eq!(
+            review.description.as_deref(),
+            Some("Use for strict, security-focused reviews.")
+        );
     }
 
     #[test]
@@ -753,6 +774,7 @@ max_depth = 5
             types: vec![WorkflowTypeEntry {
                 name: "new".into(),
                 title: None,
+                description: None,
                 prompt: None,
                 roles: vec![],
                 manager_backend: None,
@@ -768,12 +790,14 @@ max_depth = 5
         assert!(err.contains("reserved"), "got: {err}");
         assert!(!path.exists(), "must not write on validation failure");
 
-        // `list` is reserved too (`agentpit workflow list` prints the catalog).
-        let mut listed = reserved.clone();
-        listed.types[0].name = "list".into();
-        let err = settings_save_at(&listed, &path).unwrap_err();
-        assert!(err.contains("reserved"), "got: {err}");
-        assert!(!path.exists(), "must not write on validation failure");
+        // `list` and `describe` are reserved too (both are `agentpit workflow` subcommands).
+        for name in ["list", "describe"] {
+            let mut other = reserved.clone();
+            other.types[0].name = name.into();
+            let err = settings_save_at(&other, &path).unwrap_err();
+            assert!(err.contains("reserved"), "got: {err}");
+            assert!(!path.exists(), "must not write on validation failure");
+        }
     }
 
     #[test]

@@ -135,7 +135,7 @@ const JA = {
   "Enter a name": "名前を入力してください",
   "Only lowercase letters, digits, - and _ (must start alphanumeric)": "英小文字・数字・- ・_ のみ（先頭は英数字）",
   "This name is already in use": "この名前は既に使われています",
-  "'{name}' is reserved (used by the workflow generate/list commands)": "'{name}' は予約語です（workflow の generate/list コマンドで使用）",
+  "'{name}' is reserved (used by an agentpit workflow subcommand)": "'{name}' は予約語です（agentpit workflow のサブコマンドで使用）",
   // generate modal
   "GENERATE": "生成",
   "Generate a workflow": "ワークフローを生成",
@@ -196,6 +196,23 @@ const JA = {
   "Add a role": "ロールを追加",
   "No roles yet. Add one with +.": "ロールはまだありません。+ で追加します。",
   "+ Add step": "+ ステップを追加",
+  // saved-step library
+  "SAVED STEPS": "保存済みステップ",
+  "Save a step from its inspector to reuse it on any workflow.": "インスペクタからステップを保存すると、どのワークフローでも再利用できます。",
+  "{n} workers · {mgr}": "{n} ワーカー · {mgr}",
+  "Click to add this step to the canvas": "クリックでこのステップをキャンバスに追加",
+  "Remove from library": "ライブラリから削除",
+  "SAVE STEP": "ステップを保存",
+  "Save as reusable step": "再利用可能なステップとして保存",
+  "Save this step's persona, behavior, workers, and settings to your library to reuse on any workflow.": "このステップのペルソナ・behavior・ワーカー・設定をライブラリに保存し、どのワークフローでも再利用します。",
+  "Library name": "ライブラリ名",
+  "Saved \"{name}\" to your step library.": "「{name}」をステップライブラリに保存しました。",
+  // workflow type description + AI-fill
+  "Description (when to use)": "説明（どんな時に使うか）",
+  "✨ Generate with AI": "✨ AI で生成",
+  "Describe when this workflow is effective, so the right one is easy to pick.": "このワークフローがどんな時に効果的かを記述し、適切なものを選びやすくします。",
+  "AI description generated. Review and edit it.": "AI が説明を生成しました。内容を確認・編集してください。",
+  "Kept your edits; the AI suggestion was discarded.": "あなたの編集を保持し、AI の提案は破棄しました。",
   "{steps} steps · {roles} roles": "{steps} ステップ · {roles} ロール",
   // inspector — step
   "This step is a blueprint (draft). Only the cast and workflow settings save; the manager improvises the decomposition at runtime.": "このステップはブループリント（ドラフト）です。保存されるのはキャストとワークフロー設定のみで、分解は実行時にマネージャーが即興で行います。",
@@ -606,8 +623,11 @@ function workerRow(run, m) {
 
   const body = el("div", "body");
   const top = el("div", "top");
+  // Prefer the workflow ROLE (e.g. "reviewer") over the uninformative "rescue" kind for a
+  // dispatched sub-agent; fall back to the kind for a plain (backend-addressed) run.
+  const primary = run.role ? `${run.role} · ${m.backend}` : `${kindLabel(run.kind)} / ${m.backend}`;
   top.append(
-    el("span", "label", `${kindLabel(run.kind)} / ${m.backend}${m.aggregator ? " ·agg" : ""}`),
+    el("span", "label", primary + (m.aggregator ? " ·agg" : "")),
     el("span", "model", m.backend)
   );
   body.append(top, el("div", "task", run.cwd || "—"));
@@ -643,33 +663,44 @@ function workerRow(run, m) {
   return row;
 }
 
+// One run in the execution tree: its member row(s), indented by workflow depth. A run dispatched
+// by a manager (parent_run_id) nests under it; depth drives the indent + a guide border.
+function runNode(run, depth) {
+  const node = el("div", "swarm-run" + (depth > 0 ? " child" : ""));
+  if (depth > 0) node.style.marginLeft = Math.min(depth, 6) * 16 + "px";
+  const members = (run.members || []).length ? run.members : [{ backend: "—", status: run.status || "pending" }];
+  for (const m of members) node.appendChild(workerRow(run, m));
+  return node;
+}
+
 function buildSwarm(root, runs) {
   root.innerHTML = "";
   const scrim = el("div", "swarm-scrim");
   scrim.addEventListener("click", toggleSwarm);
   const sheet = el("div", "swarm-sheet");
 
-  // group members by project (= cwd basename)
-  const groups = new Map();
+  // group whole runs by project (= cwd basename), for the per-project execution tree.
+  const runsByProject = new Map();
   for (const r of runs) {
     const proj = basename(r.cwd) || r.run_id;
-    for (const m of r.members || []) {
-      if (!groups.has(proj)) groups.set(proj, []);
-      groups.get(proj).push({ run: r, m });
-    }
+    if (!runsByProject.has(proj)) runsByProject.set(proj, []);
+    runsByProject.get(proj).push(r);
   }
-  const projects = [...groups.keys()];
-  const totalAll = runs.reduce((a, r) => a + (r.members || []).length, 0);
-  const runningAll = runs.reduce((a, r) => a + (r.members || []).filter((m) => m.status === "running").length, 0);
+  const projects = [...runsByProject.keys()];
+  // Header/rail counts are over MEMBERS (agents) — derived from the runs, no separate map.
+  const memberCount = (rs) => rs.reduce((a, r) => a + (r.members || []).length, 0);
+  const runningCount = (rs) => rs.reduce((a, r) => a + (r.members || []).filter((m) => m.status === "running").length, 0);
+  const totalAll = memberCount(runs);
+  const runningAll = runningCount(runs);
 
   // head
   const head = el("div", "swarm-head");
   const ht = el("div");
   const title = el("div", "swarm-title");
   title.appendChild(el("span", "t", t("Swarm")));
-  const filteredItems = projectFilter ? groups.get(projectFilter) || [] : null;
+  const filteredRuns = projectFilter ? runsByProject.get(projectFilter) || [] : null;
   const headCount = projectFilter
-    ? t("{running} running / {total} agents", { running: filteredItems.filter((x) => x.m.status === "running").length, total: filteredItems.length })
+    ? t("{running} running / {total} agents", { running: runningCount(filteredRuns), total: memberCount(filteredRuns) })
     : t("{projects} projects · {running} running / {total} total", { projects: projects.length, running: runningAll, total: totalAll });
   title.appendChild(el("span", "c", headCount));
   ht.append(title, el("div", "swarm-sub", t("You do not need to watch this — the manager is.")));
@@ -686,7 +717,7 @@ function buildSwarm(root, runs) {
   rail.appendChild(el("div", "rail-head", t("PROJECTS")));
   const railList = el("div", "rail-list");
   railList.appendChild(railItem(t("All"), null, totalAll, projectFilter === null));
-  for (const p of projects) railList.appendChild(railItem(p, p, (groups.get(p) || []).length, projectFilter === p));
+  for (const p of projects) railList.appendChild(railItem(p, p, memberCount(runsByProject.get(p) || []), projectFilter === p));
   rail.append(railList);
   body.appendChild(rail);
 
@@ -695,7 +726,7 @@ function buildSwarm(root, runs) {
   const showProjects = projectFilter ? projects.filter((p) => p === projectFilter) : projects;
   if (showProjects.length === 0) scroll.appendChild(el("div", "swarm-empty", t("No swarm is running right now.")));
   for (const p of showProjects) {
-    const items = groups.get(p) || [];
+    const projRuns = runsByProject.get(p) || [];
     const g = el("div", "swarm-group");
     const gh = el("div", "group-head");
     const gd = el("span", "dot");
@@ -703,10 +734,43 @@ function buildSwarm(root, runs) {
     gh.append(
       gd,
       el("span", "name", p),
-      el("span", "meta", t("{running} / {total} running", { running: items.filter((x) => x.m.status === "running").length, total: items.length }))
+      el("span", "meta", t("{running} / {total} running", { running: runningCount(projRuns), total: memberCount(projRuns) }))
     );
     g.appendChild(gh);
-    for (const { run, m } of items) g.appendChild(workerRow(run, m));
+    // Build the dispatch forest: a run nests under its parent_run_id when that parent is also
+    // visible in this project; otherwise it's a root (top-level manager, or an orphan whose
+    // parent already finished). Render depth-first, oldest-first, indented by depth.
+    const visible = new Set(projRuns.map((r) => r.run_id));
+    const kids = new Map();
+    const roots = [];
+    for (const r of projRuns) {
+      const par = r.parent_run_id;
+      if (par && visible.has(par)) {
+        if (!kids.has(par)) kids.set(par, []);
+        kids.get(par).push(r);
+      } else {
+        roots.push(r);
+      }
+    }
+    const byStart = (a, b) => (a.started_ts || 0) - (b.started_ts || 0);
+    // Depth here is the VISIBLE-subtree position, not the run's absolute workflow depth: an orphan
+    // (whose manager isn't shown) renders at indent 0, which is what you want. `run.depth` stays
+    // available in the payload as absolute telemetry. `rendered` guards against a corrupted
+    // parent_run_id cycle (a run naming itself, or A→B→A) causing infinite recursion.
+    const rendered = new Set();
+    const walk = (r, depth) => {
+      if (rendered.has(r.run_id)) return;
+      rendered.add(r.run_id);
+      g.appendChild(runNode(r, depth));
+      for (const c of (kids.get(r.run_id) || []).sort(byStart)) walk(c, depth + 1);
+    };
+    for (const r of roots.sort(byStart)) walk(r, 0);
+    // Any run not reached from a root (only possible via a parent_run_id cycle in corrupted event
+    // data) is surfaced as a root rather than silently dropped. Skipped entirely in the normal
+    // no-cycle case, where every run is already rendered.
+    if (rendered.size < projRuns.length) {
+      for (const r of projRuns.sort(byStart)) if (!rendered.has(r.run_id)) walk(r, 0);
+    }
     scroll.appendChild(g);
   }
   main.appendChild(scroll);
@@ -938,7 +1002,23 @@ function cliRow(cli) {
 //   invoke('get_agent_clis') -> [{ id, label, installed, path, command, note, version, ... }]
 
 const ROLE_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
+// Fallback reserved workflow-type names, used only if the payload lacks `reserved_type_names`
+// (settings.rs is the authority). Single source so the two fallback sites can't drift.
+const DEFAULT_RESERVED_TYPE_NAMES = ["new", "list", "describe"];
 const BLUEPRINT_KEY = "agentpit.studio.blueprint.v1";
+
+// Saved-step library: reusable step templates, shared across ALL workflows (unlike a blueprint,
+// which is per-workflow). Persisted to localStorage so they survive reloads. A template holds the
+// step's reusable fields (name/manager/persona/behavior/workers/knobs) — never its canvas geometry.
+const SAVED_STEPS_KEY = "agentpit.studio.savedsteps.v1";
+function loadSavedSteps() {
+  try { const a = JSON.parse(localStorage.getItem(SAVED_STEPS_KEY) || "[]"); return Array.isArray(a) ? a : []; }
+  catch (e) { return []; }
+}
+let savedSteps = loadSavedSteps();
+function persistSavedSteps() {
+  try { localStorage.setItem(SAVED_STEPS_KEY, JSON.stringify(savedSteps)); } catch (e) { /* best-effort */ }
+}
 // Wire/transport per backend — the CLI inventory has no transport field, so pin the known shapes
 // (matches how each backend is actually launched: exec for the CLIs, ACP for opencode).
 const CLI_TRANSPORT = { claude: "exec", codex: "exec", antigravity: "exec", gemini: "exec", opencode: "acp" };
@@ -953,7 +1033,7 @@ function draftFromSettings(data) {
   const wf = data.workflow || {};
   return {
     known_backends: data.known_backends || [],
-    reserved_type_names: data.reserved_type_names || ["new", "list"],
+    reserved_type_names: data.reserved_type_names || DEFAULT_RESERVED_TYPE_NAMES,
     workflow: {
       manager_backend: wf.manager_backend || "",
       default_agents: wf.default_agents || [],
@@ -975,6 +1055,7 @@ function draftFromSettings(data) {
       _key: typeKeySeq++,
       name: t.name,
       title: t.title || "",
+      description: t.description || "",
       prompt: t.prompt || "",
       roles: [...(t.roles || [])],
       manager_backend: t.manager_backend || "",
@@ -1295,14 +1376,7 @@ function removeWorker(stepId, idx) {
   renderStudio();
 }
 function addStep() {
-  const id = "st-" + ++studio.seq;
-  const n = studio.steps.length + 1;
-  const idx = n < 10 ? "0" + n : "" + n;
-  studio.steps.push({ id, index: idx, name: "New step", manager: "claude", persona: "", behavior: "", dynamic: true, ask: false, fanout: 2, workers: [], x: 0, y: 200, w: 250 });
-  relayout();
-  studio.selectedId = id;
-  saveBlueprint();
-  renderStudio();
+  addStepFromTemplate({ name: "New step" }); // a blank step is just an empty template (defaults filled by stepTemplate)
 }
 function deleteStep(id) {
   studio.steps = studio.steps.filter((s) => s.id !== id);
@@ -1318,6 +1392,79 @@ function setStepField(id, key, val, render) {
   s[key] = val;
   saveBlueprint();
   if (render) renderStudio();
+}
+// Copy a step's reusable fields (no id/index/geometry — the canvas assigns those).
+function stepTemplate(st) {
+  return {
+    name: st.name || "",
+    manager: st.manager || "claude",
+    persona: st.persona || "",
+    behavior: st.behavior || "",
+    dynamic: st.dynamic !== false,
+    ask: !!st.ask,
+    fanout: st.fanout || 2,
+    workers: (st.workers || []).map((w) => ({ type: w.type, id: w.id })),
+  };
+}
+// Save a step to the shared library under `label`, then surface it in the palette.
+function saveStepToLibrary(st, label) {
+  savedSteps.push({
+    id: "sv-" + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36),
+    label: label || st.name || "step",
+    ...stepTemplate(st),
+  });
+  persistSavedSteps();
+  renderPalette();
+}
+function deleteSavedStep(id) {
+  savedSteps = savedSteps.filter((s) => s.id !== id);
+  persistSavedSteps();
+  renderPalette();
+}
+// Add a library template to the CURRENT workflow's canvas as a fresh step (same path as addStep).
+function addStepFromTemplate(tpl) {
+  const id = "st-" + ++studio.seq;
+  const n = studio.steps.length + 1;
+  const idx = n < 10 ? "0" + n : "" + n;
+  studio.steps.push({ id, index: idx, ...stepTemplate(tpl), x: 0, y: 200, w: 250 });
+  relayout();
+  studio.selectedId = id;
+  saveBlueprint();
+  renderStudio();
+}
+// Small modal to name a step before saving it to the library (reuses the generate-modal chrome).
+function openSaveStepModal(st) {
+  const root = document.getElementById("settings");
+  if (root.querySelector(".ws-gen-modal")) return;
+  const overlay = el("div", "ws-gen-modal");
+  const card = el("div", "ws-gen-card");
+  card.append(
+    el("div", "ws-eyebrow", t("SAVE STEP")),
+    el("div", "ws-gen-title", t("Save as reusable step")),
+    el("p", "ws-gen-sub", t("Save this step's persona, behavior, workers, and settings to your library to reuse on any workflow."))
+  );
+  const input = el("input", "ws-gen-input-line"); input.type = "text";
+  input.value = st.name || ""; input.placeholder = t("Library name");
+  card.appendChild(input);
+  const actions = el("div", "ws-gen-actions");
+  const cancel = el("button", "ws-btn", t("Cancel")); cancel.type = "button";
+  const go = el("button", "ws-save", t("Save")); go.type = "button";
+  const close = () => overlay.remove();
+  const commit = () => {
+    const label = input.value.trim() || st.name || "step";
+    saveStepToLibrary(st, label);
+    close();
+    showToast(t('Saved "{name}" to your step library.', { name: label }), "#4ec9a0");
+  };
+  cancel.addEventListener("click", close);
+  go.addEventListener("click", commit);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") commit(); });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  actions.append(cancel, go);
+  card.appendChild(actions);
+  overlay.appendChild(card);
+  root.appendChild(overlay);
+  input.focus(); input.select();
 }
 function setGoalText(val, render) {
   studio.goal.text = val;
@@ -1390,12 +1537,12 @@ function updateRoleNameErr(role) {
 
 // ── workflow types (config-dirty) ────────────────────────────────────────────
 // Mirrors the settings.rs type rules: ^[a-z0-9][a-z0-9_-]*$, no duplicates, and no reserved
-// name. The reserved set (`new`/`list`) is shipped in the payload (reserved_type_names) so this
-// client hint can't drift from the settings.rs gate that actually rejects the save.
+// name. The reserved set (new/list/describe) is shipped in the payload (reserved_type_names) so
+// this client hint can't drift from the settings.rs gate that actually rejects the save.
 function typeNameError(name, selfKey) {
   if (!name) return t("Enter a name");
-  const reserved = (settingsDraft && settingsDraft.reserved_type_names) || ["new", "list"];
-  if (reserved.includes(name)) return t("'{name}' is reserved (used by the workflow generate/list commands)", { name });
+  const reserved = (settingsDraft && settingsDraft.reserved_type_names) || DEFAULT_RESERVED_TYPE_NAMES;
+  if (reserved.includes(name)) return t("'{name}' is reserved (used by an agentpit workflow subcommand)", { name });
   if (!ROLE_NAME_RE.test(name)) return t("Only lowercase letters, digits, - and _ (must start alphanumeric)");
   if (settingsDraft.types.some((ty) => ty._key !== selfKey && ty.name === name)) return t("This name is already in use");
   return null;
@@ -2070,6 +2217,12 @@ function renderPalette() {
   const roles = castRoles();
   if (!roles.length) list.appendChild(el("div", "ws-pal-hint", t("No roles yet. Add one with +.")));
   for (const r of roles) list.appendChild(paletteRole(r));
+
+  const sec3 = el("div", "ws-pal-sec");
+  sec3.appendChild(el("span", null, t("SAVED STEPS")));
+  list.appendChild(sec3);
+  if (!savedSteps.length) list.appendChild(el("div", "ws-pal-hint", t("Save a step from its inspector to reuse it on any workflow.")));
+  for (const tpl of savedSteps) list.appendChild(paletteSavedStep(tpl));
   pal.appendChild(list);
 
   const foot = el("div", "ws-pal-foot");
@@ -2102,6 +2255,22 @@ function paletteRole(r) {
   if (r.name === "manager") { const b = el("span", "ws-badge", "MGR"); item.appendChild(b); }
   item.addEventListener("pointerdown", (e) => { if (r.name) beginPaletteDrag("role", r.name, e); else selectNode("role:" + r._key); });
   item.addEventListener("click", () => selectNode("role:" + r._key));
+  return item;
+}
+// A saved-step library entry: click to drop a copy onto the current canvas; ✕ removes it.
+function paletteSavedStep(tpl) {
+  const item = el("div", "ws-pal-item ws-pal-saved");
+  item.title = t("Click to add this step to the canvas");
+  const sw = el("span", "swatch"); sw.style.background = metaFor(tpl.manager).color;
+  item.appendChild(sw);
+  const col = el("div", "col");
+  col.appendChild(el("div", "nm", tpl.label || tpl.name || t("(unnamed)")));
+  col.appendChild(el("div", "sub", t("{n} workers · {mgr}", { n: (tpl.workers || []).length, mgr: tpl.manager || "—" })));
+  item.appendChild(col);
+  const rm = el("button", "ws-mini", "✕"); rm.type = "button"; rm.title = t("Remove from library");
+  rm.addEventListener("click", (e) => { e.stopPropagation(); deleteSavedStep(tpl.id); });
+  item.appendChild(rm);
+  item.addEventListener("click", () => addStepFromTemplate(tpl));
   return item;
 }
 
@@ -2237,8 +2406,12 @@ function inspStep(bd, st) {
   tg.appendChild(rr);
   form.appendChild(tg);
 
+  const actions = el("div", "ws-insp-actions");
+  const saveStep = el("button", "ws-save-step", t("Save as reusable step")); saveStep.type = "button";
+  saveStep.addEventListener("click", () => openSaveStepModal(st));
   const del = el("button", "ws-del", t("Delete this step")); del.type = "button"; del.addEventListener("click", () => deleteStep(st.id));
-  form.appendChild(del);
+  actions.append(saveStep, del);
+  form.appendChild(actions);
   bd.appendChild(form);
   return { title: st.index + " · " + st.name, sub: t("Workflow step (draft)") };
 }
@@ -2368,6 +2541,63 @@ function inspWorkflowBase(bd) {
   bd.appendChild(form);
   return { title: t("(default) workflow"), sub: t("base [workflow]") };
 }
+// Type _keys with an AI-describe request in flight. Keyed on the TYPE (not the button DOM node)
+// so the guard survives a re-render: inspWorkflowType renders the button disabled while its key is
+// here, preventing a duplicate concurrent call after switching workflows away and back.
+const describingTypes = new Set();
+// AI-fill the type's when-to-use description: send the whole workflow (roles + brief + blueprint
+// steps + knobs) to `agentpit workflow describe` (via Tauri) and drop the result into the field.
+async function generateTypeDescription(ty, btn) {
+  if (describingTypes.has(ty._key)) return; // already generating for this type
+  const descId = "ws-typedesc-" + ty._key;
+  const fieldVal = () => document.getElementById(descId)?.value ?? ty.description;
+  const snapshot = fieldVal() || ""; // what the field held when the user asked — to detect edits made while waiting
+  const names = (ty.roles && ty.roles.length) ? ty.roles : workerRoleNames();
+  const roles = names
+    .map((n) => (settingsDraft.roles || []).find((r) => r.name === n))
+    .filter(Boolean)
+    .map((r) => ({ name: r.name, backends: r.backends || [], prompt: r.prompt || "" }));
+  const steps = (studio.steps || []).map((s) => ({ name: s.name || "", persona: s.persona || "", behavior: s.behavior || "" }));
+  const spec = {
+    title: ty.title || "",
+    brief: ty.prompt || "",
+    manager_backend: ty.manager_backend || "",
+    roles,
+    uses_roles: ty.roles || [],
+    steps,
+    max_depth: ty.max_depth,
+    max_calls_per_manager: ty.max_calls_per_manager,
+    use_mcp: ty.use_mcp,
+    enable_ask_human: ty.enable_ask_human,
+  };
+  describingTypes.add(ty._key);
+  const prev = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = t("Generating…");
+  try {
+    const desc = ((await invoke("workflow_describe", { spec })) || "").trim();
+    const live = fieldVal() || "";
+    if (live !== snapshot && live.trim() !== "") {
+      // The user edited the field while the request was in flight — keep their text, don't clobber.
+      showToast(t("Kept your edits; the AI suggestion was discarded."), "#e0b25e");
+    } else {
+      ty.description = desc;
+      const ta = document.getElementById(descId);
+      if (ta) ta.value = desc; // patch in place (not a full re-render) so focus elsewhere is preserved
+      markDirty();
+      refreshSaveState();
+      showToast(t("AI description generated. Review and edit it."), "#4ec9a0");
+    }
+  } catch (e) {
+    showToast(String(e), "var(--err)");
+  } finally {
+    describingTypes.delete(ty._key);
+    // Reset whichever button is currently mounted for this type (the original, or a re-rendered one).
+    const b = document.getElementById("ws-aidesc-" + ty._key);
+    if (b) { b.disabled = false; b.textContent = prev; }
+    else if (btn.isConnected) { btn.disabled = false; btn.textContent = prev; }
+  }
+}
 function inspWorkflowType(bd, ty) {
   const form = el("div", "ws-form");
   const known = settingsDraft.known_backends || Object.keys(CLI_NAME);
@@ -2396,6 +2626,21 @@ function inspWorkflowType(bd, ty) {
 
   form.appendChild(field(t("Display name (optional)"), textInput(ty.title, (v) => setTypeField(ty._key, "title", v, false), null, { placeholder: t("Strict code review") })));
   form.appendChild(field(t("BRIEF (the manager instruction for this workflow)"), textArea(ty.prompt, (v) => setTypeField(ty._key, "prompt", v, false), null, { ac: true }), { ac: true }));
+
+  // When-to-use description — human/agent-facing docs for picking this workflow. AI can draft it
+  // from the whole workflow (roles, brief, blueprint steps); always manually editable.
+  const descField = el("div", "ws-field");
+  descField.appendChild(el("label", null, t("Description (when to use)")));
+  const descTa = textArea(ty.description, (v) => setTypeField(ty._key, "description", v, false), null, { ac: true });
+  descTa.id = "ws-typedesc-" + ty._key; // stable handle so AI-fill can patch it in place
+  descField.appendChild(descTa);
+  const generating = describingTypes.has(ty._key); // survives re-render: keep the button disabled
+  const aiBtn = el("button", "ws-ai-desc", generating ? t("Generating…") : t("✨ Generate with AI"));
+  aiBtn.type = "button"; aiBtn.id = "ws-aidesc-" + ty._key; aiBtn.disabled = generating;
+  aiBtn.addEventListener("click", () => generateTypeDescription(ty, aiBtn));
+  descField.appendChild(aiBtn);
+  descField.appendChild(el("p", "ws-fhint", t("Describe when this workflow is effective, so the right one is easy to pick.")));
+  form.appendChild(descField);
 
   const rolesField = el("div", "ws-field");
   rolesField.appendChild(el("label", null, t("Roles used (none selected = all worker roles)")));
@@ -2518,6 +2763,7 @@ async function saveSettings() {
       types: (settingsDraft.types || []).map((t) => ({
         name: t.name,
         title: t.title || null,
+        description: t.description || null,
         prompt: t.prompt || null,
         roles: t.roles || [],
         manager_backend: t.manager_backend || null,

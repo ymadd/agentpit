@@ -223,7 +223,8 @@ fn main() {
             asks::answer_ask,
             settings::settings_get,
             settings::settings_save,
-            workflow_gen::workflow_generate
+            workflow_gen::workflow_generate,
+            workflow_gen::workflow_describe
         ])
         .setup(|app| {
             spawn_watcher(app.handle().clone());

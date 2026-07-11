@@ -149,6 +149,19 @@ pub enum Event {
         kind: RunKind,
         members: Vec<BackendId>,
         cwd: String,
+        /// The run this one was dispatched from (a workflow manager), for the dashboard's live
+        /// execution tree. `None` = a top-level run. Read from `AGENTPIT_PARENT_RUN_ID` (set by
+        /// the workflow guard's child_env when a manager spawns a sub-agent). Backward-compatible:
+        /// old log lines lack it and deserialize as `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
+        /// Workflow recursion depth (0 = top-level manager). Read from `AGENTPIT_WORKFLOW_DEPTH`.
+        #[serde(default)]
+        depth: u32,
+        /// The workflow ROLE this run was dispatched as (e.g. "reviewer"), when addressed by role.
+        /// `None` = dispatched by backend / not part of a role.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
     },
     MemberStarted {
         ts: u64,
@@ -482,6 +495,20 @@ pub struct RunLogger {
 impl RunLogger {
     /// Start a run and emit `RunStarted`. Returns a logger carrying the run id.
     pub fn start(kind: RunKind, members: &[BackendId], cwd: &std::path::Path) -> Self {
+        Self::start_with_role(kind, members, cwd, None)
+    }
+
+    /// Like [`start`], but also records the workflow ROLE this run plays (e.g. "reviewer") so the
+    /// dashboard can label a dispatched sub-agent by role, not just its backend. `parent_run_id`
+    /// and `depth` are read from the environment (`AGENTPIT_PARENT_RUN_ID` / `AGENTPIT_WORKFLOW_DEPTH`,
+    /// set by the workflow guard's child_env at spawn) — a top-level run has neither, so it emits
+    /// `parent_run_id: None` and `depth: 0`.
+    pub fn start_with_role(
+        kind: RunKind,
+        members: &[BackendId],
+        cwd: &std::path::Path,
+        role: Option<&str>,
+    ) -> Self {
         let enabled = events_enabled();
         if enabled {
             // Bound on-disk state before this run adds to it.
@@ -492,6 +519,14 @@ impl RunLogger {
             run_id: next_run_id(),
             enabled,
         };
+        // Names mirror the main crate's `workflow::guard` constants (this crate can't depend on it).
+        let parent_run_id = std::env::var("AGENTPIT_PARENT_RUN_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let depth = std::env::var("AGENTPIT_WORKFLOW_DEPTH")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
         logger.emit(Event::RunStarted {
             ts: now_ms(),
             run_id: logger.run_id.clone(),
@@ -499,6 +534,9 @@ impl RunLogger {
             kind,
             members: members.to_vec(),
             cwd: cwd.display().to_string(),
+            parent_run_id,
+            depth,
+            role: role.map(str::to_string),
         });
         logger
     }
@@ -715,12 +753,90 @@ mod tests {
             kind: RunKind::Bench,
             members: vec![BackendId::Codex],
             cwd: "/x".into(),
+            parent_run_id: None,
+            depth: 0,
+            role: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"kind\":\"bench\""), "got: {json}");
         match serde_json::from_str::<Event>(&json).unwrap() {
             Event::RunStarted { kind, .. } => assert_eq!(kind, RunKind::Bench),
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn run_started_parent_role_default_and_round_trip() {
+        // Backward compat: an old RunStarted line without the new keys deserializes as None/0.
+        let old = r#"{"event":"run_started","ts":1,"run_id":"r","pid":2,"kind":"rescue","members":["codex"],"cwd":"/x"}"#;
+        match serde_json::from_str::<Event>(old).unwrap() {
+            Event::RunStarted { parent_run_id, depth, role, .. } => {
+                assert_eq!(parent_run_id, None);
+                assert_eq!(depth, 0);
+                assert_eq!(role, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // And the new keys round-trip.
+        let ev = Event::RunStarted {
+            ts: 1, run_id: "r1".into(), pid: 2, kind: RunKind::Rescue,
+            members: vec![BackendId::Codex], cwd: "/x".into(),
+            parent_run_id: Some("r0".into()), depth: 1, role: Some("reviewer".into()),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        match serde_json::from_str::<Event>(&json).unwrap() {
+            Event::RunStarted { parent_run_id, depth, role, .. } => {
+                assert_eq!(parent_run_id.as_deref(), Some("r0"));
+                assert_eq!(depth, 1);
+                assert_eq!(role.as_deref(), Some("reviewer"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn start_with_role_reads_parent_depth_from_env_and_carries_role() {
+        let _env = lock_env();
+        // Happy path: env set by the guard's child_env → parent/depth captured; role from the arg.
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+            std::env::set_var("AGENTPIT_PARENT_RUN_ID", "r-parent");
+            std::env::set_var("AGENTPIT_WORKFLOW_DEPTH", "2");
+        }
+        RunLogger::start_with_role(RunKind::Rescue, &[BackendId::Codex], tmp.path(), Some("reviewer"));
+        let contents = std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap();
+        match serde_json::from_str::<Event>(contents.lines().next().unwrap()).unwrap() {
+            Event::RunStarted { parent_run_id, depth, role, .. } => {
+                assert_eq!(parent_run_id.as_deref(), Some("r-parent"));
+                assert_eq!(depth, 2);
+                assert_eq!(role.as_deref(), Some("reviewer"));
+            }
+            _ => panic!("expected RunStarted"),
+        }
+
+        // Fallback: empty parent + non-numeric depth + no role → None / 0 / None (guard against a
+        // regression that drops the empty-string filter or the parse-or-default).
+        let tmp2 = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp2.path());
+            std::env::set_var("AGENTPIT_PARENT_RUN_ID", "");
+            std::env::set_var("AGENTPIT_WORKFLOW_DEPTH", "not-a-number");
+        }
+        RunLogger::start(RunKind::Rescue, &[BackendId::Codex], tmp2.path());
+        let contents2 = std::fs::read_to_string(tmp2.path().join("agentpit/events.jsonl")).unwrap();
+        match serde_json::from_str::<Event>(contents2.lines().next().unwrap()).unwrap() {
+            Event::RunStarted { parent_run_id, depth, role, .. } => {
+                assert_eq!(parent_run_id, None);
+                assert_eq!(depth, 0);
+                assert_eq!(role, None);
+            }
+            _ => panic!("expected RunStarted"),
+        }
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("AGENTPIT_PARENT_RUN_ID");
+            std::env::remove_var("AGENTPIT_WORKFLOW_DEPTH");
         }
     }
 

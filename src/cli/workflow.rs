@@ -359,6 +359,10 @@ pub const RESERVED_TYPE_NEW: &str = "new";
 /// types, so a user-defined type may never be named `list` (it would be unreachable).
 pub const RESERVED_TYPE_LIST: &str = "list";
 
+/// Reserved first-positional token: `agentpit workflow describe` generates a when-to-use
+/// description for a workflow (reads a spec on stdin), so a type may never be named `describe`.
+pub const RESERVED_TYPE_DESCRIBE: &str = "describe";
+
 /// The effective workflow after applying a named TYPE preset over the base `[workflow]`. All of
 /// `run_capture`'s knobs read from here so a type override and the base path share one code path.
 #[derive(Debug, Clone, PartialEq)]
@@ -470,6 +474,9 @@ struct TypeListingEntry {
     roles_missing_from_cast: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     brief: Option<String>,
+    /// When-to-use description (`[workflow.types.<name>].description`). Base workflow has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
 }
 
 /// The full `workflow list` summary. Pure data — built by [`build_types_listing`], rendered by
@@ -518,12 +525,16 @@ fn build_types_listing(
             // Base behavior: every configured worker role.
             None => (all_workers.clone(), Vec::new()),
         };
-        let (title, invoke) = match name {
-            Some(n) => (
-                section.types.get(n).and_then(|t| t.title.clone()),
-                format!("agentpit workflow {n} \"<goal>\""),
-            ),
-            None => (None, "agentpit workflow \"<goal>\"".to_string()),
+        let (title, description, invoke) = match name {
+            Some(n) => {
+                let ty = section.types.get(n);
+                (
+                    ty.and_then(|t| t.title.clone()),
+                    ty.and_then(|t| t.description.clone()),
+                    format!("agentpit workflow {n} \"<goal>\""),
+                )
+            }
+            None => (None, None, "agentpit workflow \"<goal>\"".to_string()),
         };
         TypeListingEntry {
             name: name.map(str::to_string),
@@ -538,6 +549,7 @@ fn build_types_listing(
             roles,
             roles_missing_from_cast: missing,
             brief: eff.brief,
+            description,
         }
     };
 
@@ -578,6 +590,9 @@ fn render_types_listing(listing: &TypesListing) -> String {
             roles_line.push_str(&format!(", {missing}? (not in cast)"));
         }
         out.push_str(&format!("    roles: {roles_line}\n"));
+        if let Some(desc) = &e.description {
+            out.push_str(&format!("    when to use: {}\n", truncate_line(desc, 100)));
+        }
         if let Some(brief) = &e.brief {
             out.push_str(&format!("    brief: {}\n", truncate_line(brief, 100)));
         }
@@ -1249,6 +1264,201 @@ a sensible general-purpose workflow.\n\
     )
 }
 
+/// `agentpit workflow describe [--json]` — generate a WHEN-TO-USE description for a workflow.
+/// Reads a workflow spec (the dashboard's draft, or any `{title,brief,roles,steps,...}` JSON) on
+/// STDIN, runs a one-shot backend to summarize when the workflow is effective, and prints the
+/// description to STDOUT (`{"description": "..."}` with `--json`, else plain text). Progress →
+/// STDERR so STDOUT carries only the result (the dashboard parses stdout).
+pub async fn describe(
+    manager: Option<BackendId>,
+    model: Option<String>,
+    json: bool,
+    cwd: Option<String>,
+) -> Result<()> {
+    use std::io::Read;
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .map_err(|e| anyhow::anyhow!("failed to read workflow spec from stdin: {e}"))?;
+    let spec: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| anyhow::anyhow!("stdin is not valid workflow-spec JSON: {e}"))?;
+    let summary = summarize_spec(&spec);
+
+    let cwd = resolve_cwd(cwd)?;
+    let ctx = load_context()?;
+    let config = &ctx.loaded.config;
+    // A pre-existing `[workflow.types.describe]` preset is now shadowed by this built-in command
+    // (it can no longer be launched by name); warn so an upgrading user isn't silently confused.
+    if config.workflow.types.contains_key(RESERVED_TYPE_DESCRIBE) {
+        eprintln!(
+            "note: a [workflow.types.describe] preset exists but is shadowed by the built-in \
+             `workflow describe` command and can't be run by name — rename it to use it."
+        );
+    }
+    // Any capable backend can describe; prefer the configured manager. One-shot, no sub-dispatch.
+    let backend = manager
+        .or(config.workflow.manager_backend)
+        .unwrap_or(config.default.backend);
+    let auth = check_auth(backend).await;
+    if !auth.ok {
+        anyhow::bail!(
+            "[{backend}] not authenticated. Run `{}`, or call `agentpit login {backend}`.",
+            auth.login_command
+        );
+    }
+
+    let prompt = describe_prompt(&summary);
+    eprintln!("Describing the workflow with {backend}… (one-shot; no sub-agents)");
+    let cancel = CancellationToken::new();
+    install_ctrlc_cancel(cancel.clone());
+    let noop: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_: &str| {});
+    let describe_model = roles::resolve_model(
+        model.as_deref(),
+        None,
+        config.backends.get(&backend).and_then(|o| o.model.as_deref()),
+    );
+    let res = dispatch(backend, &prompt, &cwd, cancel, noop, &ctx.regs, describe_model.as_deref())
+        .await?;
+    if res.auth_failed {
+        anyhow::bail!("[{backend}] auth failure during describe. Run `{}`.", auth.login_command);
+    }
+    let description = clean_description(&res.output);
+    if description.is_empty() {
+        anyhow::bail!("the model returned an empty description");
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({ "description": description }))?
+        );
+    } else {
+        println!("{description}");
+    }
+    Ok(())
+}
+
+/// Flatten a workflow-spec JSON into a compact plain-text summary for the describer prompt. Reads
+/// tolerantly (any missing field is skipped) so it accepts the dashboard draft or a saved type.
+fn summarize_spec(spec: &serde_json::Value) -> String {
+    let field = |k: &str| spec.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let mut out = String::new();
+    let title = field("title");
+    if !title.is_empty() {
+        out.push_str(&format!("title: {title}\n"));
+    }
+    let mgr = field("manager_backend");
+    if !mgr.is_empty() {
+        out.push_str(&format!("manager backend: {mgr}\n"));
+    }
+    let brief = field("brief");
+    if !brief.is_empty() {
+        out.push_str(&format!("brief (the manager's runtime instruction): {brief}\n"));
+    }
+    if let Some(roles) = spec.get("roles").and_then(|v| v.as_array()) {
+        let mut lines = String::new();
+        for r in roles {
+            let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if name.is_empty() {
+                continue;
+            }
+            let backends = r
+                .get("backends")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|b| b.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            let persona = r.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+            lines.push_str(&format!("  - {name}"));
+            if !backends.is_empty() {
+                lines.push_str(&format!(" [{backends}]"));
+            }
+            if !persona.is_empty() {
+                lines.push_str(&format!(": {persona}"));
+            }
+            lines.push('\n');
+        }
+        if !lines.is_empty() {
+            out.push_str("roles:\n");
+            out.push_str(&lines);
+        }
+    }
+    if let Some(uses) = spec.get("uses_roles").and_then(|v| v.as_array()) {
+        let names: Vec<&str> = uses.iter().filter_map(|v| v.as_str()).collect();
+        if !names.is_empty() {
+            out.push_str(&format!("dispatches to roles: {}\n", names.join(", ")));
+        }
+    }
+    if let Some(steps) = spec.get("steps").and_then(|v| v.as_array()) {
+        let mut lines = String::new();
+        for st in steps {
+            let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let persona = st.get("persona").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let behavior = st.get("behavior").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if name.is_empty() && persona.is_empty() && behavior.is_empty() {
+                continue;
+            }
+            lines.push_str(&format!("  - {name}"));
+            if !persona.is_empty() {
+                lines.push_str(&format!(" — {persona}"));
+            }
+            if !behavior.is_empty() {
+                lines.push_str(&format!(" ({behavior})"));
+            }
+            lines.push('\n');
+        }
+        if !lines.is_empty() {
+            out.push_str("illustrative steps:\n");
+            out.push_str(&lines);
+        }
+    }
+    let mut knobs = Vec::new();
+    if let Some(v) = spec.get("max_depth").and_then(|v| v.as_u64()) {
+        knobs.push(format!("max_depth={v}"));
+    }
+    if let Some(v) = spec.get("use_mcp").and_then(|v| v.as_bool()) {
+        knobs.push(format!("use_mcp={v}"));
+    }
+    if let Some(v) = spec.get("enable_ask_human").and_then(|v| v.as_bool()) {
+        knobs.push(format!("ask_human={v}"));
+    }
+    if !knobs.is_empty() {
+        out.push_str(&format!("settings: {}\n", knobs.join(", ")));
+    }
+    if out.trim().is_empty() {
+        out.push_str("(an empty or minimal workflow — infer a sensible general purpose)\n");
+    }
+    out
+}
+
+/// Build the describer system-prompt: turn a workflow summary into a short when-to-use blurb.
+fn describe_prompt(summary: &str) -> String {
+    format!(
+        "=== AGENTPIT WORKFLOW DESCRIBER ===\n\
+You are given the definition of a REUSABLE agentpit workflow (its cast of roles, the manager's\n\
+brief, and an illustrative step sketch). Write a concise WHEN-TO-USE description: what kind of\n\
+task this workflow is best suited for, and when a user — or an agent selecting a workflow —\n\
+should reach for it over another. 2-4 sentences. Plain text only: no markdown, no bullet list,\n\
+no preamble, no surrounding quotes. Describe the workflow's purpose and strengths, not its\n\
+mechanics. Output ONLY the description text.\n\
+\n\
+=== WORKFLOW DEFINITION ===\n\
+{summary}\n"
+    )
+}
+
+/// Strip a model's description output down to clean prose: drop a stray ``` fence, surrounding
+/// quotes, and cap the length so a runaway response can't bloat the config.
+fn clean_description(raw: &str) -> String {
+    let mut s = raw.trim();
+    // Strip a wrapping code fence whether it spans multiple lines (```\n…\n```) or a single line
+    // (```…```): drop the opening fence (and an optional language tag up to the first newline),
+    // then any leading/trailing backtick run — so a single-line fence can't leave a stray ```.
+    if let Some(rest) = s.strip_prefix("```") {
+        let rest = rest.split_once('\n').map(|(_, body)| body).unwrap_or(rest);
+        s = rest.trim_end_matches('`').trim_start_matches('`').trim();
+    }
+    s.trim().trim_matches('"').trim().chars().take(1000).collect()
+}
+
 /// Extract the first balanced JSON object from raw model output (tolerating a ```json fence or
 /// leading/trailing prose). Returns the `{...}` slice.
 fn extract_json(raw: &str) -> Result<&str> {
@@ -1303,6 +1513,7 @@ fn normalize_proposal(p: &mut WorkflowProposal) -> Result<()> {
     if p.type_name.is_empty()
         || p.type_name == RESERVED_TYPE_NEW
         || p.type_name == RESERVED_TYPE_LIST
+        || p.type_name == RESERVED_TYPE_DESCRIBE
     {
         anyhow::bail!("the model generated an invalid workflow type name");
     }
@@ -1889,6 +2100,7 @@ goal\n";
             "review".into(),
             crate::config::WorkflowType {
                 title: Some("Strict review".into()),
+                description: Some("Use when a change needs a strict, adversarial review.".into()),
                 prompt: Some("Run a strict review.".into()),
                 roles: vec!["reviewer".into(), "security".into()],
                 manager_backend: Some(BackendId::Claude),
@@ -1986,6 +2198,10 @@ goal\n";
             "got: {text}"
         );
         assert!(text.contains("brief: Run a strict review."), "got: {text}");
+        assert!(
+            text.contains("when to use: Use when a change needs a strict, adversarial review."),
+            "got: {text}"
+        );
         assert!(text.contains("ask_human: on"), "got: {text}");
     }
 
@@ -2098,7 +2314,7 @@ goal\n";
 
     #[test]
     fn normalize_rejects_reserved_type_names() {
-        for reserved in [RESERVED_TYPE_NEW, RESERVED_TYPE_LIST] {
+        for reserved in [RESERVED_TYPE_NEW, RESERVED_TYPE_LIST, RESERVED_TYPE_DESCRIBE] {
             let mut p = WorkflowProposal {
                 type_name: reserved.to_string(),
                 ..Default::default()
@@ -2153,6 +2369,40 @@ goal\n";
         assert!(p.contains("claude, codex"));
         assert!(p.contains("build a review flow"));
         assert!(p.contains("\"type\""));
+    }
+
+    #[test]
+    fn summarize_spec_flattens_roles_steps_and_knobs() {
+        let spec = serde_json::json!({
+            "title": "Strict review",
+            "brief": "Review hard.",
+            "manager_backend": "claude",
+            "roles": [{ "name": "reviewer", "backends": ["codex"], "prompt": "Find bugs." }],
+            "uses_roles": ["reviewer"],
+            "steps": [{ "name": "review", "persona": "skeptic", "behavior": "refute" }],
+            "max_depth": 2, "use_mcp": true, "enable_ask_human": false
+        });
+        let s = summarize_spec(&spec);
+        assert!(s.contains("title: Strict review"), "{s}");
+        assert!(s.contains("brief (the manager's runtime instruction): Review hard."), "{s}");
+        assert!(s.contains("- reviewer [codex]: Find bugs."), "{s}");
+        assert!(s.contains("dispatches to roles: reviewer"), "{s}");
+        assert!(s.contains("- review — skeptic (refute)"), "{s}");
+        assert!(s.contains("max_depth=2") && s.contains("use_mcp=true") && s.contains("ask_human=false"), "{s}");
+    }
+
+    #[test]
+    fn summarize_spec_handles_empty() {
+        assert!(summarize_spec(&serde_json::json!({})).contains("empty or minimal"));
+    }
+
+    #[test]
+    fn clean_description_strips_fences_and_quotes() {
+        assert_eq!(clean_description("  \"hello there\"  "), "hello there");
+        assert_eq!(clean_description("```text\nuse for X\n```"), "use for X");
+        assert_eq!(clean_description("```\nuse for X\n```"), "use for X");
+        assert_eq!(clean_description("```Use this for X```"), "Use this for X");
+        assert_eq!(clean_description("plain desc"), "plain desc");
     }
 
     #[test]

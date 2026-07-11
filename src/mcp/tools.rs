@@ -230,7 +230,7 @@ impl AgentpitTools {
     ) -> Result<CallToolResult, McpError> {
         // Exactly one of backend|role addresses the dispatch; both or neither is ambiguous and a
         // structured error, mirroring the CLI's `--role`/`--backend` mutual exclusion.
-        let (backend, task, model) = match (&req.backend, &req.role) {
+        let (backend, task, model, role) = match (&req.backend, &req.role) {
             (Some(_), Some(_)) => {
                 return Ok(tool_error(
                     "'backend' and 'role' are mutually exclusive; pass exactly one".to_string(),
@@ -242,7 +242,7 @@ impl AgentpitTools {
                 ));
             }
             (Some(b), None) => match b.parse::<BackendId>() {
-                Ok(b) => (b, req.task, req.model.clone()),
+                Ok(b) => (b, req.task, req.model.clone(), None),
                 Err(e) => return Ok(tool_error(format!("unknown backend '{b}': {e}"))),
             },
             (None, Some(role_name)) => {
@@ -261,7 +261,7 @@ impl AgentpitTools {
                             resolved.model.as_deref(),
                             None,
                         );
-                        (resolved.backend, wrapped, model)
+                        (resolved.backend, wrapped, model, Some(resolved.name))
                     }
                     Err(e) => return Ok(tool_error(format!("{e:#}"))),
                 }
@@ -270,8 +270,9 @@ impl AgentpitTools {
         let cancel = CancellationToken::new();
         // Surface single MCP dispatches in the dashboard swarm, like `agentpit rescue` — this is
         // also how a `--use-mcp` workflow manager's per-worker dispatches become visible. A role
-        // dispatch logs under its RESOLVED backend, so dashboard events look identical.
-        let logger = RunLogger::start(RunKind::Rescue, &[backend], &self.cwd);
+        // dispatch logs under its RESOLVED backend + carries the role so the dashboard tree can
+        // label it "reviewer · codex" rather than just the backend.
+        let logger = RunLogger::start_with_role(RunKind::Rescue, &[backend], &self.cwd, role.as_deref());
         let outcome = dispatch_member_logged(
             backend,
             task,
@@ -876,6 +877,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.is_error, Some(false), "expected success, got: {res:?}");
+        // The dispatched sub-run's RunStarted must carry the resolved role so the dashboard tree
+        // can label it by role — guards the start_with_role wiring at this call site.
+        let log = std::fs::read_to_string(agentpit_events::events_path()).unwrap_or_default();
+        let started = log
+            .lines()
+            .find(|l| l.contains("run_started"))
+            .expect("a run_started line was written");
+        assert!(started.contains("\"role\":\"reviewer\""), "role not emitted: {started}");
     }
 
     #[tokio::test]

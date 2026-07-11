@@ -148,11 +148,12 @@ pub enum Command {
     /// Run a model-driven workflow, or generate one. `agentpit workflow [type] "<goal>"` runs a
     /// named `[workflow.types.<type>]` preset (omit the type to run the base `[workflow]`);
     /// `agentpit workflow new "<description>"` generates a workflow from a description;
-    /// `agentpit workflow list` prints the configured types.
+    /// `agentpit workflow list` prints the configured types; `agentpit workflow describe`
+    /// generates a when-to-use description for a workflow (reads a spec on stdin).
     Workflow {
-        /// A workflow TYPE (`[workflow.types.<name>]`), the literal `new` to generate one, the
-        /// literal `list` to print configured types — OR, when no second positional follows,
-        /// the goal itself.
+        /// A workflow TYPE (`[workflow.types.<name>]`), the literal `new` to generate one, `list`
+        /// to print configured types, `describe` to generate a when-to-use blurb — OR, when no
+        /// second positional follows, the goal itself.
         type_or_goal: String,
         /// The goal (when a type is given first), or the description (with `new`).
         goal: Option<String>,
@@ -404,6 +405,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                     );
                 }
                 workflow::list(json).await
+            } else if type_or_goal == workflow::RESERVED_TYPE_DESCRIBE {
+                // `describe` is reserved: read a workflow spec on stdin, print a when-to-use blurb.
+                if goal.is_some() {
+                    anyhow::bail!(
+                        "usage: agentpit workflow describe [--json] — reads a workflow spec on stdin"
+                    );
+                }
+                workflow::describe(manager, model, json, cwd).await
             } else {
                 // Two positionals = <type> <goal>; one positional = <goal> (base workflow).
                 let (workflow_type, goal) = match goal {

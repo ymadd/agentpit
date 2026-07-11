@@ -14,9 +14,12 @@ description: Run a model-driven multi-step workflow where a manager backend (cla
 ## How to invoke
 
 ```bash
-agentpit workflow "<goal>" [--manager claude|codex] [--agents a,b,c] [--max-depth N] [--use-mcp]
+agentpit workflow [type] "<goal>" [--manager claude|codex] [--agents a,b,c] [--max-depth N] [--use-mcp]
 ```
 
+- An optional leading `type` selects a named `[workflow.types.<type>]` preset (see below); with a
+  single positional that positional is the goal and the base `[workflow]` runs. `new` and `list`
+  are reserved (the generator and the catalog).
 - `--manager` selects the orchestrating backend (claude or codex). Defaults to
   `[workflow].manager_backend` or `[default].backend`.
 - `--agents` lists the worker backends the manager may dispatch to. Defaults to all available
@@ -52,10 +55,11 @@ prompt   = "You are a strict reviewer. Critique only; do not rewrite."
 ```
 
 The reserved `manager` role configures the orchestrator itself and is never a worker dispatch
-target (`--role manager` is a hard error). Manager resolution order is `--manager` >
-`[workflow.roles.manager]` (first claude|codex in its list) > `[workflow].manager_backend` >
-`[default].backend`; the manager role's `prompt`, when present, is injected into the
-orchestrator prompt as a MANAGER PERSONA block regardless of where the backend came from.
+target (`--role manager` is a hard error). Manager resolution order is `--manager` > the type's
+`manager_backend` (selecting a type is an explicit per-kind choice) > `[workflow.roles.manager]`
+(first claude|codex in its list) > `[workflow].manager_backend` > `[default].backend`; the
+manager role's `prompt`, when present, is injected into the orchestrator prompt as a MANAGER
+PERSONA block regardless of where the backend came from.
 
 For every other role, dispatch by name with `agentpit rescue --role <name> "<sub-task>"`
 (`--role` and `--backend` are mutually exclusive — the role resolves the backend). Resolution
@@ -64,6 +68,35 @@ walks the role's `backends` preference list for the first currently-available en
 available backend is a hard error rather than a silent substitution. The MCP equivalent is
 `mcp__agentpit__dispatch_task {"role":"<name>","task":"<sub-task>"}` (`role` and `backend` are
 mutually exclusive there too), so a `--use-mcp` workflow targets roles by name the same way.
+
+## Models per agent
+
+Any agent can be pinned to a model. Precedence (highest first): an explicit `--model <m>` on the
+command → the role's `[workflow.roles.<name>].model` → the backend's `[backends.<id>].model`
+default → the CLI's own default (no flag emitted, byte-identical to before). So `agentpit rescue
+--role reviewer "…"` runs on the reviewer role's model, `agentpit workflow --model opus "…"` pins
+the manager, and a workflow's cast can mix a different model per role. Each backend maps `--model`
+to its own CLI flag (claude/codex `--model`, gemini `-m`, agy `--model`, opencode `--model` on the
+ACP spawn). The MCP tools (`dispatch_task` / `run_ensemble` / `run_workflow`) each take a `model`.
+
+## Named workflows (types) + generation
+
+A workflow TYPE (`[workflow.types.<name>]`) is a PRESET over the base `[workflow]`: it picks which
+shared roles to cast (`roles = [...]`, empty = all worker roles), gives the manager a BRIEF
+(`prompt`, injected as a `WORKFLOW BRIEF` block), and may override `manager_backend` / `max_depth` /
+`max_calls_per_manager` / `use_mcp` / `enable_ask_human` (unset = inherit base). The cast itself is
+never duplicated — a type only selects shared roles. Run one with `agentpit workflow <type>
+"<goal>"`; over MCP pass `run_workflow {"type":"<name>","goal":"..."}`.
+
+See what is configured with `agentpit workflow list` (no goal): the base `[workflow]` plus every
+type with its EFFECTIVE manager/knobs/roster/brief and a copy-pasteable invocation. Roles missing
+from the shared cast and an unsupported manager are flagged inline. `--json` for machines.
+
+Generate a workflow from a description with `agentpit workflow new "<description>"`: a one-shot
+manager call proposes a type + the roles it needs. Default prints TOML; `--json` emits the
+structured proposal (the desktop dashboard's ✨ generate button shells out to this); `--write`
+appends it to `config.toml` (refusing to clobber an existing type). The model output is parsed,
+sanitized (names → kebab, backends filtered to known ids), and re-serialized — never executed.
 
 ## MCP channel
 

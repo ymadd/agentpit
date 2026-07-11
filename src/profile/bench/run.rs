@@ -109,6 +109,7 @@ pub async fn run_live(
             cancel.clone(),
             on_chunk.clone(),
             regs,
+            None,
         )
         .await
         .with_context(|| format!("dispatch failed for gold task {}", task.id))?;

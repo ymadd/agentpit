@@ -95,6 +95,7 @@ pub(crate) async fn dispatch_to_outcome(
     cancel: CancellationToken,
     on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
     regs: &Registries,
+    model: Option<&str>,
 ) -> MemberOutcome {
     let transport = resolve_transport(backend, regs);
     if transport.is_none() {
@@ -105,7 +106,7 @@ pub(crate) async fn dispatch_to_outcome(
             error: Some("not registered".into()),
         };
     }
-    match dispatch(backend, prompt, cwd, cancel, on_chunk, regs).await {
+    match dispatch(backend, prompt, cwd, cancel, on_chunk, regs, model).await {
         Ok(res) if res.auth_failed => MemberOutcome {
             backend,
             transport: Some(res.transport),
@@ -134,10 +135,12 @@ async fn run_one_member(
     cancel: CancellationToken,
     regs: Arc<Registries>,
     logger: RunLogger,
+    model: Option<String>,
 ) -> MemberOutcome {
     let started = Instant::now();
     let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
-    let outcome = dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs).await;
+    let outcome =
+        dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs, model.as_deref()).await;
     let elapsed_s = started.elapsed().as_secs_f32();
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &outcome.error {
@@ -218,25 +221,40 @@ pub async fn run(
     prompt: String,
     members: Option<Vec<BackendId>>,
     aggregator: Option<BackendId>,
+    model: Option<String>,
     cwd: Option<String>,
 ) -> Result<()> {
     let ctx = load_context()?;
     let members = members.unwrap_or_else(|| ctx.loaded.config.ensemble.default_members.clone());
     let aggregator = aggregator.or(ctx.loaded.config.ensemble.aggregator);
-    run_resolved(ctx, RunKind::Ensemble, prompt, members, aggregator, cwd).await
+    run_resolved(ctx, RunKind::Ensemble, prompt, members, aggregator, model, cwd).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_resolved(
     ctx: Context,
     kind: RunKind,
     prompt: String,
     members: Vec<BackendId>,
     aggregator: Option<BackendId>,
+    model: Option<String>,
     cwd: Option<String>,
 ) -> Result<()> {
     let cwd = resolve_cwd(cwd)?;
     let cancel = CancellationToken::new();
     install_ctrlc_cancel(cancel.clone());
+
+    // Per-backend effective model: an explicit `--model` applies to every member/aggregator, else
+    // each falls back to its own `[backends.<id>].model` default. Resolved up front (owned Strings)
+    // so the spawn closures capture no config borrow.
+    let backend_models = ctx.loaded.config.backends.clone();
+    let model_for = |b: BackendId| -> Option<String> {
+        crate::workflow::roles::resolve_model(
+            model.as_deref(),
+            None,
+            backend_models.get(&b).and_then(|o| o.model.as_deref()),
+        )
+    };
 
     let regs = Arc::new(ctx.regs);
     let logger = RunLogger::start(kind, &members, &cwd);
@@ -276,8 +294,9 @@ pub async fn run_resolved(
         let regs_c = regs.clone();
         let prompt_c = prompt.clone();
         let logger_c = logger.clone();
+        let model_c = model_for(m);
         let handle = tokio::spawn(async move {
-            run_one_member(m, prompt_c, cwd_c, cancel_c, regs_c, logger_c).await
+            run_one_member(m, prompt_c, cwd_c, cancel_c, regs_c, logger_c, model_c).await
         });
         handles.push((m, handle));
     }
@@ -360,6 +379,7 @@ pub async fn run_resolved(
         let started = Instant::now();
         let agg_prompt = build_aggregator_prompt(&prompt, &outcomes);
         let on_chunk = crate::events::output_streamer(logger.run_id(), aggregator_id, true);
+        let agg_model = model_for(aggregator_id);
         match dispatch(
             aggregator_id,
             &agg_prompt,
@@ -367,6 +387,7 @@ pub async fn run_resolved(
             cancel.clone(),
             on_chunk,
             &regs,
+            agg_model.as_deref(),
         )
         .await
         {

@@ -57,6 +57,9 @@ pub enum Command {
         /// Override target backend.
         #[arg(long)]
         backend: Option<BackendId>,
+        /// Pin the model (e.g. opus, gpt-5-codex). Overrides the role's and the backend's default.
+        #[arg(long)]
+        model: Option<String>,
         /// Working directory (defaults to current).
         #[arg(long)]
         cwd: Option<String>,
@@ -134,14 +137,25 @@ pub enum Command {
         members: Option<Vec<BackendId>>,
         #[arg(long)]
         aggregator: Option<BackendId>,
+        /// Pin the model for every member + the aggregator (e.g. opus). Otherwise each backend
+        /// uses its own `[backends.<id>].model` default.
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
     },
 
-    /// Run a model-driven workflow: a manager backend (claude|codex) orchestrates sub-agents.
+    /// Run a model-driven workflow, or generate one. `agentpit workflow [type] "<goal>"` runs a
+    /// named `[workflow.types.<type>]` preset (omit the type to run the base `[workflow]`);
+    /// `agentpit workflow new "<description>"` generates a workflow from a description;
+    /// `agentpit workflow list` prints the configured types.
     Workflow {
-        /// High-level goal for the manager to decompose and orchestrate.
-        goal: String,
+        /// A workflow TYPE (`[workflow.types.<name>]`), the literal `new` to generate one, the
+        /// literal `list` to print configured types — OR, when no second positional follows,
+        /// the goal itself.
+        type_or_goal: String,
+        /// The goal (when a type is given first), or the description (with `new`).
+        goal: Option<String>,
         /// Manager backend (claude|codex). Defaults to [workflow].manager_backend or default.backend.
         #[arg(long)]
         manager: Option<BackendId>,
@@ -154,6 +168,16 @@ pub enum Command {
         /// Orchestrate via the MCP channel (claude manager only) instead of shelling out.
         #[arg(long, default_value_t = false)]
         use_mcp: bool,
+        /// Pin the model for the manager (e.g. opus, gpt-5-codex). Overrides roles.manager.model
+        /// and the backend default. With `new`, pins the designer's model.
+        #[arg(long)]
+        model: Option<String>,
+        /// (`new`/`list`) Emit JSON instead of the human-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// (`new` only) Append the generated `[workflow.types.*]` (+ any new roles) to config.toml.
+        #[arg(long, default_value_t = false)]
+        write: bool,
         #[arg(long)]
         cwd: Option<String>,
     },
@@ -302,9 +326,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             task,
             role,
             backend,
+            model,
             cwd,
             no_auto_login,
-        } => rescue::run_with_role(task, role, backend, cwd, !no_auto_login).await,
+        } => rescue::run_with_role(task, role, backend, model, cwd, !no_auto_login).await,
 
         Command::Review {
             target,
@@ -348,17 +373,56 @@ pub async fn run(cli: Cli) -> Result<()> {
             prompt,
             members,
             aggregator,
+            model,
             cwd,
-        } => ensemble::run(prompt, members, aggregator, cwd).await,
+        } => ensemble::run(prompt, members, aggregator, model, cwd).await,
 
         Command::Workflow {
+            type_or_goal,
             goal,
             manager,
             agents,
             max_depth,
             use_mcp,
+            model,
+            json,
+            write,
             cwd,
-        } => workflow::run(goal, manager, agents, max_depth, use_mcp, cwd).await,
+        } => {
+            // `new` is reserved: `agentpit workflow new "<description>"` generates a workflow.
+            if type_or_goal == workflow::RESERVED_TYPE_NEW {
+                let description = goal.ok_or_else(|| {
+                    anyhow::anyhow!("usage: agentpit workflow new \"<description>\"")
+                })?;
+                workflow::generate(description, manager, model, json, write, cwd).await
+            } else if type_or_goal == workflow::RESERVED_TYPE_LIST {
+                // `list` is reserved: print the configured workflow types.
+                if goal.is_some() {
+                    anyhow::bail!(
+                        "usage: agentpit workflow list [--json] — `list` takes no goal. \
+                         To run a type: agentpit workflow <type> \"<goal>\""
+                    );
+                }
+                workflow::list(json).await
+            } else {
+                // Two positionals = <type> <goal>; one positional = <goal> (base workflow).
+                let (workflow_type, goal) = match goal {
+                    Some(g) => (Some(type_or_goal), g),
+                    None => (None, type_or_goal),
+                };
+                workflow::run(
+                    goal,
+                    workflow_type,
+                    manager,
+                    agents,
+                    max_depth,
+                    use_mcp,
+                    model,
+                    cwd,
+                )
+                .await
+            }
+        }
 
         Command::Dashboard => dashboard::run().await,
 

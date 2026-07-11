@@ -4,6 +4,7 @@
 mod asks;
 mod cli_versions;
 mod settings;
+mod workflow_gen;
 mod state;
 
 use std::path::PathBuf;
@@ -221,7 +222,8 @@ fn main() {
             asks::get_pending_asks,
             asks::answer_ask,
             settings::settings_get,
-            settings::settings_save
+            settings::settings_save,
+            workflow_gen::workflow_generate
         ])
         .setup(|app| {
             spawn_watcher(app.handle().clone());

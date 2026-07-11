@@ -17,7 +17,10 @@ pub use workflow_manager::{McpConfigGuard, WorkflowManagerExec, is_supported_man
 /// Trait implemented by exec-mode backends (direct CLI spawn).
 pub trait ExecAdapter: Send + Sync {
     fn id(&self) -> BackendId;
-    fn build_spec(&self, task: &str) -> ExecSpec;
+    /// Build the spawn spec for `task`. `model` optionally pins the backend's model: `Some(m)`
+    /// emits the CLI's model flag (e.g. `--model m`), `None` leaves the CLI on its own default
+    /// (no flag — the pre-model behaviour, so an unset model is a zero-diff regression guard).
+    fn build_spec(&self, task: &str, model: Option<&str>) -> ExecSpec;
 
     /// The permission posture this backend is spawned with. Centralised in
     /// [`autonomy`] so the security decision is auditable in one place rather than
@@ -33,6 +36,6 @@ pub async fn run<A: ExecAdapter + ?Sized>(
     task: &str,
     options: ExecRunOptions,
 ) -> Result<ExecOutcome> {
-    let spec = adapter.build_spec(task);
+    let spec = adapter.build_spec(task, options.model.as_deref());
     run_spec(adapter.id(), spec, options).await
 }

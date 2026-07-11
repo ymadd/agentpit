@@ -90,7 +90,7 @@ impl ExecAdapter for WorkflowManagerExec {
         self.backend
     }
 
-    fn build_spec(&self, task: &str) -> ExecSpec {
+    fn build_spec(&self, task: &str, model: Option<&str>) -> ExecSpec {
         match self.backend {
             // `bypassPermissions` is required so the manager can run `agentpit` via its Bash tool
             // non-interactively — `acceptEdits` only auto-accepts file edits, not Bash commands.
@@ -110,6 +110,12 @@ impl ExecAdapter for WorkflowManagerExec {
                     "--permission-mode".into(),
                     "bypassPermissions".into(),
                 ];
+                // `--model` must precede the variadic `--allowedTools` (which greedily consumes
+                // following tokens), so inject it here before the mode-specific tool flags.
+                if let Some(m) = model {
+                    args.push("--model".into());
+                    args.push(m.to_string());
+                }
                 match &self.mcp_config_path {
                     // MCP mode: the manager orchestrates via the agentpit MCP server's tools
                     // instead of shelling out. Point claude at the temp server config and scope
@@ -142,18 +148,25 @@ impl ExecAdapter for WorkflowManagerExec {
                 }
             }
             // `--sandbox danger-full-access` lets codex run the agentpit sub-commands.
-            BackendId::Codex => ExecSpec {
-                command: "codex".into(),
-                args: vec![
+            BackendId::Codex => {
+                let mut args = vec![
                     "exec".into(),
                     "--skip-git-repo-check".into(),
                     "--sandbox".into(),
                     "danger-full-access".into(),
-                    "-".into(),
-                ],
-                env: self.child_env.clone(),
-                stdin_input: Some(task.to_string()),
-            },
+                ];
+                if let Some(m) = model {
+                    args.push("--model".into());
+                    args.push(m.to_string());
+                }
+                args.push("-".into());
+                ExecSpec {
+                    command: "codex".into(),
+                    args,
+                    env: self.child_env.clone(),
+                    stdin_input: Some(task.to_string()),
+                }
+            }
             // The dangerous full-autonomy posture is isolated to exactly the two supported
             // managers above. Every other backend must be rejected by `is_supported_manager`
             // before this adapter is ever constructed; reaching here means that gate was
@@ -194,7 +207,7 @@ mod tests {
 
     #[test]
     fn claude_spec_bypasses_permissions_with_bash_allowlist() {
-        let spec = exec(BackendId::Claude).build_spec("drive the workflow");
+        let spec = exec(BackendId::Claude).build_spec("drive the workflow", None);
         assert_eq!(spec.command, "claude");
         assert!(spec.args.iter().any(|a| a == "bypassPermissions"));
         assert!(spec.args.iter().any(|a| a == "--allowedTools"));
@@ -216,7 +229,7 @@ mod tests {
     fn claude_mcp_mode_uses_mcp_config_and_tool_allowlist() {
         let mut e = exec(BackendId::Claude);
         e.mcp_config_path = Some(PathBuf::from("/tmp/agentpit-mcp-run-1.json"));
-        let spec = e.build_spec("drive the workflow");
+        let spec = e.build_spec("drive the workflow", None);
         assert_eq!(spec.command, "claude");
         assert!(spec.args.iter().any(|a| a == "bypassPermissions"));
         // MCP mode wires --mcp-config <path> + the mcp__agentpit__* tool scope.
@@ -256,7 +269,7 @@ mod tests {
 
     #[test]
     fn codex_spec_uses_danger_full_access_and_stdin() {
-        let spec = exec(BackendId::Codex).build_spec("drive the workflow");
+        let spec = exec(BackendId::Codex).build_spec("drive the workflow", None);
         assert_eq!(spec.command, "codex");
         assert!(spec.args.iter().any(|a| a == "danger-full-access"));
         assert_eq!(spec.stdin_input.as_deref(), Some("drive the workflow"));
@@ -264,6 +277,22 @@ mod tests {
             spec.env
                 .contains(&("AGENTPIT_SELF".into(), "/bin/agentpit".into()))
         );
+        assert!(!spec.args.iter().any(|a| a == "--model"));
+    }
+
+    #[test]
+    fn manager_model_flag_precedes_allowedtools_for_claude_and_dash_for_codex() {
+        // claude: --model must land before the variadic --allowedTools.
+        let c = exec(BackendId::Claude).build_spec("go", Some("opus"));
+        let mi = c.args.iter().position(|a| a == "--model").unwrap();
+        let ti = c.args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(c.args[mi + 1], "opus");
+        assert!(mi < ti, "--model must precede --allowedTools");
+        // codex: --model before the stdin `-`.
+        let x = exec(BackendId::Codex).build_spec("go", Some("gpt-5-codex"));
+        let mi = x.args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(x.args[mi + 1], "gpt-5-codex");
+        assert_eq!(x.args.last().unwrap(), "-");
     }
 
     #[test]

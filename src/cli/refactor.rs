@@ -35,6 +35,7 @@ pub async fn run(
                 prompt,
                 members,
                 aggregator,
+                None, // model: refactor has no --model; each member uses its backend default
                 cwd,
             )
             .await;

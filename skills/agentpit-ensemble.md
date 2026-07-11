@@ -14,10 +14,14 @@ description: Fan a prompt out to multiple backend agents in parallel, optionally
 ## How to invoke
 
 ```bash
-agentpit ensemble "<prompt>" [--members <a,b,c>] [--aggregator <id>]
+agentpit ensemble "<prompt>" [--members <a,b,c>] [--aggregator <id>] [--model <m>]
 ```
 
 Defaults come from `~/.config/agentpit/config.toml` — typically `antigravity, claude, opencode` with no aggregator.
+
+`--model <m>` pins that model for every member and the aggregator (each backend maps it to its
+own CLI flag). Omitted = each backend's `[backends.<id>].model` default, else the backend CLI's
+own default — mixed-model panels come from those per-backend defaults, not from the flag.
 
 ## Output
 

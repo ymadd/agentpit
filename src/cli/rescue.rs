@@ -41,14 +41,16 @@ pub async fn run(
     cwd: Option<String>,
     auto_login: bool,
 ) -> Result<()> {
-    run_with_role(task, None, backend, cwd, auto_login).await
+    run_with_role(task, None, backend, None, cwd, auto_login).await
 }
 
-/// `agentpit rescue` entry point used by the CLI command dispatcher, with `--role` support.
+/// `agentpit rescue` entry point used by the CLI command dispatcher, with `--role` + `--model`.
+/// `model` is the explicit `--model`; it wins over the role's / backend's configured model.
 pub async fn run_with_role(
     task: String,
     role: Option<String>,
     backend: Option<BackendId>,
+    model: Option<String>,
     cwd: Option<String>,
     auto_login: bool,
 ) -> Result<()> {
@@ -68,7 +70,8 @@ pub async fn run_with_role(
             let wrapped_task =
                 crate::workflow::roles::persona_task(&resolved.name, resolved.prompt.as_deref(), &task);
             // A role dispatch is always single-backend: skip the rescue_members ensemble
-            // shortcut entirely and go straight to the resolved backend's explicit route.
+            // shortcut entirely and go straight to the resolved backend's explicit route. The
+            // role's model is the mid-precedence source (below an explicit --model).
             run_with_route_inner(
                 wrapped_task,
                 Some(resolved.backend),
@@ -76,6 +79,8 @@ pub async fn run_with_role(
                 auto_login,
                 RouteKey::Rescue,
                 Some(resolved.name.as_str()),
+                model,
+                resolved.model,
             )
             .await
         }
@@ -91,12 +96,23 @@ pub async fn run_with_role(
                         task,
                         members,
                         aggregator,
+                        model,
                         cwd,
                     )
                     .await;
                 }
             }
-            run_with_route(task, backend, cwd, auto_login, RouteKey::Rescue).await
+            run_with_route_inner(
+                task,
+                backend,
+                cwd,
+                auto_login,
+                RouteKey::Rescue,
+                None,
+                model,
+                None,
+            )
+            .await
         }
     }
 }
@@ -108,7 +124,9 @@ pub async fn run_with_route(
     auto_login: bool,
     route_key: RouteKey,
 ) -> Result<()> {
-    run_with_route_inner(task, backend, cwd, auto_login, route_key, None).await
+    // explain/refactor/review reach here with no model concept of their own — pass None/None so
+    // the backend's `[backends.<id>].model` default still applies inside run_with_route_inner.
+    run_with_route_inner(task, backend, cwd, auto_login, route_key, None, None, None).await
 }
 
 /// Shared implementation behind [`run_with_route`]. `role_label`, when set, is a resolved
@@ -116,6 +134,7 @@ pub async fn run_with_route(
 /// own reason string — the backend was pinned by role resolution, not the router, so the
 /// printed route should say so. `None` keeps the original `route=<reason>` format byte-identical
 /// (explain/refactor and the plain `rescue --backend` path all go through this branch).
+#[allow(clippy::too_many_arguments)]
 async fn run_with_route_inner(
     task: String,
     backend: Option<BackendId>,
@@ -123,6 +142,8 @@ async fn run_with_route_inner(
     auto_login: bool,
     route_key: RouteKey,
     role_label: Option<&str>,
+    model: Option<String>,
+    role_model: Option<String>,
 ) -> Result<()> {
     let ctx = load_context()?;
     let available = ctx.regs.available();
@@ -208,7 +229,22 @@ async fn run_with_route_inner(
             to_file(c);
         });
 
-    let result = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &ctx.regs).await;
+    // Effective model: explicit --model > role.model > [backends.<id>].model default > None.
+    let effective_model = crate::workflow::roles::resolve_model(
+        model.as_deref(),
+        role_model.as_deref(),
+        ctx.loaded.config.backends.get(&backend_id).and_then(|o| o.model.as_deref()),
+    );
+    let result = dispatch(
+        backend_id,
+        &task,
+        &cwd,
+        cancel,
+        on_chunk,
+        &ctx.regs,
+        effective_model.as_deref(),
+    )
+    .await;
     match result {
         Ok(res) => {
             if res.auth_failed {

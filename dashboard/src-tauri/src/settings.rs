@@ -73,6 +73,32 @@ pub struct RoleEntry {
     pub backends: Vec<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Model to run this role on (e.g. "opus"). None/empty = the resolved backend's default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// One named workflow preset (`[workflow.types.<name>]`). Every override is optional; `roles`
+/// selects a subset of the shared cast (empty = all worker roles). Mirrors `config::WorkflowType`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowTypeEntry {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub manager_backend: Option<String>,
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+    #[serde(default)]
+    pub max_calls_per_manager: Option<u32>,
+    #[serde(default)]
+    pub use_mcp: Option<bool>,
+    #[serde(default)]
+    pub enable_ask_human: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,13 +107,17 @@ pub struct SettingsPayload {
     pub exists: bool,
     pub workflow: WorkflowPayload,
     pub roles: Vec<RoleEntry>,
+    pub types: Vec<WorkflowTypeEntry>,
     pub known_backends: Vec<String>,
+    pub reserved_type_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SettingsSave {
     pub workflow: WorkflowPayload,
     pub roles: Vec<RoleEntry>,
+    #[serde(default)]
+    pub types: Vec<WorkflowTypeEntry>,
 }
 
 fn known_backends() -> Vec<String> {
@@ -95,6 +125,13 @@ fn known_backends() -> Vec<String> {
         .iter()
         .map(|b| b.as_str().to_string())
         .collect()
+}
+
+/// Workflow type names the CLI claims as `agentpit workflow` subcommands (`new` launches the
+/// generator, `list` prints the catalog), so a `[workflow.types.*]` cannot use them. Shipped to
+/// the UI in the payload so its client-side validator can never drift from this gate.
+fn reserved_type_names() -> Vec<String> {
+    vec!["new".to_string(), "list".to_string()]
 }
 
 /// Read `[workflow]` / `[workflow.roles]` from `path`, tolerantly: a missing file, an
@@ -107,6 +144,7 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
 
     let mut workflow = WorkflowPayload::default();
     let mut roles = Vec::new();
+    let mut types = Vec::new();
 
     if let Some(wf) = doc.get("workflow").and_then(Item::as_table_like) {
         if let Some(v) = wf.get("manager_backend").and_then(Item::as_str) {
@@ -142,10 +180,42 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
                     })
                     .unwrap_or_default();
                 let prompt = item.get("prompt").and_then(Item::as_str).map(str::to_string);
+                let model = item.get("model").and_then(Item::as_str).map(str::to_string);
                 roles.push(RoleEntry {
                     name: name.to_string(),
                     backends,
                     prompt,
+                    model,
+                });
+            }
+        }
+        if let Some(types_table) = wf.get("types").and_then(Item::as_table_like) {
+            for (name, item) in types_table.iter() {
+                let roles = item
+                    .get("roles")
+                    .and_then(Item::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                types.push(WorkflowTypeEntry {
+                    name: name.to_string(),
+                    title: item.get("title").and_then(Item::as_str).map(str::to_string),
+                    prompt: item.get("prompt").and_then(Item::as_str).map(str::to_string),
+                    roles,
+                    manager_backend: item
+                        .get("manager_backend")
+                        .and_then(Item::as_str)
+                        .map(str::to_string),
+                    max_depth: item.get("max_depth").and_then(Item::as_integer).map(|n| n.max(0) as u32),
+                    max_calls_per_manager: item
+                        .get("max_calls_per_manager")
+                        .and_then(Item::as_integer)
+                        .map(|n| n.max(0) as u32),
+                    use_mcp: item.get("use_mcp").and_then(Item::as_bool),
+                    enable_ask_human: item.get("enable_ask_human").and_then(Item::as_bool),
                 });
             }
         }
@@ -156,7 +226,9 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
         exists,
         workflow,
         roles,
+        types,
         known_backends: known_backends(),
+        reserved_type_names: reserved_type_names(),
     }
 }
 
@@ -201,6 +273,28 @@ fn validate(payload: &SettingsSave) -> Result<(), String> {
         }
         for b in &role.backends {
             check_backend(b)?;
+        }
+    }
+
+    let mut seen_types = std::collections::HashSet::new();
+    for t in &payload.types {
+        if !valid_role_name(&t.name) {
+            return Err(format!(
+                "invalid workflow type name: {:?} (must match ^[a-z0-9][a-z0-9_-]*$)",
+                t.name
+            ));
+        }
+        if reserved_type_names().iter().any(|r| r == &t.name) {
+            return Err(format!(
+                "workflow type name '{}' is reserved ('new' launches the generator, 'list' prints the catalog)",
+                t.name
+            ));
+        }
+        if !seen_types.insert(t.name.as_str()) {
+            return Err(format!("duplicate workflow type name: {}", t.name));
+        }
+        if let Some(mb) = &t.manager_backend {
+            check_backend(mb)?;
         }
     }
 
@@ -274,9 +368,55 @@ fn apply_workflow(doc: &mut DocumentMut, payload: &SettingsSave) {
                 role_table["prompt"] = value(prompt.clone());
             }
         }
+        if let Some(model) = &role.model {
+            if !model.trim().is_empty() {
+                role_table["model"] = value(model.clone());
+            }
+        }
         roles_table[&role.name] = Item::Table(role_table);
     }
     set_preserving_decor(workflow, "roles", Item::Table(roles_table));
+
+    // Replace [workflow.types] wholesale, in the order given. Only NON-EMPTY optional overrides
+    // are written, so a promptless/rolesless type stays a minimal table rather than being padded
+    // with empty strings (mirrors the role-persona handling above).
+    let mut types_table = Table::new();
+    types_table.set_implicit(true);
+    for t in &payload.types {
+        let mut tt = Table::new();
+        if let Some(v) = &t.title {
+            if !v.trim().is_empty() {
+                tt["title"] = value(v.clone());
+            }
+        }
+        if let Some(v) = &t.prompt {
+            if !v.trim().is_empty() {
+                tt["prompt"] = value(v.clone());
+            }
+        }
+        if !t.roles.is_empty() {
+            tt["roles"] = Item::Value(Value::Array(string_array(&t.roles)));
+        }
+        if let Some(v) = &t.manager_backend {
+            if !v.is_empty() {
+                tt["manager_backend"] = value(v.clone());
+            }
+        }
+        if let Some(v) = t.max_depth {
+            tt["max_depth"] = value(v as i64);
+        }
+        if let Some(v) = t.max_calls_per_manager {
+            tt["max_calls_per_manager"] = value(v as i64);
+        }
+        if let Some(v) = t.use_mcp {
+            tt["use_mcp"] = value(v);
+        }
+        if let Some(v) = t.enable_ask_human {
+            tt["enable_ask_human"] = value(v);
+        }
+        types_table[&t.name] = Item::Table(tt);
+    }
+    set_preserving_decor(workflow, "types", Item::Table(types_table));
 }
 
 /// Assign `item` to `key` while preserving the existing key's VALUE decor (the trailing
@@ -378,14 +518,24 @@ mod tests {
     #[test]
     fn wire_contract_uses_snake_case_keys() {
         let payload = SettingsPayload {
+            types: vec![],
             config_path: "/x/config.toml".into(),
             exists: true,
             workflow: WorkflowPayload::default(),
             roles: vec![],
             known_backends: known_backends(),
+            reserved_type_names: reserved_type_names(),
         };
         let json = serde_json::to_value(&payload).unwrap();
-        for key in ["config_path", "exists", "workflow", "roles", "known_backends"] {
+        for key in [
+            "config_path",
+            "exists",
+            "workflow",
+            "roles",
+            "types",
+            "known_backends",
+            "reserved_type_names",
+        ] {
             assert!(json.get(key).is_some(), "missing top-level key {key}: {json}");
         }
         let wf = json.get("workflow").unwrap();
@@ -417,6 +567,7 @@ mod tests {
         assert!(!payload.exists);
         assert_eq!(payload.workflow, WorkflowPayload::default());
         assert!(payload.roles.is_empty());
+        assert!(payload.types.is_empty());
         assert!(payload.known_backends.contains(&"claude".to_string()));
     }
 
@@ -438,6 +589,7 @@ max_depth = 5
         fs::write(&path, original).unwrap();
 
         let save = SettingsSave {
+            types: vec![],
             workflow: wf(|w| {
                 w.manager_backend = Some("claude".into());
                 w.max_depth = 7;
@@ -446,11 +598,13 @@ max_depth = 5
                 name: "implementer".into(),
                 backends: vec!["claude".into(), "codex".into()],
                 prompt: Some("Write tests.".into()),
+                model: Some("opus".into()),
             }],
         };
         settings_save_at(&save, &path).unwrap();
 
         let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("model = \"opus\""), "role model must persist; got: {raw}");
         assert!(raw.contains("# agentpit config"), "got: {raw}");
         assert!(raw.contains("# a leading comment that must survive"), "got: {raw}");
         assert!(raw.contains("[default]"), "got: {raw}");
@@ -474,6 +628,7 @@ max_depth = 5
             vec!["claude".to_string(), "codex".to_string()]
         );
         assert_eq!(payload.roles[0].prompt.as_deref(), Some("Write tests."));
+        assert_eq!(payload.roles[0].model.as_deref(), Some("opus"));
     }
 
     #[test]
@@ -482,17 +637,20 @@ max_depth = 5
         let path = dir.path().join("config.toml");
 
         let initial = SettingsSave {
+            types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![
                 RoleEntry {
                     name: "manager".into(),
                     backends: vec!["claude".into()],
                     prompt: None,
+                    model: None,
                 },
                 RoleEntry {
                     name: "reviewer".into(),
                     backends: vec!["codex".into()],
                     prompt: Some("Critique only.".into()),
+                    model: None,
                 },
             ],
         };
@@ -500,17 +658,20 @@ max_depth = 5
 
         // Add "implementer", edit "reviewer"'s backends, delete "manager".
         let updated = SettingsSave {
+            types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![
                 RoleEntry {
                     name: "reviewer".into(),
                     backends: vec!["codex".into(), "antigravity".into()],
                     prompt: Some("Critique only.".into()),
+                    model: None,
                 },
                 RoleEntry {
                     name: "implementer".into(),
                     backends: vec!["claude".into()],
                     prompt: None,
+                    model: None,
                 },
             ],
         };
@@ -528,15 +689,105 @@ max_depth = 5
     }
 
     #[test]
+    fn types_round_trip_and_only_nonempty_overrides_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let save = SettingsSave {
+            types: vec![
+                WorkflowTypeEntry {
+                    name: "review".into(),
+                    title: Some("Strict review".into()),
+                    prompt: Some("Run a strict review.".into()),
+                    roles: vec!["reviewer".into(), "security".into()],
+                    manager_backend: Some("claude".into()),
+                    max_depth: Some(2),
+                    max_calls_per_manager: None,
+                    use_mcp: None,
+                    enable_ask_human: Some(true),
+                },
+                // A minimal type: just a brief, no roles/knobs — must not emit empty keys.
+                WorkflowTypeEntry {
+                    name: "research".into(),
+                    title: None,
+                    prompt: Some("Research only.".into()),
+                    roles: vec![],
+                    manager_backend: None,
+                    max_depth: None,
+                    max_calls_per_manager: None,
+                    use_mcp: None,
+                    enable_ask_human: None,
+                },
+            ],
+            workflow: WorkflowPayload::default(),
+            roles: vec![],
+        };
+        settings_save_at(&save, &path).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[workflow.types.review]"), "got: {raw}");
+        assert!(raw.contains("roles = [\"reviewer\", \"security\"]"), "got: {raw}");
+        assert!(raw.contains("enable_ask_human = true"), "got: {raw}");
+        assert!(raw.contains("[workflow.types.research]"), "got: {raw}");
+        // The minimal type must not be padded with empty overrides.
+        let research_block = raw
+            .split("[workflow.types.research]")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(!research_block.contains("roles ="), "no empty roles: {research_block}");
+        assert!(!research_block.contains("manager_backend"), "no empty backend: {research_block}");
+
+        let payload = settings_get_at(&path);
+        assert_eq!(payload.types.len(), 2);
+        let review = payload.types.iter().find(|t| t.name == "review").unwrap();
+        assert_eq!(review.roles, vec!["reviewer".to_string(), "security".to_string()]);
+        assert_eq!(review.manager_backend.as_deref(), Some("claude"));
+        assert_eq!(review.max_depth, Some(2));
+        assert_eq!(review.enable_ask_human, Some(true));
+    }
+
+    #[test]
+    fn validation_rejects_reserved_and_duplicate_type_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let reserved = SettingsSave {
+            types: vec![WorkflowTypeEntry {
+                name: "new".into(),
+                title: None,
+                prompt: None,
+                roles: vec![],
+                manager_backend: None,
+                max_depth: None,
+                max_calls_per_manager: None,
+                use_mcp: None,
+                enable_ask_human: None,
+            }],
+            workflow: WorkflowPayload::default(),
+            roles: vec![],
+        };
+        let err = settings_save_at(&reserved, &path).unwrap_err();
+        assert!(err.contains("reserved"), "got: {err}");
+        assert!(!path.exists(), "must not write on validation failure");
+
+        // `list` is reserved too (`agentpit workflow list` prints the catalog).
+        let mut listed = reserved.clone();
+        listed.types[0].name = "list".into();
+        let err = settings_save_at(&listed, &path).unwrap_err();
+        assert!(err.contains("reserved"), "got: {err}");
+        assert!(!path.exists(), "must not write on validation failure");
+    }
+
+    #[test]
     fn validation_rejects_bad_role_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let payload = SettingsSave {
+            types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![RoleEntry {
                 name: "Bad Name!".into(),
                 backends: vec![],
                 prompt: None,
+                model: None,
             }],
         };
         let err = settings_save_at(&payload, &path).unwrap_err();
@@ -549,11 +800,13 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let payload = SettingsSave {
+            types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![RoleEntry {
                 name: "implementer".into(),
                 backends: vec!["not-a-real-backend".into()],
                 prompt: None,
+                model: None,
             }],
         };
         let err = settings_save_at(&payload, &path).unwrap_err();
@@ -565,17 +818,20 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let payload = SettingsSave {
+            types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![
                 RoleEntry {
                     name: "implementer".into(),
                     backends: vec![],
                     prompt: None,
+                    model: None,
                 },
                 RoleEntry {
                     name: "implementer".into(),
                     backends: vec![],
                     prompt: None,
+                    model: None,
                 },
             ],
         };
@@ -590,6 +846,7 @@ max_depth = 5
         assert!(!path.parent().unwrap().exists());
 
         let payload = SettingsSave {
+            types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![],
         };
@@ -611,6 +868,7 @@ max_depth = 5
         fs::write(&path, "workflow = { manager_backend = \"codex\", max_depth = 5 }\n").unwrap();
 
         let save = SettingsSave {
+            types: vec![],
             workflow: wf(|w| {
                 w.manager_backend = Some("claude".into());
                 w.max_depth = 9;
@@ -637,6 +895,7 @@ max_depth = 5
         .unwrap();
 
         let save = SettingsSave {
+            types: vec![],
             workflow: wf(|w| w.manager_backend = Some("claude".into())),
             roles: vec![],
         };
@@ -657,11 +916,13 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let save = SettingsSave {
+            types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![RoleEntry {
                 name: "implementer".into(),
                 backends: vec!["claude".into()],
                 prompt: Some(String::new()), // what the UI sends for a promptless role
+                model: None,
             }],
         };
         settings_save_at(&save, &path).unwrap();
@@ -685,6 +946,7 @@ max_depth = 5
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let save = SettingsSave {
+            types: vec![],
             workflow: wf(|w| w.max_depth = 4),
             roles: vec![],
         };

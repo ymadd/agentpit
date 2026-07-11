@@ -146,6 +146,42 @@ pub struct RoleConfig {
     /// orchestrator prompt for the `manager` role).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Model to run this role on (e.g. "opus", "gpt-5-codex"). `None` = the resolved backend's
+    /// own default. Overridden by an explicit `--model` at dispatch, and falls back to the
+    /// backend's `[backends.<id>].model` when unset. Passed to the backend CLI's model flag.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// A named workflow "type" (`[workflow.types.<name>]`) — a PRESET over the base `[workflow]`
+/// and the shared `[workflow.roles.*]` cast, selected by `agentpit workflow <type> "<goal>"`.
+/// Every field is an optional override: unset fields inherit from `[workflow]`, and an empty
+/// `roles` list means "every configured worker role" (same roster as the base workflow). The
+/// cast itself is never duplicated — a type only *chooses* which shared roles it dispatches to.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowType {
+    /// Human-readable label for dashboards/UX (the config key is the machine name).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The workflow BRIEF: high-level instructions for the manager in this type, injected as a
+    /// dedicated block above the roster. Composes with any `[workflow.roles.manager]` persona.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Which worker roles (from the shared cast) this type dispatches to, in order. Empty = every
+    /// configured worker role. Names not present in `[workflow.roles.*]` are skipped with a warning.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Override the manager backend for this type. Unset = base `[workflow].manager_backend`.
+    #[serde(default)]
+    pub manager_backend: Option<BackendId>,
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+    #[serde(default)]
+    pub max_calls_per_manager: Option<u32>,
+    #[serde(default)]
+    pub use_mcp: Option<bool>,
+    #[serde(default)]
+    pub enable_ask_human: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +193,10 @@ pub struct WorkflowSection {
     /// Named roles (`[workflow.roles.<name>]`). Empty = legacy flat-backend roster.
     #[serde(default)]
     pub roles: BTreeMap<String, RoleConfig>,
+    /// Named workflow presets (`[workflow.types.<name>]`), selected by `agentpit workflow <type>`.
+    /// Empty = only the base `[workflow]` (invoked as `agentpit workflow "<goal>"`).
+    #[serde(default)]
+    pub types: BTreeMap<String, WorkflowType>,
     #[serde(default = "default_workflow_max_depth")]
     pub max_depth: u32,
     #[serde(default = "default_workflow_max_calls")]
@@ -178,6 +218,7 @@ impl Default for WorkflowSection {
             manager_backend: None,
             default_agents: Vec::new(),
             roles: BTreeMap::new(),
+            types: BTreeMap::new(),
             max_depth: 3,
             max_calls_per_manager: 8,
             use_mcp: false,
@@ -197,6 +238,10 @@ fn default_workflow_max_calls() -> u32 {
 pub struct BackendOverride {
     #[serde(default)]
     pub transport: Option<Transport>,
+    /// Default model for this backend (e.g. "opus", "gpt-5-codex"). `None` = the CLI's own
+    /// default. This is the lowest-precedence source: `--model` and a role's `model` both win.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -435,14 +480,27 @@ review_members = ["antigravity", "opencode"]
 # [workflow.roles.implementer]
 # backends = ["claude", "codex"]     # preference order; first AVAILABLE backend wins
 # prompt   = "You are the implementer. Write the smallest correct change with tests."
+# model    = "opus"                  # optional: pin this role's model (--model wins; else backend default)
 #
 # [workflow.roles.reviewer]
 # backends = ["codex", "antigravity"]
 # prompt   = "You are a strict reviewer. Critique only; do not rewrite."
 
-# Per-backend transport override.
+# Named workflow presets: `agentpit workflow <type> "<goal>"` selects one. A type is a PRESET
+# over [workflow] and the shared cast above — it picks which roles to use, gives the manager a
+# brief, and may override knobs. Omitting the type runs the base [workflow]. `new` is reserved
+# (`agentpit workflow new "<description>"` generates a type). Roles are never duplicated here.
+# [workflow.types.review]
+# title    = "Strict code review"
+# prompt   = "Run a strict review: find spec violations, boundary bugs, and security issues."
+# roles    = ["reviewer", "security"]   # subset of the shared cast; empty/omitted = all worker roles
+# manager_backend = "claude"            # optional per-type override
+# enable_ask_human = true               # optional per-type knob override
+
+# Per-backend transport + default model override.
 # [backends.antigravity]
 # transport = "acp"
+# model     = "gemini-3-pro"   # default model for this backend (lowest precedence; --model / role.model win)
 "#;
 
 #[cfg(test)]
@@ -642,6 +700,71 @@ prompt = "You research."
         assert!(roles["reviewer"].prompt.is_none());
         // A role may omit backends entirely (any available backend qualifies).
         assert!(roles["researcher"].backends.is_empty());
+    }
+
+    #[test]
+    fn workflow_types_default_empty_and_parse_presets() {
+        let dir = tempdir().unwrap();
+        let empty = dir.path().join("empty.toml");
+        fs::write(&empty, "").unwrap();
+        assert!(
+            load_config(Some(&empty))
+                .unwrap()
+                .config
+                .workflow
+                .types
+                .is_empty()
+        );
+
+        let path = dir.path().join("types.toml");
+        fs::write(
+            &path,
+            r#"
+[workflow.roles.reviewer]
+backends = ["codex"]
+
+[workflow.types.review]
+title = "Strict code review"
+prompt = "Run a strict review."
+roles = ["reviewer", "security"]
+manager_backend = "claude"
+enable_ask_human = true
+
+[workflow.types.research]
+prompt = "Research only."
+"#,
+        )
+        .unwrap();
+        let wf = load_config(Some(&path)).unwrap().config.workflow;
+        assert_eq!(wf.types.len(), 2);
+        let review = &wf.types["review"];
+        assert_eq!(review.title.as_deref(), Some("Strict code review"));
+        assert_eq!(review.prompt.as_deref(), Some("Run a strict review."));
+        assert_eq!(review.roles, vec!["reviewer".to_string(), "security".to_string()]);
+        assert_eq!(review.manager_backend, Some(BackendId::Claude));
+        assert_eq!(review.enable_ask_human, Some(true));
+        // Unset per-type knobs stay None (they inherit from [workflow] at resolution time).
+        assert!(review.max_depth.is_none());
+        // A minimal type may set just a brief; roles omitted = all worker roles.
+        assert!(wf.types["research"].roles.is_empty());
+        assert!(wf.types["research"].manager_backend.is_none());
+    }
+
+    #[test]
+    fn sample_config_types_example_parses_when_uncommented() {
+        // The commented [workflow.types.*] example must stay valid TOML when uncommented.
+        let block: String = DEFAULT_CONFIG_TOML
+            .lines()
+            .skip_while(|l| !l.starts_with("# [workflow.types.review]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| l.strip_prefix("# ").or_else(|| l.strip_prefix("#")).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!block.is_empty(), "types example block not found in sample config");
+        let parsed: HubConfig = toml::from_str(&block).expect("uncommented types example parses");
+        let review = parsed.workflow.types.get("review").expect("review type present");
+        assert_eq!(review.roles, vec!["reviewer".to_string(), "security".to_string()]);
+        assert_eq!(review.manager_backend, Some(BackendId::Claude));
     }
 
     #[test]

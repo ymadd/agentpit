@@ -32,6 +32,10 @@ agentpit rescue "<task description>" --role reviewer
 
 `--role` and `--backend` are mutually exclusive — passing both is a hard error.
 
+Add `--model <m>` (e.g. `opus`, `gpt-5-codex`) to pin the model. Precedence: `--model` > the
+role's `[workflow.roles.<name>].model` > the backend's `[backends.<id>].model` default > the
+CLI's own default. Omitting it emits no `--model` flag (identical to the pre-model behaviour).
+
 ## Output
 
 The CLI prints a header line `[backend=... transport=... route=...]` then streams the agent's reply to stdout. When dispatched via `--role`, the route segment reads `route=role:<name>` instead of the router's reason string.

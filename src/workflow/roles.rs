@@ -28,6 +28,9 @@ pub struct ResolvedRole {
     pub name: String,
     pub backend: BackendId,
     pub prompt: Option<String>,
+    /// The role's configured model, if any (`[workflow.roles.<name>].model`). Threaded to the
+    /// backend CLI's model flag at dispatch, unless an explicit `--model` overrides it.
+    pub model: Option<String>,
 }
 
 /// The manager role's contribution to a workflow run. `backend` is `None` when the role only
@@ -37,6 +40,8 @@ pub struct ResolvedRole {
 pub struct ManagerRole {
     pub backend: Option<BackendId>,
     pub prompt: Option<String>,
+    /// The manager role's configured model (`[workflow.roles.manager].model`), if any.
+    pub model: Option<String>,
 }
 
 /// Resolve a WORKER role by name against the available backends: the first entry of the role's
@@ -87,6 +92,7 @@ pub fn resolve_role(
         name: name.to_string(),
         backend,
         prompt: role.prompt.clone(),
+        model: role.model.clone(),
     })
 }
 
@@ -123,7 +129,22 @@ pub fn resolve_manager(
     Ok(Some(ManagerRole {
         backend,
         prompt: role.prompt.clone(),
+        model: role.model.clone(),
     }))
+}
+
+/// Resolve the effective model for a dispatch by precedence: an explicit `--model` wins, then the
+/// role's `model`, then the backend's `[backends.<id>].model` default; `None` = the CLI's own
+/// default (no `--model` flag emitted). Pure so the CLI and MCP layers share one rule.
+pub fn resolve_model(
+    explicit: Option<&str>,
+    role_model: Option<&str>,
+    backend_default: Option<&str>,
+) -> Option<String> {
+    explicit
+        .or(role_model)
+        .or(backend_default)
+        .map(str::to_string)
 }
 
 /// Iterate the WORKER roles (every configured role except the reserved manager), in the map's
@@ -188,6 +209,7 @@ mod tests {
                     RoleConfig {
                         backends: backends.to_vec(),
                         prompt: prompt.map(str::to_string),
+                        model: None,
                     },
                 )
             })
@@ -340,6 +362,7 @@ mod tests {
         let blank = RoleConfig {
             backends: vec![],
             prompt: Some("   ".into()),
+            model: None,
         };
         assert_eq!(summary_line(&blank), "(no persona)");
     }
@@ -349,11 +372,13 @@ mod tests {
         let role = RoleConfig {
             backends: vec![],
             prompt: Some("\n\n  You review code.  \nSecond line.".into()),
+            model: None,
         };
         assert_eq!(summary_line(&role), "You review code.");
         let long = RoleConfig {
             backends: vec![],
             prompt: Some("あ".repeat(100)),
+            model: None,
         };
         let s = summary_line(&long);
         assert!(s.ends_with('…'));
@@ -361,7 +386,29 @@ mod tests {
         let none = RoleConfig {
             backends: vec![],
             prompt: None,
+            model: None,
         };
         assert_eq!(summary_line(&none), "(no persona)");
+    }
+
+    #[test]
+    fn resolve_role_carries_model_and_resolve_model_follows_precedence() {
+        let mut r = BTreeMap::new();
+        r.insert(
+            "reviewer".to_string(),
+            RoleConfig {
+                backends: vec![BackendId::Codex],
+                prompt: Some("x".into()),
+                model: Some("gpt-5-codex".into()),
+            },
+        );
+        let resolved = resolve_role("reviewer", &r, &[BackendId::Codex]).unwrap();
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5-codex"));
+
+        // Precedence: explicit --model > role.model > backend default > None.
+        assert_eq!(resolve_model(Some("opus"), Some("rm"), Some("bm")).as_deref(), Some("opus"));
+        assert_eq!(resolve_model(None, Some("rm"), Some("bm")).as_deref(), Some("rm"));
+        assert_eq!(resolve_model(None, None, Some("bm")).as_deref(), Some("bm"));
+        assert_eq!(resolve_model(None, None, None), None);
     }
 }

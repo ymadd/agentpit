@@ -51,6 +51,9 @@ pub struct DispatchTaskRequest {
     /// plays it and prepends its persona to the task. Exactly one of `backend` or `role`.
     #[serde(default)]
     pub role: Option<String>,
+    /// Optional model to pin (e.g. "opus"). Overrides the role's configured model.
+    #[serde(default)]
+    pub model: Option<String>,
     /// The task / prompt to give the backend.
     pub task: String,
 }
@@ -65,6 +68,9 @@ pub struct RunEnsembleRequest {
     /// Optional backend id to synthesize the members' responses into one answer.
     #[serde(default)]
     pub aggregator: Option<String>,
+    /// Optional model to pin for every member + the aggregator (e.g. "opus").
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Parameters for the `run_workflow` tool.
@@ -72,9 +78,16 @@ pub struct RunEnsembleRequest {
 pub struct RunWorkflowRequest {
     /// The high-level goal for the manager to decompose and orchestrate.
     pub goal: String,
+    /// Named workflow type from `[workflow.types.<name>]` (a preset roster + brief + knobs).
+    /// Omit to run the base `[workflow]`.
+    #[serde(default, rename = "type")]
+    pub workflow_type: Option<String>,
     /// Manager backend (claude|codex). Defaults to config/default backend.
     #[serde(default)]
     pub manager: Option<String>,
+    /// Optional model to pin for the manager (e.g. "opus"). Overrides roles.manager.model.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Worker backends the manager may dispatch to. Defaults to all available minus the manager.
     #[serde(default)]
     pub agents: Option<Vec<String>>,
@@ -217,7 +230,7 @@ impl AgentpitTools {
     ) -> Result<CallToolResult, McpError> {
         // Exactly one of backend|role addresses the dispatch; both or neither is ambiguous and a
         // structured error, mirroring the CLI's `--role`/`--backend` mutual exclusion.
-        let (backend, task) = match (&req.backend, &req.role) {
+        let (backend, task, model) = match (&req.backend, &req.role) {
             (Some(_), Some(_)) => {
                 return Ok(tool_error(
                     "'backend' and 'role' are mutually exclusive; pass exactly one".to_string(),
@@ -229,7 +242,7 @@ impl AgentpitTools {
                 ));
             }
             (Some(b), None) => match b.parse::<BackendId>() {
-                Ok(b) => (b, req.task),
+                Ok(b) => (b, req.task, req.model.clone()),
                 Err(e) => return Ok(tool_error(format!("unknown backend '{b}': {e}"))),
             },
             (None, Some(role_name)) => {
@@ -241,7 +254,14 @@ impl AgentpitTools {
                             resolved.prompt.as_deref(),
                             &req.task,
                         );
-                        (resolved.backend, wrapped)
+                        // Explicit `model` wins over the role's configured model (no backend
+                        // default here — the MCP server holds roles, not the [backends] table).
+                        let model = crate::workflow::roles::resolve_model(
+                            req.model.as_deref(),
+                            resolved.model.as_deref(),
+                            None,
+                        );
+                        (resolved.backend, wrapped, model)
                     }
                     Err(e) => return Ok(tool_error(format!("{e:#}"))),
                 }
@@ -259,6 +279,7 @@ impl AgentpitTools {
             cancel,
             self.regs.clone(),
             logger.clone(),
+            model,
         )
         .await;
         logger.finished(if outcome.output.is_some() {
@@ -324,9 +345,10 @@ impl AgentpitTools {
             let regs = self.regs.clone();
             let cancel = cancel.clone();
             let logger = logger.clone();
-            set.spawn(
-                async move { dispatch_member_logged(b, prompt, cwd, cancel, regs, logger).await },
-            );
+            let model = req.model.clone();
+            set.spawn(async move {
+                dispatch_member_logged(b, prompt, cwd, cancel, regs, logger, model).await
+            });
         }
         let mut outcomes: Vec<MemberOutcome> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
@@ -355,7 +377,7 @@ impl AgentpitTools {
                 logger.member_started(agg, true);
                 let started = Instant::now();
                 let on_chunk = crate::events::output_streamer(logger.run_id(), agg, true);
-                match dispatch(agg, &agg_prompt, &self.cwd, cancel, on_chunk, &self.regs).await {
+                match dispatch(agg, &agg_prompt, &self.cwd, cancel, on_chunk, &self.regs, req.model.as_deref()).await {
                     Ok(res) if res.auth_failed => {
                         logger.member_finished(
                             agg,
@@ -456,10 +478,12 @@ impl AgentpitTools {
         // tool errors below rather than panicking.
         match crate::cli::workflow::run_capture(
             req.goal,
+            req.workflow_type,
             manager,
             agents,
             req.max_depth,
             req.use_mcp.unwrap_or(false),
+            req.model,
             self.cwd.clone(),
             CancellationToken::new(),
             noop_sink(),
@@ -672,11 +696,13 @@ async fn dispatch_member_logged(
     cancel: CancellationToken,
     regs: Arc<Registries>,
     logger: RunLogger,
+    model: Option<String>,
 ) -> MemberOutcome {
     logger.member_started(backend, false);
     let started = Instant::now();
     let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
-    let outcome = dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs).await;
+    let outcome =
+        dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs, model.as_deref()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &outcome.error {
         None => {
@@ -720,7 +746,7 @@ mod tests {
         fn id(&self) -> BackendId {
             BackendId::Gemini
         }
-        fn build_spec(&self, _task: &str) -> ExecSpec {
+        fn build_spec(&self, _task: &str, _model: Option<&str>) -> ExecSpec {
             ExecSpec {
                 command: "true".into(),
                 args: vec![],
@@ -792,6 +818,7 @@ mod tests {
         let _g = isolated_state_dir();
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
+                model: None,
                 backend: Some("gemini".into()),
                 role: None,
                 task: "noop".into(),
@@ -805,6 +832,7 @@ mod tests {
     async fn dispatch_task_unknown_backend_is_structured_error_not_panic() {
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
+                model: None,
                 backend: Some("imaginary".into()),
                 role: None,
                 task: "noop".into(),
@@ -828,6 +856,7 @@ mod tests {
             crate::config::RoleConfig {
                 backends: vec![BackendId::Gemini],
                 prompt: Some("You review.".into()),
+                model: None,
             },
         );
         tools().with_roles(roles)
@@ -839,6 +868,7 @@ mod tests {
         let _g = isolated_state_dir();
         let res = tools_with_reviewer_role()
             .dispatch_task(Parameters(DispatchTaskRequest {
+                model: None,
                 backend: None,
                 role: Some("reviewer".into()),
                 task: "noop".into(),
@@ -852,6 +882,7 @@ mod tests {
     async fn dispatch_task_unknown_role_is_structured_error() {
         let res = tools_with_reviewer_role()
             .dispatch_task(Parameters(DispatchTaskRequest {
+                model: None,
                 backend: None,
                 role: Some("ghost".into()),
                 task: "noop".into(),
@@ -873,6 +904,7 @@ mod tests {
     async fn dispatch_task_backend_and_role_together_is_structured_error() {
         let res = tools_with_reviewer_role()
             .dispatch_task(Parameters(DispatchTaskRequest {
+                model: None,
                 backend: Some("gemini".into()),
                 role: Some("reviewer".into()),
                 task: "noop".into(),
@@ -893,6 +925,7 @@ mod tests {
     async fn dispatch_task_neither_backend_nor_role_is_structured_error() {
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
+                model: None,
                 backend: None,
                 role: None,
                 task: "noop".into(),
@@ -913,6 +946,7 @@ mod tests {
     async fn run_ensemble_rejects_empty_members() {
         let res = tools()
             .run_ensemble(Parameters(RunEnsembleRequest {
+                model: None,
                 members: vec![],
                 prompt: "hi".into(),
                 aggregator: None,
@@ -930,6 +964,7 @@ mod tests {
         let _g = isolated_state_dir();
         let res = tools()
             .run_ensemble(Parameters(RunEnsembleRequest {
+                model: None,
                 members: vec!["gemini".into(), "gemini".into(), "gemini".into()],
                 prompt: "noop".into(),
                 aggregator: None,
@@ -954,7 +989,9 @@ mod tests {
     async fn run_workflow_unknown_manager_is_structured_error_not_panic() {
         let res = tools()
             .run_workflow(Parameters(RunWorkflowRequest {
+                model: None,
                 goal: "do something".into(),
+                workflow_type: None,
                 manager: Some("imaginary".into()),
                 agents: None,
                 max_depth: None,
@@ -976,7 +1013,9 @@ mod tests {
     async fn run_workflow_unknown_agent_is_structured_error_not_panic() {
         let res = tools()
             .run_workflow(Parameters(RunWorkflowRequest {
+                model: None,
                 goal: "do something".into(),
+                workflow_type: None,
                 manager: None,
                 agents: Some(vec!["gemini".into(), "imaginary".into()]),
                 max_depth: None,

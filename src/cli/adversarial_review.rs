@@ -65,6 +65,7 @@ pub async fn run(
         lines.join("\n"),
         members,
         aggregator,
+        None, // model: no --model; each member uses its backend default
         cwd,
     )
     .await

@@ -155,7 +155,7 @@ pub async fn dispatch_free_text(
     let cwd = state.cwd.clone();
 
     let result = tokio::select! {
-        res = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &regs_ref) => {
+        res = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &regs_ref, None) => {
             indicator_cancel.cancel();
             // Erase indicator if no streaming output has arrived.
             if !first_chunk_seen.load(std::sync::atomic::Ordering::Relaxed) {

@@ -3,7 +3,7 @@
 A native desktop window that shows what `agentpit` is doing **right now** — which runs
 are in flight, which backends are still working, and how each one finished.
 
-![live](../assets/demo.gif)
+![The decision cockpit — one manager, one decision at a time](../assets/dashboard-cockpit.png)
 
 ## How it works
 

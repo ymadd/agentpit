@@ -137,7 +137,7 @@ pub async fn handle_slash(
                 eprintln!("{}", style("usage: /ensemble <prompt>").yellow());
             } else {
                 let cwd_str = state.cwd.display().to_string();
-                let _ = crate::cli::ensemble::run(prompt, None, None, Some(cwd_str)).await;
+                let _ = crate::cli::ensemble::run(prompt, None, None, None, Some(cwd_str)).await;
             }
             Ok((state, LoopControl::Continue))
         }
@@ -157,8 +157,17 @@ pub async fn handle_slash(
                 eprintln!("{}", style("usage: /workflow <goal>").yellow());
             } else {
                 let cwd_str = state.cwd.display().to_string();
-                let _ =
-                    crate::cli::workflow::run(goal, None, None, None, false, Some(cwd_str)).await;
+                let _ = crate::cli::workflow::run(
+                    goal,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(cwd_str),
+                )
+                .await;
             }
             Ok((state, LoopControl::Continue))
         }

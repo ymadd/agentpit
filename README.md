@@ -2,7 +2,9 @@
 
 Single-binary CLI that routes coding tasks across **Gemini**, **Antigravity (agy)**, **Claude Code**, **Codex**, and **OpenCode** — pick the best agent per task, fan out to several in parallel, or let `agentpit` choose for you.
 
-![demo](assets/demo.gif)
+![agentpit Workflow Studio — cast each agent into a role and orchestrate a model-driven workflow](assets/dashboard-studio.png)
+
+<p align="center"><em>The desktop dashboard's <strong>Workflow Studio</strong>: cast each agent CLI into a role, design a model-driven workflow, and pin a model per agent.</em></p>
 
 ## Why
 
@@ -11,9 +13,12 @@ Different coding agents are good at different things: long-context reads on Gemi
 - **One binary, many backends** — Rust, no runtime
 - **One-shot dispatch** — `agentpit rescue "task"` picks a backend by your routing rules
 - **Ensembles** — `agentpit review <target>` runs Gemini + OpenCode in parallel (configurable) and optionally synthesizes
+- **Model-driven workflows** — a manager backend decomposes a goal and dispatches sub-tasks to configured **roles** (the cast), then synthesizes
+- **Named workflows** — `agentpit workflow <type> "goal"` runs a saved preset; `workflow list` shows what's configured; `workflow new "<description>"` generates one for you
+- **Per-agent models** — pin a model per role or backend (`--model`, `[workflow.roles.<name>].model`, `[backends.<id>].model`), flowing through both one-shot and workflows
+- **Desktop dashboard** — a decision cockpit (one supervised window) plus a visual **Workflow Studio** to cast roles and design workflows
 - **Auth-aware** — checks each backend's credentials before dispatching; `agentpit login <backend>` triggers the right login flow
 - **Self-updating** — `agentpit update` updates the CLI and an installed desktop dashboard together
-- **CLI version cockpit** — the desktop app inventories and updates installed agent CLIs
 - **Discoverable** — running `agentpit` with no args opens an interactive menu
 
 ## Install
@@ -89,10 +94,37 @@ agentpit refactor src/big.rs "split into modules"
 
 agentpit ensemble "design X" --members antigravity,claude,codex
 
+agentpit workflow "fix the auth flow"            # model-driven workflow: a manager orchestrates roles
+agentpit workflow review "check the diff"        # run a named [workflow.types.review] preset
+agentpit workflow list                           # show the base workflow + every configured type
+agentpit workflow new "a strict PR review flow"  # generate a workflow from a description
+agentpit rescue "..." --role reviewer --model opus  # dispatch to a role, pinned to a model
+
 agentpit status                       # config + per-backend auth state
 agentpit login antigravity            # opens `agy auth login` in a terminal
+agentpit dashboard                    # launch the desktop dashboard (needs the dashboard binary)
 agentpit update                       # update the CLI + an installed dashboard together
 ```
+
+## Desktop dashboard
+
+`agentpit dashboard` launches a desktop app (install the `agentpit-dashboard` binary next to
+`agentpit`). It has two faces:
+
+**The decision cockpit** — one supervised window. A manager backend runs the swarm; the cockpit
+surfaces *exactly one* thing that needs a human at a time, and says so when nothing does (inbox
+zero). Reversible work never stops while you decide.
+
+![The decision cockpit — one manager, one decision at a time](assets/dashboard-cockpit.png)
+
+**The Workflow Studio** (⚙ → the node-graph above) — cast each agent CLI into a **role**, design a
+model-driven workflow visually, and pin a **model per agent**. Save named workflow *types* (presets
+over a shared cast) or hit **✨ 生成** to have an agent draft one from a description — everything
+writes back to `~/.config/agentpit/config.toml`.
+
+| Named workflows (types) | Per-agent roles & models |
+|---|---|
+| ![A named workflow type: brief, role selection, and its `agentpit workflow review` invocation](assets/dashboard-workflow-type.png) | ![A role's backend preference order and a pinned model](assets/dashboard-role-model.png) |
 
 ## Configuration
 

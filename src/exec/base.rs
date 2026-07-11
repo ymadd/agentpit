@@ -30,6 +30,9 @@ pub struct ExecRunOptions {
     pub cwd: PathBuf,
     pub cancel: CancellationToken,
     pub on_stdout: Option<OutputSink>,
+    /// Optional model to pin for this run. `None` = the backend CLI's own default (no `--model`
+    /// flag emitted — byte-identical to the pre-model behaviour). Threaded to `build_spec`.
+    pub model: Option<String>,
 }
 
 pub struct ExecOutcome {
@@ -188,6 +191,7 @@ mod tests {
                 cwd: std::env::current_dir().unwrap(),
                 cancel: CancellationToken::new(),
                 on_stdout: None,
+                model: None,
             },
         )
         .await

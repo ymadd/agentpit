@@ -39,6 +39,7 @@ pub async fn run(
         lines.join("\n"),
         members,
         aggregator,
+        None, // model: review has no --model; each member uses its backend default
         cwd,
     )
     .await

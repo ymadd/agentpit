@@ -148,6 +148,7 @@ pub async fn dispatch(
     cancel: CancellationToken,
     on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
     regs: &Registries,
+    model: Option<&str>,
 ) -> Result<DispatchResult> {
     // A child of the caller's token: the parent (Ctrl-C) still cancels every member, but a
     // per-member timeout cancels only this child, leaving concurrent siblings untouched.
@@ -157,6 +158,7 @@ pub async fn dispatch(
             cwd: cwd.to_path_buf(),
             cancel: child.clone(),
             on_stdout: Some(on_chunk.clone()),
+            model: model.map(str::to_string),
         };
         let fut = crate::exec::run(exec.as_ref(), task, options);
         let outcome = with_timeout(backend, &child, fut).await?;
@@ -168,7 +170,7 @@ pub async fn dispatch(
         });
     }
     if let Some(acp) = regs.acps.get(&backend) {
-        let fut = crate::acp::run(acp.as_ref(), task, cwd, on_chunk, child.clone());
+        let fut = crate::acp::run(acp.as_ref(), task, cwd, on_chunk, child.clone(), model);
         let outcome = with_timeout(backend, &child, fut).await?;
         return Ok(DispatchResult {
             backend,
@@ -190,7 +192,7 @@ mod tests {
         fn id(&self) -> BackendId {
             BackendId::Gemini
         }
-        fn build_spec(&self, _task: &str) -> ExecSpec {
+        fn build_spec(&self, _task: &str, _model: Option<&str>) -> ExecSpec {
             ExecSpec {
                 command: "true".into(),
                 args: vec![],
@@ -205,7 +207,7 @@ mod tests {
         fn id(&self) -> BackendId {
             BackendId::Opencode
         }
-        fn spawn_spec(&self) -> crate::acp::SpawnSpec {
+        fn spawn_spec(&self, _model: Option<&str>) -> crate::acp::SpawnSpec {
             crate::acp::SpawnSpec {
                 command_line: "true".into(),
             }
@@ -242,7 +244,7 @@ mod tests {
             fn id(&self) -> BackendId {
                 BackendId::Gemini
             }
-            fn spawn_spec(&self) -> crate::acp::SpawnSpec {
+            fn spawn_spec(&self, _model: Option<&str>) -> crate::acp::SpawnSpec {
                 crate::acp::SpawnSpec {
                     command_line: "true".into(),
                 }

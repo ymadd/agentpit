@@ -159,15 +159,53 @@
 .sd-top .sd-save:disabled { opacity: 0.4; cursor: default; border-color: var(--line-3); background: #10141d; color: var(--muted-2); }
 .sd-saveerr { flex: none; padding: 7px 18px; background: rgba(229, 104, 122, 0.12); color: #f08a98; font-size: 12px; border-bottom: 1px solid var(--line-2); }
 
-/* CAST panel (roles) */
+/* Palette panel (CLIs + cast + saved steps) */
+.sd-palette,
 .sd-cast {
   flex: none;
-  width: 210px;
+  width: 214px;
   border-right: 1px solid var(--line-2);
   background: var(--panel-2);
   padding: 12px 12px 14px;
   overflow: auto;
 }
+.sd-pal-hd { font-family: "IBM Plex Mono", monospace; font-size: 10px; letter-spacing: 0.2em; color: var(--ac-tx); }
+.sd-pal-sub { margin: 4px 0 12px; font-size: 10px; line-height: 1.5; color: var(--faint); }
+.sd-pal-sec-hd {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 14px 0 8px; font-family: "IBM Plex Mono", monospace; font-size: 9px;
+  letter-spacing: 0.16em; color: var(--faint);
+}
+.sd-pal-clis { display: flex; flex-direction: column; gap: 5px; }
+.sd-pal-cli {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 8px; border-radius: 7px; border: 1px solid var(--line-2);
+  background: #10141d; color: var(--text-2); font-size: 11px; cursor: grab;
+}
+.sd-pal-cli:active { cursor: grabbing; }
+.sd-cast-item.drag { cursor: grab; }
+.sd-cast-item.drag:active { cursor: grabbing; }
+.sd-saved-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-bottom: 6px; padding: 7px 9px; border-radius: 7px;
+  border: 1px dashed var(--line-3); background: #10141d; color: var(--text-2);
+  font-size: 12px; cursor: grab;
+}
+.sd-saved-item:active { cursor: grabbing; }
+.sd-x { border: none; background: none; color: var(--muted-2); cursor: pointer; font-size: 10px; padding: 0 2px; }
+.sd-x:hover { color: #e5687a; }
+.sd-mini-btn {
+  width: 100%; margin: 2px 0 8px; padding: 6px; border-radius: 7px;
+  border: 1px solid var(--line-3); background: #10141d; color: var(--text-2);
+  cursor: pointer; font-family: inherit; font-size: 11px;
+}
+.sd-mini-btn:hover { border-color: var(--ac-bd); color: var(--ac-tx); }
+/* worker chips in the step inspector */
+.sd-wchip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px;
+  border-radius: 6px; border: 1px solid var(--line-3); font-size: 10px; color: var(--text-2);
+}
+.sd-swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
 .sd-cast-hd { display: flex; align-items: center; justify-content: space-between; font-family: "IBM Plex Mono", monospace; font-size: 9px; letter-spacing: 0.16em; color: var(--faint); margin-bottom: 10px; }
 .sd-mini { width: 20px; height: 20px; border-radius: 5px; border: 1px solid var(--line-3); background: #10141d; color: var(--ac-tx); cursor: pointer; font-size: 12px; line-height: 1; }
 .sd-cast-item {

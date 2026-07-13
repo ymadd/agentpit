@@ -12,9 +12,10 @@ import {
 import "@xyflow/react/dist/style.css";
 import StudioStepNode from "../StudioStepNode.jsx";
 import { WorkflowNode, GenStepNode, GhostNode } from "./nodes.jsx";
-import { stepNodeData, metaFor } from "./backends.js";
+import { stepNodeData, metaFor, resolveWorker } from "./backends.js";
 import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName } from "./blueprint.js";
 import { draftFromSettings, validate, buildPayload, newRole, newType, typeNameError } from "./settings.js";
+import { loadSavedSteps, saveSavedSteps, stepTemplate, stepFromTemplate, maxStepSeq } from "./savedsteps.js";
 import { Field, Text, Area, Num, Toggle, Select, TriState, BackendChips } from "./forms.jsx";
 import "./studio.css";
 
@@ -94,6 +95,11 @@ export default function StudioApp() {
   const bpRef = useRef(loadBlueprint("base"));
   const bpNameRef = useRef("base");
   const builtForRef = useRef(null); // which workflow the current `nodes` were built for
+  const rfRef = useRef(null); // ReactFlow instance (for screenToFlowPosition on drop)
+  // Seeded from the loaded blueprint's max st-N so a remount/reload can't re-mint
+  // an id that already exists; re-seeded per workflow in loadCanvas.
+  const stepSeqRef = useRef(maxStepSeq(bpRef.current));
+  const [savedSteps, setSavedSteps] = useState(() => loadSavedSteps());
   const [bpVersion, setBpVersion] = useState(0);
   const [wfKey, setWfKey] = useState(0);
   const [draft, setDraft] = useState(null);
@@ -145,6 +151,7 @@ export default function StudioApp() {
     (name) => {
       bpRef.current = loadBlueprint(name);
       bpNameRef.current = name;
+      stepSeqRef.current = maxStepSeq(bpRef.current); // per-workflow id counter
       setEdges(edgesFor(bpRef.current).map(toRfEdge));
       setBpVersion((v) => v + 1);
       setWfKey((k) => k + 1); // remount ReactFlow → fitView the new graph
@@ -200,6 +207,64 @@ export default function StudioApp() {
     updateBlueprint((bp) => ({ ...bp, steps: bp.steps.map((s) => (s.id === id ? { ...s, [key]: val } : s)) }));
   const deleteStep = (id) =>
     updateBlueprint((bp) => ({ ...bp, steps: (bp.steps || []).filter((s) => s.id !== id).map((s, i) => ({ ...s, index: i + 1 < 10 ? "0" + (i + 1) : "" + (i + 1) })) }));
+  const addWorker = (stepId, worker) =>
+    updateBlueprint((bp) => ({
+      ...bp,
+      steps: bp.steps.map((s) => {
+        if (s.id !== stepId) return s;
+        const ws = s.workers || [];
+        if (ws.some((w) => w.type === worker.type && w.id === worker.id)) return s; // no dup
+        return { ...s, workers: [...ws, { type: worker.type, id: worker.id }] };
+      }),
+    }));
+  const removeWorker = (stepId, idx) =>
+    updateBlueprint((bp) => ({ ...bp, steps: bp.steps.map((s) => (s.id === stepId ? { ...s, workers: (s.workers || []).filter((_, i) => i !== idx) } : s)) }));
+  const dropStepTemplate = (tpl, pos) =>
+    updateBlueprint((bp) => {
+      const step = stepFromTemplate(tpl, pos, (bp.steps || []).length + 1, ++stepSeqRef.current);
+      return { ...bp, steps: [...(bp.steps || []), step] };
+    });
+
+  // ── saved-step library (global, localStorage) ───────────────────────────────
+  const saveStepAsTemplate = (step) => {
+    const next = [...savedSteps, stepTemplate(step)];
+    setSavedSteps(next);
+    saveSavedSteps(next);
+  };
+  const removeSavedStep = (i) => {
+    const next = savedSteps.filter((_, idx) => idx !== i);
+    setSavedSteps(next);
+    saveSavedSteps(next);
+  };
+
+  // ── palette drag-and-drop ───────────────────────────────────────────────────
+  const onPaletteDragStart = (payload) => (e) => {
+    e.dataTransfer.setData("application/json", JSON.stringify(payload));
+    e.dataTransfer.effectAllowed = "copy";
+  };
+  const onCanvasDragOver = (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+  const onCanvasDrop = (e) => {
+    e.preventDefault();
+    let payload;
+    try {
+      payload = JSON.parse(e.dataTransfer.getData("application/json"));
+    } catch {
+      return;
+    }
+    if (!payload) return;
+    if (payload.kind === "worker") {
+      // must land on a step card
+      const nodeEl = e.target.closest(".react-flow__node");
+      const nodeId = nodeEl && nodeEl.getAttribute("data-id");
+      if (nodeId && (bpRef.current.steps || []).some((s) => s.id === nodeId)) addWorker(nodeId, payload.worker);
+    } else if (payload.kind === "savedstep") {
+      const pos = rfRef.current ? rfRef.current.screenToFlowPosition({ x: e.clientX, y: e.clientY }) : null;
+      dropStepTemplate(payload.template, pos);
+    }
+  };
 
   // ── config edits (roles / workflow knobs / types — dirty, saved) ────────────
   const setWorkflowField = (key, val) => {
@@ -359,38 +424,64 @@ export default function StudioApp() {
       </div>
       {saveError ? <div className="sd-saveerr">{saveError}</div> : null}
       <div className="sd-body">
-        <div className="sd-cast">
-          <div className="sd-cast-hd">
-            <span>CAST · roles</span>
-            <button className="sd-mini" onClick={addRole}>
-              ＋
-            </button>
+        <div className="sd-palette">
+          <div className="sd-pal-hd">PALETTE</div>
+          <div className="sd-pal-sub">drag a CLI/role onto a step · a saved step onto the canvas</div>
+
+          <div className="sd-pal-sec-hd">
+            <span>CLIs</span>
           </div>
-          {draft.roles.length === 0 ? <div className="sd-empty">No roles. Add one → it becomes a `[workflow.roles.*]`.</div> : null}
+          <div className="sd-pal-clis">
+            {backends.map((b) => (
+              <div key={b} className="sd-pal-cli" draggable onDragStart={onPaletteDragStart({ kind: "worker", worker: { type: "cli", id: b } })} title="drag onto a step">
+                <span className="sd-mono" style={{ background: metaFor(b).color }}>{metaFor(b).mono}</span>
+                {metaFor(b).label}
+              </div>
+            ))}
+          </div>
+
+          <div className="sd-pal-sec-hd">
+            <span>CAST · roles</span>
+            <button className="sd-mini" onClick={addRole}>＋</button>
+          </div>
+          {draft.roles.length === 0 ? <div className="sd-empty">No roles yet.</div> : null}
           {draft.roles.map((r) => (
-            <button
+            <div
               key={r._key}
-              className={"sd-cast-item" + (selRoleKey === r._key ? " sel" : "") + (errors[r._key] ? " err" : "")}
+              className={"sd-cast-item" + (r.name ? " drag" : "") + (selRoleKey === r._key ? " sel" : "") + (errors[r._key] ? " err" : "")}
+              draggable={!!r.name}
+              onDragStart={r.name ? onPaletteDragStart({ kind: "worker", worker: { type: "role", id: r.name } }) : undefined}
               onClick={() => {
                 setSelRoleKey(r._key);
                 setSelNodeId(null);
               }}
+              title={r.name ? "click to edit · drag onto a step" : "name this role to drag it"}
             >
               <span className="sd-cast-name">{r.name || "(unnamed)"}</span>
               <span className="sd-cast-be">
                 {(r.backends || []).map((b) => (
-                  <span key={b} className="sd-mono" style={{ background: metaFor(b).color }}>
-                    {metaFor(b).mono}
-                  </span>
+                  <span key={b} className="sd-mono" style={{ background: metaFor(b).color }}>{metaFor(b).mono}</span>
                 ))}
               </span>
-            </button>
+            </div>
+          ))}
+
+          <div className="sd-pal-sec-hd">
+            <span>SAVED STEPS</span>
+          </div>
+          {savedSteps.length === 0 ? <div className="sd-empty">Save a step (in its inspector) → drag it onto any canvas.</div> : null}
+          {savedSteps.map((s, i) => (
+            <div key={i} className="sd-saved-item" draggable onDragStart={onPaletteDragStart({ kind: "savedstep", template: s })} title="drag onto the canvas">
+              <span className="sd-cast-name">{s.name || "(step)"}</span>
+              <button className="sd-x" onClick={() => removeSavedStep(i)} title="remove template">✕</button>
+            </div>
           ))}
         </div>
 
-        <div className="sd-canvas">
+        <div className="sd-canvas" onDrop={onCanvasDrop} onDragOver={onCanvasDragOver}>
           <ReactFlow
             key={wfKey}
+            onInit={(inst) => (rfRef.current = inst)}
             nodes={nodes}
             edges={edges}
             nodeTypes={nodeTypes}
@@ -417,7 +508,7 @@ export default function StudioApp() {
           {selRole ? (
             <RoleForm role={selRole} backends={backends} error={errors[selRole._key]} onField={setRoleField} onToggleBackend={toggleRoleBackend} onRemove={removeRole} />
           ) : selStep ? (
-            <StepForm step={selStep} beOpts={beOpts} onField={setStepField} onDelete={deleteStep} />
+            <StepForm step={selStep} beOpts={beOpts} roles={draft.roles} onField={setStepField} onDelete={deleteStep} onRemoveWorker={removeWorker} onSaveTemplate={saveStepAsTemplate} />
           ) : curType ? (
             <TypeForm
               type={curType}
@@ -437,7 +528,8 @@ export default function StudioApp() {
   );
 }
 
-function StepForm({ step, beOpts, onField, onDelete }) {
+function StepForm({ step, beOpts, roles, onField, onDelete, onRemoveWorker, onSaveTemplate }) {
+  const workers = step.workers || [];
   return (
     <>
       <h3>
@@ -459,6 +551,28 @@ function StepForm({ step, beOpts, onField, onDelete }) {
         <Toggle checked={!!step.dynamic} onChange={(v) => onField(step.id, "dynamic", v)} label="self-spawn" />
         <Toggle checked={!!step.ask} onChange={(v) => onField(step.id, "ask", v)} label="ask human" />
       </div>
+      <Field label="Workers">
+        <div className="sd-chips">
+          {workers.map((w, i) => {
+            const rw = resolveWorker(w, roles);
+            return (
+              <span key={i} className="sd-wchip" style={{ borderColor: rw.color }}>
+                {rw.mono ? (
+                  <span className="sd-mono" style={{ background: rw.color }}>{rw.mono}</span>
+                ) : (
+                  <span className="sd-swatch" style={{ background: rw.color }} />
+                )}
+                {rw.label}
+                <button className="sd-x" onClick={() => onRemoveWorker(step.id, i)} title="remove">✕</button>
+              </span>
+            );
+          })}
+          {workers.length === 0 ? <span className="sd-empty">drag a CLI/role from the palette onto this card</span> : null}
+        </div>
+      </Field>
+      <button className="sd-mini-btn" onClick={() => onSaveTemplate(step)}>
+        Save as template
+      </button>
       <button className="sd-danger" onClick={() => onDelete(step.id)}>
         Delete step
       </button>

@@ -158,6 +158,35 @@
 }
 .sd-top .sd-save:disabled { opacity: 0.4; cursor: default; border-color: var(--line-3); background: #10141d; color: var(--muted-2); }
 .sd-saveerr { flex: none; padding: 7px 18px; background: rgba(229, 104, 122, 0.12); color: #f08a98; font-size: 12px; border-bottom: 1px solid var(--line-2); }
+.sd-top .sd-gen {
+  padding: 6px 12px; border-radius: 7px; border: 1px solid var(--ac-bd);
+  background: transparent; color: var(--ac-tx); cursor: pointer;
+  font-family: inherit; font-size: 12px;
+}
+.sd-top .sd-gen:hover { background: var(--ac-soft); }
+
+/* generate modal */
+.sd-modal-overlay {
+  position: absolute; inset: 0; z-index: 20;
+  display: grid; place-items: center;
+  background: rgba(6, 8, 13, 0.72); backdrop-filter: blur(3px);
+}
+.sd-modal {
+  width: min(520px, 90%);
+  border-radius: 14px; border: 1px solid var(--line-3);
+  background: var(--panel-2); padding: 20px 22px;
+  box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.8);
+}
+.sd-modal-title { margin: 6px 0 8px; font-size: 16px; color: var(--text); }
+.sd-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+/* AI describe button */
+.sd-ai {
+  margin-top: 6px; padding: 5px 10px; border-radius: 7px;
+  border: 1px solid var(--ac-bd); background: var(--ac-soft); color: var(--ac-tx);
+  cursor: pointer; font-family: inherit; font-size: 11px;
+}
+.sd-ai:disabled { opacity: 0.5; cursor: default; }
 
 /* Palette panel (CLIs + cast + saved steps) */
 .sd-palette,

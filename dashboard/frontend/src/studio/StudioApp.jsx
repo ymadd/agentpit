@@ -13,7 +13,7 @@ import "@xyflow/react/dist/style.css";
 import StudioStepNode from "../StudioStepNode.jsx";
 import { WorkflowNode, GenStepNode, GhostNode } from "./nodes.jsx";
 import { stepNodeData, metaFor, resolveWorker } from "./backends.js";
-import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName } from "./blueprint.js";
+import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName, seedBlueprint } from "./blueprint.js";
 import { draftFromSettings, validate, buildPayload, newRole, newType, typeNameError } from "./settings.js";
 import { loadSavedSteps, saveSavedSteps, stepTemplate, stepFromTemplate, maxStepSeq } from "./savedsteps.js";
 import { Field, Text, Area, Num, Toggle, Select, TriState, BackendChips } from "./forms.jsx";
@@ -110,6 +110,8 @@ export default function StudioApp() {
   const [saveError, setSaveError] = useState(null);
   const [selNodeId, setSelNodeId] = useState(null);
   const [selRoleKey, setSelRoleKey] = useState(null);
+  const [gen, setGen] = useState(null); // generate modal: null=closed, else {desc, busy, error}
+  const [describingKeys, setDescribingKeys] = useState(() => new Set()); // type _keys whose description is AI-generating
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
 
@@ -345,6 +347,146 @@ export default function StudioApp() {
     }
   };
 
+  // ── AI generate / describe ──────────────────────────────────────────────────
+  // Apply a generated proposal as an UNSAVED draft: merge roles into the cast, add
+  // a uniquely-named type, and seed + persist its blueprint sketch. Nothing hits
+  // config until the user clicks Save.
+  const applyProposal = (p) => {
+    if (!p || !p.type) throw new Error("Invalid generation result.");
+    // Compute EVERYTHING (incl. the throw-prone step mapping) before any setState,
+    // so a malformed proposal can't leave a half-applied draft + orphan type.
+    let roles = [...draft.roles];
+    for (const pr of p.roles || []) {
+      if (!pr || !pr.name) continue;
+      const ex = roles.find((r) => r.name === pr.name);
+      if (ex) {
+        roles = roles.map((r) =>
+          r.name === pr.name ? { ...r, backends: r.backends.length ? r.backends : [...(pr.backends || [])], prompt: r.prompt || pr.prompt || "" } : r
+        );
+      } else {
+        roles = [...roles, { ...newRole(), name: pr.name, backends: [...(pr.backends || [])], prompt: pr.prompt || "" }];
+      }
+    }
+    const names = new Set(draft.types.map((t) => t.name));
+    let name = p.type;
+    for (let n = 2; names.has(name); n++) name = `${p.type}-${n}`;
+    const t = {
+      ...newType(),
+      name,
+      title: p.title || "",
+      prompt: p.brief || "",
+      roles: [...(p.uses_roles || [])],
+      manager_backend: p.manager_backend || "",
+      max_depth: p.max_depth ?? null,
+      max_calls_per_manager: p.max_calls_per_manager ?? null,
+      use_mcp: p.use_mcp ?? null,
+      enable_ask_human: p.enable_ask_human ?? null,
+    };
+    const src = p.steps && p.steps.length ? p.steps : seedBlueprint().steps;
+    const steps = src.map((s, i) => ({
+      id: "st-" + (i + 1),
+      index: i + 1 < 10 ? "0" + (i + 1) : "" + (i + 1),
+      name: s.name || "step",
+      manager: s.manager || p.manager_backend || "claude",
+      persona: s.persona || "",
+      behavior: s.behavior || "",
+      dynamic: s.dynamic !== false,
+      ask: !!s.ask,
+      fanout: s.fanout || 2,
+      // filter falsy (empty string / null) workers before mapping, then drop empty ids
+      workers: (s.workers || [])
+        .filter(Boolean)
+        .map((w) => (typeof w === "string" ? { type: "role", id: w } : { type: (w && w.type) || "role", id: w && w.id }))
+        .filter((w) => w.id),
+      x: 320 + i * 300,
+      y: 200,
+      w: 250,
+    }));
+    const bp = {
+      goal: { id: "goal", x: 40, y: 250, w: 210 },
+      ghost: { id: "ghost", x: (steps.length ? 320 + (steps.length - 1) * 300 : 320) + 300, y: 236, w: 156 },
+      steps,
+      gensteps: [],
+    };
+    // --- all computed and safe; commit ---
+    setDraft((d) => ({ ...d, roles, types: [...d.types, t] }));
+    setDirty(true);
+    saveBlueprint(bpNameRef.current, bpRef.current); // persist OUTGOING first
+    bpRef.current = bp;
+    bpNameRef.current = workflowName(t);
+    stepSeqRef.current = maxStepSeq(bp);
+    saveBlueprint(bpNameRef.current, bp);
+    setCurrentType(t._key);
+    setEdges(edgesFor(bp).map(toRfEdge));
+    setBpVersion((v) => v + 1);
+    setWfKey((k) => k + 1);
+    setSelNodeId(null);
+    setSelRoleKey(null);
+  };
+  const runGenerate = async () => {
+    const desc = (gen && gen.desc ? gen.desc : "").trim();
+    if (!desc) {
+      setGen((g) => ({ ...(g || {}), error: "Enter a description." }));
+      return;
+    }
+    setGen((g) => ({ ...(g || {}), busy: true, error: null }));
+    try {
+      const invoke = window.__TAURI__?.core?.invoke;
+      const proposal = invoke ? await invoke("workflow_generate", { description: desc }) : window.__AGENTPIT_MOCK_PROPOSAL__ || null;
+      if (!proposal) throw new Error("No backend available to generate.");
+      applyProposal(proposal);
+      setGen(null);
+    } catch (e) {
+      setGen((g) => ({ ...(g || {}), busy: false, error: String(e && e.message ? e.message : e) }));
+    }
+  };
+  const runDescribe = async (t) => {
+    const snapshot = t.description || "";
+    // "none selected = all worker roles" — expand so the describer gets the real cast.
+    const usesRoles = t.roles && t.roles.length ? t.roles : draft.roles.map((r) => r.name).filter((n) => n && n !== "manager");
+    setDescribingKeys((s) => new Set(s).add(t._key));
+    setSaveError(null);
+    try {
+      const spec = {
+        title: t.title,
+        manager_backend: t.manager_backend,
+        brief: t.prompt,
+        roles: usesRoles
+          .map((nm) => {
+            const r = draft.roles.find((x) => x.name === nm);
+            return r ? { name: nm, backends: r.backends || [], prompt: r.prompt || "" } : null;
+          })
+          .filter(Boolean),
+        uses_roles: t.roles || [],
+        max_depth: t.max_depth,
+        max_calls_per_manager: t.max_calls_per_manager,
+        use_mcp: t.use_mcp,
+        enable_ask_human: t.enable_ask_human,
+        steps: (bpRef.current.steps || []).map((s) => ({ name: s.name, persona: s.persona, behavior: s.behavior })),
+      };
+      const invoke = window.__TAURI__?.core?.invoke;
+      const desc = invoke ? await invoke("workflow_describe", { spec }) : window.__AGENTPIT_MOCK_DESCRIBE__ || "";
+      if (typeof desc === "string" && desc.trim()) {
+        // Only apply if the user hasn't edited the field meanwhile — keep their edit.
+        setDraft((d) => ({
+          ...d,
+          types: d.types.map((x) => (x._key === t._key && (x.description || "") === snapshot ? { ...x, description: desc.trim() } : x)),
+        }));
+        setDirty(true);
+      } else {
+        setSaveError("The model returned an empty description.");
+      }
+    } catch (e) {
+      setSaveError(String(e && e.message ? e.message : e));
+    } finally {
+      setDescribingKeys((s) => {
+        const n = new Set(s);
+        n.delete(t._key);
+        return n;
+      });
+    }
+  };
+
   // ── edge drawing / persistence ──────────────────────────────────────────────
   const persistEdges = useCallback((rfEdges) => {
     bpRef.current = {
@@ -415,6 +557,9 @@ export default function StudioApp() {
         </select>
         <span className="sd-hint">drag a handle → handle to draw an arrow</span>
         <span className={"sd-dirty" + (dirty ? " on" : "")}>{saving ? "Saving…" : dirty ? "Unsaved config" : "Saved"}</span>
+        <button className="sd-gen" onClick={() => setGen({ desc: "", busy: false, error: null })}>
+          ✨ Generate
+        </button>
         <button className="sd-save" disabled={!dirty || saving} onClick={save}>
           Save config
         </button>
@@ -515,13 +660,46 @@ export default function StudioApp() {
               beOpts={beOpts}
               roleNames={workerRoleNames}
               error={errors["t" + curType._key]}
+              describing={describingKeys.has(curType._key)}
               onField={setTypeField}
               onToggleRole={toggleTypeRole}
+              onDescribe={runDescribe}
               onDelete={deleteType}
             />
           ) : (
             <WorkflowForm wf={draft.workflow} beOpts={beOpts} onField={setWorkflowField} />
           )}
+        </div>
+      </div>
+      {gen ? <GenerateModal gen={gen} setGen={setGen} onGenerate={runGenerate} /> : null}
+    </div>
+  );
+}
+
+function GenerateModal({ gen, setGen, onGenerate }) {
+  return (
+    <div className="sd-modal-overlay" onClick={(e) => e.target === e.currentTarget && !gen.busy && setGen(null)}>
+      <div className="sd-modal">
+        <div className="sd-eyebrow">✨ GENERATE</div>
+        <h3 className="sd-modal-title">Generate a workflow</h3>
+        <div className="sd-note">Describe the workflow in plain language. An agent drafts the cast (roles) and an illustrative blueprint — nothing is saved until you review and Save.</div>
+        <textarea
+          className="sd-input sd-area"
+          rows={4}
+          autoFocus
+          placeholder="e.g. A workflow that strictly reviews PRs and hardens security & edge cases with refutation"
+          value={gen.desc}
+          disabled={gen.busy}
+          onChange={(e) => setGen((g) => ({ ...g, desc: e.target.value }))}
+        />
+        {gen.error ? <div className="sd-fielderr">{gen.error}</div> : null}
+        <div className="sd-modal-actions">
+          <button className="sd-close" disabled={gen.busy} onClick={() => setGen(null)}>
+            Cancel
+          </button>
+          <button className="sd-save" disabled={gen.busy} onClick={onGenerate}>
+            {gen.busy ? "Generating…" : "Generate"}
+          </button>
         </div>
       </div>
     </div>
@@ -606,7 +784,7 @@ function WorkflowForm({ wf, beOpts, onField }) {
   );
 }
 
-function TypeForm({ type, beOpts, roleNames, error, onField, onToggleRole, onDelete }) {
+function TypeForm({ type, beOpts, roleNames, error, describing, onField, onToggleRole, onDescribe, onDelete }) {
   const t = type;
   return (
     <>
@@ -626,6 +804,9 @@ function TypeForm({ type, beOpts, roleNames, error, onField, onToggleRole, onDel
       </Field>
       <Field label="Description (when to use)">
         <Area value={t.description} onChange={(v) => onField(t._key, "description", v)} rows={2} />
+        <button className="sd-ai" disabled={describing} onClick={() => onDescribe(t)}>
+          {describing ? "✨ Generating…" : "✨ Generate with AI"}
+        </button>
       </Field>
       <Field label="Roles used (none selected = all worker roles)">
         {roleNames.length === 0 ? (

@@ -1,0 +1,121 @@
+/* Live "Workflow Run" stage view. Reuses the dashboard's global CSS tokens
+   (--ac, --panel, --line-*, IBM Plex fonts) loaded via public/style.css. */
+
+.wr-launcher {
+  position: fixed;
+  top: 46px;
+  right: 16px;
+  z-index: 40;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  color: var(--text-2);
+  font-family: "IBM Plex Sans JP", system-ui, sans-serif;
+  font-size: 12px;
+  cursor: pointer;
+}
+.wr-launcher:hover { border-color: var(--ac-bd); }
+.wr-launcher .wr-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.wr-launcher.live .wr-dot { background: var(--ac); }
+.wr-launcher .wr-count { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--ac-tx); }
+
+.wr-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: rgba(6, 8, 13, 0.86);
+  backdrop-filter: blur(3px);
+}
+.wr-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line-2);
+}
+.wr-head .wr-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.wr-head .wr-meta { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--faint); }
+.wr-head .wr-live { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ac-tx); }
+.wr-head .wr-live .wr-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ac); }
+.wr-head .wr-close {
+  margin-left: auto;
+  padding: 5px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+.wr-canvas { flex: 1 1 auto; min-height: 0; }
+.wr-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+/* stage node */
+.wr-stage {
+  width: 210px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #141a27, #10141d);
+  border: 1px solid var(--line-3);
+  overflow: hidden;
+}
+.wr-stage.root { border-color: var(--ac-bd); }
+.wr-stage.st-running { border-color: var(--st); box-shadow: 0 0 0 1px var(--st), 0 0 22px -8px var(--st); }
+.wr-stage-hd {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-2);
+}
+.wr-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--st, var(--faint)); }
+.wr-dot.pulse { animation: wr-pulse 1.1s ease-in-out infinite; }
+@keyframes wr-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.7); } }
+.wr-stage-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wr-stage-status {
+  flex: none;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  color: var(--st-tx, var(--faint));
+  text-transform: uppercase;
+}
+.wr-stage-bd {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 10px 9px;
+}
+.wr-stage-sub {
+  flex: 1;
+  min-width: 0;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wr-stage-elapsed { flex: none; font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }

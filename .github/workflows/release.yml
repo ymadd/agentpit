@@ -118,6 +118,7 @@ jobs:
         working-directory: dashboard/frontend
         run: |
           npm ci
+          npm test
           npm run build
 
       - name: Build release binaries

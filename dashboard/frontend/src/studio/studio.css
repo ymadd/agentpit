@@ -128,4 +128,116 @@
 .sd-insp .sd-row { margin-bottom: 10px; }
 .sd-insp .sd-lb { font-family: "IBM Plex Mono", monospace; font-size: 8px; letter-spacing: 0.1em; color: var(--faint); text-transform: uppercase; }
 .sd-insp .sd-val { margin-top: 3px; font-size: 12px; color: var(--text-2); line-height: 1.5; }
-.sd-insp .sd-empty { color: var(--faint); font-size: 12px; }
+.sd-insp .sd-empty { color: var(--faint); font-size: 12px; line-height: 1.6; }
+
+/* topbar Save + dirty state */
+.sd-top .sd-dirty { margin-left: auto; font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }
+.sd-top .sd-dirty.on { color: var(--ac-tx); }
+.sd-top .sd-save {
+  padding: 6px 13px;
+  border-radius: 7px;
+  border: 1px solid var(--ac-bd);
+  background: var(--ac-soft);
+  color: var(--ac-tx);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+}
+.sd-top .sd-save:disabled { opacity: 0.4; cursor: default; border-color: var(--line-3); background: #10141d; color: var(--muted-2); }
+.sd-saveerr { flex: none; padding: 7px 18px; background: rgba(229, 104, 122, 0.12); color: #f08a98; font-size: 12px; border-bottom: 1px solid var(--line-2); }
+
+/* CAST panel (roles) */
+.sd-cast {
+  flex: none;
+  width: 210px;
+  border-right: 1px solid var(--line-2);
+  background: var(--panel-2);
+  padding: 12px 12px 14px;
+  overflow: auto;
+}
+.sd-cast-hd { display: flex; align-items: center; justify-content: space-between; font-family: "IBM Plex Mono", monospace; font-size: 9px; letter-spacing: 0.16em; color: var(--faint); margin-bottom: 10px; }
+.sd-mini { width: 20px; height: 20px; border-radius: 5px; border: 1px solid var(--line-3); background: #10141d; color: var(--ac-tx); cursor: pointer; font-size: 12px; line-height: 1; }
+.sd-cast-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--line-2);
+  background: #10141d;
+  color: var(--text-2);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+.sd-cast-item.sel { border-color: var(--ac-bd); }
+.sd-cast-item.err { border-color: #e5687a; }
+.sd-cast-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sd-cast-be { display: inline-flex; gap: 3px; flex: none; }
+
+/* forms */
+.sd-field { display: block; margin-bottom: 11px; }
+.sd-flabel { display: block; font-family: "IBM Plex Mono", monospace; font-size: 8px; letter-spacing: 0.1em; color: var(--faint); text-transform: uppercase; margin-bottom: 4px; }
+.sd-flabel.mono { text-transform: none; }
+.sd-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--line-3);
+  background: #0b0e16;
+  color: var(--text);
+  font-family: "IBM Plex Sans JP", system-ui, sans-serif;
+  font-size: 12px;
+}
+.sd-input.mono { font-family: "IBM Plex Mono", monospace; }
+.sd-input.sd-area { resize: vertical; line-height: 1.5; }
+.sd-input:focus { outline: none; border-color: var(--ac-bd); }
+.sd-togglerow { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 11px; }
+.sd-togglerow .sd-field { flex: 1; margin-bottom: 0; }
+.sd-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  color: var(--muted-2);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+}
+.sd-toggle.on { border-color: var(--ac-bd); background: var(--ac-soft); color: var(--ac-tx); }
+.sd-toggle-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: 0.5; }
+.sd-toggle.on .sd-toggle-dot { opacity: 1; }
+.sd-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.sd-bchip {
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  color: var(--muted-2);
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+}
+.sd-bchip.on { border-color: var(--ac-bd); background: var(--ac-soft); color: var(--ac-tx); }
+.sd-danger {
+  width: 100%;
+  margin-top: 6px;
+  padding: 7px;
+  border-radius: 7px;
+  border: 1px solid rgba(229, 104, 122, 0.4);
+  background: rgba(229, 104, 122, 0.08);
+  color: #f08a98;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+.sd-note { margin-top: 10px; font-size: 10px; line-height: 1.5; color: var(--faint); }
+.sd-fielderr { margin: -6px 0 10px; font-size: 11px; color: #f08a98; }

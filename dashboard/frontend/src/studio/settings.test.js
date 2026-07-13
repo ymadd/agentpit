@@ -1,0 +1,52 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { draftFromSettings, validate, roleNameError, buildPayload, newRole, DEFAULT_MAX_DEPTH } from "./settings.js";
+
+const raw = {
+  known_backends: ["claude", "codex", "gemini"],
+  workflow: { manager_backend: "claude", max_depth: 4, max_calls_per_manager: 10, use_mcp: true, enable_ask_human: false },
+  roles: [{ name: "coder", backends: ["codex"], prompt: "be precise", model: "gpt-5-codex" }],
+  types: [{ name: "review", title: "Review", roles: ["coder"], max_depth: 2 }],
+};
+
+test("draftFromSettings makes an editable draft with defaults", () => {
+  const d = draftFromSettings(raw);
+  assert.equal(d.workflow.manager_backend, "claude");
+  assert.equal(d.workflow.max_depth, 4);
+  assert.equal(d.roles.length, 1);
+  assert.ok(typeof d.roles[0]._key === "number");
+  assert.equal(d.roles[0].model, "gpt-5-codex");
+  // an empty config still gets sane knob defaults
+  assert.equal(draftFromSettings({}).workflow.max_depth, DEFAULT_MAX_DEPTH);
+});
+
+test("roleNameError enforces the backend name rules", () => {
+  const roles = [{ _key: 1, name: "coder" }, { _key: 2, name: "reviewer" }];
+  assert.equal(roleNameError("coder", roles, 1), null); // itself, ok
+  assert.equal(roleNameError("", roles, 3), "Enter a name");
+  assert.ok(roleNameError("Bad Name", roles, 3)); // spaces/uppercase
+  assert.ok(roleNameError("coder", roles, 3)); // duplicate
+});
+
+test("validate flags a duplicate role name", () => {
+  const draft = { roles: [newRole(), newRole()] };
+  draft.roles[0].name = "dup";
+  draft.roles[1].name = "dup";
+  assert.equal(validate(draft).ok, false);
+  draft.roles[1].name = "other";
+  assert.equal(validate(draft).ok, true);
+});
+
+test("buildPayload matches the settings_save contract (nulls, round-tripped types)", () => {
+  const p = buildPayload(draftFromSettings(raw));
+  assert.equal(p.workflow.manager_backend, "claude");
+  assert.equal(p.workflow.max_depth, 4);
+  assert.deepEqual(p.roles[0], { name: "coder", backends: ["codex"], prompt: "be precise", model: "gpt-5-codex" });
+  // empty model → null
+  const d2 = draftFromSettings({ roles: [{ name: "r", backends: [], prompt: "" }] });
+  assert.equal(buildPayload(d2).roles[0].model, null);
+  // types survive Save unchanged
+  assert.equal(p.types[0].name, "review");
+  assert.equal(p.types[0].max_depth, 2);
+  assert.equal(p.types[0].title, "Review");
+});

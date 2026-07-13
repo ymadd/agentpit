@@ -1,5 +1,5 @@
 import { createRoot } from "react-dom/client";
-import StudioCanvas from "./App.jsx";
+import StudioApp from "./studio/StudioApp.jsx";
 import WorkflowRunApp from "./workflow-run/WorkflowRunApp.jsx";
 
 // Strangler bridge (Phase 2). The legacy vanilla dashboard (public/app.js) owns
@@ -13,7 +13,7 @@ let root = null;
 window.__agentpitMountStudio = (container) => {
   if (!container) return;
   if (!root) root = createRoot(container);
-  root.render(<StudioCanvas />);
+  root.render(<StudioApp />);
 };
 
 window.__agentpitUnmountStudio = () => {

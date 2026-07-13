@@ -2715,17 +2715,28 @@ function toggleSettings() {
     cliSig = null;
     updateSwarm();
     updateCliManager();
+    updateSettings();
+    // Phase 2b: hand #settings to the React Studio when the bridge is present.
+    // Falls back to the legacy vanilla Studio when it is not.
+    if (window.__agentpitMountStudio) {
+      window.__agentpitMountStudio(document.getElementById("settings"));
+      return;
+    }
     buildStudioShell();
     if (!studio) newStudio();
     if (!settingsDraft) fetchSettings();
     else renderStudio();
     if (agentClis.length === 0) fetchAgentClis().then(refreshStudioClis);
-    updateSettings();
     requestAnimationFrame(() => { if (showSettings) { fitToView(); renderStudio(); } });
   } else {
     updateSettings();
+    if (window.__agentpitUnmountStudio) window.__agentpitUnmountStudio();
   }
 }
+// Let the React Studio's Close button drive the same toggle (keeps showSettings in sync).
+window.__agentpitCloseSettings = () => {
+  if (showSettings) toggleSettings();
+};
 async function fetchSettings() {
   settingsLoading = true;
   settingsError = null;

@@ -1,0 +1,131 @@
+/* React Studio (Phase 2b). Reuses the dashboard's global tokens from
+   public/style.css (--ac, --panel, --line-*, IBM Plex). */
+
+.sd-root {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: radial-gradient(120% 100% at 50% -8%, #11151f 0%, #080b12 55%, var(--panel) 100%);
+  font-family: "IBM Plex Sans JP", system-ui, sans-serif;
+}
+.sd-top {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line-2);
+}
+.sd-top .sd-badge {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--ac-tx);
+  border: 1px solid var(--ac-bd);
+  border-radius: 5px;
+  padding: 3px 7px;
+}
+.sd-top .sd-name { font-size: 14px; font-weight: 600; color: var(--text); }
+.sd-top .sd-hint { font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }
+.sd-top .sd-close {
+  margin-left: auto;
+  padding: 5px 11px;
+  border-radius: 7px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+.sd-body { flex: 1 1 auto; min-height: 0; display: flex; }
+.sd-canvas { flex: 1 1 auto; min-width: 0; }
+
+/* StudioStepNode reuses legacy .ws-* class names for its self-contained styles.
+   The globally-loaded legacy style.css sets `.ws-node { position:absolute; left:0;
+   top:0 }`, which pulls the card out of flow and collapses the React Flow node
+   wrapper to 0×0. Neutralize it inside the studio canvas so the wrapper sizes to
+   the 250px card. (Follow-up: re-scope StudioStepNode to sd-* classes.) */
+.sd-canvas .react-flow__node .ws-node {
+  position: relative;
+  left: auto;
+  top: auto;
+}
+
+/* root WORKFLOW node */
+.sd-goal {
+  position: relative;
+  width: 210px;
+  border-radius: 12px;
+  background: #0d111a;
+  border: 1px solid var(--line-3);
+  padding: 11px 13px;
+}
+.sd-goal.sel { border-color: var(--ac-bd); }
+.sd-eyebrow { font-family: "IBM Plex Mono", monospace; font-size: 9px; letter-spacing: 0.22em; color: var(--faint); }
+.sd-goal-txt {
+  margin-top: 6px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* generated sub-step */
+.sd-gen {
+  position: relative;
+  width: 180px;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #141a27, #10141d);
+  border: 1px solid var(--line-2);
+  padding: 9px 11px;
+}
+.sd-gen.sel { border-color: var(--ac-bd); }
+.sd-gen-name { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--text); }
+.sd-gen-sub { margin-top: 5px; display: flex; align-items: center; gap: 7px; }
+.sd-gen-role { font-size: 9px; color: var(--ac-tx); }
+.sd-gen-be { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-2); }
+.sd-mono {
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  color: #fff;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 7px;
+}
+
+/* grow placeholder */
+.sd-ghost {
+  position: relative;
+  width: 156px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 12px;
+  border: 1px dashed var(--line-3);
+  background: rgba(12, 15, 23, 0.5);
+  padding: 12px 14px;
+  color: var(--faint);
+  font-size: 12px;
+}
+.sd-ghost-plus { font-size: 14px; color: var(--muted-2); }
+
+/* selected-node inspector (read-only in this slice) */
+.sd-insp {
+  flex: none;
+  width: 300px;
+  border-left: 1px solid var(--line-2);
+  background: var(--panel-2);
+  padding: 14px 16px;
+  overflow: auto;
+}
+.sd-insp h3 { margin: 0 0 10px; font-size: 13px; color: var(--text); }
+.sd-insp .sd-row { margin-bottom: 10px; }
+.sd-insp .sd-lb { font-family: "IBM Plex Mono", monospace; font-size: 8px; letter-spacing: 0.1em; color: var(--faint); text-transform: uppercase; }
+.sd-insp .sd-val { margin-top: 3px; font-size: 12px; color: var(--text-2); line-height: 1.5; }
+.sd-insp .sd-empty { color: var(--faint); font-size: 12px; }

@@ -1,5 +1,6 @@
 import { Handle, Position } from "@xyflow/react";
 import { metaFor } from "./backends.js";
+import { t as tr } from "./i18n.js";
 
 const port = {
   width: 9,
@@ -13,7 +14,7 @@ const port = {
 export function WorkflowNode({ data, selected }) {
   return (
     <div className={`sd-goal ${selected ? "sel" : ""}`}>
-      <div className="sd-eyebrow">WORKFLOW</div>
+      <div className="sd-eyebrow">{tr("WORKFLOW")}</div>
       <div className="sd-goal-txt">{data.label}</div>
       <Handle type="source" position={Position.Right} style={port} />
     </div>

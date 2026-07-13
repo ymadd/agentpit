@@ -17,6 +17,7 @@ import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName, see
 import { draftFromSettings, validate, buildPayload, newRole, newType, typeNameError } from "./settings.js";
 import { loadSavedSteps, saveSavedSteps, stepTemplate, stepFromTemplate, maxStepSeq } from "./savedsteps.js";
 import { Field, Text, Area, Num, Toggle, Select, TriState, BackendChips } from "./forms.jsx";
+import { t as tr, setStudioLang, detectLang, persistLang } from "./i18n.js";
 import "./studio.css";
 
 const nodeTypes = {
@@ -72,9 +73,9 @@ function toRfEdge(e) {
 }
 
 function goalLabel(currentType, types) {
-  if (currentType == null) return "(default)";
+  if (currentType == null) return tr("(default)");
   const t = types.find((x) => x._key === currentType);
-  return t ? t.name || "(unnamed)" : "(default)";
+  return t ? t.name || tr("(unnamed)") : tr("(default)");
 }
 
 function buildNodes(bp, roles, label) {
@@ -87,7 +88,7 @@ function buildNodes(bp, roles, label) {
   for (const g of bp.gensteps || []) {
     nodes.push({ id: g.id, type: "genstep", position: { x: g.x, y: g.y }, data: { name: g.name, role: g.role, backend: g.backend } });
   }
-  nodes.push({ id: "ghost", type: "ghost", position: { x: bp.ghost.x, y: bp.ghost.y }, data: { label: "dynamic" } });
+  nodes.push({ id: "ghost", type: "ghost", position: { x: bp.ghost.x, y: bp.ghost.y }, data: { label: tr("dynamic") } });
   return nodes;
 }
 
@@ -112,6 +113,11 @@ export default function StudioApp() {
   const [selRoleKey, setSelRoleKey] = useState(null);
   const [gen, setGen] = useState(null); // generate modal: null=closed, else {desc, busy, error}
   const [describingKeys, setDescribingKeys] = useState(() => new Set()); // type _keys whose description is AI-generating
+  const [lang, setLang] = useState(detectLang);
+  setStudioLang(lang); // sync module translator before children render (idempotent)
+  const switchLang = (l) => {
+    setLang(persistLang(l)); // persist + notify legacy app.js so the whole dashboard follows
+  };
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
 
@@ -545,40 +551,44 @@ export default function StudioApp() {
   return (
     <div className="sd-root">
       <div className="sd-top">
-        <span className="sd-badge">BLUEPRINT</span>
+        <span className="sd-badge">{tr("BLUEPRINT")}</span>
         <select className="sd-switch" value={currentType == null ? "base" : "t" + currentType} onChange={onSwitcher}>
-          <option value="base">(default) workflow</option>
-          {draft.types.map((t) => (
-            <option key={t._key} value={"t" + t._key}>
-              {t.title || t.name || "(unnamed)"}
+          <option value="base">{tr("(default) workflow")}</option>
+          {draft.types.map((ty) => (
+            <option key={ty._key} value={"t" + ty._key}>
+              {ty.title || ty.name || tr("(unnamed)")}
             </option>
           ))}
-          <option value="__new">＋ New workflow</option>
+          <option value="__new">{tr("＋ New workflow")}</option>
         </select>
-        <span className="sd-hint">drag a handle → handle to draw an arrow</span>
-        <span className={"sd-dirty" + (dirty ? " on" : "")}>{saving ? "Saving…" : dirty ? "Unsaved config" : "Saved"}</span>
+        <span className="sd-hint">{tr("drag a handle → handle to draw an arrow")}</span>
+        <span className={"sd-dirty" + (dirty ? " on" : "")}>{saving ? tr("Saving…") : dirty ? tr("Unsaved config") : tr("Saved")}</span>
+        <span className="sd-langs">
+          <button className={"sd-lang" + (lang === "en" ? " on" : "")} onClick={() => switchLang("en")}>EN</button>
+          <button className={"sd-lang" + (lang === "ja" ? " on" : "")} onClick={() => switchLang("ja")}>日本語</button>
+        </span>
         <button className="sd-gen" onClick={() => setGen({ desc: "", busy: false, error: null })}>
-          ✨ Generate
+          {tr("✨ Generate")}
         </button>
         <button className="sd-save" disabled={!dirty || saving} onClick={save}>
-          Save config
+          {tr("Save config")}
         </button>
         <button className="sd-close" onClick={() => window.__agentpitCloseSettings?.()}>
-          Close ✕
+          {tr("Close ✕")}
         </button>
       </div>
-      {saveError ? <div className="sd-saveerr">{saveError}</div> : null}
+      {saveError ? <div className="sd-saveerr">{tr(saveError)}</div> : null}
       <div className="sd-body">
         <div className="sd-palette">
-          <div className="sd-pal-hd">PALETTE</div>
-          <div className="sd-pal-sub">drag a CLI/role onto a step · a saved step onto the canvas</div>
+          <div className="sd-pal-hd">{tr("PALETTE")}</div>
+          <div className="sd-pal-sub">{tr("drag a CLI/role onto a step · a saved step onto the canvas")}</div>
 
           <div className="sd-pal-sec-hd">
-            <span>CLIs</span>
+            <span>{tr("CLIs")}</span>
           </div>
           <div className="sd-pal-clis">
             {backends.map((b) => (
-              <div key={b} className="sd-pal-cli" draggable onDragStart={onPaletteDragStart({ kind: "worker", worker: { type: "cli", id: b } })} title="drag onto a step">
+              <div key={b} className="sd-pal-cli" draggable onDragStart={onPaletteDragStart({ kind: "worker", worker: { type: "cli", id: b } })} title={tr("drag onto a step")}>
                 <span className="sd-mono" style={{ background: metaFor(b).color }}>{metaFor(b).mono}</span>
                 {metaFor(b).label}
               </div>
@@ -586,10 +596,10 @@ export default function StudioApp() {
           </div>
 
           <div className="sd-pal-sec-hd">
-            <span>CAST · roles</span>
+            <span>{tr("CAST · roles")}</span>
             <button className="sd-mini" onClick={addRole}>＋</button>
           </div>
-          {draft.roles.length === 0 ? <div className="sd-empty">No roles yet.</div> : null}
+          {draft.roles.length === 0 ? <div className="sd-empty">{tr("No roles yet.")}</div> : null}
           {draft.roles.map((r) => (
             <div
               key={r._key}
@@ -600,9 +610,9 @@ export default function StudioApp() {
                 setSelRoleKey(r._key);
                 setSelNodeId(null);
               }}
-              title={r.name ? "click to edit · drag onto a step" : "name this role to drag it"}
+              title={r.name ? tr("click to edit · drag onto a step") : tr("name this role to drag it")}
             >
-              <span className="sd-cast-name">{r.name || "(unnamed)"}</span>
+              <span className="sd-cast-name">{r.name || tr("(unnamed)")}</span>
               <span className="sd-cast-be">
                 {(r.backends || []).map((b) => (
                   <span key={b} className="sd-mono" style={{ background: metaFor(b).color }}>{metaFor(b).mono}</span>
@@ -612,13 +622,13 @@ export default function StudioApp() {
           ))}
 
           <div className="sd-pal-sec-hd">
-            <span>SAVED STEPS</span>
+            <span>{tr("SAVED STEPS")}</span>
           </div>
-          {savedSteps.length === 0 ? <div className="sd-empty">Save a step (in its inspector) → drag it onto any canvas.</div> : null}
+          {savedSteps.length === 0 ? <div className="sd-empty">{tr("Save a step (in its inspector) → drag it onto any canvas.")}</div> : null}
           {savedSteps.map((s, i) => (
-            <div key={i} className="sd-saved-item" draggable onDragStart={onPaletteDragStart({ kind: "savedstep", template: s })} title="drag onto the canvas">
-              <span className="sd-cast-name">{s.name || "(step)"}</span>
-              <button className="sd-x" onClick={() => removeSavedStep(i)} title="remove template">✕</button>
+            <div key={i} className="sd-saved-item" draggable onDragStart={onPaletteDragStart({ kind: "savedstep", template: s })} title={tr("drag onto the canvas")}>
+              <span className="sd-cast-name">{s.name || tr("(step)")}</span>
+              <button className="sd-x" onClick={() => removeSavedStep(i)} title={tr("remove template")}>✕</button>
             </div>
           ))}
         </div>
@@ -680,25 +690,25 @@ function GenerateModal({ gen, setGen, onGenerate }) {
   return (
     <div className="sd-modal-overlay" onClick={(e) => e.target === e.currentTarget && !gen.busy && setGen(null)}>
       <div className="sd-modal">
-        <div className="sd-eyebrow">✨ GENERATE</div>
-        <h3 className="sd-modal-title">Generate a workflow</h3>
-        <div className="sd-note">Describe the workflow in plain language. An agent drafts the cast (roles) and an illustrative blueprint — nothing is saved until you review and Save.</div>
+        <div className="sd-eyebrow">{tr("✨ GENERATE")}</div>
+        <h3 className="sd-modal-title">{tr("Generate a workflow")}</h3>
+        <div className="sd-note">{tr("Describe the workflow in plain language. An agent drafts the cast (roles) and an illustrative blueprint — nothing is saved until you review and Save.")}</div>
         <textarea
           className="sd-input sd-area"
           rows={4}
           autoFocus
-          placeholder="e.g. A workflow that strictly reviews PRs and hardens security & edge cases with refutation"
+          placeholder={tr("e.g. A workflow that strictly reviews PRs and hardens security & edge cases with refutation")}
           value={gen.desc}
           disabled={gen.busy}
           onChange={(e) => setGen((g) => ({ ...g, desc: e.target.value }))}
         />
-        {gen.error ? <div className="sd-fielderr">{gen.error}</div> : null}
+        {gen.error ? <div className="sd-fielderr">{tr(gen.error)}</div> : null}
         <div className="sd-modal-actions">
           <button className="sd-close" disabled={gen.busy} onClick={() => setGen(null)}>
-            Cancel
+            {tr("Cancel")}
           </button>
           <button className="sd-save" disabled={gen.busy} onClick={onGenerate}>
-            {gen.busy ? "Generating…" : "Generate"}
+            {gen.busy ? tr("Generating…") : tr("Generate")}
           </button>
         </div>
       </div>
@@ -713,23 +723,23 @@ function StepForm({ step, beOpts, roles, onField, onDelete, onRemoveWorker, onSa
       <h3>
         {step.index} · {step.name || "(step)"}
       </h3>
-      <Field label="Name">
+      <Field label={tr("Name")}>
         <Text value={step.name} onChange={(v) => onField(step.id, "name", v)} />
       </Field>
-      <Field label="Manager">
-        <Select value={step.manager} onChange={(v) => onField(step.id, "manager", v)} options={beOpts} placeholder="pick a backend" />
+      <Field label={tr("Manager")}>
+        <Select value={step.manager} onChange={(v) => onField(step.id, "manager", v)} options={beOpts} placeholder={tr("pick a backend")} />
       </Field>
-      <Field label="Persona">
+      <Field label={tr("Persona")}>
         <Area value={step.persona} onChange={(v) => onField(step.id, "persona", v)} rows={2} />
       </Field>
-      <Field label="Behavior / directive">
+      <Field label={tr("Behavior / directive")}>
         <Area value={step.behavior} onChange={(v) => onField(step.id, "behavior", v)} rows={3} />
       </Field>
       <div className="sd-togglerow">
-        <Toggle checked={!!step.dynamic} onChange={(v) => onField(step.id, "dynamic", v)} label="self-spawn" />
-        <Toggle checked={!!step.ask} onChange={(v) => onField(step.id, "ask", v)} label="ask human" />
+        <Toggle checked={!!step.dynamic} onChange={(v) => onField(step.id, "dynamic", v)} label={tr("self-spawn")} />
+        <Toggle checked={!!step.ask} onChange={(v) => onField(step.id, "ask", v)} label={tr("ask human")} />
       </div>
-      <Field label="Workers">
+      <Field label={tr("Workers")}>
         <div className="sd-chips">
           {workers.map((w, i) => {
             const rw = resolveWorker(w, roles);
@@ -741,20 +751,20 @@ function StepForm({ step, beOpts, roles, onField, onDelete, onRemoveWorker, onSa
                   <span className="sd-swatch" style={{ background: rw.color }} />
                 )}
                 {rw.label}
-                <button className="sd-x" onClick={() => onRemoveWorker(step.id, i)} title="remove">✕</button>
+                <button className="sd-x" onClick={() => onRemoveWorker(step.id, i)} title={tr("remove")}>✕</button>
               </span>
             );
           })}
-          {workers.length === 0 ? <span className="sd-empty">drag a CLI/role from the palette onto this card</span> : null}
+          {workers.length === 0 ? <span className="sd-empty">{tr("drag a CLI/role from the palette onto this card")}</span> : null}
         </div>
       </Field>
       <button className="sd-mini-btn" onClick={() => onSaveTemplate(step)}>
-        Save as template
+        {tr("Save as template")}
       </button>
       <button className="sd-danger" onClick={() => onDelete(step.id)}>
-        Delete step
+        {tr("Delete step")}
       </button>
-      <div className="sd-note">Step cards are the blueprint sketch (saved locally), not config.</div>
+      <div className="sd-note">{tr("Step cards are the blueprint sketch (saved locally), not config.")}</div>
     </>
   );
 }
@@ -762,24 +772,24 @@ function StepForm({ step, beOpts, roles, onField, onDelete, onRemoveWorker, onSa
 function WorkflowForm({ wf, beOpts, onField }) {
   return (
     <>
-      <h3>WORKFLOW · base [workflow]</h3>
-      <div className="sd-note">Invoke: <code>agentpit workflow "&lt;goal&gt;"</code></div>
-      <Field label="Manager backend">
-        <Select value={wf.manager_backend} onChange={(v) => onField("manager_backend", v || "")} options={beOpts} placeholder="default backend" />
+      <h3>{tr("WORKFLOW · base [workflow]")}</h3>
+      <div className="sd-note">{tr("Invoke:")} <code>agentpit workflow "&lt;goal&gt;"</code></div>
+      <Field label={tr("Manager backend")}>
+        <Select value={wf.manager_backend} onChange={(v) => onField("manager_backend", v || "")} options={beOpts} placeholder={tr("default backend")} />
       </Field>
       <div className="sd-togglerow">
-        <Field label="Max depth">
+        <Field label={tr("Max depth")}>
           <Num value={wf.max_depth} min={1} onChange={(v) => onField("max_depth", v)} />
         </Field>
-        <Field label="Max calls / manager">
+        <Field label={tr("Max calls / manager")}>
           <Num value={wf.max_calls_per_manager} min={1} onChange={(v) => onField("max_calls_per_manager", v)} />
         </Field>
       </div>
       <div className="sd-togglerow">
-        <Toggle checked={!!wf.use_mcp} onChange={(v) => onField("use_mcp", v)} label="use MCP" />
-        <Toggle checked={!!wf.enable_ask_human} onChange={(v) => onField("enable_ask_human", v)} label="ask-human" />
+        <Toggle checked={!!wf.use_mcp} onChange={(v) => onField("use_mcp", v)} label={tr("use MCP")} />
+        <Toggle checked={!!wf.enable_ask_human} onChange={(v) => onField("enable_ask_human", v)} label={tr("ask-human")} />
       </div>
-      <div className="sd-note">Saved to config.toml `[workflow]` on Save.</div>
+      <div className="sd-note">{tr("Saved to config.toml `[workflow]` on Save.")}</div>
     </>
   );
 }
@@ -788,29 +798,29 @@ function TypeForm({ type, beOpts, roleNames, error, describing, onField, onToggl
   const t = type;
   return (
     <>
-      <h3>WORKFLOW TYPE · {t.title || t.name || "(unnamed)"}</h3>
-      <Field label="Workflow name">
+      <h3>{tr("WORKFLOW TYPE ·")} {t.title || t.name || tr("(unnamed)")}</h3>
+      <Field label={tr("Workflow name")}>
         <Text value={t.name} onChange={(v) => onField(t._key, "name", v.trim())} mono />
       </Field>
-      {error ? <div className="sd-fielderr">{error}</div> : null}
+      {error ? <div className="sd-fielderr">{tr(error)}</div> : null}
       <div className="sd-note">
-        Invoke: <code>agentpit workflow {t.name || "&lt;name&gt;"} "&lt;goal&gt;"</code>
+        {tr("Invoke:")} <code>agentpit workflow {t.name || "&lt;name&gt;"} "&lt;goal&gt;"</code>
       </div>
-      <Field label="Display name (optional)">
-        <Text value={t.title} onChange={(v) => onField(t._key, "title", v)} placeholder="Strict code review" />
+      <Field label={tr("Display name (optional)")}>
+        <Text value={t.title} onChange={(v) => onField(t._key, "title", v)} placeholder={tr("Strict code review")} />
       </Field>
-      <Field label="Brief (manager instruction for this workflow)">
+      <Field label={tr("Brief (manager instruction for this workflow)")}>
         <Area value={t.prompt} onChange={(v) => onField(t._key, "prompt", v)} rows={3} />
       </Field>
-      <Field label="Description (when to use)">
+      <Field label={tr("Description (when to use)")}>
         <Area value={t.description} onChange={(v) => onField(t._key, "description", v)} rows={2} />
         <button className="sd-ai" disabled={describing} onClick={() => onDescribe(t)}>
-          {describing ? "✨ Generating…" : "✨ Generate with AI"}
+          {describing ? tr("✨ Generating…") : tr("✨ Generate with AI")}
         </button>
       </Field>
-      <Field label="Roles used (none selected = all worker roles)">
+      <Field label={tr("Roles used (none selected = all worker roles)")}>
         {roleNames.length === 0 ? (
-          <div className="sd-empty">Add roles (the cast) first.</div>
+          <div className="sd-empty">{tr("Add roles (the cast) first.")}</div>
         ) : (
           <div className="sd-chips">
             {roleNames.map((rn) => (
@@ -821,30 +831,30 @@ function TypeForm({ type, beOpts, roleNames, error, describing, onField, onToggl
           </div>
         )}
       </Field>
-      <div className="sd-note">Overrides below — empty = inherit base [workflow].</div>
-      <Field label="Manager backend (override)">
-        <Select value={t.manager_backend} onChange={(v) => onField(t._key, "manager_backend", v || "")} options={beOpts} placeholder="inherit" />
+      <div className="sd-note">{tr("Overrides below — empty = inherit base [workflow].")}</div>
+      <Field label={tr("Manager backend (override)")}>
+        <Select value={t.manager_backend} onChange={(v) => onField(t._key, "manager_backend", v || "")} options={beOpts} placeholder={tr("inherit")} />
       </Field>
       <div className="sd-togglerow">
-        <Field label="Max depth">
-          <Num value={t.max_depth} min={1} placeholder="inherit" onChange={(v) => onField(t._key, "max_depth", v)} />
+        <Field label={tr("Max depth")}>
+          <Num value={t.max_depth} min={1} placeholder={tr("inherit")} onChange={(v) => onField(t._key, "max_depth", v)} />
         </Field>
-        <Field label="Max calls / manager">
-          <Num value={t.max_calls_per_manager} min={1} placeholder="inherit" onChange={(v) => onField(t._key, "max_calls_per_manager", v)} />
+        <Field label={tr("Max calls / manager")}>
+          <Num value={t.max_calls_per_manager} min={1} placeholder={tr("inherit")} onChange={(v) => onField(t._key, "max_calls_per_manager", v)} />
         </Field>
       </div>
       <div className="sd-togglerow">
-        <Field label="Via MCP">
+        <Field label={tr("Via MCP")}>
           <TriState value={t.use_mcp} onChange={(v) => onField(t._key, "use_mcp", v)} />
         </Field>
-        <Field label="Ask a human">
+        <Field label={tr("Ask a human")}>
           <TriState value={t.enable_ask_human} onChange={(v) => onField(t._key, "enable_ask_human", v)} />
         </Field>
       </div>
       <button className="sd-danger" onClick={() => onDelete(t._key)}>
-        Delete this workflow
+        {tr("Delete this workflow")}
       </button>
-      <div className="sd-note">Saved to config.toml `[workflow.types.{t.name || "…"}]` on Save.</div>
+      <div className="sd-note">{tr("Saved to config.toml `[workflow.types.*]` on Save.")}</div>
     </>
   );
 }
@@ -852,24 +862,24 @@ function TypeForm({ type, beOpts, roleNames, error, describing, onField, onToggl
 function RoleForm({ role, backends, error, onField, onToggleBackend, onRemove }) {
   return (
     <>
-      <h3>ROLE · {role.name || "(unnamed)"}</h3>
-      <Field label="Name">
+      <h3>{tr("ROLE ·")} {role.name || tr("(unnamed)")}</h3>
+      <Field label={tr("Name")}>
         <Text value={role.name} onChange={(v) => onField(role._key, "name", v)} mono />
       </Field>
-      {error ? <div className="sd-fielderr">{error}</div> : null}
-      <Field label="Backends (preference order)">
+      {error ? <div className="sd-fielderr">{tr(error)}</div> : null}
+      <Field label={tr("Backends (preference order)")}>
         <BackendChips selected={role.backends} all={backends} onToggle={(b) => onToggleBackend(role._key, b)} />
       </Field>
-      <Field label="Persona (prompt)">
+      <Field label={tr("Persona (prompt)")}>
         <Area value={role.prompt} onChange={(v) => onField(role._key, "prompt", v)} rows={3} />
       </Field>
-      <Field label="Model (optional)" mono>
-        <Text value={role.model} onChange={(v) => onField(role._key, "model", v)} placeholder="e.g. opus / gpt-5-codex" mono />
+      <Field label={tr("Model (optional)")} mono>
+        <Text value={role.model} onChange={(v) => onField(role._key, "model", v)} placeholder={tr("e.g. opus / gpt-5-codex")} mono />
       </Field>
       <button className="sd-danger" onClick={() => onRemove(role._key)}>
-        Remove role
+        {tr("Remove role")}
       </button>
-      <div className="sd-note">Saved to config.toml `[workflow.roles.*]` on Save.</div>
+      <div className="sd-note">{tr("Saved to config.toml `[workflow.roles.*]` on Save.")}</div>
     </>
   );
 }

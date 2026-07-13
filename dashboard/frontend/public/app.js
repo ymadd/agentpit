@@ -2737,6 +2737,8 @@ function toggleSettings() {
 window.__agentpitCloseSettings = () => {
   if (showSettings) toggleSettings();
 };
+// Let the React Studio's language toggle drive the legacy dashboard's i18n too.
+window.__agentpitSetLang = (lang) => setLang(lang);
 async function fetchSettings() {
   settingsLoading = true;
   settingsError = null;

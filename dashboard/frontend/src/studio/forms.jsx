@@ -1,4 +1,5 @@
 // Small controlled form primitives for the Studio inspector. Styled by studio.css.
+import { t as tr } from "./i18n.js";
 
 export function Field({ label, mono, children }) {
   return (
@@ -76,9 +77,9 @@ export function TriState({ value, onChange }) {
       value={v}
       onChange={(e) => onChange(e.target.value === "on" ? true : e.target.value === "off" ? false : null)}
     >
-      <option value="">inherit</option>
-      <option value="on">on</option>
-      <option value="off">off</option>
+      <option value="">{tr("inherit")}</option>
+      <option value="on">{tr("on")}</option>
+      <option value="off">{tr("off")}</option>
     </select>
   );
 }

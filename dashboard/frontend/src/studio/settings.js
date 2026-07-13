@@ -79,7 +79,7 @@ export function newType() {
 // backend is the gate). Order matches the vanilla: empty → reserved → regex → dup.
 export function typeNameError(name, types, selfKey, reserved) {
   if (!name) return "Enter a name";
-  if ((reserved || DEFAULT_RESERVED_TYPE_NAMES).includes(name)) return `'${name}' is reserved (an agentpit workflow subcommand)`;
+  if ((reserved || DEFAULT_RESERVED_TYPE_NAMES).includes(name)) return "This name is reserved (an agentpit workflow subcommand)";
   if (!ROLE_NAME_RE.test(name)) return "Only lowercase letters, digits, - and _ (must start alphanumeric)";
   if (types.some((t) => t._key !== selfKey && t.name === name)) return "This name is already in use";
   return null;

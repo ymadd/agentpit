@@ -28,6 +28,9 @@
 }
 .sd-top .sd-name { font-size: 14px; font-weight: 600; color: var(--text); }
 .sd-top .sd-hint { font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }
+.sd-langs { display: inline-flex; gap: 2px; border: 1px solid var(--line-3); border-radius: 7px; overflow: hidden; }
+.sd-lang { padding: 5px 9px; border: none; background: #10141d; color: var(--muted-2); cursor: pointer; font-family: inherit; font-size: 11px; }
+.sd-lang.on { background: var(--ac-soft); color: var(--ac-tx); }
 .sd-top .sd-switch {
   padding: 6px 10px;
   border-radius: 7px;

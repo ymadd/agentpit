@@ -9,6 +9,15 @@ export function blueprintKey(name) {
   return `${BLUEPRINT_KEY}.${name}`;
 }
 
+// The per-workflow localStorage namespace: "base" for the base [workflow], else
+// "type.<name>" for a named type or "type-<key>" for a still-unnamed one. The
+// "type." / "type-" prefixes keep a type's sketch from ever colliding with base
+// (e.g. a type literally named "base") or with another unnamed type.
+export function workflowName(type) {
+  if (!type) return "base";
+  return type.name ? "type." + type.name : "type-" + type._key;
+}
+
 // The canonical illustration: diagnose → plan → implement → review → integrate,
 // with review self-spawning an adversarial sub-swarm.
 export function seedBlueprint() {
@@ -77,5 +86,8 @@ export function deriveEdges(bp) {
 }
 
 export function edgesFor(bp) {
-  return Array.isArray(bp.edges) && bp.edges.length ? bp.edges : deriveEdges(bp);
+  // An edges ARRAY (even empty) means the user has taken control of the arrows —
+  // honour it, including a deliberately-emptied set. Only seed the default flow
+  // when no edges have ever been drawn (edges undefined).
+  return Array.isArray(bp.edges) ? bp.edges : deriveEdges(bp);
 }

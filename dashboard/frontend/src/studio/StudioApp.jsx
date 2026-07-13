@@ -13,9 +13,9 @@ import "@xyflow/react/dist/style.css";
 import StudioStepNode from "../StudioStepNode.jsx";
 import { WorkflowNode, GenStepNode, GhostNode } from "./nodes.jsx";
 import { stepNodeData, metaFor } from "./backends.js";
-import { loadBlueprint, saveBlueprint, edgesFor } from "./blueprint.js";
-import { draftFromSettings, validate, roleNameError, buildPayload, newRole } from "./settings.js";
-import { Field, Text, Area, Num, Toggle, Select, BackendChips } from "./forms.jsx";
+import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName } from "./blueprint.js";
+import { draftFromSettings, validate, buildPayload, newRole, newType, typeNameError } from "./settings.js";
+import { Field, Text, Area, Num, Toggle, Select, TriState, BackendChips } from "./forms.jsx";
 import "./studio.css";
 
 const nodeTypes = {
@@ -70,9 +70,15 @@ function toRfEdge(e) {
   };
 }
 
-function buildNodes(bp, roles) {
+function goalLabel(currentType, types) {
+  if (currentType == null) return "(default)";
+  const t = types.find((x) => x._key === currentType);
+  return t ? t.name || "(unnamed)" : "(default)";
+}
+
+function buildNodes(bp, roles, label) {
   const nodes = [
-    { id: "goal", type: "workflow", position: { x: bp.goal.x, y: bp.goal.y }, data: { label: "(default)" } },
+    { id: "goal", type: "workflow", position: { x: bp.goal.x, y: bp.goal.y }, data: { label } },
   ];
   for (const st of bp.steps || []) {
     nodes.push({ id: st.id, type: "studioStep", position: { x: st.x, y: st.y }, data: stepNodeData(st, roles) });
@@ -85,10 +91,13 @@ function buildNodes(bp, roles) {
 }
 
 export default function StudioApp() {
-  const bpName = "base";
-  const bpRef = useRef(loadBlueprint(bpName));
+  const bpRef = useRef(loadBlueprint("base"));
+  const bpNameRef = useRef("base");
+  const builtForRef = useRef(null); // which workflow the current `nodes` were built for
   const [bpVersion, setBpVersion] = useState(0);
+  const [wfKey, setWfKey] = useState(0);
   const [draft, setDraft] = useState(null);
+  const [currentType, setCurrentType] = useState(null); // null = base [workflow]; else a type _key
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState({});
@@ -101,29 +110,90 @@ export default function StudioApp() {
   useEffect(() => {
     let alive = true;
     loadSettings().then((data) => {
-      if (alive) setDraft(draftFromSettings(data));
+      if (!alive) return;
+      const d = draftFromSettings(data);
+      setDraft(d);
+      setEdges(edgesFor(bpRef.current).map(toRfEdge));
     });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [setEdges]);
 
-  // (Re)build nodes whenever the config (role resolution) or blueprint changes,
-  // preserving any positions the user dragged. Edges are seeded once.
+  // Rebuild NODES on any config (role resolution / goal label) or blueprint
+  // change, preserving dragged positions. Edges are managed explicitly (initial
+  // load, switch, connect, delete) so a workflow switch doesn't keep stale edges.
   useEffect(() => {
     if (!draft) return;
+    const label = goalLabel(currentType, draft.types);
+    // Keyed by the STABLE workflow id (currentType, not the mutable name) so a
+    // rename preserves positions but a switch does not.
+    const wfId = currentType == null ? "base" : currentType;
     setNodes((prev) => {
-      const pos = new Map(prev.map((n) => [n.id, n.position]));
-      return buildNodes(bpRef.current, draft.roles).map((n) => (pos.has(n.id) ? { ...n, position: pos.get(n.id) } : n));
+      // Preserve dragged positions only WITHIN a workflow. On a switch, build
+      // fresh from the incoming blueprint — every workflow reuses the same node
+      // ids, so a cross-workflow position map would stamp the outgoing layout
+      // onto the incoming graph (and a later drag would persist it).
+      const pos = builtForRef.current === wfId ? new Map(prev.map((n) => [n.id, n.position])) : null;
+      builtForRef.current = wfId;
+      return buildNodes(bpRef.current, draft.roles, label).map((n) => (pos && pos.has(n.id) ? { ...n, position: pos.get(n.id) } : n));
     });
-    setEdges((prev) => (prev.length ? prev : edgesFor(bpRef.current).map(toRfEdge)));
-  }, [draft, bpVersion, setNodes, setEdges]);
+  }, [draft, currentType, bpVersion, setNodes]);
+
+  // ── workflow switching (per-workflow blueprint) ─────────────────────────────
+  const loadCanvas = useCallback(
+    (name) => {
+      bpRef.current = loadBlueprint(name);
+      bpNameRef.current = name;
+      setEdges(edgesFor(bpRef.current).map(toRfEdge));
+      setBpVersion((v) => v + 1);
+      setWfKey((k) => k + 1); // remount ReactFlow → fitView the new graph
+      setSelNodeId("goal");
+      setSelRoleKey(null);
+    },
+    [setEdges]
+  );
+  const switchWorkflow = (typeKey) => {
+    saveBlueprint(bpNameRef.current, bpRef.current); // persist OUTGOING first
+    const t = typeKey == null ? null : draft.types.find((x) => x._key === typeKey);
+    setCurrentType(typeKey);
+    loadCanvas(workflowName(t));
+  };
+  const addType = () => {
+    saveBlueprint(bpNameRef.current, bpRef.current);
+    const t = newType();
+    setDraft((d) => ({ ...d, types: [...d.types, t] }));
+    setDirty(true);
+    setCurrentType(t._key);
+    loadCanvas(workflowName(t));
+  };
+  const deleteType = (key) => {
+    const t = draft.types.find((x) => x._key === key);
+    if (t) {
+      try {
+        localStorage.removeItem(blueprintKey(workflowName(t)));
+      } catch {
+        /* best-effort */
+      }
+    }
+    setDraft((d) => ({ ...d, types: d.types.filter((x) => x._key !== key) }));
+    setDirty(true);
+    // NOTE: do NOT saveBlueprint here — the current workflow is the one being
+    // deleted, so a save would immediately re-create the sketch we just removed.
+    setCurrentType(null);
+    loadCanvas("base");
+  };
+  const onSwitcher = (e) => {
+    const v = e.target.value;
+    if (v === "__new") addType();
+    else switchWorkflow(v === "base" ? null : parseInt(v.slice(1), 10));
+  };
 
   // ── blueprint edits (localStorage sketch — NOT config-dirty) ────────────────
   const updateBlueprint = useCallback((mut) => {
     const next = mut(bpRef.current);
     bpRef.current = next;
-    saveBlueprint(bpName, next);
+    saveBlueprint(bpNameRef.current, next);
     setBpVersion((v) => v + 1);
   }, []);
   const setStepField = (id, key, val) =>
@@ -131,7 +201,7 @@ export default function StudioApp() {
   const deleteStep = (id) =>
     updateBlueprint((bp) => ({ ...bp, steps: (bp.steps || []).filter((s) => s.id !== id).map((s, i) => ({ ...s, index: i + 1 < 10 ? "0" + (i + 1) : "" + (i + 1) })) }));
 
-  // ── config edits (roles / workflow knobs — dirty, saved via settings_save) ──
+  // ── config edits (roles / workflow knobs / types — dirty, saved) ────────────
   const setWorkflowField = (key, val) => {
     setDraft((d) => ({ ...d, workflow: { ...d.workflow, [key]: val } }));
     setDirty(true);
@@ -162,11 +232,35 @@ export default function StudioApp() {
     setDirty(true);
     if (selRoleKey === key) setSelRoleKey(null);
   };
+  const setTypeField = (key, field, val) => {
+    setDraft((d) => ({ ...d, types: d.types.map((t) => (t._key === key ? { ...t, [field]: val } : t)) }));
+    setDirty(true);
+    if (field === "name" && key === currentType) {
+      // Keep the blueprint namespace in sync with the rename so canvas edits (and
+      // the switch-away save) land under the new name, not the stale key.
+      bpNameRef.current = workflowName({ _key: key, name: val });
+    }
+  };
+  const toggleTypeRole = (key, roleName) =>
+    setDraft((d) => {
+      setDirty(true);
+      return {
+        ...d,
+        types: d.types.map((t) =>
+          t._key === key ? { ...t, roles: t.roles.includes(roleName) ? t.roles.filter((r) => r !== roleName) : [...t.roles, roleName] } : t
+        ),
+      };
+    });
 
   const save = async () => {
     const v = validate(draft);
     setErrors(v.errors);
-    if (!v.ok) return;
+    if (!v.ok) {
+      // The offending role/type may be in a workflow that isn't on screen, so
+      // surface a banner (the CAST panel + the current inspector also highlight).
+      setSaveError("Some roles or workflow types have invalid names (empty, reserved, or duplicate). Fix the highlighted items before saving.");
+      return;
+    }
     setSaving(true);
     setSaveError(null);
     try {
@@ -174,7 +268,11 @@ export default function StudioApp() {
       if (invoke) await invoke("settings_save", { payload: buildPayload(draft) });
       setDirty(false);
       const data = invoke ? await invoke("settings_get") : null;
-      if (data) setDraft(draftFromSettings(data));
+      if (data) {
+        setDraft(draftFromSettings(data));
+        setCurrentType(null);
+        loadCanvas("base");
+      }
     } catch (e) {
       setSaveError(String(e));
     } finally {
@@ -188,7 +286,7 @@ export default function StudioApp() {
       ...bpRef.current,
       edges: rfEdges.map((e) => ({ id: e.id, source: e.source, target: e.target, kind: e.data?.kind || "custom" })),
     };
-    saveBlueprint(bpName, bpRef.current);
+    saveBlueprint(bpNameRef.current, bpRef.current);
   }, []);
   const onConnect = useCallback(
     (params) => {
@@ -234,12 +332,22 @@ export default function StudioApp() {
   const beOpts = backends.map((b) => ({ value: b, label: metaFor(b).label }));
   const selStep = (bpRef.current.steps || []).find((s) => s.id === selNodeId) || null;
   const selRole = draft.roles.find((r) => r._key === selRoleKey) || null;
+  const curType = currentType == null ? null : draft.types.find((t) => t._key === currentType) || null;
+  const workerRoleNames = draft.roles.map((r) => r.name).filter((n) => n && n !== "manager");
 
   return (
     <div className="sd-root">
       <div className="sd-top">
         <span className="sd-badge">BLUEPRINT</span>
-        <span className="sd-name">Workflow Studio</span>
+        <select className="sd-switch" value={currentType == null ? "base" : "t" + currentType} onChange={onSwitcher}>
+          <option value="base">(default) workflow</option>
+          {draft.types.map((t) => (
+            <option key={t._key} value={"t" + t._key}>
+              {t.title || t.name || "(unnamed)"}
+            </option>
+          ))}
+          <option value="__new">＋ New workflow</option>
+        </select>
         <span className="sd-hint">drag a handle → handle to draw an arrow</span>
         <span className={"sd-dirty" + (dirty ? " on" : "")}>{saving ? "Saving…" : dirty ? "Unsaved config" : "Saved"}</span>
         <button className="sd-save" disabled={!dirty || saving} onClick={save}>
@@ -251,7 +359,6 @@ export default function StudioApp() {
       </div>
       {saveError ? <div className="sd-saveerr">{saveError}</div> : null}
       <div className="sd-body">
-        {/* CAST panel: the roles config.toml owns */}
         <div className="sd-cast">
           <div className="sd-cast-hd">
             <span>CAST · roles</span>
@@ -283,6 +390,7 @@ export default function StudioApp() {
 
         <div className="sd-canvas">
           <ReactFlow
+            key={wfKey}
             nodes={nodes}
             edges={edges}
             nodeTypes={nodeTypes}
@@ -305,14 +413,23 @@ export default function StudioApp() {
         </div>
 
         <div className="sd-insp">
+          {/* Default (nothing/goal selected) = the workflow settings, base or type. */}
           {selRole ? (
             <RoleForm role={selRole} backends={backends} error={errors[selRole._key]} onField={setRoleField} onToggleBackend={toggleRoleBackend} onRemove={removeRole} />
           ) : selStep ? (
             <StepForm step={selStep} beOpts={beOpts} onField={setStepField} onDelete={deleteStep} />
-          ) : selNodeId === "goal" ? (
-            <WorkflowForm wf={draft.workflow} beOpts={beOpts} onField={setWorkflowField} />
+          ) : curType ? (
+            <TypeForm
+              type={curType}
+              beOpts={beOpts}
+              roleNames={workerRoleNames}
+              error={errors["t" + curType._key]}
+              onField={setTypeField}
+              onToggleRole={toggleTypeRole}
+              onDelete={deleteType}
+            />
           ) : (
-            <div className="sd-empty">Select a step, the WORKFLOW node, or a role to edit it.</div>
+            <WorkflowForm wf={draft.workflow} beOpts={beOpts} onField={setWorkflowField} />
           )}
         </div>
       </div>
@@ -354,6 +471,7 @@ function WorkflowForm({ wf, beOpts, onField }) {
   return (
     <>
       <h3>WORKFLOW · base [workflow]</h3>
+      <div className="sd-note">Invoke: <code>agentpit workflow "&lt;goal&gt;"</code></div>
       <Field label="Manager backend">
         <Select value={wf.manager_backend} onChange={(v) => onField("manager_backend", v || "")} options={beOpts} placeholder="default backend" />
       </Field>
@@ -370,6 +488,68 @@ function WorkflowForm({ wf, beOpts, onField }) {
         <Toggle checked={!!wf.enable_ask_human} onChange={(v) => onField("enable_ask_human", v)} label="ask-human" />
       </div>
       <div className="sd-note">Saved to config.toml `[workflow]` on Save.</div>
+    </>
+  );
+}
+
+function TypeForm({ type, beOpts, roleNames, error, onField, onToggleRole, onDelete }) {
+  const t = type;
+  return (
+    <>
+      <h3>WORKFLOW TYPE · {t.title || t.name || "(unnamed)"}</h3>
+      <Field label="Workflow name">
+        <Text value={t.name} onChange={(v) => onField(t._key, "name", v.trim())} mono />
+      </Field>
+      {error ? <div className="sd-fielderr">{error}</div> : null}
+      <div className="sd-note">
+        Invoke: <code>agentpit workflow {t.name || "&lt;name&gt;"} "&lt;goal&gt;"</code>
+      </div>
+      <Field label="Display name (optional)">
+        <Text value={t.title} onChange={(v) => onField(t._key, "title", v)} placeholder="Strict code review" />
+      </Field>
+      <Field label="Brief (manager instruction for this workflow)">
+        <Area value={t.prompt} onChange={(v) => onField(t._key, "prompt", v)} rows={3} />
+      </Field>
+      <Field label="Description (when to use)">
+        <Area value={t.description} onChange={(v) => onField(t._key, "description", v)} rows={2} />
+      </Field>
+      <Field label="Roles used (none selected = all worker roles)">
+        {roleNames.length === 0 ? (
+          <div className="sd-empty">Add roles (the cast) first.</div>
+        ) : (
+          <div className="sd-chips">
+            {roleNames.map((rn) => (
+              <button key={rn} type="button" className={"sd-bchip" + (t.roles.includes(rn) ? " on" : "")} onClick={() => onToggleRole(t._key, rn)}>
+                {rn}
+              </button>
+            ))}
+          </div>
+        )}
+      </Field>
+      <div className="sd-note">Overrides below — empty = inherit base [workflow].</div>
+      <Field label="Manager backend (override)">
+        <Select value={t.manager_backend} onChange={(v) => onField(t._key, "manager_backend", v || "")} options={beOpts} placeholder="inherit" />
+      </Field>
+      <div className="sd-togglerow">
+        <Field label="Max depth">
+          <Num value={t.max_depth} min={1} placeholder="inherit" onChange={(v) => onField(t._key, "max_depth", v)} />
+        </Field>
+        <Field label="Max calls / manager">
+          <Num value={t.max_calls_per_manager} min={1} placeholder="inherit" onChange={(v) => onField(t._key, "max_calls_per_manager", v)} />
+        </Field>
+      </div>
+      <div className="sd-togglerow">
+        <Field label="Via MCP">
+          <TriState value={t.use_mcp} onChange={(v) => onField(t._key, "use_mcp", v)} />
+        </Field>
+        <Field label="Ask a human">
+          <TriState value={t.enable_ask_human} onChange={(v) => onField(t._key, "enable_ask_human", v)} />
+        </Field>
+      </div>
+      <button className="sd-danger" onClick={() => onDelete(t._key)}>
+        Delete this workflow
+      </button>
+      <div className="sd-note">Saved to config.toml `[workflow.types.{t.name || "…"}]` on Save.</div>
     </>
   );
 }

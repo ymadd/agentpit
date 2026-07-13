@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { seedBlueprint, deriveEdges, edgesFor } from "./blueprint.js";
+import { seedBlueprint, deriveEdges, edgesFor, workflowName } from "./blueprint.js";
 import { stepNodeData, metaFor } from "./backends.js";
 
 test("deriveEdges mirrors the vanilla default flow (goal→steps→ghost + spawn sub-flow)", () => {
@@ -17,10 +17,21 @@ test("deriveEdges mirrors the vanilla default flow (goal→steps→ghost + spawn
 
 test("edgesFor prefers stored edges over the derived seed", () => {
   const bp = seedBlueprint();
-  assert.equal(edgesFor(bp).length, 10); // none stored → derived
+  assert.equal(edgesFor(bp).length, 10); // no edges array → derived seed
   bp.edges = [{ id: "x", source: "goal", target: "s1", kind: "custom" }];
   assert.equal(edgesFor(bp).length, 1); // stored wins
   assert.equal(edgesFor(bp)[0].kind, "custom");
+  // regression: a deliberately-emptied edge set must persist as empty, not reseed
+  bp.edges = [];
+  assert.equal(edgesFor(bp).length, 0);
+});
+
+test("workflowName namespaces types so they never collide with base", () => {
+  assert.equal(workflowName(null), "base");
+  assert.equal(workflowName({ name: "review", _key: 1 }), "type.review");
+  assert.equal(workflowName({ name: "", _key: 7 }), "type-7"); // unnamed
+  // regression: a type literally named "base" must not share base's sketch
+  assert.notEqual(workflowName({ name: "base", _key: 2 }), "base");
 });
 
 test("stepNodeData resolves manager + role workers to visuals", () => {

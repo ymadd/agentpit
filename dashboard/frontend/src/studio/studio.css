@@ -28,6 +28,18 @@
 }
 .sd-top .sd-name { font-size: 14px; font-weight: 600; color: var(--text); }
 .sd-top .sd-hint { font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }
+.sd-top .sd-switch {
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  color: var(--text);
+  font-family: "IBM Plex Sans JP", system-ui, sans-serif;
+  font-size: 12px;
+  cursor: pointer;
+  max-width: 220px;
+}
+.sd-top .sd-switch:focus { outline: none; border-color: var(--ac-bd); }
 .sd-top .sd-close {
   margin-left: auto;
   padding: 5px 11px;

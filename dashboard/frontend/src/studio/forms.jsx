@@ -67,6 +67,22 @@ export function Select({ value, onChange, options, placeholder }) {
   );
 }
 
+// Tri-state override: inherit (null) / on (true) / off (false).
+export function TriState({ value, onChange }) {
+  const v = value === true ? "on" : value === false ? "off" : "";
+  return (
+    <select
+      className="sd-input"
+      value={v}
+      onChange={(e) => onChange(e.target.value === "on" ? true : e.target.value === "off" ? false : null)}
+    >
+      <option value="">inherit</option>
+      <option value="on">on</option>
+      <option value="off">off</option>
+    </select>
+  );
+}
+
 // Multi-select of backend ids as toggleable chips (order = selection order).
 export function BackendChips({ selected, all, onToggle }) {
   return (

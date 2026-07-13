@@ -6,13 +6,35 @@ export const ROLE_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 export const DEFAULT_MAX_DEPTH = 3;
 export const DEFAULT_MAX_CALLS = 8;
 export const DEFAULT_BACKENDS = ["claude", "codex", "gemini", "antigravity", "opencode"];
+export const DEFAULT_RESERVED_TYPE_NAMES = ["new", "list", "describe"];
 
 let roleKeySeq = 0;
+let typeKeySeq = 0;
+
+// A settings-draft type: knob overrides are null = inherit base (the vanilla
+// null-preserving convention), and _key/isNew are client-only (stripped on save).
+function typeFromConfig(t) {
+  return {
+    _key: ++typeKeySeq,
+    name: t.name || "",
+    title: t.title || "",
+    description: t.description || "",
+    prompt: t.prompt || "",
+    roles: [...(t.roles || [])],
+    manager_backend: t.manager_backend || "",
+    max_depth: t.max_depth ?? null,
+    max_calls_per_manager: t.max_calls_per_manager ?? null,
+    use_mcp: t.use_mcp == null ? null : !!t.use_mcp,
+    enable_ask_human: t.enable_ask_human == null ? null : !!t.enable_ask_human,
+    isNew: false,
+  };
+}
 
 export function draftFromSettings(data) {
   const wf = (data && data.workflow) || {};
   return {
     known_backends: (data && data.known_backends) || DEFAULT_BACKENDS,
+    reserved_type_names: (data && data.reserved_type_names) || DEFAULT_RESERVED_TYPE_NAMES,
     workflow: {
       manager_backend: wf.manager_backend || "",
       default_agents: wf.default_agents || [],
@@ -28,13 +50,39 @@ export function draftFromSettings(data) {
       prompt: r.prompt || "",
       model: r.model || "",
     })),
-    // Not edited in this slice — round-tripped unchanged so Save never drops them.
-    types: ((data && data.types) || []).map((t) => ({ ...t })),
+    types: ((data && data.types) || []).map(typeFromConfig),
   };
 }
 
 export function newRole() {
   return { _key: ++roleKeySeq, name: "", backends: [], prompt: "", model: "" };
+}
+
+export function newType() {
+  return {
+    _key: ++typeKeySeq,
+    name: "",
+    title: "",
+    description: "",
+    prompt: "",
+    roles: [],
+    manager_backend: "",
+    max_depth: null,
+    max_calls_per_manager: null,
+    use_mcp: null,
+    enable_ask_human: null,
+    isNew: true,
+  };
+}
+
+// Mirror of settings.rs valid_role_name + reserved-type rules (client hint; the
+// backend is the gate). Order matches the vanilla: empty → reserved → regex → dup.
+export function typeNameError(name, types, selfKey, reserved) {
+  if (!name) return "Enter a name";
+  if ((reserved || DEFAULT_RESERVED_TYPE_NAMES).includes(name)) return `'${name}' is reserved (an agentpit workflow subcommand)`;
+  if (!ROLE_NAME_RE.test(name)) return "Only lowercase letters, digits, - and _ (must start alphanumeric)";
+  if (types.some((t) => t._key !== selfKey && t.name === name)) return "This name is already in use";
+  return null;
 }
 
 export function roleNameError(name, roles, selfKey) {
@@ -49,6 +97,10 @@ export function validate(draft) {
   for (const r of draft.roles) {
     const m = roleNameError(r.name, draft.roles, r._key);
     if (m) errors[r._key] = m;
+  }
+  for (const t of draft.types || []) {
+    const m = typeNameError(t.name, draft.types, t._key, draft.reserved_type_names);
+    if (m) errors["t" + t._key] = m;
   }
   return { ok: Object.keys(errors).length === 0, errors };
 }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { draftFromSettings, validate, roleNameError, buildPayload, newRole, DEFAULT_MAX_DEPTH } from "./settings.js";
+import { draftFromSettings, validate, roleNameError, typeNameError, buildPayload, newRole, newType, DEFAULT_MAX_DEPTH } from "./settings.js";
 
 const raw = {
   known_backends: ["claude", "codex", "gemini"],
@@ -34,6 +34,25 @@ test("validate flags a duplicate role name", () => {
   draft.roles[1].name = "dup";
   assert.equal(validate(draft).ok, false);
   draft.roles[1].name = "other";
+  assert.equal(validate(draft).ok, true);
+});
+
+test("typeNameError enforces reserved names, regex, and uniqueness", () => {
+  const types = [{ _key: 1, name: "review" }, { _key: 2, name: "harden" }];
+  assert.equal(typeNameError("review", types, 1), null); // itself, ok
+  assert.equal(typeNameError("", types, 3), "Enter a name");
+  assert.ok(typeNameError("new", types, 3)); // reserved
+  assert.ok(typeNameError("list", types, 3)); // reserved
+  assert.ok(typeNameError("Bad Name", types, 3)); // regex
+  assert.ok(typeNameError("review", types, 3)); // duplicate
+});
+
+test("validate flags an invalid workflow type (unnamed / reserved)", () => {
+  const draft = { roles: [], types: [newType()] };
+  assert.equal(validate(draft).ok, false); // unnamed new type
+  draft.types[0].name = "describe";
+  assert.equal(validate(draft).ok, false); // reserved
+  draft.types[0].name = "code-review";
   assert.equal(validate(draft).ok, true);
 });
 

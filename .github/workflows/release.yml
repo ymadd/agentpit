@@ -103,6 +103,23 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: dashboard/frontend/package-lock.json
+
+      - name: Build dashboard frontend
+        # The dashboard's frontendDist is dashboard/frontend/dist — a Vite/React
+        # bundle. tauri-build embeds it at compile time (plain cargo build, no
+        # tauri-cli) and hard-fails if dist is missing, so it must be built
+        # BEFORE the cargo step below.
+        working-directory: dashboard/frontend
+        run: |
+          npm ci
+          npm run build
+
       - name: Build release binaries
         run: |
           cargo build -p agentpit --release --target ${{ matrix.target }} --locked

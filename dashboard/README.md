@@ -67,11 +67,12 @@ agentpit review src/
 
 ```
 dashboard/
-  ui/                 static frontend (index.html, style.css, app.js)
+  frontend/           Vite app (React island for the Workflow Studio + legacy
+                      vanilla dashboard in public/app.js); builds to frontend/dist
   src-tauri/
     src/main.rs        Tauri app: file watcher + pid liveness + `get_snapshot`
     src/state.rs       JSONL → run/member snapshot (mirrors the event wire format)
-    tauri.conf.json    points frontendDist at ../ui; withGlobalTauri for the JS API
+    tauri.conf.json    points frontendDist at ../frontend/dist; withGlobalTauri for the JS API
 ```
 
 The dashboard deliberately mirrors the event schema as strings rather than depending on

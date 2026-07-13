@@ -521,7 +521,7 @@ mod tests {
         );
     }
 
-    /// Pins the wire contract with dashboard/ui/app.js: the payload keys are snake_case
+    /// Pins the wire contract with dashboard/frontend/public/app.js: the payload keys are snake_case
     /// (`config_path`, `known_backends`, `manager_backend`, ...). The UI reads/writes these
     /// literal keys, so a serde rename here silently empties the settings panel — this test
     /// makes that drift a build failure instead.

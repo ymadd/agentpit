@@ -189,6 +189,7 @@ pub(crate) async fn run_capture(
         roster: roster.as_ref().map(|r| r.lines.as_str()),
         persona: manager_persona.as_deref(),
         brief: eff.brief.as_deref(),
+        flow: eff.flow.as_deref(),
     };
     let prompt = if mcp_mode {
         build_manager_prompt_mcp(
@@ -382,6 +383,9 @@ struct EffectiveWorkflow {
     role_filter: Option<Vec<String>>,
     /// The type's manager BRIEF (`[workflow.types.<name>].prompt`), injected into the prompt.
     brief: Option<String>,
+    /// The type's soft FLOW hint (`[workflow.types.<name>].flow`) — the sketched step order,
+    /// injected as a non-binding suggestion. `None` = no hint (base + unsketched types).
+    flow: Option<String>,
     /// The resolved type name, for the leader line. `None` = base workflow.
     type_name: Option<String>,
 }
@@ -403,6 +407,7 @@ fn resolve_workflow_type(
         enable_ask_human: section.enable_ask_human,
         role_filter: None,
         brief: None,
+        flow: None,
         type_name: None,
     };
     let Some(name) = type_name else {
@@ -425,6 +430,7 @@ fn resolve_workflow_type(
         enable_ask_human: t.enable_ask_human.unwrap_or(base.enable_ask_human),
         role_filter: (!t.roles.is_empty()).then(|| t.roles.clone()),
         brief: t.prompt.clone(),
+        flow: t.flow.clone(),
         type_name: Some(name.to_string()),
     })
 }
@@ -746,6 +752,9 @@ pub struct PromptRoles<'a> {
     pub persona: Option<&'a str>,
     /// The workflow BRIEF from `[workflow.types.<name>].prompt` (a selected named workflow).
     pub brief: Option<&'a str>,
+    /// The soft FLOW hint from `[workflow.types.<name>].flow` — the sketched step order, injected
+    /// as a NON-BINDING suggestion (the manager still improvises). `None` = no hint.
+    pub flow: Option<&'a str>,
 }
 
 /// The manager-persona block injected right below the orchestrator header, or empty.
@@ -765,6 +774,20 @@ fn brief_block(brief: Option<&str>) -> String {
     match brief {
         None => String::new(),
         Some(b) => format!("WORKFLOW BRIEF:\n{b}\n\n", b = b.trim()),
+    }
+}
+
+/// The soft FLOW-hint block (from `[workflow.types.<name>].flow`), or empty. A NON-BINDING
+/// suggestion of the step order the user sketched on the dashboard — the manager adapts it to the
+/// actual goal and stays model-driven (this is never a hard DAG). Sits just below the BRIEF.
+fn flow_hint_block(flow: Option<&str>) -> String {
+    match flow {
+        None => String::new(),
+        Some(f) if f.trim().is_empty() => String::new(),
+        Some(f) => format!(
+            "SUGGESTED FLOW (the user sketched this on the canvas — treat it as a hint, not a script; adapt freely to the goal):\n{f}\n\n",
+            f = f.trim()
+        ),
     }
 }
 
@@ -936,6 +959,7 @@ pub fn build_manager_prompt(
     };
     let persona = persona_block(roles.persona);
     let brief = brief_block(roles.brief);
+    let flow = flow_hint_block(roles.flow);
     format!(
         "=== AGENTPIT WORKFLOW ORCHESTRATOR ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
@@ -944,6 +968,7 @@ synthesis. Your LAST message MUST be the synthesis — do not stop after the las
 \n\
 {persona}\
 {brief}\
+{flow}\
 {roster_block}\
 \n\
 {grammar_block}\
@@ -1036,6 +1061,7 @@ pub fn build_manager_prompt_mcp(
     };
     let persona = persona_block(roles.persona);
     let brief = brief_block(roles.brief);
+    let flow = flow_hint_block(roles.flow);
     format!(
         "=== AGENTPIT WORKFLOW ORCHESTRATOR (MCP MODE) ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
@@ -1044,6 +1070,7 @@ synthesis. Your LAST message MUST be the synthesis — do not stop after the las
 \n\
 {persona}\
 {brief}\
+{flow}\
 {roster_block}\
 \n\
 {tools_block}\
@@ -1892,6 +1919,7 @@ goal\n";
             ),
             persona: None,
             brief: None,
+            flow: None,
         }
     }
 
@@ -1937,6 +1965,7 @@ goal\n";
             roster: None,
             persona: Some("Prefer small, verifiable steps.\n"),
             brief: None,
+            flow: None,
         };
         let shell = build_manager_prompt(
             "goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &roles);
@@ -1947,6 +1976,23 @@ goal\n";
             // Persona composes with the legacy roster (persona-only manager role).
             assert!(text.contains("AVAILABLE WORKER BACKENDS: gemini"));
         }
+    }
+
+    #[test]
+    fn flow_hint_block_is_injected_only_when_set() {
+        let agents = [BackendId::Gemini];
+        let with_flow = PromptRoles { flow: Some("diagnose → plan → implement"), ..Default::default() };
+        let shell = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &with_flow);
+        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &with_flow);
+        for text in [&shell, &mcp] {
+            assert!(text.contains("SUGGESTED FLOW"));
+            assert!(text.contains("diagnose → plan → implement"));
+            // the framing must stay SOFT — a hint, never a hard DAG
+            assert!(text.contains("hint, not a script"));
+        }
+        // Absent in the default path — this is what keeps the byte-identical goldens green.
+        let default_shell = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &PromptRoles::default());
+        assert!(!default_shell.contains("SUGGESTED FLOW"));
     }
 
     // ---- roles: roster + manager resolution helpers ----
@@ -2108,6 +2154,7 @@ goal\n";
                 max_calls_per_manager: None,
                 use_mcp: None,
                 enable_ask_human: Some(true),
+                flow: Some("diagnose → plan → implement".into()),
             },
         );
         s

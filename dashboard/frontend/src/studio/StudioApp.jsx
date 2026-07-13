@@ -13,7 +13,7 @@ import "@xyflow/react/dist/style.css";
 import StudioStepNode from "../StudioStepNode.jsx";
 import { WorkflowNode, GenStepNode, GhostNode } from "./nodes.jsx";
 import { stepNodeData, metaFor, resolveWorker } from "./backends.js";
-import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName, seedBlueprint } from "./blueprint.js";
+import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName, seedBlueprint, deriveFlow, hasBlueprint } from "./blueprint.js";
 import { draftFromSettings, validate, buildPayload, newRole, newType, typeNameError } from "./settings.js";
 import { loadSavedSteps, saveSavedSteps, stepTemplate, stepFromTemplate, maxStepSeq } from "./savedsteps.js";
 import { Field, Text, Area, Num, Toggle, Select, TriState, BackendChips } from "./forms.jsx";
@@ -309,9 +309,23 @@ export default function StudioApp() {
     setDraft((d) => ({ ...d, types: d.types.map((t) => (t._key === key ? { ...t, [field]: val } : t)) }));
     setDirty(true);
     if (field === "name" && key === currentType) {
-      // Keep the blueprint namespace in sync with the rename so canvas edits (and
-      // the switch-away save) land under the new name, not the stale key.
-      bpNameRef.current = workflowName({ _key: key, name: val });
+      // Keep the blueprint namespace in sync with the rename AND migrate the
+      // stored sketch to the new key, so the sketch (and its derived flow hint)
+      // follows the type instead of orphaning under the old name.
+      const newName = workflowName({ _key: key, name: val });
+      const oldName = bpNameRef.current;
+      if (oldName !== newName) {
+        try {
+          const raw = localStorage.getItem(blueprintKey(oldName));
+          if (raw != null) {
+            localStorage.setItem(blueprintKey(newName), raw);
+            localStorage.removeItem(blueprintKey(oldName));
+          }
+        } catch {
+          /* best-effort */
+        }
+        bpNameRef.current = newName;
+      }
     }
   };
   const toggleTypeRole = (key, roleName) =>
@@ -338,7 +352,20 @@ export default function StudioApp() {
     setSaveError(null);
     try {
       const invoke = window.__TAURI__?.core?.invoke;
-      if (invoke) await invoke("settings_save", { payload: buildPayload(draft) });
+      // Phase 4: recompute the soft flow hint ONLY for types the user actually
+      // sketched (a real localStorage blueprint). A config-authored type never
+      // opened in the canvas keeps its existing flow — we must NOT stamp the
+      // generic seed flow onto it (that would clobber a hand-authored flow and
+      // break "unset = no hint").
+      const withFlows = {
+        ...draft,
+        types: draft.types.map((t) => {
+          const name = workflowName(t);
+          if (!hasBlueprint(name)) return { ...t, flow: t.flow || "" }; // never sketched → preserve
+          return { ...t, flow: deriveFlow(t._key === currentType ? bpRef.current : loadBlueprint(name)) };
+        }),
+      };
+      if (invoke) await invoke("settings_save", { payload: buildPayload(withFlows) });
       setDirty(false);
       const data = invoke ? await invoke("settings_get") : null;
       if (data) {

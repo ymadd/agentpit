@@ -60,6 +60,21 @@ export function saveBlueprint(name, bp) {
   }
 }
 
+// True only when a REAL sketch is stored (vs loadBlueprint's seed fallback). Used
+// so Save derives a flow hint ONLY for workflows the user actually drew — a
+// config-authored type never opened in the canvas must keep "unset = no hint",
+// not silently get the generic seed flow stamped onto it.
+export function hasBlueprint(name) {
+  try {
+    const raw = localStorage.getItem(blueprintKey(name));
+    if (!raw) return false;
+    const p = JSON.parse(raw);
+    return !!(p && Array.isArray(p.steps) && p.goal);
+  } catch {
+    return false;
+  }
+}
+
 // The illustrative default flow, used to seed edges when the sketch has none:
 // goal → each step in order → ghost, with the self-spawn step feeding its
 // gensteps and returning to the next step. Once the user draws their own arrows
@@ -90,4 +105,30 @@ export function edgesFor(bp) {
   // honour it, including a deliberately-emptied set. Only seed the default flow
   // when no edges have ever been drawn (edges undefined).
   return Array.isArray(bp.edges) ? bp.edges : deriveEdges(bp);
+}
+
+// Phase 4: distil the drawn edges into a prose "flow" — the STEP names in the
+// order they're reached from the goal. This is the soft ordering hint written to
+// [workflow.types.*].flow and injected into the manager brief ("you sketched
+// this; adapt freely"). Returns "" when there are no steps.
+export function deriveFlow(bp) {
+  const steps = new Map((bp.steps || []).map((s) => [s.id, s]));
+  if (steps.size === 0) return "";
+  const next = new Map();
+  for (const e of edgesFor(bp)) {
+    if (!next.has(e.source)) next.set(e.source, []);
+    next.get(e.source).push(e.target);
+  }
+  const seen = new Set();
+  const order = [];
+  const visit = (id) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    if (steps.has(id)) order.push(steps.get(id).name || "step");
+    for (const nx of next.get(id) || []) visit(nx);
+  };
+  visit("goal");
+  // any steps not reachable from the goal (orphans) trail in array order
+  for (const s of bp.steps || []) if (!seen.has(s.id)) order.push(s.name || "step");
+  return order.join(" → ");
 }

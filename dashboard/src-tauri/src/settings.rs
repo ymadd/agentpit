@@ -101,6 +101,9 @@ pub struct WorkflowTypeEntry {
     pub use_mcp: Option<bool>,
     #[serde(default)]
     pub enable_ask_human: Option<bool>,
+    /// Soft flow hint (sketched step order) — written to `[workflow.types.<name>].flow`.
+    #[serde(default)]
+    pub flow: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +222,7 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
                         .map(|n| n.max(0) as u32),
                     use_mcp: item.get("use_mcp").and_then(Item::as_bool),
                     enable_ask_human: item.get("enable_ask_human").and_then(Item::as_bool),
+                    flow: item.get("flow").and_then(Item::as_str).map(str::to_string),
                 });
             }
         }
@@ -423,6 +427,11 @@ fn apply_workflow(doc: &mut DocumentMut, payload: &SettingsSave) {
         }
         if let Some(v) = t.enable_ask_human {
             tt["enable_ask_human"] = value(v);
+        }
+        if let Some(v) = &t.flow {
+            if !v.trim().is_empty() {
+                tt["flow"] = value(v.clone());
+            }
         }
         types_table[&t.name] = Item::Table(tt);
     }
@@ -715,6 +724,7 @@ max_depth = 5
                     max_calls_per_manager: None,
                     use_mcp: None,
                     enable_ask_human: Some(true),
+                    flow: Some("audit → refute".into()),
                 },
                 // A minimal type: just a brief, no roles/knobs — must not emit empty keys.
                 WorkflowTypeEntry {
@@ -728,6 +738,7 @@ max_depth = 5
                     max_calls_per_manager: None,
                     use_mcp: None,
                     enable_ask_human: None,
+                    flow: None,
                 },
             ],
             workflow: WorkflowPayload::default(),
@@ -782,6 +793,7 @@ max_depth = 5
                 max_calls_per_manager: None,
                 use_mcp: None,
                 enable_ask_human: None,
+                flow: None,
             }],
             workflow: WorkflowPayload::default(),
             roles: vec![],

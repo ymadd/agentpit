@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { seedBlueprint, deriveEdges, edgesFor, workflowName } from "./blueprint.js";
+import { seedBlueprint, deriveEdges, edgesFor, workflowName, deriveFlow } from "./blueprint.js";
 import { stepNodeData, metaFor } from "./backends.js";
 
 test("deriveEdges mirrors the vanilla default flow (goal→steps→ghost + spawn sub-flow)", () => {
@@ -24,6 +24,20 @@ test("edgesFor prefers stored edges over the derived seed", () => {
   // regression: a deliberately-emptied edge set must persist as empty, not reseed
   bp.edges = [];
   assert.equal(edgesFor(bp).length, 0);
+});
+
+test("deriveFlow distils the drawn edges into an ordered step sequence", () => {
+  // seed flow follows goal→s1→…→s5 (spawn sub-flow doesn't reorder the main steps)
+  assert.equal(deriveFlow(seedBlueprint()), "Diagnose → Plan → Implement → Review → Integrate");
+  // custom edges reorder the flow: reachable-from-goal first (in edge order),
+  // then any unreached steps trail in array order
+  const bp = seedBlueprint();
+  bp.edges = [
+    { id: "e1", source: "goal", target: "s2" },
+    { id: "e2", source: "s2", target: "s1" },
+  ];
+  assert.equal(deriveFlow(bp), "Plan → Diagnose → Implement → Review → Integrate");
+  assert.equal(deriveFlow({ steps: [] }), "");
 });
 
 test("workflowName namespaces types so they never collide with base", () => {

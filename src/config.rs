@@ -187,6 +187,12 @@ pub struct WorkflowType {
     pub use_mcp: Option<bool>,
     #[serde(default)]
     pub enable_ask_human: Option<bool>,
+    /// A soft "suggested flow" for this type — the ordered step names the user sketched on the
+    /// dashboard canvas (distilled from the drawn edges). Injected into the manager prompt as a
+    /// non-binding hint ("you sketched this; adapt freely"); the manager still improvises. Unset =
+    /// no flow hint (the default). Never a hard DAG — this stays model-driven.
+    #[serde(default)]
+    pub flow: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

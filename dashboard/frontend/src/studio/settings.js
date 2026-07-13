@@ -26,6 +26,8 @@ function typeFromConfig(t) {
     max_calls_per_manager: t.max_calls_per_manager ?? null,
     use_mcp: t.use_mcp == null ? null : !!t.use_mcp,
     enable_ask_human: t.enable_ask_human == null ? null : !!t.enable_ask_human,
+    // Phase 4: soft flow hint (derived from the drawn edges; recomputed on Save).
+    flow: t.flow || "",
     isNew: false,
   };
 }
@@ -132,6 +134,7 @@ export function buildPayload(draft) {
       max_calls_per_manager: t.max_calls_per_manager ?? null,
       use_mcp: t.use_mcp ?? null,
       enable_ask_human: t.enable_ask_human ?? null,
+      flow: t.flow && t.flow.trim() ? t.flow : null,
     })),
   };
 }

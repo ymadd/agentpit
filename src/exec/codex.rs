@@ -1,4 +1,4 @@
-use super::{AutonomyLevel, ExecAdapter, ExecSpec};
+use super::{AutonomyLevel, ExecAdapter, ExecSpec, StreamFormat};
 use crate::types::BackendId;
 
 pub struct CodexExec;
@@ -9,7 +9,11 @@ impl ExecAdapter for CodexExec {
     }
 
     fn build_spec(&self, task: &str, model: Option<&str>) -> ExecSpec {
-        let mut args = vec!["exec".into(), "--skip-git-repo-check".into()];
+        let mut args = vec![
+            "exec".into(),
+            "--skip-git-repo-check".into(),
+            "--json".into(),
+        ];
         if let Some(m) = model {
             // codex exec: `--model <id>` (also `-m`).
             args.push("--model".into());
@@ -22,6 +26,10 @@ impl ExecAdapter for CodexExec {
             env: Vec::new(),
             stdin_input: Some(task.to_string()),
         }
+    }
+
+    fn stream_format(&self) -> StreamFormat {
+        StreamFormat::CodexJsonl
     }
 
     fn autonomy(&self) -> AutonomyLevel {
@@ -39,7 +47,11 @@ mod tests {
     fn passes_task_via_stdin() {
         let spec = CodexExec.build_spec("summarize file", None);
         assert_eq!(spec.command, "codex");
-        assert_eq!(spec.args, vec!["exec", "--skip-git-repo-check", "-"]);
+        assert_eq!(
+            spec.args,
+            vec!["exec", "--skip-git-repo-check", "--json", "-"]
+        );
+        assert_eq!(CodexExec.stream_format(), StreamFormat::CodexJsonl);
         assert_eq!(spec.stdin_input.as_deref(), Some("summarize file"));
     }
 
@@ -51,6 +63,7 @@ mod tests {
             vec![
                 "exec",
                 "--skip-git-repo-check",
+                "--json",
                 "--model",
                 "gpt-5-codex",
                 "-"

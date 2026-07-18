@@ -3,11 +3,13 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::types::BackendId;
+
+use super::stream::{DecodedChunk, StreamDecoder, StreamFormat};
 
 /// Hard cap on how much stdout/stderr we retain in memory per backend run. A wedged or
 /// runaway backend can emit unbounded output; we keep streaming chunks to the caller
@@ -44,6 +46,7 @@ pub async fn run_spec(
     id: BackendId,
     spec: ExecSpec,
     options: ExecRunOptions,
+    stream_format: StreamFormat,
 ) -> Result<ExecOutcome> {
     let mut cmd = Command::new(&spec.command);
     cmd.args(&spec.args)
@@ -90,29 +93,56 @@ pub async fn run_spec(
 
     let on_stdout = options.on_stdout.clone();
     let stdout_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout);
         let mut collected = String::new();
         let mut truncated = false;
-        let mut buf = Vec::with_capacity(1024);
-        loop {
-            buf.clear();
-            let n = reader.read_until(b'\n', &mut buf).await?;
-            if n == 0 {
-                break;
+        let mut decoder = StreamDecoder::new(stream_format);
+
+        if stream_format == StreamFormat::Text {
+            // Human-readable CLIs do not necessarily flush on newline boundaries. Read arbitrary
+            // bytes so Antigravity's `--print` output can appear as soon as the process writes it,
+            // while retaining an incomplete UTF-8 sequence until the next read.
+            let mut stdout = stdout;
+            let mut read_buf = [0_u8; 4096];
+            let mut pending = Vec::new();
+            loop {
+                let n = stdout.read(&mut read_buf).await?;
+                if n == 0 {
+                    break;
+                }
+                pending.extend_from_slice(&read_buf[..n]);
+                drain_valid_utf8(
+                    &mut pending,
+                    false,
+                    &on_stdout,
+                    &mut collected,
+                    &mut truncated,
+                );
             }
-            let chunk = String::from_utf8_lossy(&buf).into_owned();
-            // Keep streaming every chunk to the caller, but stop growing the in-memory
-            // buffer once it exceeds the cap so a runaway backend can't OOM the hub. We
-            // still drain to EOF so the child never blocks on a full stdout pipe.
-            if let Some(cb) = &on_stdout {
-                cb(&chunk);
+            drain_valid_utf8(
+                &mut pending,
+                true,
+                &on_stdout,
+                &mut collected,
+                &mut truncated,
+            );
+        } else {
+            let mut reader = BufReader::new(stdout);
+            let mut buf = Vec::with_capacity(1024);
+            loop {
+                buf.clear();
+                let n = reader.read_until(b'\n', &mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                let chunk = String::from_utf8_lossy(&buf).into_owned();
+                consume_decoded(
+                    decoder.decode_line(&chunk),
+                    &on_stdout,
+                    &mut collected,
+                    &mut truncated,
+                );
             }
-            if collected.len() < MAX_CAPTURED_BYTES {
-                collected.push_str(&chunk);
-            } else if !truncated {
-                truncated = true;
-                collected.push_str("\n[output truncated: exceeded capture limit]\n");
-            }
+            consume_decoded(decoder.finish(), &on_stdout, &mut collected, &mut truncated);
         }
         Ok::<String, std::io::Error>(collected)
     });
@@ -148,11 +178,13 @@ pub async fn run_spec(
 
     let code = exit_status.code();
     if !exit_status.success() {
-        let detail = if stderr_text.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\nstderr: {}", stderr_text.trim())
-        };
+        let mut detail = String::new();
+        if !stdout_text.trim().is_empty() {
+            detail.push_str(&format!("\nstdout: {}", stdout_text.trim()));
+        }
+        if !stderr_text.trim().is_empty() {
+            detail.push_str(&format!("\nstderr: {}", stderr_text.trim()));
+        }
         return Err(anyhow!(
             "{} exited with code {}{detail}",
             id,
@@ -165,6 +197,98 @@ pub async fn run_spec(
         output: stdout_text,
         exit_code: code,
     })
+}
+
+fn drain_valid_utf8(
+    pending: &mut Vec<u8>,
+    eof: bool,
+    on_stdout: &Option<OutputSink>,
+    collected: &mut String,
+    truncated: &mut bool,
+) {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                if !text.is_empty() {
+                    consume_decoded(
+                        DecodedChunk {
+                            display: Some(text.to_string()),
+                            answer: Some(text.to_string()),
+                        },
+                        on_stdout,
+                        collected,
+                        truncated,
+                    );
+                }
+                pending.clear();
+                return;
+            }
+            Err(error) if error.valid_up_to() > 0 => {
+                let valid = error.valid_up_to();
+                let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                pending.drain(..valid);
+                consume_decoded(
+                    DecodedChunk {
+                        display: Some(text.clone()),
+                        answer: Some(text),
+                    },
+                    on_stdout,
+                    collected,
+                    truncated,
+                );
+            }
+            Err(error) if error.error_len().is_some() || eof => {
+                let invalid_len = error.error_len().unwrap_or(pending.len()).max(1);
+                let end = invalid_len.min(pending.len());
+                let text = String::from_utf8_lossy(&pending[..end]).into_owned();
+                pending.drain(..end);
+                consume_decoded(
+                    DecodedChunk {
+                        display: Some(text.clone()),
+                        answer: Some(text),
+                    },
+                    on_stdout,
+                    collected,
+                    truncated,
+                );
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn consume_decoded(
+    chunk: DecodedChunk,
+    on_stdout: &Option<OutputSink>,
+    collected: &mut String,
+    truncated: &mut bool,
+) {
+    if let Some(display) = chunk.display
+        && let Some(cb) = on_stdout
+    {
+        cb(&display);
+    }
+
+    let Some(answer) = chunk.answer else {
+        return;
+    };
+    if collected.len() < MAX_CAPTURED_BYTES {
+        let remaining = MAX_CAPTURED_BYTES - collected.len();
+        if answer.len() <= remaining {
+            collected.push_str(&answer);
+        } else {
+            let mut end = remaining;
+            while end > 0 && !answer.is_char_boundary(end) {
+                end -= 1;
+            }
+            collected.push_str(&answer[..end]);
+            *truncated = true;
+            collected.push_str("\n[output truncated: exceeded capture limit]\n");
+        }
+    } else if !*truncated {
+        *truncated = true;
+        collected.push_str("\n[output truncated: exceeded capture limit]\n");
+    }
 }
 
 #[cfg(test)]
@@ -193,12 +317,29 @@ mod tests {
                 on_stdout: None,
                 model: None,
             },
+            StreamFormat::Text,
         )
         .await
         .unwrap()
         .output
         .trim()
         .to_string()
+    }
+
+    #[test]
+    fn raw_text_stream_holds_incomplete_utf8_until_the_next_chunk() {
+        let mut pending = vec![0xe3, 0x81];
+        let mut collected = String::new();
+        let mut truncated = false;
+        drain_valid_utf8(&mut pending, false, &None, &mut collected, &mut truncated);
+        assert!(collected.is_empty());
+        assert_eq!(pending, vec![0xe3, 0x81]);
+
+        pending.push(0x82);
+        drain_valid_utf8(&mut pending, false, &None, &mut collected, &mut truncated);
+        assert_eq!(collected, "あ");
+        assert!(pending.is_empty());
+        assert!(!truncated);
     }
 
     // R3 worker-isolation fix: the parent (this test process, standing in for the manager) has

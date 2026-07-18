@@ -1,4 +1,4 @@
-use super::{AutonomyLevel, ExecAdapter, ExecSpec};
+use super::{AutonomyLevel, ExecAdapter, ExecSpec, StreamFormat};
 use crate::types::BackendId;
 
 pub struct GeminiExec;
@@ -13,7 +13,7 @@ impl ExecAdapter for GeminiExec {
             "--yolo".into(),
             "--skip-trust".into(),
             "--output-format".into(),
-            "text".into(),
+            "stream-json".into(),
         ];
         if let Some(m) = model {
             // gemini CLI: `-m <model>` (also `--model`).
@@ -28,6 +28,10 @@ impl ExecAdapter for GeminiExec {
             env: Vec::new(),
             stdin_input: None,
         }
+    }
+
+    fn stream_format(&self) -> StreamFormat {
+        StreamFormat::GeminiJsonl
     }
 
     fn autonomy(&self) -> AutonomyLevel {
@@ -46,6 +50,8 @@ mod tests {
         assert_eq!(spec.command, "gemini");
         assert!(spec.args.iter().any(|a| a == "--yolo"));
         assert!(spec.args.iter().any(|a| a == "--skip-trust"));
+        assert!(spec.args.iter().any(|a| a == "stream-json"));
+        assert_eq!(GeminiExec.stream_format(), StreamFormat::GeminiJsonl);
         assert_eq!(spec.args.last().unwrap(), "hello world");
         assert!(spec.stdin_input.is_none());
         assert!(!spec.args.iter().any(|a| a == "-m"));

@@ -67,6 +67,13 @@ agentpit init --scope user
 
 Each backend's transport (`exec` per-request or `acp` persistent session) can be overridden in `config.toml`.
 
+Backend output is streamed to the terminal and dashboard without exposing provider-specific
+framing. Claude Code (`stream-json` partial messages), Gemini CLI (`stream-json` message events),
+and Codex (`exec --json`) are decoded into clean text plus live tool progress; OpenCode already
+streams text through ACP. Antigravity currently has no documented structured stream, so its
+`--print` stdout remains a best-effort byte stream. Aggregators receive only the decoded answer —
+never JSONL or progress lines.
+
 ### Installing the backends
 
 - **Gemini CLI** — `npm i -g @google/gemini-cli` (deprecated June 18 2026)

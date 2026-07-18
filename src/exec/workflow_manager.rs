@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::{AutonomyLevel, ExecAdapter, ExecSpec};
+use super::{AutonomyLevel, ExecAdapter, ExecSpec, StreamFormat};
 use crate::types::BackendId;
 
 /// Manager exec adapter. Holds the resolved manager backend and the guard env to inject.
@@ -106,7 +106,9 @@ impl ExecAdapter for WorkflowManagerExec {
                 let mut args = vec![
                     "--print".into(),
                     "--output-format".into(),
-                    "text".into(),
+                    "stream-json".into(),
+                    "--include-partial-messages".into(),
+                    "--verbose".into(),
                     "--permission-mode".into(),
                     "bypassPermissions".into(),
                 ];
@@ -152,6 +154,7 @@ impl ExecAdapter for WorkflowManagerExec {
                 let mut args = vec![
                     "exec".into(),
                     "--skip-git-repo-check".into(),
+                    "--json".into(),
                     "--sandbox".into(),
                     "danger-full-access".into(),
                 ];
@@ -171,6 +174,17 @@ impl ExecAdapter for WorkflowManagerExec {
             // managers above. Every other backend must be rejected by `is_supported_manager`
             // before this adapter is ever constructed; reaching here means that gate was
             // bypassed, so fail loudly rather than silently mis-classifying as codex.
+            other => unreachable!(
+                "WorkflowManagerExec built with unsupported manager backend {other:?}; \
+                 call is_supported_manager() before constructing this adapter"
+            ),
+        }
+    }
+
+    fn stream_format(&self) -> StreamFormat {
+        match self.backend {
+            BackendId::Claude => StreamFormat::ClaudeJsonl,
+            BackendId::Codex => StreamFormat::CodexJsonl,
             other => unreachable!(
                 "WorkflowManagerExec built with unsupported manager backend {other:?}; \
                  call is_supported_manager() before constructing this adapter"
@@ -210,6 +224,12 @@ mod tests {
         let spec = exec(BackendId::Claude).build_spec("drive the workflow", None);
         assert_eq!(spec.command, "claude");
         assert!(spec.args.iter().any(|a| a == "bypassPermissions"));
+        assert!(spec.args.iter().any(|a| a == "stream-json"));
+        assert!(spec.args.iter().any(|a| a == "--include-partial-messages"));
+        assert_eq!(
+            exec(BackendId::Claude).stream_format(),
+            StreamFormat::ClaudeJsonl
+        );
         assert!(spec.args.iter().any(|a| a == "--allowedTools"));
         assert!(spec.args.iter().any(|a| a == "Bash"));
         // CLI mode must NOT carry any MCP wiring.
@@ -272,6 +292,11 @@ mod tests {
         let spec = exec(BackendId::Codex).build_spec("drive the workflow", None);
         assert_eq!(spec.command, "codex");
         assert!(spec.args.iter().any(|a| a == "danger-full-access"));
+        assert!(spec.args.iter().any(|a| a == "--json"));
+        assert_eq!(
+            exec(BackendId::Codex).stream_format(),
+            StreamFormat::CodexJsonl
+        );
         assert_eq!(spec.stdin_input.as_deref(), Some("drive the workflow"));
         assert!(
             spec.env

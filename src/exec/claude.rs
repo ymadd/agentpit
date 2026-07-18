@@ -1,4 +1,4 @@
-use super::{AutonomyLevel, ExecAdapter, ExecSpec};
+use super::{AutonomyLevel, ExecAdapter, ExecSpec, StreamFormat};
 use crate::types::BackendId;
 
 pub struct ClaudeExec;
@@ -12,7 +12,9 @@ impl ExecAdapter for ClaudeExec {
         let mut args = vec![
             "--print".into(),
             "--output-format".into(),
-            "text".into(),
+            "stream-json".into(),
+            "--include-partial-messages".into(),
+            "--verbose".into(),
             "--permission-mode".into(),
             "acceptEdits".into(),
         ];
@@ -30,6 +32,10 @@ impl ExecAdapter for ClaudeExec {
         }
     }
 
+    fn stream_format(&self) -> StreamFormat {
+        StreamFormat::ClaudeJsonl
+    }
+
     fn autonomy(&self) -> AutonomyLevel {
         // `--permission-mode acceptEdits` auto-accepts edits without prompting.
         AutonomyLevel::FullAutonomy
@@ -45,7 +51,11 @@ mod tests {
         let spec = ClaudeExec.build_spec("write a haiku", None);
         assert_eq!(spec.command, "claude");
         assert!(spec.args.iter().any(|a| a == "--print"));
+        assert!(spec.args.iter().any(|a| a == "stream-json"));
+        assert!(spec.args.iter().any(|a| a == "--include-partial-messages"));
+        assert!(spec.args.iter().any(|a| a == "--verbose"));
         assert!(spec.args.iter().any(|a| a == "acceptEdits"));
+        assert_eq!(ClaudeExec.stream_format(), StreamFormat::ClaudeJsonl);
         assert_eq!(spec.args.last().unwrap(), "write a haiku");
         assert!(spec.stdin_input.is_none());
         // No model → no --model flag (byte-identical to the pre-model spec).

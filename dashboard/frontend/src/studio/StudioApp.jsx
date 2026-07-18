@@ -274,9 +274,13 @@ export default function StudioApp() {
     }
   };
 
-  // ── config edits (roles / workflow knobs / types — dirty, saved) ────────────
+  // ── config edits (roles / workflow knobs / types / backend models — dirty, saved) ──
   const setWorkflowField = (key, val) => {
     setDraft((d) => ({ ...d, workflow: { ...d.workflow, [key]: val } }));
+    setDirty(true);
+  };
+  const setBackendModel = (backend, model) => {
+    setDraft((d) => ({ ...d, backend_models: { ...d.backend_models, [backend]: model } }));
     setDirty(true);
   };
   const setRoleField = (key, field, val) => {
@@ -704,7 +708,14 @@ export default function StudioApp() {
               onDelete={deleteType}
             />
           ) : (
-            <WorkflowForm wf={draft.workflow} beOpts={beOpts} onField={setWorkflowField} />
+            <WorkflowForm
+              wf={draft.workflow}
+              backends={backends}
+              backendModels={draft.backend_models}
+              beOpts={beOpts}
+              onField={setWorkflowField}
+              onBackendModel={setBackendModel}
+            />
           )}
         </div>
       </div>
@@ -796,7 +807,7 @@ function StepForm({ step, beOpts, roles, onField, onDelete, onRemoveWorker, onSa
   );
 }
 
-function WorkflowForm({ wf, beOpts, onField }) {
+function WorkflowForm({ wf, backends, backendModels, beOpts, onField, onBackendModel }) {
   return (
     <>
       <h3>{tr("WORKFLOW · base [workflow]")}</h3>
@@ -816,7 +827,23 @@ function WorkflowForm({ wf, beOpts, onField }) {
         <Toggle checked={!!wf.use_mcp} onChange={(v) => onField("use_mcp", v)} label={tr("use MCP")} />
         <Toggle checked={!!wf.enable_ask_human} onChange={(v) => onField("enable_ask_human", v)} label={tr("ask-human")} />
       </div>
-      <div className="sd-note">{tr("Saved to config.toml `[workflow]` on Save.")}</div>
+      <div className="sd-section-title">{tr("BACKEND MODELS")}</div>
+      <div className="sd-note sd-note-before">
+        {tr("Empty uses each CLI's own default. Role and --model overrides still take precedence.")}
+      </div>
+      <div className="sd-model-list">
+        {backends.map((backend) => (
+          <Field key={backend} label={metaFor(backend).label} mono>
+            <Text
+              value={backendModels?.[backend] || ""}
+              onChange={(value) => onBackendModel(backend, value)}
+              placeholder={tr("CLI default")}
+              mono
+            />
+          </Field>
+        ))}
+      </div>
+      <div className="sd-note">{tr("Saved to config.toml `[workflow]` and `[backends.*].model` on Save.")}</div>
     </>
   );
 }

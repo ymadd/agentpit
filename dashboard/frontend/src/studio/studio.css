@@ -323,3 +323,14 @@
 }
 .sd-note { margin-top: 10px; font-size: 10px; line-height: 1.5; color: var(--faint); }
 .sd-fielderr { margin: -6px 0 10px; font-size: 11px; color: #f08a98; }
+.sd-section-title {
+  margin: 18px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-2);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--ac-tx);
+}
+.sd-note.sd-note-before { margin: 5px 0 10px; }
+.sd-model-list .sd-field { margin-bottom: 8px; }

@@ -4,6 +4,7 @@ import { draftFromSettings, validate, roleNameError, typeNameError, buildPayload
 
 const raw = {
   known_backends: ["claude", "codex", "gemini"],
+  backend_models: { claude: "claude-fable-5", codex: null, gemini: "gemini-3-pro" },
   workflow: { manager_backend: "claude", max_depth: 4, max_calls_per_manager: 10, use_mcp: true, enable_ask_human: false },
   roles: [{ name: "coder", backends: ["codex"], prompt: "be precise", model: "gpt-5-codex" }],
   types: [{ name: "review", title: "Review", roles: ["coder"], max_depth: 2 }],
@@ -16,6 +17,8 @@ test("draftFromSettings makes an editable draft with defaults", () => {
   assert.equal(d.roles.length, 1);
   assert.ok(typeof d.roles[0]._key === "number");
   assert.equal(d.roles[0].model, "gpt-5-codex");
+  assert.equal(d.backend_models.claude, "claude-fable-5");
+  assert.equal(d.backend_models.codex, "");
   // an empty config still gets sane knob defaults
   assert.equal(draftFromSettings({}).workflow.max_depth, DEFAULT_MAX_DEPTH);
 });
@@ -60,10 +63,16 @@ test("buildPayload matches the settings_save contract (nulls, round-tripped type
   const p = buildPayload(draftFromSettings(raw));
   assert.equal(p.workflow.manager_backend, "claude");
   assert.equal(p.workflow.max_depth, 4);
+  assert.deepEqual(p.backend_models, {
+    claude: "claude-fable-5",
+    codex: null,
+    gemini: "gemini-3-pro",
+  });
   assert.deepEqual(p.roles[0], { name: "coder", backends: ["codex"], prompt: "be precise", model: "gpt-5-codex" });
   // empty model → null
   const d2 = draftFromSettings({ roles: [{ name: "r", backends: [], prompt: "" }] });
   assert.equal(buildPayload(d2).roles[0].model, null);
+  assert.ok(Object.values(buildPayload(d2).backend_models).every((model) => model === null));
   // types survive Save unchanged
   assert.equal(p.types[0].name, "review");
   assert.equal(p.types[0].max_depth, 2);

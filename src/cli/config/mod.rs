@@ -20,7 +20,7 @@ pub enum Action {
         #[arg(long)]
         force: bool,
     },
-    /// Set a backend's transport (exec/acp). Launches an interactive picker.
+    /// Set a backend's transport and default model. Launches interactive prompts.
     Backend {
         /// Backend to configure.
         id: BackendId,

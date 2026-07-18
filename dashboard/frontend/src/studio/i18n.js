@@ -80,7 +80,11 @@ export const JA = {
   "Max calls / manager": "最大呼び出し数／マネージャー",
   "use MCP": "MCP を使用",
   "ask-human": "人に確認",
-  "Saved to config.toml `[workflow]` on Save.": "保存時に config.toml の `[workflow]` に書き込まれます。",
+  "BACKEND MODELS": "バックエンドモデル",
+  "Empty uses each CLI's own default. Role and --model overrides still take precedence.":
+    "空欄では各 CLI の既定モデルを使用します。ロールおよび --model 指定が引き続き優先されます。",
+  "CLI default": "CLI の既定値",
+  "Saved to config.toml `[workflow]` and `[backends.*].model` on Save.": "保存時に config.toml の `[workflow]` と `[backends.*].model` に書き込まれます。",
   // type form
   "WORKFLOW TYPE ·": "ワークフロータイプ ·",
   "Workflow name": "ワークフロー名",

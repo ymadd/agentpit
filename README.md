@@ -176,7 +176,7 @@ Environment variables in string values are expanded as `${VAR}`.
 ```bash
 agentpit config show
 agentpit config init [--force]
-agentpit config backend antigravity          # interactive transport picker
+agentpit config backend antigravity          # interactive transport + default-model settings
 agentpit config route review --backend agy   # set per-tool default
 agentpit config ensemble review              # edit members + aggregator
 ```

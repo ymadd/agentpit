@@ -1,4 +1,4 @@
-//! Read/write `[workflow]` + `[workflow.roles]` in the user's `config.toml`.
+//! Read/write workflow settings and per-backend model defaults in the user's `config.toml`.
 //!
 //! The dashboard crate does not depend on the main `agentpit` crate, so the tiny
 //! config-path rule is duplicated here (kept in sync with
@@ -6,9 +6,11 @@
 //! `$XDG_CONFIG_HOME/agentpit/config.toml`, else `~/.config/agentpit/config.toml`.
 //!
 //! Parsing uses `toml_edit` (not `toml`) so `settings_save` can rewrite only the
-//! `[workflow]` scalars and replace `[workflow.roles]` wholesale while leaving every
-//! other table/comment in the file byte-for-byte untouched.
+//! `[workflow]` scalars, replace `[workflow.roles]` wholesale, and update only the `model`
+//! key under `[backends.<id>]` while leaving unrelated tables, backend transports, and comments
+//! untouched.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -113,6 +115,8 @@ pub struct SettingsPayload {
     pub workflow: WorkflowPayload,
     pub roles: Vec<RoleEntry>,
     pub types: Vec<WorkflowTypeEntry>,
+    /// Per-backend default model. A null value means the backend CLI chooses its own default.
+    pub backend_models: BTreeMap<String, Option<String>>,
     pub known_backends: Vec<String>,
     pub reserved_type_names: Vec<String>,
 }
@@ -123,6 +127,10 @@ pub struct SettingsSave {
     pub roles: Vec<RoleEntry>,
     #[serde(default)]
     pub types: Vec<WorkflowTypeEntry>,
+    /// Only keys sent by the client are changed. An omitted/empty map preserves every existing
+    /// backend model, keeping older dashboard frontends forward-compatible with this contract.
+    #[serde(default)]
+    pub backend_models: BTreeMap<String, Option<String>>,
 }
 
 fn known_backends() -> Vec<String> {
@@ -154,6 +162,20 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
     let mut workflow = WorkflowPayload::default();
     let mut roles = Vec::new();
     let mut types = Vec::new();
+    let backend_models = known_backends()
+        .into_iter()
+        .map(|backend| {
+            let model = doc
+                .get("backends")
+                .and_then(Item::as_table_like)
+                .and_then(|backends| backends.get(&backend))
+                .and_then(Item::as_table_like)
+                .and_then(|entry| entry.get("model"))
+                .and_then(Item::as_str)
+                .map(str::to_string);
+            (backend, model)
+        })
+        .collect();
 
     if let Some(wf) = doc.get("workflow").and_then(Item::as_table_like) {
         if let Some(v) = wf.get("manager_backend").and_then(Item::as_str) {
@@ -250,6 +272,7 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
         workflow,
         roles,
         types,
+        backend_models,
         known_backends: known_backends(),
         reserved_type_names: reserved_type_names(),
     }
@@ -281,6 +304,9 @@ fn validate(payload: &SettingsSave) -> Result<(), String> {
     }
     for b in &payload.workflow.default_agents {
         check_backend(b)?;
+    }
+    for backend in payload.backend_models.keys() {
+        check_backend(backend)?;
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -458,6 +484,55 @@ fn apply_workflow(doc: &mut DocumentMut, payload: &SettingsSave) {
     set_preserving_decor(workflow, "types", Item::Table(types_table));
 }
 
+/// Update only `[backends.<id>].model`. Existing transport overrides, unknown future keys, table
+/// layout, and inline comments survive. Missing keys mean "leave untouched" (old frontend
+/// compatibility); a present null/blank value removes only that backend's model override.
+fn apply_backend_models(doc: &mut DocumentMut, models: &BTreeMap<String, Option<String>>) {
+    for (backend, model) in models {
+        let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+
+        if model.is_none() {
+            if let Some(entry) = doc
+                .get_mut("backends")
+                .and_then(Item::as_table_like_mut)
+                .and_then(|backends| backends.get_mut(backend))
+                .and_then(Item::as_table_like_mut)
+            {
+                entry.remove("model");
+            }
+            continue;
+        }
+
+        let backends_item = doc
+            .as_table_mut()
+            .entry("backends")
+            .or_insert_with(|| Item::Table(Table::new()));
+        if !backends_item.is_table_like() {
+            *backends_item = Item::Table(Table::new());
+        }
+        let backends = backends_item
+            .as_table_like_mut()
+            .expect("just ensured table-like");
+        if backends.get(backend).is_none() {
+            backends.insert(backend, Item::Table(Table::new()));
+        }
+        let backend_item = backends
+            .get_mut(backend)
+            .expect("just inserted backend table");
+        if !backend_item.is_table_like() {
+            *backend_item = Item::Table(Table::new());
+        }
+        let backend_table = backend_item
+            .as_table_like_mut()
+            .expect("just ensured backend table-like");
+        set_preserving_decor(
+            backend_table,
+            "model",
+            value(model.expect("checked non-empty").to_string()),
+        );
+    }
+}
+
 /// Assign `item` to `key` while preserving the existing key's VALUE decor (the trailing
 /// `# comment` and surrounding whitespace) when the key is already present and both old and new
 /// items are values. A bare `table[key] = value(x)` replaces the whole entry including its decor,
@@ -516,6 +591,7 @@ fn settings_save_at(payload: &SettingsSave, path: &Path) -> Result<(), String> {
     };
 
     apply_workflow(&mut doc, payload);
+    apply_backend_models(&mut doc, &payload.backend_models);
 
     write_atomic(path, &doc.to_string())
 }
@@ -556,6 +632,7 @@ mod tests {
     #[test]
     fn wire_contract_uses_snake_case_keys() {
         let payload = SettingsPayload {
+            backend_models: BTreeMap::from([("codex".into(), Some("gpt-5.6-sol".into()))]),
             types: vec![],
             config_path: "/x/config.toml".into(),
             exists: true,
@@ -571,6 +648,7 @@ mod tests {
             "workflow",
             "roles",
             "types",
+            "backend_models",
             "known_backends",
             "reserved_type_names",
         ] {
@@ -598,6 +676,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(save.roles[0].name, "reviewer");
+        assert!(save.backend_models.is_empty());
     }
 
     #[test]
@@ -609,7 +688,83 @@ mod tests {
         assert_eq!(payload.workflow, WorkflowPayload::default());
         assert!(payload.roles.is_empty());
         assert!(payload.types.is_empty());
+        assert!(payload.backend_models.values().all(Option::is_none));
         assert!(payload.known_backends.contains(&"claude".to_string()));
+    }
+
+    #[test]
+    fn backend_models_round_trip_without_clobbering_transport_or_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = r#"[backends.codex]
+transport = "exec"
+model = "gpt-old" # keep this explanation
+future_key = "preserve-me"
+
+[backends.opencode]
+transport = "acp"
+model = "opencode/old"
+"#;
+        fs::write(&path, original).unwrap();
+
+        let save = SettingsSave {
+            backend_models: BTreeMap::from([
+                ("claude".into(), Some("  claude-fable-5  ".into())),
+                ("codex".into(), Some("gpt-5.6-sol".into())),
+                ("opencode".into(), None),
+            ]),
+            types: vec![],
+            workflow: WorkflowPayload::default(),
+            roles: vec![],
+        };
+        settings_save_at(&save, &path).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("transport = \"exec\""), "got: {raw}");
+        assert!(raw.contains("transport = \"acp\""), "got: {raw}");
+        assert!(raw.contains("future_key = \"preserve-me\""), "got: {raw}");
+        assert!(
+            raw.contains("model = \"gpt-5.6-sol\" # keep this explanation"),
+            "model comment must survive; got: {raw}"
+        );
+
+        let doc = raw.parse::<DocumentMut>().unwrap();
+        let models = |backend: &str| {
+            doc.get("backends")
+                .and_then(Item::as_table_like)
+                .and_then(|backends| backends.get(backend))
+                .and_then(Item::as_table_like)
+                .and_then(|entry| entry.get("model"))
+                .and_then(Item::as_str)
+        };
+        assert_eq!(models("claude"), Some("claude-fable-5"));
+        assert_eq!(models("codex"), Some("gpt-5.6-sol"));
+        assert_eq!(models("opencode"), None);
+
+        let payload = settings_get_at(&path);
+        assert_eq!(
+            payload.backend_models["claude"].as_deref(),
+            Some("claude-fable-5")
+        );
+        assert_eq!(
+            payload.backend_models["codex"].as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(payload.backend_models["opencode"], None);
+
+        // An older frontend does not send backend_models. Its save must leave these values alone.
+        let legacy_save: SettingsSave = serde_json::from_str(
+            r#"{"workflow":{"manager_backend":null,"default_agents":[],"max_depth":4,
+                "max_calls_per_manager":8,"use_mcp":false,"enable_ask_human":false},
+                "roles":[]}"#,
+        )
+        .unwrap();
+        settings_save_at(&legacy_save, &path).unwrap();
+        let reread = settings_get_at(&path);
+        assert_eq!(
+            reread.backend_models["codex"].as_deref(),
+            Some("gpt-5.6-sol")
+        );
     }
 
     #[test]
@@ -630,6 +785,7 @@ max_depth = 5
         fs::write(&path, original).unwrap();
 
         let save = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: wf(|w| {
                 w.manager_backend = Some("claude".into());
@@ -684,6 +840,7 @@ max_depth = 5
         let path = dir.path().join("config.toml");
 
         let initial = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![
@@ -705,6 +862,7 @@ max_depth = 5
 
         // Add "implementer", edit "reviewer"'s backends, delete "manager".
         let updated = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![
@@ -743,6 +901,7 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let save = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![
                 WorkflowTypeEntry {
                     name: "review".into(),
@@ -828,6 +987,7 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let reserved = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![WorkflowTypeEntry {
                 name: "new".into(),
                 title: None,
@@ -863,6 +1023,7 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let payload = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![RoleEntry {
@@ -882,6 +1043,7 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let payload = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![RoleEntry {
@@ -900,6 +1062,7 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let payload = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![
@@ -928,6 +1091,7 @@ max_depth = 5
         assert!(!path.parent().unwrap().exists());
 
         let payload = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![],
@@ -954,6 +1118,7 @@ max_depth = 5
         .unwrap();
 
         let save = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: wf(|w| {
                 w.manager_backend = Some("claude".into());
@@ -981,6 +1146,7 @@ max_depth = 5
         .unwrap();
 
         let save = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: wf(|w| w.manager_backend = Some("claude".into())),
             roles: vec![],
@@ -1002,6 +1168,7 @@ max_depth = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let save = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: WorkflowPayload::default(),
             roles: vec![RoleEntry {
@@ -1035,6 +1202,7 @@ max_depth = 5
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let save = SettingsSave {
+            backend_models: BTreeMap::new(),
             types: vec![],
             workflow: wf(|w| w.max_depth = 4),
             roles: vec![],

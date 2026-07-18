@@ -32,7 +32,7 @@ let cliLatest = {}; // id -> latest version string from the public registry (asy
 let settingsLoading = false;
 let settingsSaving = false;
 let settingsError = null; // load error (settings_get rejected)
-let settingsData = null; // last-fetched raw payload: { config_path, exists, workflow, roles, known_backends }
+let settingsData = null; // last-fetched raw payload: { config_path, exists, workflow, roles, types, backend_models, known_backends }
 let settingsDraft = null; // editable working copy built from settingsData — see draftFromSettings()
 let roleKeySeq = 0; // stable client-side key for role cards (name may be edited before save)
 
@@ -270,6 +270,9 @@ const JA = {
   "max calls / manager (per-manager dispatch budget)": "最大呼び出し / マネージャー（マネージャーごとのディスパッチ上限）",
   "Run via MCP (use_mcp)": "MCP 経由で実行 (use_mcp)",
   "Enable asking a human (enable_ask_human)": "人間への確認を有効化 (enable_ask_human)",
+  "BACKEND MODELS": "バックエンドモデル",
+  "Empty uses each CLI's own default. Role and --model overrides still take precedence.": "空欄の場合は各 CLI の既定モデルを使用します。ロールまたは --model の指定が引き続き優先されます。",
+  "CLI default": "CLI の既定値",
   "base [workflow]": "ベース [workflow]",
   // inspector — workflow type
   "Workflow name (type)": "ワークフロー名（type）",
@@ -984,7 +987,8 @@ function cliRow(cli) {
 //   • the cast — [workflow.roles.*] (backend preference order + persona)
 //   • the workflow knobs — [workflow] (manager_backend, max_depth, max_calls_per_manager,
 //     use_mcp, enable_ask_human)
-// held in `settingsDraft` (unchanged contract; see draftFromSettings). The Save button and the
+//   • the per-backend model defaults — [backends.<id>].model
+// held in `settingsDraft` (see draftFromSettings). The Save button and the
 // "unsaved/saved" indicator tracks THESE edits only.
 //
 // What is an ILLUSTRATIVE BLUEPRINT (never written to config): the canvas of steps/gensteps +
@@ -997,8 +1001,9 @@ function cliRow(cli) {
 //   invoke('settings_get') -> { config_path, exists,
 //     workflow: { manager_backend, default_agents, max_depth, max_calls_per_manager,
 //                 use_mcp, enable_ask_human },
-//     roles: [{ name, backends, prompt }], known_backends: [...] }
-//   invoke('settings_save', { payload: { workflow, roles } }) -> resolves/rejects(string)
+//     roles: [{ name, backends, prompt }], backend_models: { [backend]: model | null },
+//     known_backends: [...] }
+//   invoke('settings_save', { payload: { workflow, roles, backend_models } }) -> resolves/rejects(string)
 //   invoke('get_agent_clis') -> [{ id, label, installed, path, command, note, version, ... }]
 
 const ROLE_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
@@ -1024,15 +1029,18 @@ function persistSavedSteps() {
 const CLI_TRANSPORT = { claude: "exec", codex: "exec", antigravity: "exec", gemini: "exec", opencode: "acp" };
 const CLI_NAME = { claude: "Claude Code", codex: "Codex", antigravity: "Antigravity", gemini: "Gemini CLI", opencode: "OpenCode" };
 
-let settingsDirty = false; // unsaved CONFIG edits (roles/workflow/types) — not the blueprint
+let settingsDirty = false; // unsaved CONFIG edits (roles/workflow/types/backend models) — not the blueprint
 let studio = null; // local studio/blueprint view state (see newStudio)
 let studioBuilt = false; // shell mounted once
 let typeKeySeq = 0; // stable client-side key for workflow-type cards (name may be edited)
 
 function draftFromSettings(data) {
   const wf = data.workflow || {};
+  const knownBackends = data.known_backends || Object.keys(CLI_NAME);
+  const configuredModels = data.backend_models || {};
   return {
-    known_backends: data.known_backends || [],
+    known_backends: knownBackends,
+    backend_models: Object.fromEntries(knownBackends.map((backend) => [backend, configuredModels[backend] || ""])),
     reserved_type_names: data.reserved_type_names || DEFAULT_RESERVED_TYPE_NAMES,
     workflow: {
       manager_backend: wf.manager_backend || "",
@@ -1524,6 +1532,11 @@ function setRoleField(key, field, val, render) {
 }
 function setWorkflowField(field, val) {
   settingsDraft.workflow[field] = val;
+  markDirty();
+}
+function setBackendModel(backend, val) {
+  settingsDraft.backend_models ||= {};
+  settingsDraft.backend_models[backend] = val;
   markDirty();
 }
 function updateRoleNameErr(role) {
@@ -2538,6 +2551,20 @@ function inspWorkflowBase(bd) {
   tg.appendChild(checkRow(t("Run via MCP (use_mcp)"), settingsDraft.workflow.use_mcp, (v) => setWorkflowField("use_mcp", v)));
   tg.appendChild(checkRow(t("Enable asking a human (enable_ask_human)"), settingsDraft.workflow.enable_ask_human, (v) => setWorkflowField("enable_ask_human", v)));
   form.appendChild(tg);
+  form.appendChild(el("div", "ws-section-title", t("BACKEND MODELS")));
+  form.appendChild(el("p", "ws-note", t("Empty uses each CLI's own default. Role and --model overrides still take precedence.")));
+  for (const backend of known) {
+    form.appendChild(field(
+      CLI_NAME[backend] || backend,
+      textInput(
+        (settingsDraft.backend_models && settingsDraft.backend_models[backend]) || "",
+        (v) => setBackendModel(backend, v),
+        null,
+        { placeholder: t("CLI default") }
+      ),
+      { mono: true }
+    ));
+  }
   bd.appendChild(form);
   return { title: t("(default) workflow"), sub: t("base [workflow]") };
 }
@@ -2764,6 +2791,12 @@ async function saveSettings() {
   renderTopbar();
   try {
     const payload = {
+      backend_models: Object.fromEntries(
+        (settingsDraft.known_backends || Object.keys(CLI_NAME)).map((backend) => {
+          const model = (settingsDraft.backend_models && settingsDraft.backend_models[backend]) || "";
+          return [backend, model.trim() || null];
+        })
+      ),
       workflow: {
         manager_backend: settingsDraft.workflow.manager_backend || null,
         default_agents: settingsDraft.workflow.default_agents,

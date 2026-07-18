@@ -34,8 +34,11 @@ function typeFromConfig(t) {
 
 export function draftFromSettings(data) {
   const wf = (data && data.workflow) || {};
+  const knownBackends = (data && data.known_backends) || DEFAULT_BACKENDS;
+  const configuredModels = (data && data.backend_models) || {};
   return {
-    known_backends: (data && data.known_backends) || DEFAULT_BACKENDS,
+    known_backends: knownBackends,
+    backend_models: Object.fromEntries(knownBackends.map((backend) => [backend, configuredModels[backend] || ""])),
     reserved_type_names: (data && data.reserved_type_names) || DEFAULT_RESERVED_TYPE_NAMES,
     workflow: {
       manager_backend: wf.manager_backend || "",
@@ -109,6 +112,12 @@ export function validate(draft) {
 
 export function buildPayload(draft) {
   return {
+    backend_models: Object.fromEntries(
+      (draft.known_backends || DEFAULT_BACKENDS).map((backend) => {
+        const model = (draft.backend_models && draft.backend_models[backend]) || "";
+        return [backend, model.trim() || null];
+      })
+    ),
     workflow: {
       manager_backend: draft.workflow.manager_backend || null,
       default_agents: draft.workflow.default_agents || [],

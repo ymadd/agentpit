@@ -476,7 +476,7 @@ review_members = ["antigravity", "opencode"]
 
 # [workflow]
 # Model-driven workflow: a manager backend (claude|codex) orchestrates sub-agents.
-# manager_backend       = "claude"   # defaults to [default].backend
+# manager_backend       = "claude"   # unset: first authenticated manager; supported [default], then claude/codex
 # default_agents        = ["gemini", "opencode", "codex"]  # defaults to all available minus the manager
 # max_depth             = 3          # hard recursion ceiling, enforced in Rust; clamped to 1..=32
 # max_calls_per_manager = 8          # advisory sub-dispatch budget surfaced in the prompt
@@ -705,7 +705,10 @@ prompt = "You research."
         let roles = load_config(Some(&path)).unwrap().config.workflow.roles;
         assert_eq!(roles.len(), 3);
         assert_eq!(roles["manager"].backends, vec![BackendId::Claude]);
-        assert_eq!(roles["manager"].prompt.as_deref(), Some("Prefer small steps."));
+        assert_eq!(
+            roles["manager"].prompt.as_deref(),
+            Some("Prefer small steps.")
+        );
         assert_eq!(
             roles["reviewer"].backends,
             vec![BackendId::Codex, BackendId::Antigravity]
@@ -753,7 +756,10 @@ prompt = "Research only."
         let review = &wf.types["review"];
         assert_eq!(review.title.as_deref(), Some("Strict code review"));
         assert_eq!(review.prompt.as_deref(), Some("Run a strict review."));
-        assert_eq!(review.roles, vec!["reviewer".to_string(), "security".to_string()]);
+        assert_eq!(
+            review.roles,
+            vec!["reviewer".to_string(), "security".to_string()]
+        );
         assert_eq!(review.manager_backend, Some(BackendId::Claude));
         assert_eq!(review.enable_ask_human, Some(true));
         // Unset per-type knobs stay None (they inherit from [workflow] at resolution time).
@@ -770,13 +776,27 @@ prompt = "Research only."
             .lines()
             .skip_while(|l| !l.starts_with("# [workflow.types.review]"))
             .take_while(|l| l.starts_with('#'))
-            .map(|l| l.strip_prefix("# ").or_else(|| l.strip_prefix("#")).unwrap_or(l))
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .or_else(|| l.strip_prefix("#"))
+                    .unwrap_or(l)
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!block.is_empty(), "types example block not found in sample config");
+        assert!(
+            !block.is_empty(),
+            "types example block not found in sample config"
+        );
         let parsed: HubConfig = toml::from_str(&block).expect("uncommented types example parses");
-        let review = parsed.workflow.types.get("review").expect("review type present");
-        assert_eq!(review.roles, vec!["reviewer".to_string(), "security".to_string()]);
+        let review = parsed
+            .workflow
+            .types
+            .get("review")
+            .expect("review type present");
+        assert_eq!(
+            review.roles,
+            vec!["reviewer".to_string(), "security".to_string()]
+        );
         assert_eq!(review.manager_backend, Some(BackendId::Claude));
     }
 
@@ -789,10 +809,17 @@ prompt = "Research only."
             .lines()
             .skip_while(|l| !l.starts_with("# [workflow.roles.manager]"))
             .take_while(|l| l.starts_with('#'))
-            .map(|l| l.strip_prefix("# ").or_else(|| l.strip_prefix("#")).unwrap_or(l))
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .or_else(|| l.strip_prefix("#"))
+                    .unwrap_or(l)
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!block.is_empty(), "roles example block not found in sample config");
+        assert!(
+            !block.is_empty(),
+            "roles example block not found in sample config"
+        );
         let parsed: HubConfig = toml::from_str(&block).expect("uncommented roles example parses");
         assert!(parsed.workflow.roles.contains_key("manager"));
         assert!(parsed.workflow.roles.contains_key("implementer"));

@@ -16,7 +16,11 @@ use std::process::Command;
 fn agentpit_bin() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let name = if cfg!(windows) { "agentpit.exe" } else { "agentpit" };
+            let name = if cfg!(windows) {
+                "agentpit.exe"
+            } else {
+                "agentpit"
+            };
             let sibling = dir.join(name);
             if sibling.is_file() {
                 return sibling;
@@ -31,7 +35,11 @@ fn agentpit_bin() -> PathBuf {
 /// shell-out": bin resolution, spawn, the optional stdin write (reaping the child on a write
 /// failure so it can't zombie), status/stderr error formatting, and the JSON parse. `what` labels
 /// the operation in user-facing errors.
-fn run_cli_json(args: &[&str], stdin: Option<&[u8]>, what: &str) -> Result<serde_json::Value, String> {
+fn run_cli_json(
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    what: &str,
+) -> Result<serde_json::Value, String> {
     use std::io::Write;
     let bin = agentpit_bin();
     let mut cmd = Command::new(&bin);
@@ -81,7 +89,11 @@ fn run_cli_json(args: &[&str], stdin: Option<&[u8]>, what: &str) -> Result<serde
 
 /// Blocking: run the designer CLI and parse its JSON proposal from stdout.
 fn run_designer(description: &str) -> Result<serde_json::Value, String> {
-    run_cli_json(&["workflow", "new", description, "--json"], None, "workflow generation")
+    run_cli_json(
+        &["workflow", "new", description, "--json"],
+        None,
+        "workflow generation",
+    )
 }
 
 /// Generate a workflow proposal from a natural-language `description`. Runs the (slow, LLM-backed)

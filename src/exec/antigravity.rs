@@ -9,10 +9,7 @@ impl ExecAdapter for AntigravityExec {
     }
 
     fn build_spec(&self, task: &str, model: Option<&str>) -> ExecSpec {
-        let mut args = vec![
-            "--dangerously-skip-permissions".into(),
-            "--print".into(),
-        ];
+        let mut args = vec!["--dangerously-skip-permissions".into(), "--print".into()];
         if let Some(m) = model {
             // agy (Gemini-CLI-derived): `--model <id>`.
             args.push("--model".into());

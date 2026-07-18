@@ -102,14 +102,18 @@ pub(crate) async fn run_capture(
     let eff = resolve_workflow_type(&config.workflow, workflow_type.as_deref())?;
 
     // 1. Resolve the manager: explicit arg → the type's manager_backend → [workflow.roles.manager]
-    //    → [workflow].manager_backend → default backend. The manager role's persona applies
-    //    whenever the role exists, even when the backend came from another step.
+    //    → [workflow].manager_backend → an authenticated implicit manager. The last step prefers
+    //    a supported [default].backend, then claude/codex, so the shipped antigravity default can
+    //    never make a bare `agentpit workflow "<goal>"` select an unsupported orchestrator.
+    //    The manager role's persona applies whenever the role exists, even when the backend came
+    //    from another step.
+    let implicit_manager = select_implicit_manager(config.default.backend).await;
     let (manager, manager_persona, manager_role_model) = resolve_manager_backend(
         manager,
         eff.type_manager_backend,
         &config.workflow.roles,
         eff.manager_backend,
-        config.default.backend,
+        implicit_manager,
     )?;
     if !is_supported_manager(manager) {
         anyhow::bail!("supported workflow managers: claude, codex (got: {manager})");
@@ -119,7 +123,10 @@ pub(crate) async fn run_capture(
     let manager_model = roles::resolve_model(
         model.as_deref(),
         manager_role_model.as_deref(),
-        config.backends.get(&manager).and_then(|o| o.model.as_deref()),
+        config
+            .backends
+            .get(&manager)
+            .and_then(|o| o.model.as_deref()),
     );
 
     // 1b. MCP mode: the `--use-mcp` flag OR the effective use_mcp knob, but only the claude manager
@@ -136,7 +143,11 @@ pub(crate) async fn run_capture(
     //    roster is ROLES (casting is config-driven); a type may further NARROW it to a subset.
     //    Otherwise the legacy flat backend list: explicit → config → all available minus manager.
     let available: Vec<BackendId> = ctx.regs.available().into_iter().collect();
-    let roster = build_role_roster(&config.workflow.roles, &available, eff.role_filter.as_deref())?;
+    let roster = build_role_roster(
+        &config.workflow.roles,
+        &available,
+        eff.role_filter.as_deref(),
+    )?;
     if let Some(r) = &roster {
         for (name, reason) in &r.skipped {
             eprintln!("warning: workflow role '{name}' skipped: {reason}");
@@ -272,8 +283,16 @@ pub(crate) async fn run_capture(
     });
 
     let started = Instant::now();
-    let result =
-        dispatch(manager, &prompt, &cwd, cancel, on_chunk, &regs, manager_model.as_deref()).await;
+    let result = dispatch(
+        manager,
+        &prompt,
+        &cwd,
+        cancel,
+        on_chunk,
+        &regs,
+        manager_model.as_deref(),
+    )
+    .await;
 
     // 12. Record the outcome. `mcp_guard` is still in scope here, so the temp MCP config stays
     //     on disk for the whole dispatch and is removed when this function returns.
@@ -425,7 +444,9 @@ fn resolve_workflow_type(
         type_manager_backend: t.manager_backend,
         manager_backend: base.manager_backend,
         max_depth: t.max_depth.unwrap_or(base.max_depth),
-        max_calls_per_manager: t.max_calls_per_manager.unwrap_or(base.max_calls_per_manager),
+        max_calls_per_manager: t
+            .max_calls_per_manager
+            .unwrap_or(base.max_calls_per_manager),
         use_mcp: t.use_mcp.unwrap_or(base.use_mcp),
         enable_ask_human: t.enable_ask_human.unwrap_or(base.enable_ask_human),
         role_filter: (!t.roles.is_empty()).then(|| t.roles.clone()),
@@ -443,7 +464,8 @@ pub async fn list(json: bool) -> Result<()> {
     let ctx = load_context()?;
     let config = &ctx.loaded.config;
     let path = crate::config::default_config_path();
-    let listing = build_types_listing(&config.workflow, config.default.backend, &path);
+    let implicit_manager = select_implicit_manager(config.default.backend).await;
+    let listing = build_types_listing(&config.workflow, implicit_manager, &path);
     if json {
         println!("{}", serde_json::to_string_pretty(&listing)?);
     } else {
@@ -500,7 +522,7 @@ struct TypesListing {
 /// the whole listing (`list` is a read-only inspection command).
 fn build_types_listing(
     section: &WorkflowSection,
-    default_backend: BackendId,
+    implicit_manager: BackendId,
     config_path: &std::path::Path,
 ) -> TypesListing {
     let all_workers: Vec<String> = roles::worker_roles(&section.roles)
@@ -517,7 +539,7 @@ fn build_types_listing(
             eff.type_manager_backend,
             &section.roles,
             eff.manager_backend,
-            default_backend,
+            implicit_manager,
         ) {
             Ok((backend, _, _)) => (backend.to_string(), is_supported_manager(backend)),
             Err(_) => ("(invalid [workflow.roles.manager])".to_string(), false),
@@ -577,7 +599,10 @@ fn render_types_listing(listing: &TypesListing) -> String {
             e.manager.clone()
         } else {
             // A run with this manager aborts at startup — say so here instead of at run time.
-            format!("{} (unsupported — workflow managers: claude, codex)", e.manager)
+            format!(
+                "{} (unsupported — workflow managers: claude, codex)",
+                e.manager
+            )
         };
         out.push_str(&format!(
             "    manager: {}   max_depth: {}   max_calls: {}   mcp: {}   ask_human: {}\n",
@@ -645,8 +670,9 @@ fn truncate_line(s: &str, max: usize) -> String {
 /// Resolve the manager backend and its optional persona. Resolution order for the backend:
 /// explicit CLI arg → the TYPE's `[workflow.types.<t>].manager_backend` (selecting a type is an
 /// explicit per-kind choice) → `[workflow.roles.manager]` (first claude|codex in its list) →
-/// `[workflow].manager_backend` → the default backend. The persona applies whenever the manager
-/// role exists — a persona-only role (empty `backends`) still colors a legacy-resolved manager.
+/// `[workflow].manager_backend` → the caller's authenticated implicit-manager fallback. The
+/// persona applies whenever the manager role exists — a persona-only role (empty `backends`) still
+/// colors an implicitly resolved manager.
 /// Pure and unit-tested; the `is_supported_manager` check on the final choice stays in
 /// `run_capture` (an explicit arg may still name an unsupported backend).
 fn resolve_manager_backend(
@@ -654,17 +680,39 @@ fn resolve_manager_backend(
     type_manager: Option<BackendId>,
     role_map: &BTreeMap<String, RoleConfig>,
     manager_backend: Option<BackendId>,
-    default_backend: BackendId,
+    implicit_manager: BackendId,
 ) -> Result<(BackendId, Option<String>, Option<String>)> {
     let manager_role = roles::resolve_manager(role_map, is_supported_manager)?;
     let backend = explicit
         .or(type_manager)
         .or(manager_role.as_ref().and_then(|m| m.backend))
         .or(manager_backend)
-        .unwrap_or(default_backend);
+        .unwrap_or(implicit_manager);
     let persona = manager_role.as_ref().and_then(|m| m.prompt.clone());
     let model = manager_role.and_then(|m| m.model);
     Ok((backend, persona, model))
+}
+
+/// Candidate order for an unconfigured workflow manager. A supported global default keeps its
+/// precedence; an unsupported default (the shipped default is antigravity) falls back to Claude,
+/// then Codex. Kept pure so the policy is unit-testable independently of local credentials.
+fn implicit_manager_candidates(default_backend: BackendId) -> [BackendId; 2] {
+    match default_backend {
+        BackendId::Codex => [BackendId::Codex, BackendId::Claude],
+        _ => [BackendId::Claude, BackendId::Codex],
+    }
+}
+
+/// Pick the first authenticated supported manager. If neither probe succeeds, return the first
+/// candidate so the normal manager auth preflight produces the actionable login error.
+async fn select_implicit_manager(default_backend: BackendId) -> BackendId {
+    let candidates = implicit_manager_candidates(default_backend);
+    for candidate in candidates {
+        if check_auth(candidate).await.ok {
+            return candidate;
+        }
+    }
+    candidates[0]
 }
 
 /// The rendered role roster for a run: the manager-facing block plus the resolved role names
@@ -700,7 +748,10 @@ fn build_role_roster(
             .iter()
             .filter_map(|n| {
                 if n == roles::MANAGER_ROLE {
-                    skipped.push((n.clone(), "reserved manager role is not a dispatch target".into()));
+                    skipped.push((
+                        n.clone(),
+                        "reserved manager role is not a dispatch target".into(),
+                    ));
                     None
                 } else if let Some(role) = role_map.get(n) {
                     Some((n, role))
@@ -1199,10 +1250,21 @@ pub async fn generate(
     let designer_model = roles::resolve_model(
         model.as_deref(),
         None,
-        config.backends.get(&backend).and_then(|o| o.model.as_deref()),
+        config
+            .backends
+            .get(&backend)
+            .and_then(|o| o.model.as_deref()),
     );
-    let res = dispatch(backend, &prompt, &cwd, cancel, noop, &ctx.regs, designer_model.as_deref())
-        .await?;
+    let res = dispatch(
+        backend,
+        &prompt,
+        &cwd,
+        cancel,
+        noop,
+        &ctx.regs,
+        designer_model.as_deref(),
+    )
+    .await?;
     if res.auth_failed {
         anyhow::bail!(
             "[{backend}] auth failure during generation. Run `{}`.",
@@ -1242,7 +1304,11 @@ pub async fn generate(
         updated.push_str(&toml);
         std::fs::write(&path, &updated)
             .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
-        eprintln!("Wrote workflow '{}' to {}", proposal.type_name, path.display());
+        eprintln!(
+            "Wrote workflow '{}' to {}",
+            proposal.type_name,
+            path.display()
+        );
     } else {
         println!("{toml}");
         eprintln!("\nReview the above, then append it to your config (or re-run with --write).");
@@ -1342,12 +1408,26 @@ pub async fn describe(
     let describe_model = roles::resolve_model(
         model.as_deref(),
         None,
-        config.backends.get(&backend).and_then(|o| o.model.as_deref()),
+        config
+            .backends
+            .get(&backend)
+            .and_then(|o| o.model.as_deref()),
     );
-    let res = dispatch(backend, &prompt, &cwd, cancel, noop, &ctx.regs, describe_model.as_deref())
-        .await?;
+    let res = dispatch(
+        backend,
+        &prompt,
+        &cwd,
+        cancel,
+        noop,
+        &ctx.regs,
+        describe_model.as_deref(),
+    )
+    .await?;
     if res.auth_failed {
-        anyhow::bail!("[{backend}] auth failure during describe. Run `{}`.", auth.login_command);
+        anyhow::bail!(
+            "[{backend}] auth failure during describe. Run `{}`.",
+            auth.login_command
+        );
     }
     let description = clean_description(&res.output);
     if description.is_empty() {
@@ -1367,7 +1447,13 @@ pub async fn describe(
 /// Flatten a workflow-spec JSON into a compact plain-text summary for the describer prompt. Reads
 /// tolerantly (any missing field is skipped) so it accepts the dashboard draft or a saved type.
 fn summarize_spec(spec: &serde_json::Value) -> String {
-    let field = |k: &str| spec.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let field = |k: &str| {
+        spec.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
     let mut out = String::new();
     let title = field("title");
     if !title.is_empty() {
@@ -1379,7 +1465,9 @@ fn summarize_spec(spec: &serde_json::Value) -> String {
     }
     let brief = field("brief");
     if !brief.is_empty() {
-        out.push_str(&format!("brief (the manager's runtime instruction): {brief}\n"));
+        out.push_str(&format!(
+            "brief (the manager's runtime instruction): {brief}\n"
+        ));
     }
     if let Some(roles) = spec.get("roles").and_then(|v| v.as_array()) {
         let mut lines = String::new();
@@ -1391,9 +1479,18 @@ fn summarize_spec(spec: &serde_json::Value) -> String {
             let backends = r
                 .get("backends")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|b| b.as_str()).collect::<Vec<_>>().join(", "))
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|b| b.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
                 .unwrap_or_default();
-            let persona = r.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let persona = r
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             lines.push_str(&format!("  - {name}"));
             if !backends.is_empty() {
                 lines.push_str(&format!(" [{backends}]"));
@@ -1418,8 +1515,16 @@ fn summarize_spec(spec: &serde_json::Value) -> String {
         let mut lines = String::new();
         for st in steps {
             let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let persona = st.get("persona").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let behavior = st.get("behavior").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let persona = st
+                .get("persona")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let behavior = st
+                .get("behavior")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             if name.is_empty() && persona.is_empty() && behavior.is_empty() {
                 continue;
             }
@@ -1483,7 +1588,12 @@ fn clean_description(raw: &str) -> String {
         let rest = rest.split_once('\n').map(|(_, body)| body).unwrap_or(rest);
         s = rest.trim_end_matches('`').trim_start_matches('`').trim();
     }
-    s.trim().trim_matches('"').trim().chars().take(1000).collect()
+    s.trim()
+        .trim_matches('"')
+        .trim()
+        .chars()
+        .take(1000)
+        .collect()
 }
 
 /// Extract the first balanced JSON object from raw model output (tolerating a ```json fence or
@@ -1535,7 +1645,10 @@ fn parse_proposal(raw: &str) -> Result<WorkflowProposal> {
 /// Sanitize a proposal so it can never inject bad config: names → lowercase-kebab, backends
 /// filtered to known ids, `uses_roles` restricted to defined role names.
 fn normalize_proposal(p: &mut WorkflowProposal) -> Result<()> {
-    let known: Vec<String> = BackendId::ALL.iter().map(|b| b.as_str().to_string()).collect();
+    let known: Vec<String> = BackendId::ALL
+        .iter()
+        .map(|b| b.as_str().to_string())
+        .collect();
     p.type_name = sanitize_name(&p.type_name);
     if p.type_name.is_empty()
         || p.type_name == RESERVED_TYPE_NEW
@@ -1559,8 +1672,7 @@ fn normalize_proposal(p: &mut WorkflowProposal) -> Result<()> {
         .map(|n| sanitize_name(n))
         .filter(|n| defined.contains(n))
         .collect();
-    if p
-        .manager_backend
+    if p.manager_backend
         .as_ref()
         .is_some_and(|mb| !known.contains(mb))
     {
@@ -1661,7 +1773,9 @@ mod tests {
             3,
             8,
             "run-42",
-            None, &PromptRoles::default());
+            None,
+            &PromptRoles::default(),
+        );
         // Each agent id appears.
         assert!(text.contains("gemini"));
         assert!(text.contains("opencode"));
@@ -1691,7 +1805,9 @@ mod tests {
             3,
             8,
             "run-1",
-            None, &PromptRoles::default());
+            None,
+            &PromptRoles::default(),
+        );
         // The path is single-quoted so it survives word-splitting in the model's Bash commands.
         assert!(text.contains("'/Users/a b/bin/agentpit' rescue --backend"));
         assert!(text.contains("'/Users/a b/bin/agentpit' ensemble"));
@@ -1700,7 +1816,16 @@ mod tests {
     #[test]
     fn mcp_prompt_uses_mcp_tools_and_omits_bash_grammar() {
         let agents = [BackendId::Gemini, BackendId::Codex];
-        let text = build_manager_prompt_mcp("ship the feature", &agents, 1, 3, 8, "run-9", None, &PromptRoles::default());
+        let text = build_manager_prompt_mcp(
+            "ship the feature",
+            &agents,
+            1,
+            3,
+            8,
+            "run-9",
+            None,
+            &PromptRoles::default(),
+        );
         // The MCP tool names are present.
         assert!(text.contains("mcp__agentpit__list_backends"));
         assert!(text.contains("mcp__agentpit__dispatch_task"));
@@ -1722,15 +1847,44 @@ mod tests {
     fn cli_prompt_has_no_mcp_tool_names() {
         // The CLI variant must stay free of the MCP tool surface.
         let agents = [BackendId::Gemini];
-        let text = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &PromptRoles::default());
+        let text = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &PromptRoles::default(),
+        );
         assert!(!text.contains("mcp__agentpit__"));
     }
 
     #[test]
     fn discipline_block_absent_when_ask_disabled() {
         let agents = [BackendId::Gemini];
-        let cli = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &PromptRoles::default());
-        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &PromptRoles::default());
+        let cli = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &PromptRoles::default(),
+        );
+        let mcp = build_manager_prompt_mcp(
+            "goal",
+            &agents,
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &PromptRoles::default(),
+        );
         for text in [&cli, &mcp] {
             assert!(
                 !text.contains("HUMAN BACK-CHANNEL"),
@@ -1761,7 +1915,9 @@ mod tests {
             3,
             8,
             "run-1",
-            Some(AskTier::High), &PromptRoles::default());
+            Some(AskTier::High),
+            &PromptRoles::default(),
+        );
         assert!(cli.contains("CONVERSATION LAYER"));
         // The CLI grammar for both moves is taught.
         assert!(cli.contains("note \"<context>\" --kind handoff"));
@@ -1777,7 +1933,16 @@ mod tests {
     #[test]
     fn mcp_conversation_block_points_at_post_note_and_refute_tools() {
         let agents = [BackendId::Gemini];
-        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", Some(AskTier::High), &PromptRoles::default());
+        let mcp = build_manager_prompt_mcp(
+            "goal",
+            &agents,
+            1,
+            3,
+            8,
+            "run-1",
+            Some(AskTier::High),
+            &PromptRoles::default(),
+        );
         assert!(mcp.contains("CONVERSATION LAYER"));
         assert!(mcp.contains("mcp__agentpit__post_note"));
         assert!(mcp.contains("mcp__agentpit__refute"));
@@ -1796,7 +1961,9 @@ mod tests {
             3,
             8,
             "run-1",
-            Some(AskTier::High), &PromptRoles::default());
+            Some(AskTier::High),
+            &PromptRoles::default(),
+        );
         assert!(text.contains("HUMAN BACK-CHANNEL"));
         assert!(text.contains("tier: high"));
         assert!(text.contains("DESTRUCTIVE or IRREVERSIBLE"));
@@ -1823,7 +1990,9 @@ mod tests {
             3,
             8,
             "run-1",
-            Some(AskTier::Low), &PromptRoles::default());
+            Some(AskTier::Low),
+            &PromptRoles::default(),
+        );
         assert!(text.contains("tier: low"));
         assert!(text.contains("A genuine A/B fork"));
     }
@@ -1831,7 +2000,16 @@ mod tests {
     #[test]
     fn mcp_discipline_points_at_ask_human_tool() {
         let agents = [BackendId::Gemini];
-        let text = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", Some(AskTier::High), &PromptRoles::default());
+        let text = build_manager_prompt_mcp(
+            "goal",
+            &agents,
+            1,
+            3,
+            8,
+            "run-1",
+            Some(AskTier::High),
+            &PromptRoles::default(),
+        );
         assert!(text.contains("HUMAN BACK-CHANNEL"));
         assert!(text.contains("mcp__agentpit__ask_human"));
         // No shell-out ask grammar in MCP mode.
@@ -1846,7 +2024,17 @@ mod tests {
     #[test]
     fn legacy_prompt_is_byte_identical_without_roles() {
         let agents = [BackendId::Gemini];
-        let text = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &PromptRoles::default());
+        let text = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &PromptRoles::default(),
+        );
         let expected = "=== AGENTPIT WORKFLOW ORCHESTRATOR ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
 sub-tasks, dispatch each to the best worker backend, read results, and write a final\n\
@@ -1880,7 +2068,16 @@ goal\n";
     #[test]
     fn legacy_mcp_prompt_is_byte_identical_without_roles() {
         let agents = [BackendId::Gemini];
-        let text = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &PromptRoles::default());
+        let text = build_manager_prompt_mcp(
+            "goal",
+            &agents,
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &PromptRoles::default(),
+        );
         let expected = "=== AGENTPIT WORKFLOW ORCHESTRATOR (MCP MODE) ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
 sub-tasks, dispatch each to the best worker backend, read results, and write a final\n\
@@ -1914,9 +2111,7 @@ goal\n";
 
     fn sample_roster() -> PromptRoles<'static> {
         PromptRoles {
-            roster: Some(
-                "  implementer (claude): You implement.\n  reviewer (codex): You review.",
-            ),
+            roster: Some("  implementer (claude): You implement.\n  reviewer (codex): You review."),
             persona: None,
             brief: None,
             flow: None,
@@ -1927,7 +2122,16 @@ goal\n";
     fn role_mode_shell_prompt_teaches_rescue_role_grammar() {
         let agents: [BackendId; 0] = [];
         let text = build_manager_prompt(
-            "goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &sample_roster());
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &sample_roster(),
+        );
         assert!(text.contains("AVAILABLE ROLES"));
         assert!(text.contains("implementer (claude): You implement."));
         assert!(text.contains("reviewer (codex): You review."));
@@ -1968,7 +2172,16 @@ goal\n";
             flow: None,
         };
         let shell = build_manager_prompt(
-            "goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &roles);
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &roles,
+        );
         let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &roles);
         for text in [&shell, &mcp] {
             assert!(text.contains("MANAGER PERSONA (from [workflow.roles.manager]):"));
@@ -1981,8 +2194,21 @@ goal\n";
     #[test]
     fn flow_hint_block_is_injected_only_when_set() {
         let agents = [BackendId::Gemini];
-        let with_flow = PromptRoles { flow: Some("diagnose → plan → implement"), ..Default::default() };
-        let shell = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &with_flow);
+        let with_flow = PromptRoles {
+            flow: Some("diagnose → plan → implement"),
+            ..Default::default()
+        };
+        let shell = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &with_flow,
+        );
         let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &with_flow);
         for text in [&shell, &mcp] {
             assert!(text.contains("SUGGESTED FLOW"));
@@ -1991,7 +2217,17 @@ goal\n";
             assert!(text.contains("hint, not a script"));
         }
         // Absent in the default path — this is what keeps the byte-identical goldens green.
-        let default_shell = build_manager_prompt("goal", &agents, "/bin/agentpit", 1, 3, 8, "run-1", None, &PromptRoles::default());
+        let default_shell = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &PromptRoles::default(),
+        );
         assert!(!default_shell.contains("SUGGESTED FLOW"));
     }
 
@@ -2015,7 +2251,10 @@ goal\n";
 
     #[test]
     fn roster_is_none_without_worker_roles() {
-        assert_eq!(build_role_roster(&BTreeMap::new(), &[], None).unwrap(), None);
+        assert_eq!(
+            build_role_roster(&BTreeMap::new(), &[], None).unwrap(),
+            None
+        );
         // A manager-only config is still legacy mode for the roster.
         let manager_only = role_map(&[("manager", &[BackendId::Claude], None)]);
         assert_eq!(
@@ -2035,7 +2274,11 @@ goal\n";
             .unwrap()
             .unwrap();
         assert_eq!(roster.names, vec!["implementer"]);
-        assert!(roster.lines.contains("implementer (claude): You implement."));
+        assert!(
+            roster
+                .lines
+                .contains("implementer (claude): You implement.")
+        );
         assert_eq!(roster.skipped.len(), 1);
         assert_eq!(roster.skipped[0].0, "reviewer");
         assert!(roster.skipped[0].1.contains("codex"));
@@ -2044,18 +2287,16 @@ goal\n";
     #[test]
     fn roster_errors_when_every_worker_role_is_unresolvable() {
         let roles = role_map(&[("reviewer", &[BackendId::Codex], None)]);
-        let err = build_role_roster(&roles, &[], None).unwrap_err().to_string();
+        let err = build_role_roster(&roles, &[], None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no configured worker role could be resolved"));
         assert!(err.contains("reviewer"));
     }
 
     #[test]
-    fn manager_resolution_order_explicit_then_type_then_role_then_config_then_default() {
-        let roles = role_map(&[(
-            "manager",
-            &[BackendId::Codex],
-            Some("plan tightly"),
-        )]);
+    fn manager_resolution_order_explicit_then_type_then_role_then_config_then_implicit() {
+        let roles = role_map(&[("manager", &[BackendId::Codex], Some("plan tightly"))]);
         // Explicit CLI arg wins over everything; the persona still applies.
         let (backend, persona, _) = resolve_manager_backend(
             Some(BackendId::Claude),
@@ -2089,7 +2330,7 @@ goal\n";
         )
         .unwrap();
         assert_eq!(backend, BackendId::Codex);
-        // No role → config → default.
+        // No role → config → caller-provided implicit manager.
         let empty = BTreeMap::new();
         let (backend, persona, _) = resolve_manager_backend(
             None,
@@ -2102,8 +2343,24 @@ goal\n";
         assert_eq!(backend, BackendId::Claude);
         assert_eq!(persona, None);
         let (backend, _, _) =
-            resolve_manager_backend(None, None, &empty, None, BackendId::Antigravity).unwrap();
-        assert_eq!(backend, BackendId::Antigravity);
+            resolve_manager_backend(None, None, &empty, None, BackendId::Codex).unwrap();
+        assert_eq!(backend, BackendId::Codex);
+    }
+
+    #[test]
+    fn implicit_manager_candidates_prefer_a_supported_global_default() {
+        assert_eq!(
+            implicit_manager_candidates(BackendId::Codex),
+            [BackendId::Codex, BackendId::Claude]
+        );
+        assert_eq!(
+            implicit_manager_candidates(BackendId::Claude),
+            [BackendId::Claude, BackendId::Codex]
+        );
+        assert_eq!(
+            implicit_manager_candidates(BackendId::Antigravity),
+            [BackendId::Claude, BackendId::Codex]
+        );
     }
 
     #[test]
@@ -2125,9 +2382,7 @@ goal\n";
     fn manager_role_with_unsupported_backends_propagates_the_error() {
         // Gemini cannot manage (is_supported_manager: claude|codex only).
         let roles = role_map(&[("manager", &[BackendId::Gemini], None)]);
-        assert!(
-            resolve_manager_backend(None, None, &roles, None, BackendId::Antigravity).is_err()
-        );
+        assert!(resolve_manager_backend(None, None, &roles, None, BackendId::Antigravity).is_err());
     }
 
     // ---- named workflow types ----
@@ -2196,7 +2451,10 @@ goal\n";
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown workflow type 'nope'"), "got: {err}");
-        assert!(err.contains("review"), "should list configured types: {err}");
+        assert!(
+            err.contains("review"),
+            "should list configured types: {err}"
+        );
     }
 
     // ---- workflow list ----
@@ -2204,8 +2462,11 @@ goal\n";
     #[test]
     fn listing_resolves_effective_values_per_type() {
         let s = section_with_types();
-        let listing =
-            build_types_listing(&s, BackendId::Antigravity, std::path::Path::new("/tmp/c.toml"));
+        let listing = build_types_listing(
+            &s,
+            BackendId::Antigravity,
+            std::path::Path::new("/tmp/c.toml"),
+        );
 
         // Base: [workflow].manager_backend, defaults, and every worker role from the cast.
         assert_eq!(listing.base.name, None);
@@ -2234,8 +2495,11 @@ goal\n";
     #[test]
     fn listing_render_shows_types_and_invocations() {
         let s = section_with_types();
-        let listing =
-            build_types_listing(&s, BackendId::Antigravity, std::path::Path::new("/tmp/c.toml"));
+        let listing = build_types_listing(
+            &s,
+            BackendId::Antigravity,
+            std::path::Path::new("/tmp/c.toml"),
+        );
         let text = render_types_listing(&listing);
         assert!(text.contains("config: /tmp/c.toml"), "got: {text}");
         assert!(text.contains("base [workflow]"), "got: {text}");
@@ -2265,19 +2529,18 @@ goal\n";
             text.contains("agentpit workflow new \"<description>\""),
             "got: {text}"
         );
-        assert!(
-            text.contains("(none — flat backend roster)"),
-            "got: {text}"
-        );
+        assert!(text.contains("(none — flat backend roster)"), "got: {text}");
     }
 
     #[test]
     fn listing_flags_roles_missing_from_cast() {
         let mut s = section_with_types();
-        s.types.get_mut("review").unwrap().roles =
-            vec!["reviewer".into(), "ghost".into()];
-        let listing =
-            build_types_listing(&s, BackendId::Antigravity, std::path::Path::new("/tmp/c.toml"));
+        s.types.get_mut("review").unwrap().roles = vec!["reviewer".into(), "ghost".into()];
+        let listing = build_types_listing(
+            &s,
+            BackendId::Antigravity,
+            std::path::Path::new("/tmp/c.toml"),
+        );
         let t = &listing.types[0];
         assert_eq!(t.roles, vec!["reviewer"]);
         assert_eq!(t.roles_missing_from_cast, vec!["ghost"]);
@@ -2293,8 +2556,11 @@ goal\n";
             ("manager", &[BackendId::Gemini], None),
             ("reviewer", &[BackendId::Codex], Some("review")),
         ]);
-        let listing =
-            build_types_listing(&s, BackendId::Antigravity, std::path::Path::new("/tmp/c.toml"));
+        let listing = build_types_listing(
+            &s,
+            BackendId::Antigravity,
+            std::path::Path::new("/tmp/c.toml"),
+        );
         assert_eq!(listing.base.manager, "(invalid [workflow.roles.manager])");
         assert!(!listing.base.manager_supported);
     }
@@ -2313,19 +2579,25 @@ goal\n";
             },
         );
         s.types.get_mut("review").unwrap().manager_backend = Some(BackendId::Codex);
-        let listing =
-            build_types_listing(&s, BackendId::Antigravity, std::path::Path::new("/tmp/c.toml"));
+        let listing = build_types_listing(
+            &s,
+            BackendId::Antigravity,
+            std::path::Path::new("/tmp/c.toml"),
+        );
         assert_eq!(listing.base.manager, "claude"); // role governs the base
         assert_eq!(listing.types[0].manager, "codex"); // type override governs the type
     }
 
     #[test]
     fn listing_marks_unsupported_manager_backends() {
-        // No manager role, no [workflow].manager_backend → the default backend wins, but
-        // antigravity cannot manage a workflow; the listing must say so, not hide it.
-        let s = WorkflowSection::default();
+        // An explicitly configured unsupported manager remains a hard configuration error; the
+        // authenticated implicit fallback applies only when no manager was configured.
+        let s = WorkflowSection {
+            manager_backend: Some(BackendId::Antigravity),
+            ..WorkflowSection::default()
+        };
         let listing =
-            build_types_listing(&s, BackendId::Antigravity, std::path::Path::new("/tmp/c.toml"));
+            build_types_listing(&s, BackendId::Claude, std::path::Path::new("/tmp/c.toml"));
         assert_eq!(listing.base.manager, "antigravity");
         assert!(!listing.base.manager_supported);
         let text = render_types_listing(&listing);
@@ -2338,8 +2610,11 @@ goal\n";
     #[test]
     fn listing_json_uses_stable_keys() {
         let s = section_with_types();
-        let listing =
-            build_types_listing(&s, BackendId::Antigravity, std::path::Path::new("/tmp/c.toml"));
+        let listing = build_types_listing(
+            &s,
+            BackendId::Antigravity,
+            std::path::Path::new("/tmp/c.toml"),
+        );
         let v = serde_json::to_value(&listing).unwrap();
         assert_eq!(v["base"]["manager"], "codex");
         assert_eq!(v["types"][0]["name"], "review");
@@ -2361,7 +2636,11 @@ goal\n";
 
     #[test]
     fn normalize_rejects_reserved_type_names() {
-        for reserved in [RESERVED_TYPE_NEW, RESERVED_TYPE_LIST, RESERVED_TYPE_DESCRIBE] {
+        for reserved in [
+            RESERVED_TYPE_NEW,
+            RESERVED_TYPE_LIST,
+            RESERVED_TYPE_DESCRIBE,
+        ] {
             let mut p = WorkflowProposal {
                 type_name: reserved.to_string(),
                 ..Default::default()
@@ -2412,7 +2691,10 @@ goal\n";
 
     #[test]
     fn designer_prompt_pins_available_backend_ids() {
-        let p = designer_prompt("build a review flow", &[BackendId::Claude, BackendId::Codex]);
+        let p = designer_prompt(
+            "build a review flow",
+            &[BackendId::Claude, BackendId::Codex],
+        );
         assert!(p.contains("claude, codex"));
         assert!(p.contains("build a review flow"));
         assert!(p.contains("\"type\""));
@@ -2431,11 +2713,19 @@ goal\n";
         });
         let s = summarize_spec(&spec);
         assert!(s.contains("title: Strict review"), "{s}");
-        assert!(s.contains("brief (the manager's runtime instruction): Review hard."), "{s}");
+        assert!(
+            s.contains("brief (the manager's runtime instruction): Review hard."),
+            "{s}"
+        );
         assert!(s.contains("- reviewer [codex]: Find bugs."), "{s}");
         assert!(s.contains("dispatches to roles: reviewer"), "{s}");
         assert!(s.contains("- review — skeptic (refute)"), "{s}");
-        assert!(s.contains("max_depth=2") && s.contains("use_mcp=true") && s.contains("ask_human=false"), "{s}");
+        assert!(
+            s.contains("max_depth=2")
+                && s.contains("use_mcp=true")
+                && s.contains("ask_human=false"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -2455,7 +2745,10 @@ goal\n";
     #[test]
     fn extract_json_finds_object_amid_prose_and_fences() {
         let raw = "Sure!\n```json\n{\"type\": \"x\", \"roles\": []}\n```\nDone.";
-        assert_eq!(extract_json(raw).unwrap(), "{\"type\": \"x\", \"roles\": []}");
+        assert_eq!(
+            extract_json(raw).unwrap(),
+            "{\"type\": \"x\", \"roles\": []}"
+        );
         // Braces inside strings don't confuse the matcher.
         let raw2 = "{\"brief\": \"use {curly} braces\"}";
         assert_eq!(extract_json(raw2).unwrap(), raw2);
@@ -2472,7 +2765,10 @@ goal\n";
         assert_eq!(p.roles[0].name, "rev-iewer");
         assert_eq!(p.roles[0].backends, vec!["codex".to_string()]); // imaginary dropped
         assert_eq!(p.roles[1].prompt, None); // blank persona → None
-        assert_eq!(p.uses_roles, vec!["rev-iewer".to_string(), "sec".to_string()]); // ghost dropped
+        assert_eq!(
+            p.uses_roles,
+            vec!["rev-iewer".to_string(), "sec".to_string()]
+        ); // ghost dropped
         assert_eq!(p.manager_backend.as_deref(), Some("claude"));
     }
 

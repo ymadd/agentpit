@@ -106,6 +106,12 @@ agentpit dashboard                    # launch the desktop dashboard (needs the 
 agentpit update                       # update the CLI + an installed dashboard together
 ```
 
+When a workflow manager is not specified by `--manager`, a named workflow, a manager role, or
+`[workflow].manager_backend`, agentpit picks the first authenticated supported manager. A
+supported `[default].backend` is preferred; otherwise it tries Claude, then Codex. This keeps the
+default Antigravity routing useful for one-shot work without selecting it for a manager role it
+cannot run.
+
 ## Desktop dashboard
 
 `agentpit dashboard` launches a desktop app (install the `agentpit-dashboard` binary next to
@@ -214,8 +220,14 @@ The CLI, shared event schema, and Tauri desktop app share one Cargo workspace an
 
 ```bash
 cargo build -p agentpit --release
+npm --prefix dashboard/frontend ci
+npm --prefix dashboard/frontend test
+npm --prefix dashboard/frontend run build
 cargo run -p agentpit-dashboard
 ```
+
+The dashboard is a Vite/React app embedded by Tauri at compile time, so its `dist/` bundle must be
+built before `cargo run -p agentpit-dashboard` in a clean checkout.
 
 The workspace's default members remain the CLI and shared crate, so a plain `cargo build`
 does not pull the desktop/Tauri dependency graph.

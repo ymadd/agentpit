@@ -124,9 +124,8 @@ impl CapabilityProfile {
     }
 }
 
-/// Minimal stub for a benchmark run's output. The real harness (A2) will flesh this out;
-/// here it only carries the per-category scores and a measurement timestamp so the merge
-/// foundation can be exercised.
+/// Aggregated output from the gold-bench harness: per-category scores plus the optional
+/// measurement timestamp persisted by the merge layer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkResult {
     #[serde(default)]

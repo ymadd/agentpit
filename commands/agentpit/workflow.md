@@ -106,5 +106,6 @@ there too). With at least one worker role configured, the workflow manager's ros
 AVAILABLE ROLES and it dispatches by role name; `--agents` is ignored with a warning. The
 reserved `manager` role is never a dispatch target (`--role manager` is a hard error); manager
 resolution is `--manager` > the type's `manager_backend` > `[workflow.roles.manager]` (first
-claude|codex) > `[workflow].manager_backend` > `[default].backend`, and its `prompt` is injected
-into the orchestrator prompt as a MANAGER PERSONA block.
+claude|codex) > `[workflow].manager_backend` > authenticated implicit manager (a supported
+`[default].backend`, otherwise Claude then Codex), and its `prompt` is injected into the
+orchestrator prompt as a MANAGER PERSONA block.

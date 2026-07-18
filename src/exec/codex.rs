@@ -48,7 +48,13 @@ mod tests {
         let spec = CodexExec.build_spec("x", Some("gpt-5-codex"));
         assert_eq!(
             spec.args,
-            vec!["exec", "--skip-git-repo-check", "--model", "gpt-5-codex", "-"]
+            vec![
+                "exec",
+                "--skip-git-repo-check",
+                "--model",
+                "gpt-5-codex",
+                "-"
+            ]
         );
         assert_eq!(spec.stdin_input.as_deref(), Some("x")); // task still on stdin
     }

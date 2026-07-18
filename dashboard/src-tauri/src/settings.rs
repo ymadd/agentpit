@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
+use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
 
 /// Mirrors `WorkflowSection::default()` in `src/config.rs`.
 const DEFAULT_MAX_DEPTH: u32 = 3;
@@ -136,7 +136,11 @@ fn known_backends() -> Vec<String> {
 /// generator, `list` prints the catalog), so a `[workflow.types.*]` cannot use them. Shipped to
 /// the UI in the payload so its client-side validator can never drift from this gate.
 fn reserved_type_names() -> Vec<String> {
-    vec!["new".to_string(), "list".to_string(), "describe".to_string()]
+    vec![
+        "new".to_string(),
+        "list".to_string(),
+        "describe".to_string(),
+    ]
 }
 
 /// Read `[workflow]` / `[workflow.roles]` from `path`, tolerantly: a missing file, an
@@ -184,7 +188,10 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
                             .collect()
                     })
                     .unwrap_or_default();
-                let prompt = item.get("prompt").and_then(Item::as_str).map(str::to_string);
+                let prompt = item
+                    .get("prompt")
+                    .and_then(Item::as_str)
+                    .map(str::to_string);
                 let model = item.get("model").and_then(Item::as_str).map(str::to_string);
                 roles.push(RoleEntry {
                     name: name.to_string(),
@@ -208,14 +215,23 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
                 types.push(WorkflowTypeEntry {
                     name: name.to_string(),
                     title: item.get("title").and_then(Item::as_str).map(str::to_string),
-                    description: item.get("description").and_then(Item::as_str).map(str::to_string),
-                    prompt: item.get("prompt").and_then(Item::as_str).map(str::to_string),
+                    description: item
+                        .get("description")
+                        .and_then(Item::as_str)
+                        .map(str::to_string),
+                    prompt: item
+                        .get("prompt")
+                        .and_then(Item::as_str)
+                        .map(str::to_string),
                     roles,
                     manager_backend: item
                         .get("manager_backend")
                         .and_then(Item::as_str)
                         .map(str::to_string),
-                    max_depth: item.get("max_depth").and_then(Item::as_integer).map(|n| n.max(0) as u32),
+                    max_depth: item
+                        .get("max_depth")
+                        .and_then(Item::as_integer)
+                        .map(|n| n.max(0) as u32),
                     max_calls_per_manager: item
                         .get("max_calls_per_manager")
                         .and_then(Item::as_integer)
@@ -348,7 +364,11 @@ fn apply_workflow(doc: &mut DocumentMut, payload: &SettingsSave) {
         "default_agents",
         Item::Value(Value::Array(string_array(&payload.workflow.default_agents))),
     );
-    set_preserving_decor(workflow, "max_depth", value(payload.workflow.max_depth as i64));
+    set_preserving_decor(
+        workflow,
+        "max_depth",
+        value(payload.workflow.max_depth as i64),
+    );
     set_preserving_decor(
         workflow,
         "max_calls_per_manager",
@@ -462,8 +482,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    fs::create_dir_all(&dir)
-        .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    fs::create_dir_all(&dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".config.toml.{}.{seq}.tmp", std::process::id()));
     if let Err(err) = fs::write(&tmp, contents) {
@@ -555,7 +574,10 @@ mod tests {
             "known_backends",
             "reserved_type_names",
         ] {
-            assert!(json.get(key).is_some(), "missing top-level key {key}: {json}");
+            assert!(
+                json.get(key).is_some(),
+                "missing top-level key {key}: {json}"
+            );
         }
         let wf = json.get("workflow").unwrap();
         for key in [
@@ -623,9 +645,15 @@ max_depth = 5
         settings_save_at(&save, &path).unwrap();
 
         let raw = fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("model = \"opus\""), "role model must persist; got: {raw}");
+        assert!(
+            raw.contains("model = \"opus\""),
+            "role model must persist; got: {raw}"
+        );
         assert!(raw.contains("# agentpit config"), "got: {raw}");
-        assert!(raw.contains("# a leading comment that must survive"), "got: {raw}");
+        assert!(
+            raw.contains("# a leading comment that must survive"),
+            "got: {raw}"
+        );
         assert!(raw.contains("[default]"), "got: {raw}");
         assert!(
             raw.contains("backend = \"claude\" # inline comment"),
@@ -698,7 +726,10 @@ max_depth = 5
 
         let payload = settings_get_at(&path);
         let names: Vec<&str> = payload.roles.iter().map(|r| r.name.as_str()).collect();
-        assert!(!names.contains(&"manager"), "manager should be deleted: {names:?}");
+        assert!(
+            !names.contains(&"manager"),
+            "manager should be deleted: {names:?}"
+        );
         assert!(names.contains(&"implementer"));
         let reviewer = payload.roles.iter().find(|r| r.name == "reviewer").unwrap();
         assert_eq!(
@@ -748,7 +779,10 @@ max_depth = 5
 
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("[workflow.types.review]"), "got: {raw}");
-        assert!(raw.contains("roles = [\"reviewer\", \"security\"]"), "got: {raw}");
+        assert!(
+            raw.contains("roles = [\"reviewer\", \"security\"]"),
+            "got: {raw}"
+        );
         assert!(raw.contains("enable_ask_human = true"), "got: {raw}");
         assert!(
             raw.contains("description = \"Use for strict, security-focused reviews.\""),
@@ -760,14 +794,26 @@ max_depth = 5
             .split("[workflow.types.research]")
             .nth(1)
             .unwrap_or_default();
-        assert!(!research_block.contains("roles ="), "no empty roles: {research_block}");
-        assert!(!research_block.contains("manager_backend"), "no empty backend: {research_block}");
-        assert!(!research_block.contains("description"), "no empty description: {research_block}");
+        assert!(
+            !research_block.contains("roles ="),
+            "no empty roles: {research_block}"
+        );
+        assert!(
+            !research_block.contains("manager_backend"),
+            "no empty backend: {research_block}"
+        );
+        assert!(
+            !research_block.contains("description"),
+            "no empty description: {research_block}"
+        );
 
         let payload = settings_get_at(&path);
         assert_eq!(payload.types.len(), 2);
         let review = payload.types.iter().find(|t| t.name == "review").unwrap();
-        assert_eq!(review.roles, vec!["reviewer".to_string(), "security".to_string()]);
+        assert_eq!(
+            review.roles,
+            vec!["reviewer".to_string(), "security".to_string()]
+        );
         assert_eq!(review.manager_backend.as_deref(), Some("claude"));
         assert_eq!(review.max_depth, Some(2));
         assert_eq!(review.enable_ask_human, Some(true));
@@ -901,7 +947,11 @@ max_depth = 5
     fn inline_workflow_table_saves_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "workflow = { manager_backend = \"codex\", max_depth = 5 }\n").unwrap();
+        fs::write(
+            &path,
+            "workflow = { manager_backend = \"codex\", max_depth = 5 }\n",
+        )
+        .unwrap();
 
         let save = SettingsSave {
             types: vec![],
@@ -964,7 +1014,10 @@ max_depth = 5
         settings_save_at(&save, &path).unwrap();
 
         let raw = fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("prompt ="), "must not write an empty prompt; got: {raw}");
+        assert!(
+            !raw.contains("prompt ="),
+            "must not write an empty prompt; got: {raw}"
+        );
         let payload = settings_get_at(&path);
         assert_eq!(payload.roles.len(), 1);
         assert_eq!(payload.roles[0].prompt, None);
@@ -989,7 +1042,10 @@ max_depth = 5
         settings_save_at(&save, &path).unwrap();
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "restrictive mode must be preserved, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "restrictive mode must be preserved, got {mode:o}"
+        );
     }
 
     /// The duplicated defaults here must match `WorkflowSection::default()` in `src/config.rs`.

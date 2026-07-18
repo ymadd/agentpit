@@ -47,7 +47,7 @@ jobs:
         run: cargo test --workspace --exclude agentpit-dashboard --locked
 
   dashboard:
-    name: fmt · clippy · test (dashboard)
+    name: frontend · fmt · clippy · test (dashboard)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -77,6 +77,20 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-dashboard-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-dashboard-
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: dashboard/frontend/package-lock.json
+
+      - name: Test and build dashboard frontend
+        working-directory: dashboard/frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
 
       - name: Format
         run: cargo fmt -p agentpit-dashboard --check

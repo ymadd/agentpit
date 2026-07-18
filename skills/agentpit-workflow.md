@@ -20,8 +20,9 @@ agentpit workflow [type] "<goal>" [--manager claude|codex] [--agents a,b,c] [--m
 - An optional leading `type` selects a named `[workflow.types.<type>]` preset (see below); with a
   single positional that positional is the goal and the base `[workflow]` runs. `new` and `list`
   are reserved (the generator and the catalog).
-- `--manager` selects the orchestrating backend (claude or codex). Defaults to
-  `[workflow].manager_backend` or `[default].backend`.
+- `--manager` selects the orchestrating backend (claude or codex). Without an explicit or
+  configured manager, agentpit selects the first authenticated manager: a supported
+  `[default].backend`, otherwise Claude then Codex.
 - `--agents` lists the worker backends the manager may dispatch to. Defaults to all available
   backends minus the manager.
 - `--max-depth` caps workflow recursion (default 3); the ceiling is enforced in Rust.
@@ -57,9 +58,10 @@ prompt   = "You are a strict reviewer. Critique only; do not rewrite."
 The reserved `manager` role configures the orchestrator itself and is never a worker dispatch
 target (`--role manager` is a hard error). Manager resolution order is `--manager` > the type's
 `manager_backend` (selecting a type is an explicit per-kind choice) > `[workflow.roles.manager]`
-(first claude|codex in its list) > `[workflow].manager_backend` > `[default].backend`; the
-manager role's `prompt`, when present, is injected into the orchestrator prompt as a MANAGER
-PERSONA block regardless of where the backend came from.
+(first claude|codex in its list) > `[workflow].manager_backend` > authenticated implicit manager
+(a supported `[default].backend`, otherwise Claude then Codex); the manager role's `prompt`, when
+present, is injected into the orchestrator prompt as a MANAGER PERSONA block regardless of where
+the backend came from.
 
 For every other role, dispatch by name with `agentpit rescue --role <name> "<sub-task>"`
 (`--role` and `--backend` are mutually exclusive — the role resolves the backend). Resolution

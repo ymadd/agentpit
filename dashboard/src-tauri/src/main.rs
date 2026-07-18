@@ -4,8 +4,8 @@
 mod asks;
 mod cli_versions;
 mod settings;
-mod workflow_gen;
 mod state;
+mod workflow_gen;
 
 use std::path::PathBuf;
 use std::sync::mpsc;

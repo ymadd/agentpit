@@ -272,7 +272,8 @@ impl AgentpitTools {
         // also how a `--use-mcp` workflow manager's per-worker dispatches become visible. A role
         // dispatch logs under its RESOLVED backend + carries the role so the dashboard tree can
         // label it "reviewer · codex" rather than just the backend.
-        let logger = RunLogger::start_with_role(RunKind::Rescue, &[backend], &self.cwd, role.as_deref());
+        let logger =
+            RunLogger::start_with_role(RunKind::Rescue, &[backend], &self.cwd, role.as_deref());
         let outcome = dispatch_member_logged(
             backend,
             task,
@@ -378,7 +379,17 @@ impl AgentpitTools {
                 logger.member_started(agg, true);
                 let started = Instant::now();
                 let on_chunk = crate::events::output_streamer(logger.run_id(), agg, true);
-                match dispatch(agg, &agg_prompt, &self.cwd, cancel, on_chunk, &self.regs, req.model.as_deref()).await {
+                match dispatch(
+                    agg,
+                    &agg_prompt,
+                    &self.cwd,
+                    cancel,
+                    on_chunk,
+                    &self.regs,
+                    req.model.as_deref(),
+                )
+                .await
+                {
                     Ok(res) if res.auth_failed => {
                         logger.member_finished(
                             agg,
@@ -702,8 +713,16 @@ async fn dispatch_member_logged(
     logger.member_started(backend, false);
     let started = Instant::now();
     let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
-    let outcome =
-        dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs, model.as_deref()).await;
+    let outcome = dispatch_to_outcome(
+        backend,
+        &prompt,
+        &cwd,
+        cancel,
+        on_chunk,
+        &regs,
+        model.as_deref(),
+    )
+    .await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &outcome.error {
         None => {
@@ -884,7 +903,10 @@ mod tests {
             .lines()
             .find(|l| l.contains("run_started"))
             .expect("a run_started line was written");
-        assert!(started.contains("\"role\":\"reviewer\""), "role not emitted: {started}");
+        assert!(
+            started.contains("\"role\":\"reviewer\""),
+            "role not emitted: {started}"
+        );
     }
 
     #[tokio::test]

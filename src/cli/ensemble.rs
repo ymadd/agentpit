@@ -139,8 +139,16 @@ async fn run_one_member(
 ) -> MemberOutcome {
     let started = Instant::now();
     let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
-    let outcome =
-        dispatch_to_outcome(backend, &prompt, &cwd, cancel, on_chunk, &regs, model.as_deref()).await;
+    let outcome = dispatch_to_outcome(
+        backend,
+        &prompt,
+        &cwd,
+        cancel,
+        on_chunk,
+        &regs,
+        model.as_deref(),
+    )
+    .await;
     let elapsed_s = started.elapsed().as_secs_f32();
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &outcome.error {
@@ -227,7 +235,16 @@ pub async fn run(
     let ctx = load_context()?;
     let members = members.unwrap_or_else(|| ctx.loaded.config.ensemble.default_members.clone());
     let aggregator = aggregator.or(ctx.loaded.config.ensemble.aggregator);
-    run_resolved(ctx, RunKind::Ensemble, prompt, members, aggregator, model, cwd).await
+    run_resolved(
+        ctx,
+        RunKind::Ensemble,
+        prompt,
+        members,
+        aggregator,
+        model,
+        cwd,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

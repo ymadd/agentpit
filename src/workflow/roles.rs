@@ -73,9 +73,10 @@ pub fn resolve_role(
     let backend = if role.backends.is_empty() {
         let mut sorted = available.to_vec();
         sorted.sort();
-        sorted.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("role '{name}': no backend is available to play it")
-        })?
+        sorted
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("role '{name}': no backend is available to play it"))?
     } else {
         role.backends
             .iter()
@@ -152,7 +153,9 @@ pub fn resolve_model(
 pub fn worker_roles(
     roles: &BTreeMap<String, RoleConfig>,
 ) -> impl Iterator<Item = (&String, &RoleConfig)> {
-    roles.iter().filter(|(name, _)| name.as_str() != MANAGER_ROLE)
+    roles
+        .iter()
+        .filter(|(name, _)| name.as_str() != MANAGER_ROLE)
 }
 
 /// Wrap a dispatched sub-task in the role's persona preamble. Without a persona — `None` OR a
@@ -406,8 +409,14 @@ mod tests {
         assert_eq!(resolved.model.as_deref(), Some("gpt-5-codex"));
 
         // Precedence: explicit --model > role.model > backend default > None.
-        assert_eq!(resolve_model(Some("opus"), Some("rm"), Some("bm")).as_deref(), Some("opus"));
-        assert_eq!(resolve_model(None, Some("rm"), Some("bm")).as_deref(), Some("rm"));
+        assert_eq!(
+            resolve_model(Some("opus"), Some("rm"), Some("bm")).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            resolve_model(None, Some("rm"), Some("bm")).as_deref(),
+            Some("rm")
+        );
         assert_eq!(resolve_model(None, None, Some("bm")).as_deref(), Some("bm"));
         assert_eq!(resolve_model(None, None, None), None);
     }

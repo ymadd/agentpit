@@ -770,7 +770,12 @@ mod tests {
         // Backward compat: an old RunStarted line without the new keys deserializes as None/0.
         let old = r#"{"event":"run_started","ts":1,"run_id":"r","pid":2,"kind":"rescue","members":["codex"],"cwd":"/x"}"#;
         match serde_json::from_str::<Event>(old).unwrap() {
-            Event::RunStarted { parent_run_id, depth, role, .. } => {
+            Event::RunStarted {
+                parent_run_id,
+                depth,
+                role,
+                ..
+            } => {
                 assert_eq!(parent_run_id, None);
                 assert_eq!(depth, 0);
                 assert_eq!(role, None);
@@ -779,13 +784,24 @@ mod tests {
         }
         // And the new keys round-trip.
         let ev = Event::RunStarted {
-            ts: 1, run_id: "r1".into(), pid: 2, kind: RunKind::Rescue,
-            members: vec![BackendId::Codex], cwd: "/x".into(),
-            parent_run_id: Some("r0".into()), depth: 1, role: Some("reviewer".into()),
+            ts: 1,
+            run_id: "r1".into(),
+            pid: 2,
+            kind: RunKind::Rescue,
+            members: vec![BackendId::Codex],
+            cwd: "/x".into(),
+            parent_run_id: Some("r0".into()),
+            depth: 1,
+            role: Some("reviewer".into()),
         };
         let json = serde_json::to_string(&ev).unwrap();
         match serde_json::from_str::<Event>(&json).unwrap() {
-            Event::RunStarted { parent_run_id, depth, role, .. } => {
+            Event::RunStarted {
+                parent_run_id,
+                depth,
+                role,
+                ..
+            } => {
                 assert_eq!(parent_run_id.as_deref(), Some("r0"));
                 assert_eq!(depth, 1);
                 assert_eq!(role.as_deref(), Some("reviewer"));
@@ -804,10 +820,20 @@ mod tests {
             std::env::set_var("AGENTPIT_PARENT_RUN_ID", "r-parent");
             std::env::set_var("AGENTPIT_WORKFLOW_DEPTH", "2");
         }
-        RunLogger::start_with_role(RunKind::Rescue, &[BackendId::Codex], tmp.path(), Some("reviewer"));
+        RunLogger::start_with_role(
+            RunKind::Rescue,
+            &[BackendId::Codex],
+            tmp.path(),
+            Some("reviewer"),
+        );
         let contents = std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap();
         match serde_json::from_str::<Event>(contents.lines().next().unwrap()).unwrap() {
-            Event::RunStarted { parent_run_id, depth, role, .. } => {
+            Event::RunStarted {
+                parent_run_id,
+                depth,
+                role,
+                ..
+            } => {
                 assert_eq!(parent_run_id.as_deref(), Some("r-parent"));
                 assert_eq!(depth, 2);
                 assert_eq!(role.as_deref(), Some("reviewer"));
@@ -826,7 +852,12 @@ mod tests {
         RunLogger::start(RunKind::Rescue, &[BackendId::Codex], tmp2.path());
         let contents2 = std::fs::read_to_string(tmp2.path().join("agentpit/events.jsonl")).unwrap();
         match serde_json::from_str::<Event>(contents2.lines().next().unwrap()).unwrap() {
-            Event::RunStarted { parent_run_id, depth, role, .. } => {
+            Event::RunStarted {
+                parent_run_id,
+                depth,
+                role,
+                ..
+            } => {
                 assert_eq!(parent_run_id, None);
                 assert_eq!(depth, 0);
                 assert_eq!(role, None);

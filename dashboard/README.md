@@ -47,13 +47,15 @@ the CLI. An open dashboard must be restarted after its binary is replaced.
 `agentpit` executable, then `PATH` — and spawns it detached.
 
 The repository is one Cargo workspace containing `agentpit`, `agentpit-events`, and this
-desktop app. To build/run it directly during development (the frontend is plain static
-HTML/CSS/JS — no build step, no Node — so a package-targeted `cargo run` launches the
-window, no `tauri-cli` required):
+desktop app. The dashboard frontend is a Vite/React bundle embedded by `tauri-build`; build it
+before a package-targeted `cargo run` in a clean checkout (no `tauri-cli` is required):
 
 ```bash
+npm --prefix dashboard/frontend ci
+npm --prefix dashboard/frontend test
+npm --prefix dashboard/frontend run build
 cargo run -p agentpit-dashboard
-# or: cargo build -p agentpit-dashboard --release
+# or, after the same frontend build: cargo build -p agentpit-dashboard --release
 ```
 
 Then, in another terminal (or from Claude Code), drive agentpit and watch it update live:

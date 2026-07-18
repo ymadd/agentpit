@@ -89,17 +89,24 @@ async fn check_antigravity() -> AuthStatus {
 }
 
 async fn check_claude() -> AuthStatus {
-    let cfg = home_join(&[".claude.json"]);
-    let ok = file_exists(&cfg).await;
+    // A stale ~/.claude.json survives logout, so file presence is not an authentication
+    // check. Claude Code exposes a non-interactive status command whose exit code tracks the
+    // actual login state (and whose stdout is JSON in current releases).
+    let exit = run_exit_code("claude", &["auth", "status"]).await;
+    claude_status_from_exit(exit)
+}
+
+fn claude_status_from_exit(exit: i32) -> AuthStatus {
+    let ok = exit == 0;
     AuthStatus {
         backend: BackendId::Claude,
         ok,
         hint: if ok {
-            "Claude Code config is present.".into()
+            "Claude Code is authenticated.".into()
         } else {
-            "Claude Code is not configured. Run it once interactively to sign in.".into()
+            "Claude Code is not logged in. Authenticate it via `claude auth login`.".into()
         },
-        login_command: "claude".into(),
+        login_command: "claude auth login".into(),
     }
 }
 
@@ -135,5 +142,22 @@ pub async fn check_auth(backend: BackendId) -> AuthStatus {
             hint: format!("No auth checker registered for backend {other}."),
             login_command: String::new(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_status_requires_a_successful_cli_probe() {
+        let logged_in = claude_status_from_exit(0);
+        assert!(logged_in.ok);
+        assert_eq!(logged_in.backend, BackendId::Claude);
+
+        let logged_out = claude_status_from_exit(1);
+        assert!(!logged_out.ok);
+        assert_eq!(logged_out.login_command, "claude auth login");
+        assert!(logged_out.hint.contains("not logged in"));
     }
 }

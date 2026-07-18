@@ -67,8 +67,11 @@ pub async fn run_with_role(
                 &ctx.loaded.config.workflow.roles,
                 &available,
             )?;
-            let wrapped_task =
-                crate::workflow::roles::persona_task(&resolved.name, resolved.prompt.as_deref(), &task);
+            let wrapped_task = crate::workflow::roles::persona_task(
+                &resolved.name,
+                resolved.prompt.as_deref(),
+                &task,
+            );
             // A role dispatch is always single-backend: skip the rescue_members ensemble
             // shortcut entirely and go straight to the resolved backend's explicit route. The
             // role's model is the mid-precedence source (below an explicit --model).
@@ -233,7 +236,11 @@ async fn run_with_route_inner(
     let effective_model = crate::workflow::roles::resolve_model(
         model.as_deref(),
         role_model.as_deref(),
-        ctx.loaded.config.backends.get(&backend_id).and_then(|o| o.model.as_deref()),
+        ctx.loaded
+            .config
+            .backends
+            .get(&backend_id)
+            .and_then(|o| o.model.as_deref()),
     );
     let result = dispatch(
         backend_id,

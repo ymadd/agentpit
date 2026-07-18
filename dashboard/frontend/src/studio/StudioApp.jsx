@@ -15,6 +15,7 @@ import { WorkflowNode, GenStepNode, GhostNode } from "./nodes.jsx";
 import { stepNodeData, metaFor, resolveWorker } from "./backends.js";
 import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName, seedBlueprint, deriveFlow, hasBlueprint } from "./blueprint.js";
 import { draftFromSettings, validate, buildPayload, newRole, newType, typeNameError } from "./settings.js";
+import { indexModelCatalogs, primaryRoleCatalog } from "./model-catalogs.js";
 import { loadSavedSteps, saveSavedSteps, stepTemplate, stepFromTemplate, maxStepSeq } from "./savedsteps.js";
 import { Field, Text, Area, Num, Toggle, Select, TriState, BackendChips } from "./forms.jsx";
 import { t as tr, setStudioLang, detectLang, persistLang } from "./i18n.js";
@@ -39,6 +40,12 @@ async function loadSettings() {
     }
   }
   return window.__AGENTPIT_MOCK_SETTINGS__ || { known_backends: [], roles: [], types: [], workflow: {} };
+}
+
+async function loadModelCatalogs(refresh = false) {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (invoke) return await invoke("get_model_catalogs", { refresh });
+  return window.__AGENTPIT_MOCK_MODEL_CATALOGS__ || [];
 }
 
 function edgeStyle(kind) {
@@ -109,6 +116,9 @@ export default function StudioApp() {
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState({});
   const [saveError, setSaveError] = useState(null);
+  const [modelCatalogs, setModelCatalogs] = useState({});
+  const [modelCatalogLoading, setModelCatalogLoading] = useState(true);
+  const [modelCatalogError, setModelCatalogError] = useState(null);
   const [selNodeId, setSelNodeId] = useState(null);
   const [selRoleKey, setSelRoleKey] = useState(null);
   const [gen, setGen] = useState(null); // generate modal: null=closed, else {desc, busy, error}
@@ -133,6 +143,27 @@ export default function StudioApp() {
       alive = false;
     };
   }, [setEdges]);
+
+  useEffect(() => {
+    let alive = true;
+    setModelCatalogLoading(true);
+    loadModelCatalogs(false)
+      .then((catalogs) => {
+        if (!alive) return;
+        setModelCatalogs(indexModelCatalogs(catalogs));
+        setModelCatalogError(null);
+      })
+      .catch((error) => {
+        if (!alive) return;
+        setModelCatalogError(String(error));
+      })
+      .finally(() => {
+        if (alive) setModelCatalogLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // Rebuild NODES on any config (role resolution / goal label) or blueprint
   // change, preserving dragged positions. Edges are managed explicitly (initial
@@ -282,6 +313,18 @@ export default function StudioApp() {
   const setBackendModel = (backend, model) => {
     setDraft((d) => ({ ...d, backend_models: { ...d.backend_models, [backend]: model } }));
     setDirty(true);
+  };
+  const refreshModelCatalogs = async () => {
+    if (modelCatalogLoading) return;
+    setModelCatalogLoading(true);
+    setModelCatalogError(null);
+    try {
+      setModelCatalogs(indexModelCatalogs(await loadModelCatalogs(true)));
+    } catch (error) {
+      setModelCatalogError(String(error));
+    } finally {
+      setModelCatalogLoading(false);
+    }
   };
   const setRoleField = (key, field, val) => {
     setDraft((d) => ({ ...d, roles: d.roles.map((r) => (r._key === key ? { ...r, [field]: val } : r)) }));
@@ -692,7 +735,15 @@ export default function StudioApp() {
         <div className="sd-insp">
           {/* Default (nothing/goal selected) = the workflow settings, base or type. */}
           {selRole ? (
-            <RoleForm role={selRole} backends={backends} error={errors[selRole._key]} onField={setRoleField} onToggleBackend={toggleRoleBackend} onRemove={removeRole} />
+            <RoleForm
+              role={selRole}
+              backends={backends}
+              modelCatalog={primaryRoleCatalog(modelCatalogs, selRole.backends)}
+              error={errors[selRole._key]}
+              onField={setRoleField}
+              onToggleBackend={toggleRoleBackend}
+              onRemove={removeRole}
+            />
           ) : selStep ? (
             <StepForm step={selStep} beOpts={beOpts} roles={draft.roles} onField={setStepField} onDelete={deleteStep} onRemoveWorker={removeWorker} onSaveTemplate={saveStepAsTemplate} />
           ) : curType ? (
@@ -712,9 +763,13 @@ export default function StudioApp() {
               wf={draft.workflow}
               backends={backends}
               backendModels={draft.backend_models}
+              modelCatalogs={modelCatalogs}
+              modelCatalogLoading={modelCatalogLoading}
+              modelCatalogError={modelCatalogError}
               beOpts={beOpts}
               onField={setWorkflowField}
               onBackendModel={setBackendModel}
+              onRefreshModels={refreshModelCatalogs}
             />
           )}
         </div>
@@ -807,7 +862,31 @@ function StepForm({ step, beOpts, roles, onField, onDelete, onRemoveWorker, onSa
   );
 }
 
-function WorkflowForm({ wf, backends, backendModels, beOpts, onField, onBackendModel }) {
+function ModelCatalogMeta({ catalog, loading }) {
+  if (loading && !catalog) return <div className="sd-model-meta">{tr("Loading models…")}</div>;
+  if (catalog?.error) return <div className="sd-model-meta err">{tr("Could not load models: {error}", { error: catalog.error })}</div>;
+  if (catalog?.models?.length) {
+    return (
+      <div className="sd-model-meta">
+        {tr("{count} choices · {source}", { count: catalog.models.length, source: catalog.source })}
+      </div>
+    );
+  }
+  return <div className="sd-model-meta">{tr("No CLI model list; enter an ID manually.")}</div>;
+}
+
+function WorkflowForm({
+  wf,
+  backends,
+  backendModels,
+  modelCatalogs,
+  modelCatalogLoading,
+  modelCatalogError,
+  beOpts,
+  onField,
+  onBackendModel,
+  onRefreshModels,
+}) {
   return (
     <>
       <h3>{tr("WORKFLOW · base [workflow]")}</h3>
@@ -827,22 +906,34 @@ function WorkflowForm({ wf, backends, backendModels, beOpts, onField, onBackendM
         <Toggle checked={!!wf.use_mcp} onChange={(v) => onField("use_mcp", v)} label={tr("use MCP")} />
         <Toggle checked={!!wf.enable_ask_human} onChange={(v) => onField("enable_ask_human", v)} label={tr("ask-human")} />
       </div>
-      <div className="sd-section-title">{tr("BACKEND MODELS")}</div>
+      <div className="sd-model-head">
+        <div className="sd-section-title">{tr("BACKEND MODELS")}</div>
+        <button type="button" className="sd-model-refresh" disabled={modelCatalogLoading} onClick={onRefreshModels}>
+          {modelCatalogLoading ? tr("Loading models…") : tr("Refresh models")}
+        </button>
+      </div>
       <div className="sd-note sd-note-before">
         {tr("Empty uses each CLI's own default. Role and --model overrides still take precedence.")}
       </div>
+      {modelCatalogError ? <div className="sd-model-global-error">{tr("Could not load models: {error}", { error: modelCatalogError })}</div> : null}
       <div className="sd-model-list">
-        {backends.map((backend) => (
-          <Field key={backend} label={metaFor(backend).label} mono>
-            <Text
-              value={backendModels?.[backend] || ""}
-              onChange={(value) => onBackendModel(backend, value)}
-              placeholder={tr("CLI default")}
-              mono
-            />
-          </Field>
-        ))}
+        {backends.map((backend) => {
+          const catalog = modelCatalogs?.[backend];
+          return (
+            <Field key={backend} label={metaFor(backend).label} mono>
+              <Text
+                value={backendModels?.[backend] || ""}
+                onChange={(value) => onBackendModel(backend, value)}
+                placeholder={tr("CLI default")}
+                options={catalog?.models || []}
+                mono
+              />
+              <ModelCatalogMeta catalog={catalog} loading={modelCatalogLoading} />
+            </Field>
+          );
+        })}
       </div>
+      <div className="sd-note">{tr("Candidates are suggestions; custom model IDs remain valid.")}</div>
       <div className="sd-note">{tr("Saved to config.toml `[workflow]` and `[backends.*].model` on Save.")}</div>
     </>
   );
@@ -913,7 +1004,7 @@ function TypeForm({ type, beOpts, roleNames, error, describing, onField, onToggl
   );
 }
 
-function RoleForm({ role, backends, error, onField, onToggleBackend, onRemove }) {
+function RoleForm({ role, backends, modelCatalog, error, onField, onToggleBackend, onRemove }) {
   return (
     <>
       <h3>{tr("ROLE ·")} {role.name || tr("(unnamed)")}</h3>
@@ -928,7 +1019,18 @@ function RoleForm({ role, backends, error, onField, onToggleBackend, onRemove })
         <Area value={role.prompt} onChange={(v) => onField(role._key, "prompt", v)} rows={3} />
       </Field>
       <Field label={tr("Model (optional)")} mono>
-        <Text value={role.model} onChange={(v) => onField(role._key, "model", v)} placeholder={tr("e.g. opus / gpt-5-codex")} mono />
+        <Text
+          value={role.model}
+          onChange={(v) => onField(role._key, "model", v)}
+          placeholder={tr("e.g. opus / gpt-5-codex")}
+          options={modelCatalog?.models || []}
+          mono
+        />
+        {modelCatalog?.models?.length ? (
+          <div className="sd-model-meta">
+            {tr("Candidates use the first backend in the preference order: {backend}.", { backend: role.backends[0] })}
+          </div>
+        ) : null}
       </Field>
       <button className="sd-danger" onClick={() => onRemove(role._key)}>
         {tr("Remove role")}

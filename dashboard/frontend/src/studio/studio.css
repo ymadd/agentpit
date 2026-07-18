@@ -334,3 +334,28 @@
 }
 .sd-note.sd-note-before { margin: 5px 0 10px; }
 .sd-model-list .sd-field { margin-bottom: 8px; }
+.sd-model-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 18px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-2);
+}
+.sd-model-head .sd-section-title { flex: 1; margin: 0; padding: 0; border: 0; }
+.sd-model-refresh {
+  flex: none;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  color: var(--muted-2);
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9px;
+}
+.sd-model-refresh:hover:not(:disabled), .sd-model-refresh:focus-visible { border-color: var(--ac-bd); color: var(--ac-tx); }
+.sd-model-refresh:disabled { cursor: wait; opacity: 0.55; }
+.sd-model-meta { margin-top: 4px; color: var(--faint); font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
+.sd-model-meta.err, .sd-model-global-error { color: #f08a98; }
+.sd-model-global-error { margin: 0 0 9px; font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }

@@ -1,4 +1,5 @@
 // Small controlled form primitives for the Studio inspector. Styled by studio.css.
+import { useId } from "react";
 import { t as tr } from "./i18n.js";
 
 export function Field({ label, mono, children }) {
@@ -10,14 +11,30 @@ export function Field({ label, mono, children }) {
   );
 }
 
-export function Text({ value, onChange, placeholder, mono }) {
+export function Text({ value, onChange, placeholder, mono, options = [] }) {
+  const generatedListId = useId();
+  const listId = options.length ? `sd-options-${generatedListId.replaceAll(":", "")}` : undefined;
   return (
-    <input
-      className={"sd-input" + (mono ? " mono" : "")}
-      value={value ?? ""}
-      placeholder={placeholder || ""}
-      onChange={(e) => onChange(e.target.value)}
-    />
+    <>
+      <input
+        className={"sd-input" + (mono ? " mono" : "")}
+        value={value ?? ""}
+        placeholder={placeholder || ""}
+        list={listId}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      {listId ? (
+        <datalist id={listId}>
+          {options.map((option) => (
+            <option
+              key={option.value}
+              value={option.value}
+              label={option.label && option.label !== option.value ? option.label : undefined}
+            />
+          ))}
+        </datalist>
+      ) : null}
+    </>
   );
 }
 

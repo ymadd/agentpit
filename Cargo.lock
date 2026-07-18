@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agentpit"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "agent-client-protocol",
  "agentpit-events",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agentpit-dashboard"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "agentpit-events",
  "dirs 5.0.1",
@@ -96,6 +96,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tempfile",
+ "tokio",
  "toml_edit 0.22.27",
 ]
 

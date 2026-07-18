@@ -3,6 +3,7 @@
 
 mod asks;
 mod cli_versions;
+mod model_catalog;
 mod settings;
 mod state;
 mod workflow_gen;
@@ -75,6 +76,11 @@ async fn update_agent_cli(id: String) -> Result<cli_versions::AgentCliUpdate, St
     tauri::async_runtime::spawn_blocking(move || cli_versions::update(&id))
         .await
         .map_err(|error| format!("agent CLI update failed: {error}"))?
+}
+
+#[tauri::command]
+async fn get_model_catalogs(refresh: bool) -> Vec<model_catalog::ModelCatalog> {
+    model_catalog::list(refresh).await
 }
 
 /// A delta of a backend leg's captured output: only the bytes appended since `offset`.
@@ -218,6 +224,7 @@ fn main() {
             get_snapshot,
             get_agent_clis,
             update_agent_cli,
+            get_model_catalogs,
             get_output,
             asks::get_pending_asks,
             asks::answer_ask,

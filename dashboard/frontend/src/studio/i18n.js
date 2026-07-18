@@ -84,6 +84,12 @@ export const JA = {
   "Empty uses each CLI's own default. Role and --model overrides still take precedence.":
     "空欄では各 CLI の既定モデルを使用します。ロールおよび --model 指定が引き続き優先されます。",
   "CLI default": "CLI の既定値",
+  "Refresh models": "モデル候補を更新",
+  "Loading models…": "モデル候補を取得中…",
+  "{count} choices · {source}": "{count} 件の候補 · {source}",
+  "Could not load models: {error}": "モデル候補を取得できません: {error}",
+  "No CLI model list; enter an ID manually.": "CLI の一覧取得に未対応です。ID を直接入力してください。",
+  "Candidates are suggestions; custom model IDs remain valid.": "候補は入力支援です。カスタムモデル ID も引き続き指定できます。",
   "Saved to config.toml `[workflow]` and `[backends.*].model` on Save.": "保存時に config.toml の `[workflow]` と `[backends.*].model` に書き込まれます。",
   // type form
   "WORKFLOW TYPE ·": "ワークフロータイプ ·",
@@ -108,6 +114,7 @@ export const JA = {
   "Persona (prompt)": "ペルソナ（プロンプト）",
   "Model (optional)": "モデル（任意）",
   "e.g. opus / gpt-5-codex": "例: opus / gpt-5-codex",
+  "Candidates use the first backend in the preference order: {backend}.": "候補は優先順位1番目のバックエンド（{backend}）に合わせています。",
   "Remove role": "ロールを削除",
   "Saved to config.toml `[workflow.roles.*]` on Save.": "保存時に config.toml の `[workflow.roles.*]` に書き込まれます。",
   "No roles. Add one → it becomes a `[workflow.roles.*]`.": "ロールがありません。追加すると `[workflow.roles.*]` になります。",

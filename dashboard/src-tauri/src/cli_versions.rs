@@ -244,7 +244,7 @@ fn truncate_output(text: &str) -> String {
     format!("{}\n… output truncated", &text[..end])
 }
 
-fn resolve_command(command: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_command(command: &str) -> Option<PathBuf> {
     let home = dirs_home();
     resolve_command_with(command, env::var_os("PATH").as_deref(), home.as_deref())
 }

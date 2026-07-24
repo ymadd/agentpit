@@ -181,7 +181,7 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
         .map_err(|e| anyhow!("update failed: {e}"))?;
     let installed_version = status.version().to_string();
     let dashboard = sync_installed_dashboard(&installed_version);
-    let resign_error = resign_touched_bundles(!status.uptodate(), &dashboard);
+    let resign_error = resign_touched_bundles(!status.uptodate(), &dashboard, &installed_version);
     Ok(UpdateOutcome {
         already_up_to_date: status.uptodate(),
         installed_version,
@@ -199,9 +199,15 @@ fn enclosing_app_bundle(path: &Path) -> Option<PathBuf> {
 }
 
 /// Ad-hoc re-sign every `.app` bundle whose nested binaries this update replaced, restoring the
-/// bundle seal (see [`UpdateOutcome::resign_error`]). Returns the combined error text when any
-/// re-sign failed; `None` on success, off macOS, or when no bundle was touched.
-fn resign_touched_bundles(cli_updated: bool, dashboard: &DashboardUpdateOutcome) -> Option<String> {
+/// bundle seal (see [`UpdateOutcome::resign_error`]). The bundle's `Info.plist` version keys are
+/// rewritten to `installed_version` first, so Finder and the OS report the version the binaries
+/// actually are — and so the rewrite is covered by the fresh seal. Returns the combined error
+/// text when any step failed; `None` on success, off macOS, or when no bundle was touched.
+fn resign_touched_bundles(
+    cli_updated: bool,
+    dashboard: &DashboardUpdateOutcome,
+    installed_version: &str,
+) -> Option<String> {
     let mut bundles: Vec<PathBuf> = Vec::new();
     if cli_updated
         && let Some(bundle) = std::env::current_exe()
@@ -220,11 +226,51 @@ fn resign_touched_bundles(cli_updated: bool, dashboard: &DashboardUpdateOutcome)
 
     let mut errors: Vec<String> = Vec::new();
     for bundle in bundles {
+        if let Err(error) = update_bundle_version_plist(&bundle, installed_version) {
+            errors.push(error);
+        }
         if let Err(error) = resign_app_bundle(&bundle) {
             errors.push(error);
         }
     }
     (!errors.is_empty()).then(|| errors.join("; "))
+}
+
+/// Rewrite `CFBundleShortVersionString` / `CFBundleVersion` in the bundle's `Info.plist` to
+/// `version`. Without this, an in-place binary update leaves the plist advertising the old
+/// version (Finder's Get Info, `defaults read`) even though the binaries are new. Must run
+/// *before* [`resign_app_bundle`] — editing the plist afterwards would break the fresh seal.
+#[cfg(target_os = "macos")]
+fn update_bundle_version_plist(bundle: &Path, version: &str) -> std::result::Result<(), String> {
+    let plist = bundle.join("Contents").join("Info.plist");
+    if !plist.is_file() {
+        return Ok(()); // not a standard bundle layout; nothing to rewrite
+    }
+    let version = version.trim().trim_start_matches('v');
+    for key in ["CFBundleShortVersionString", "CFBundleVersion"] {
+        let output = std::process::Command::new("/usr/libexec/PlistBuddy")
+            .arg("-c")
+            .arg(format!("Set :{key} {version}"))
+            .arg(&plist)
+            .output()
+            .map_err(|error| format!("failed to run PlistBuddy on {}: {error}", plist.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "PlistBuddy Set {key} failed on {}: {}",
+                plist.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn update_bundle_version_plist(
+    _bundle: &Path,
+    _version: &str,
+) -> std::result::Result<(), String> {
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -576,6 +622,49 @@ mod tests {
     fn version_normalization_accepts_release_tags() {
         assert_eq!(normalized_version("v0.1.21\n"), "0.1.21");
         assert_eq!(normalized_version("0.1.21"), "0.1.21");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn update_bundle_version_plist_rewrites_both_version_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("fake.app");
+        let contents = bundle.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.32</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.32</string>
+</dict>
+</plist>
+"#,
+        )
+        .unwrap();
+
+        update_bundle_version_plist(&bundle, "v0.1.33").unwrap();
+
+        let read = |key: &str| {
+            let out = std::process::Command::new("/usr/libexec/PlistBuddy")
+                .arg("-c")
+                .arg(format!("Print :{key}"))
+                .arg(contents.join("Info.plist"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(read("CFBundleShortVersionString"), "0.1.33");
+        assert_eq!(read("CFBundleVersion"), "0.1.33");
+
+        // A bundle without an Info.plist (bare directory) is silently skipped.
+        let bare = temp.path().join("bare.app");
+        std::fs::create_dir_all(&bare).unwrap();
+        update_bundle_version_plist(&bare, "0.1.33").unwrap();
     }
 
     #[cfg(unix)]

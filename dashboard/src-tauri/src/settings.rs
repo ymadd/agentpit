@@ -1,14 +1,13 @@
-//! Read/write workflow settings and per-backend model defaults in the user's `config.toml`.
+//! Read/write the CLI configuration surface in the user's `config.toml`.
 //!
 //! The dashboard crate does not depend on the main `agentpit` crate, so the tiny
 //! config-path rule is duplicated here (kept in sync with
 //! `agentpit::config::default_config_path` in `src/config.rs`):
 //! `$XDG_CONFIG_HOME/agentpit/config.toml`, else `~/.config/agentpit/config.toml`.
 //!
-//! Parsing uses `toml_edit` (not `toml`) so `settings_save` can rewrite only the
-//! `[workflow]` scalars, replace `[workflow.roles]` wholesale, and update only the `model`
-//! key under `[backends.<id>]` while leaving unrelated tables, backend transports, and comments
-//! untouched.
+//! Parsing uses `toml_edit` (not `toml`) so the Workflow Studio and full settings shell can
+//! update only the tables they own while preserving comments, unknown future keys, and the
+//! other surface's unsaved-independent fields.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -131,6 +130,168 @@ pub struct SettingsSave {
     /// backend model, keeping older dashboard frontends forward-compatible with this contract.
     #[serde(default)]
     pub backend_models: BTreeMap<String, Option<String>>,
+}
+
+// ── Full CLI configuration surface ──────────────────────────────────────────
+//
+// The Workflow Studio predates the rest of the settings screen and intentionally
+// keeps its narrow `settings_get` / `settings_save` contract above.  The desktop
+// shell uses the types below for every non-workflow field understood by the CLI.
+// Keeping the contracts separate means an older Studio save cannot accidentally
+// overwrite routing or ensemble values that it never loaded.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoreConfigPayload {
+    pub backend: String,
+    pub auto_route: bool,
+}
+
+impl Default for CoreConfigPayload {
+    fn default() -> Self {
+        Self {
+            backend: "antigravity".into(),
+            auto_route: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutesConfigPayload {
+    pub rescue: String,
+    pub review: String,
+    pub explain: String,
+    pub refactor: String,
+}
+
+impl Default for RoutesConfigPayload {
+    fn default() -> Self {
+        Self {
+            rescue: "antigravity".into(),
+            review: "claude".into(),
+            explain: "antigravity".into(),
+            refactor: "claude".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoRouteConfigPayload {
+    pub long_context_threshold: u64,
+    pub long_context_backend: String,
+    #[serde(default)]
+    pub review_keywords: Vec<String>,
+    pub review_backend: String,
+}
+
+impl Default for AutoRouteConfigPayload {
+    fn default() -> Self {
+        Self {
+            long_context_threshold: 100_000,
+            long_context_backend: "antigravity".into(),
+            review_keywords: vec![
+                "review".into(),
+                "audit".into(),
+                "critique".into(),
+                "security".into(),
+            ],
+            review_backend: "claude".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EnsembleEntryPayload {
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub aggregator: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnsembleConfigPayload {
+    pub default: EnsembleEntryPayload,
+    pub review: EnsembleEntryPayload,
+    pub security_review: EnsembleEntryPayload,
+    pub adversarial_review: EnsembleEntryPayload,
+    pub rescue: EnsembleEntryPayload,
+    pub refactor: EnsembleEntryPayload,
+}
+
+impl Default for EnsembleConfigPayload {
+    fn default() -> Self {
+        Self {
+            default: EnsembleEntryPayload {
+                members: vec!["antigravity".into(), "claude".into(), "opencode".into()],
+                aggregator: None,
+            },
+            review: EnsembleEntryPayload {
+                members: vec!["antigravity".into(), "opencode".into()],
+                aggregator: None,
+            },
+            security_review: EnsembleEntryPayload {
+                members: vec!["claude".into(), "codex".into()],
+                aggregator: None,
+            },
+            adversarial_review: EnsembleEntryPayload {
+                members: vec!["codex".into(), "antigravity".into()],
+                aggregator: None,
+            },
+            rescue: EnsembleEntryPayload::default(),
+            refactor: EnsembleEntryPayload::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackendConfigEntry {
+    pub id: String,
+    /// None means the backend's built-in transport default.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// None means the provider CLI chooses its own model.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigPayload {
+    pub config_path: String,
+    pub exists: bool,
+    pub defaults: CoreConfigPayload,
+    pub routes: RoutesConfigPayload,
+    pub auto_route: AutoRouteConfigPayload,
+    pub ensemble: EnsembleConfigPayload,
+    pub backends: Vec<BackendConfigEntry>,
+    pub known_backends: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSave {
+    pub defaults: CoreConfigPayload,
+    pub routes: RoutesConfigPayload,
+    pub auto_route: AutoRouteConfigPayload,
+    pub ensemble: EnsembleConfigPayload,
+    #[serde(default)]
+    pub backends: Vec<BackendConfigEntry>,
+}
+
+impl Default for ConfigSave {
+    fn default() -> Self {
+        Self {
+            defaults: CoreConfigPayload::default(),
+            routes: RoutesConfigPayload::default(),
+            auto_route: AutoRouteConfigPayload::default(),
+            ensemble: EnsembleConfigPayload::default(),
+            backends: known_backends()
+                .into_iter()
+                .map(|id| BackendConfigEntry {
+                    id,
+                    transport: None,
+                    model: None,
+                })
+                .collect(),
+        }
+    }
 }
 
 fn known_backends() -> Vec<String> {
@@ -276,6 +437,394 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
         known_backends: known_backends(),
         reserved_type_names: reserved_type_names(),
     }
+}
+
+fn table_string(table: Option<&dyn toml_edit::TableLike>, key: &str, fallback: &str) -> String {
+    table
+        .and_then(|table| table.get(key))
+        .and_then(Item::as_str)
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn table_strings(
+    table: Option<&dyn toml_edit::TableLike>,
+    key: &str,
+    fallback: &[String],
+) -> Vec<String> {
+    table
+        .and_then(|table| table.get(key))
+        .and_then(Item::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_else(|| fallback.to_vec())
+}
+
+fn table_optional_string(table: Option<&dyn toml_edit::TableLike>, key: &str) -> Option<String> {
+    table
+        .and_then(|table| table.get(key))
+        .and_then(Item::as_str)
+        .map(str::to_string)
+}
+
+fn read_ensemble_entry(
+    table: Option<&dyn toml_edit::TableLike>,
+    members_key: &str,
+    aggregator_key: &str,
+    fallback: &EnsembleEntryPayload,
+) -> EnsembleEntryPayload {
+    EnsembleEntryPayload {
+        members: table_strings(table, members_key, &fallback.members),
+        aggregator: table_optional_string(table, aggregator_key),
+    }
+}
+
+/// Read every non-workflow field supported by `src/config.rs::HubConfig`.
+/// Wrong-typed or missing values fall back field-by-field, matching the forgiving
+/// behaviour of the existing Workflow Studio read path.
+fn config_get_at(path: &Path) -> ConfigPayload {
+    let exists = path.is_file();
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let doc = raw.parse::<DocumentMut>().unwrap_or_default();
+
+    let default_values = CoreConfigPayload::default();
+    let defaults_table = doc.get("default").and_then(Item::as_table_like);
+    let defaults = CoreConfigPayload {
+        backend: table_string(defaults_table, "backend", &default_values.backend),
+        auto_route: defaults_table
+            .and_then(|table| table.get("auto_route"))
+            .and_then(Item::as_bool)
+            .unwrap_or(default_values.auto_route),
+    };
+
+    let route_defaults = RoutesConfigPayload::default();
+    let routes_table = doc.get("routes").and_then(Item::as_table_like);
+    let routes = RoutesConfigPayload {
+        rescue: table_string(routes_table, "rescue", &route_defaults.rescue),
+        review: table_string(routes_table, "review", &route_defaults.review),
+        explain: table_string(routes_table, "explain", &route_defaults.explain),
+        refactor: table_string(routes_table, "refactor", &route_defaults.refactor),
+    };
+
+    let auto_defaults = AutoRouteConfigPayload::default();
+    let auto_table = doc.get("auto_route").and_then(Item::as_table_like);
+    let auto_route = AutoRouteConfigPayload {
+        long_context_threshold: auto_table
+            .and_then(|table| table.get("long_context_threshold"))
+            .and_then(Item::as_integer)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(auto_defaults.long_context_threshold),
+        long_context_backend: table_string(
+            auto_table,
+            "long_context_backend",
+            &auto_defaults.long_context_backend,
+        ),
+        review_keywords: table_strings(
+            auto_table,
+            "review_keywords",
+            &auto_defaults.review_keywords,
+        ),
+        review_backend: table_string(auto_table, "review_backend", &auto_defaults.review_backend),
+    };
+
+    let ensemble_defaults = EnsembleConfigPayload::default();
+    let ensemble_table = doc.get("ensemble").and_then(Item::as_table_like);
+    let ensemble = EnsembleConfigPayload {
+        default: read_ensemble_entry(
+            ensemble_table,
+            "default_members",
+            "aggregator",
+            &ensemble_defaults.default,
+        ),
+        review: read_ensemble_entry(
+            ensemble_table,
+            "review_members",
+            "review_aggregator",
+            &ensemble_defaults.review,
+        ),
+        security_review: read_ensemble_entry(
+            ensemble_table,
+            "security_review_members",
+            "security_review_aggregator",
+            &ensemble_defaults.security_review,
+        ),
+        adversarial_review: read_ensemble_entry(
+            ensemble_table,
+            "adversarial_review_members",
+            "adversarial_review_aggregator",
+            &ensemble_defaults.adversarial_review,
+        ),
+        rescue: read_ensemble_entry(
+            ensemble_table,
+            "rescue_members",
+            "rescue_aggregator",
+            &ensemble_defaults.rescue,
+        ),
+        refactor: read_ensemble_entry(
+            ensemble_table,
+            "refactor_members",
+            "refactor_aggregator",
+            &ensemble_defaults.refactor,
+        ),
+    };
+
+    let backends_table = doc.get("backends").and_then(Item::as_table_like);
+    let known = known_backends();
+    let backends = known
+        .iter()
+        .map(|id| {
+            let entry = backends_table
+                .and_then(|backends| backends.get(id))
+                .and_then(Item::as_table_like);
+            BackendConfigEntry {
+                id: id.clone(),
+                transport: table_optional_string(entry, "transport"),
+                model: table_optional_string(entry, "model"),
+            }
+        })
+        .collect();
+
+    ConfigPayload {
+        config_path: path.display().to_string(),
+        exists,
+        defaults,
+        routes,
+        auto_route,
+        ensemble,
+        backends,
+        known_backends: known,
+    }
+}
+
+fn validate_config(payload: &ConfigSave) -> Result<(), String> {
+    let known = known_backends();
+    let check_backend = |backend: &str| -> Result<(), String> {
+        if known.iter().any(|known| known == backend) {
+            Ok(())
+        } else {
+            Err(format!("unknown backend: {backend}"))
+        }
+    };
+
+    check_backend(&payload.defaults.backend)?;
+    for backend in [
+        &payload.routes.rescue,
+        &payload.routes.review,
+        &payload.routes.explain,
+        &payload.routes.refactor,
+        &payload.auto_route.long_context_backend,
+        &payload.auto_route.review_backend,
+    ] {
+        check_backend(backend)?;
+    }
+    if payload.auto_route.long_context_threshold > i64::MAX as u64 {
+        return Err("long_context_threshold exceeds TOML's integer range".into());
+    }
+
+    let ensembles = [
+        &payload.ensemble.default,
+        &payload.ensemble.review,
+        &payload.ensemble.security_review,
+        &payload.ensemble.adversarial_review,
+        &payload.ensemble.rescue,
+        &payload.ensemble.refactor,
+    ];
+    for ensemble in ensembles {
+        let mut seen = std::collections::HashSet::new();
+        for member in &ensemble.members {
+            check_backend(member)?;
+            if !seen.insert(member) {
+                return Err(format!("duplicate ensemble member: {member}"));
+            }
+        }
+        if let Some(aggregator) = &ensemble.aggregator {
+            check_backend(aggregator)?;
+        }
+    }
+
+    let mut seen_backends = std::collections::HashSet::new();
+    for backend in &payload.backends {
+        check_backend(&backend.id)?;
+        if !seen_backends.insert(backend.id.as_str()) {
+            return Err(format!("duplicate backend entry: {}", backend.id));
+        }
+        if let Some(transport) = backend.transport.as_deref() {
+            if transport != "exec" && transport != "acp" {
+                return Err(format!(
+                    "invalid transport for {}: {transport} (expected exec or acp)",
+                    backend.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn root_table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut dyn toml_edit::TableLike {
+    let item = doc
+        .as_table_mut()
+        .entry(name)
+        .or_insert_with(|| Item::Table(Table::new()));
+    if !item.is_table_like() {
+        *item = Item::Table(Table::new());
+    }
+    item.as_table_like_mut().expect("just ensured table-like")
+}
+
+fn set_optional_string(table: &mut dyn toml_edit::TableLike, key: &str, raw: Option<&str>) {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value_) => set_preserving_decor(table, key, value(value_)),
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+fn set_ensemble_entry(
+    table: &mut dyn toml_edit::TableLike,
+    members_key: &str,
+    aggregator_key: &str,
+    entry: &EnsembleEntryPayload,
+) {
+    set_preserving_decor(
+        table,
+        members_key,
+        Item::Value(Value::Array(string_array(&entry.members))),
+    );
+    set_optional_string(table, aggregator_key, entry.aggregator.as_deref());
+}
+
+/// Apply only the CLI fields represented by `ConfigSave`; workflow tables and unknown
+/// future keys survive verbatim.
+fn apply_config(doc: &mut DocumentMut, payload: &ConfigSave) {
+    let defaults = root_table_mut(doc, "default");
+    set_preserving_decor(defaults, "backend", value(payload.defaults.backend.clone()));
+    set_preserving_decor(defaults, "auto_route", value(payload.defaults.auto_route));
+
+    let routes = root_table_mut(doc, "routes");
+    set_preserving_decor(routes, "rescue", value(payload.routes.rescue.clone()));
+    set_preserving_decor(routes, "review", value(payload.routes.review.clone()));
+    set_preserving_decor(routes, "explain", value(payload.routes.explain.clone()));
+    set_preserving_decor(routes, "refactor", value(payload.routes.refactor.clone()));
+
+    let auto_route = root_table_mut(doc, "auto_route");
+    set_preserving_decor(
+        auto_route,
+        "long_context_threshold",
+        value(payload.auto_route.long_context_threshold as i64),
+    );
+    set_preserving_decor(
+        auto_route,
+        "long_context_backend",
+        value(payload.auto_route.long_context_backend.clone()),
+    );
+    set_preserving_decor(
+        auto_route,
+        "review_keywords",
+        Item::Value(Value::Array(string_array(
+            &payload.auto_route.review_keywords,
+        ))),
+    );
+    set_preserving_decor(
+        auto_route,
+        "review_backend",
+        value(payload.auto_route.review_backend.clone()),
+    );
+
+    let ensemble = root_table_mut(doc, "ensemble");
+    set_ensemble_entry(
+        ensemble,
+        "default_members",
+        "aggregator",
+        &payload.ensemble.default,
+    );
+    set_ensemble_entry(
+        ensemble,
+        "review_members",
+        "review_aggregator",
+        &payload.ensemble.review,
+    );
+    set_ensemble_entry(
+        ensemble,
+        "security_review_members",
+        "security_review_aggregator",
+        &payload.ensemble.security_review,
+    );
+    set_ensemble_entry(
+        ensemble,
+        "adversarial_review_members",
+        "adversarial_review_aggregator",
+        &payload.ensemble.adversarial_review,
+    );
+    set_ensemble_entry(
+        ensemble,
+        "rescue_members",
+        "rescue_aggregator",
+        &payload.ensemble.rescue,
+    );
+    set_ensemble_entry(
+        ensemble,
+        "refactor_members",
+        "refactor_aggregator",
+        &payload.ensemble.refactor,
+    );
+
+    for backend in &payload.backends {
+        let transport = backend
+            .transport
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let model = backend
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if transport.is_none() && model.is_none() {
+            if let Some(entry) = doc
+                .get_mut("backends")
+                .and_then(Item::as_table_like_mut)
+                .and_then(|backends| backends.get_mut(&backend.id))
+                .and_then(Item::as_table_like_mut)
+            {
+                entry.remove("transport");
+                entry.remove("model");
+            }
+            continue;
+        }
+        let backends = root_table_mut(doc, "backends");
+        if backends.get(&backend.id).is_none() {
+            backends.insert(&backend.id, Item::Table(Table::new()));
+        }
+        let item = backends
+            .get_mut(&backend.id)
+            .expect("just inserted backend table");
+        if !item.is_table_like() {
+            *item = Item::Table(Table::new());
+        }
+        let entry = item
+            .as_table_like_mut()
+            .expect("just ensured backend table-like");
+        set_optional_string(entry, "transport", backend.transport.as_deref());
+        set_optional_string(entry, "model", backend.model.as_deref());
+    }
+}
+
+fn config_save_at(payload: &ConfigSave, path: &Path) -> Result<(), String> {
+    validate_config(payload)?;
+    let mut doc = match fs::read_to_string(path) {
+        Ok(raw) => raw
+            .parse::<DocumentMut>()
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    apply_config(&mut doc, payload);
+    write_atomic(path, &doc.to_string())
 }
 
 /// Role names must match `^[a-z0-9][a-z0-9_-]*$` — lowercase-kebab, matching how they appear
@@ -606,6 +1155,16 @@ pub fn settings_save(payload: SettingsSave) -> Result<(), String> {
     settings_save_at(&payload, &config_path())
 }
 
+#[tauri::command]
+pub fn config_get() -> Result<ConfigPayload, String> {
+    Ok(config_get_at(&config_path()))
+}
+
+#[tauri::command]
+pub fn config_save(payload: ConfigSave) -> Result<(), String> {
+    config_save_at(&payload, &config_path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +1182,135 @@ mod tests {
             config_path_from(Some(base.clone())),
             base.join("agentpit").join("config.toml")
         );
+    }
+
+    #[test]
+    fn full_config_missing_file_matches_cli_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+        let payload = config_get_at(&path);
+
+        assert!(!payload.exists);
+        assert_eq!(payload.defaults, CoreConfigPayload::default());
+        assert_eq!(payload.routes, RoutesConfigPayload::default());
+        assert_eq!(payload.auto_route, AutoRouteConfigPayload::default());
+        assert_eq!(payload.ensemble, EnsembleConfigPayload::default());
+        assert_eq!(payload.backends.len(), known_backends().len());
+        assert!(payload
+            .backends
+            .iter()
+            .all(|entry| entry.transport.is_none() && entry.model.is_none()));
+    }
+
+    #[test]
+    fn saving_defaults_does_not_create_empty_backend_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config_save_at(&ConfigSave::default(), &path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("[backends"), "got: {raw}");
+    }
+
+    #[test]
+    fn full_config_round_trip_preserves_workflow_comments_and_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"# keep this header
+[default]
+backend = "claude" # keep inline
+auto_route = true
+future_key = "keep-me"
+
+[workflow]
+max_depth = 9 # untouched
+
+[backends.codex]
+transport = "exec"
+model = "old-model" # keep model note
+future_backend_key = 42
+"#,
+        )
+        .unwrap();
+
+        let mut save = ConfigSave::default();
+        save.defaults.backend = "codex".into();
+        save.defaults.auto_route = false;
+        save.routes.review = "opencode".into();
+        save.auto_route.long_context_threshold = 250_000;
+        save.auto_route.review_keywords = vec!["review".into(), "threat-model".into()];
+        save.ensemble.review = EnsembleEntryPayload {
+            members: vec!["codex".into(), "claude".into()],
+            aggregator: Some("opencode".into()),
+        };
+        let codex = save
+            .backends
+            .iter_mut()
+            .find(|entry| entry.id == "codex")
+            .unwrap();
+        codex.transport = Some("acp".into());
+        codex.model = Some("gpt-next".into());
+
+        config_save_at(&save, &path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# keep this header"), "got: {raw}");
+        assert!(
+            raw.contains("backend = \"codex\" # keep inline"),
+            "got: {raw}"
+        );
+        assert!(raw.contains("future_key = \"keep-me\""), "got: {raw}");
+        assert!(raw.contains("max_depth = 9 # untouched"), "got: {raw}");
+        assert!(raw.contains("future_backend_key = 42"), "got: {raw}");
+        assert!(
+            raw.contains("model = \"gpt-next\" # keep model note"),
+            "got: {raw}"
+        );
+
+        let loaded = config_get_at(&path);
+        assert_eq!(loaded.defaults.backend, "codex");
+        assert!(!loaded.defaults.auto_route);
+        assert_eq!(loaded.routes.review, "opencode");
+        assert_eq!(loaded.auto_route.long_context_threshold, 250_000);
+        assert_eq!(
+            loaded.ensemble.review.members,
+            vec!["codex".to_string(), "claude".to_string()]
+        );
+        assert_eq!(
+            loaded.ensemble.review.aggregator.as_deref(),
+            Some("opencode")
+        );
+        let codex = loaded
+            .backends
+            .iter()
+            .find(|entry| entry.id == "codex")
+            .unwrap();
+        assert_eq!(codex.transport.as_deref(), Some("acp"));
+        assert_eq!(codex.model.as_deref(), Some("gpt-next"));
+    }
+
+    #[test]
+    fn full_config_rejects_unknown_backends_and_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut unknown = ConfigSave::default();
+        unknown.routes.review = "ghost".into();
+        let error = config_save_at(&unknown, &path).unwrap_err();
+        assert!(error.contains("unknown backend"), "got: {error}");
+        assert!(!path.exists());
+
+        let mut bad_transport = ConfigSave::default();
+        bad_transport.backends[0].transport = Some("socket".into());
+        let error = config_save_at(&bad_transport, &path).unwrap_err();
+        assert!(error.contains("invalid transport"), "got: {error}");
+        assert!(!path.exists());
+
+        let mut overflow = ConfigSave::default();
+        overflow.auto_route.long_context_threshold = u64::MAX;
+        let error = config_save_at(&overflow, &path).unwrap_err();
+        assert!(error.contains("integer range"), "got: {error}");
+        assert!(!path.exists());
     }
 
     /// Pins the wire contract with dashboard/frontend/public/app.js: the payload keys are snake_case

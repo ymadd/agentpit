@@ -8,8 +8,10 @@
 //   answer_ask(id,value)-> the human's reply, delivered to the blocked manager
 //   get_snapshot()      -> the swarm (in-flight runs, grouped by project = cwd)
 
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
+// Vite/browser previews do not inject the Tauri bridge. Keep the cockpit renderable
+// for visual QA; desktop-only calls fail through their existing error paths.
+const invoke = window.__TAURI__?.core?.invoke || (async () => { throw new Error("Tauri bridge unavailable"); });
+const listen = window.__TAURI__?.event?.listen || (async () => () => {});
 
 // ── state ────────────────────────────────────────────────────────────────────
 let asks = []; // pending decisions (camelCase from get_pending_asks)

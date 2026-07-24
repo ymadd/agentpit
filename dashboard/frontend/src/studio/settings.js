@@ -112,12 +112,6 @@ export function validate(draft) {
 
 export function buildPayload(draft) {
   return {
-    backend_models: Object.fromEntries(
-      (draft.known_backends || DEFAULT_BACKENDS).map((backend) => {
-        const model = (draft.backend_models && draft.backend_models[backend]) || "";
-        return [backend, model.trim() || null];
-      })
-    ),
     workflow: {
       manager_backend: draft.workflow.manager_backend || null,
       default_agents: draft.workflow.default_agents || [],

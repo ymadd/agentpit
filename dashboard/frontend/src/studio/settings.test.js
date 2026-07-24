@@ -63,16 +63,14 @@ test("buildPayload matches the settings_save contract (nulls, round-tripped type
   const p = buildPayload(draftFromSettings(raw));
   assert.equal(p.workflow.manager_backend, "claude");
   assert.equal(p.workflow.max_depth, 4);
-  assert.deepEqual(p.backend_models, {
-    claude: "claude-fable-5",
-    codex: null,
-    gemini: "gemini-3-pro",
-  });
+  // Backend defaults are owned by the top-level Settings → Backends save path.
+  // A stale mounted Studio must never overwrite them.
+  assert.equal(p.backend_models, undefined);
   assert.deepEqual(p.roles[0], { name: "coder", backends: ["codex"], prompt: "be precise", model: "gpt-5-codex" });
   // empty model → null
   const d2 = draftFromSettings({ roles: [{ name: "r", backends: [], prompt: "" }] });
   assert.equal(buildPayload(d2).roles[0].model, null);
-  assert.ok(Object.values(buildPayload(d2).backend_models).every((model) => model === null));
+  assert.equal(buildPayload(d2).backend_models, undefined);
   // types survive Save unchanged
   assert.equal(p.types[0].name, "review");
   assert.equal(p.types[0].max_depth, 2);

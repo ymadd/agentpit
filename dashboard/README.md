@@ -1,7 +1,8 @@
-# agentpit dashboard
+# agentpit desktop
 
-A native desktop window that shows what `agentpit` is doing **right now** — which runs
-are in flight, which backends are still working, and how each one finished.
+The primary agentpit desktop application: a live decision cockpit, full CLI configuration,
+automatic updates, and the visual Workflow Studio. Release bundles contain the matching
+`agentpit` CLI as a Tauri sidecar, so users install one desktop package.
 
 ![The decision cockpit — one manager, one decision at a time](../assets/dashboard-cockpit.png)
 
@@ -29,19 +30,19 @@ still alive (checked via `kill(pid, 0)`); if the process dies mid-run it drops t
 
 Disable event emission entirely with `AGENTPIT_NO_EVENTS=1`.
 
-## Run it
+## Run it from source
 
-Once the `agentpit-dashboard` binary is installed next to `agentpit` (or on `PATH`):
+Portable installs can still place `agentpit-dashboard` next to `agentpit` and launch it with:
 
 ```bash
 agentpit dashboard
 ```
 
-Release assets use the name `agentpit-dashboard-<target>.gz`; decompress the matching
-asset and place the executable next to `agentpit`.
+Normal releases also publish native desktop installers. Their application bundle already contains
+the CLI; `tauri.bundle.conf.json` adds the target-suffixed sidecar during the release build.
 
-After the dashboard is installed, `agentpit update` keeps it on the same release version as
-the CLI. An open dashboard must be restarted after its binary is replaced.
+The desktop checks for a paired release after startup. With automatic updates enabled it invokes
+the bundled CLI updater in the background, then offers to restart into the new desktop binary.
 
 `agentpit dashboard` finds the binary via `AGENTPIT_DASHBOARD_BIN`, then next to the
 `agentpit` executable, then `PATH` — and spawns it detached.
@@ -69,12 +70,13 @@ agentpit review src/
 
 ```
 dashboard/
-  frontend/           Vite app (React island for the Workflow Studio + legacy
-                      vanilla dashboard in public/app.js); builds to frontend/dist
+  frontend/           Vite app (React settings shell + Workflow Studio islands +
+                      legacy cockpit in public/app.js); builds to frontend/dist
   src-tauri/
     src/main.rs        Tauri app: file watcher + pid liveness + `get_snapshot`
     src/state.rs       JSONL → run/member snapshot (mirrors the event wire format)
-    tauri.conf.json    points frontendDist at ../frontend/dist; withGlobalTauri for the JS API
+    tauri.conf.json    desktop identity/window/bundle defaults
+    tauri.bundle.conf.json  release overlay that embeds the agentpit CLI sidecar
 ```
 
 The dashboard deliberately mirrors the event schema as strings rather than depending on

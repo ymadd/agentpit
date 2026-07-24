@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "agentpit-dashboard",
+  "productName": "agentpit",
+  "mainBinaryName": "agentpit-dashboard",
   "version": "0.1.31",
-  "identifier": "dev.agentpit.dashboard",
+  "identifier": "dev.agentpit.desktop",
   "build": {
     "frontendDist": "../frontend/dist"
   },
@@ -10,11 +11,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "agentpit dashboard",
-        "width": 760,
-        "height": 640,
-        "minWidth": 520,
-        "minHeight": 420,
+        "title": "agentpit",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 560,
         "resizable": true
       }
     ],
@@ -23,8 +24,10 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": "all",
-    "icon": []
+    "icon": ["icons/icon.png"],
+    "category": "DeveloperTool",
+    "shortDescription": "Desktop control plane for agentpit workflows and agent CLIs"
   }
 }

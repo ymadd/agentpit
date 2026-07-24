@@ -1,7 +1,9 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_update;
 mod asks;
+mod cli_runner;
 mod cli_versions;
 mod model_catalog;
 mod settings;
@@ -217,6 +219,7 @@ fn spawn_watcher(app: AppHandle) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             tracker: Mutex::new(Tracker::new()),
         })
@@ -230,6 +233,11 @@ fn main() {
             asks::answer_ask,
             settings::settings_get,
             settings::settings_save,
+            settings::config_get,
+            settings::config_save,
+            app_update::app_update_check,
+            app_update::app_update_install,
+            app_update::app_restart,
             workflow_gen::workflow_generate,
             workflow_gen::workflow_describe
         ])

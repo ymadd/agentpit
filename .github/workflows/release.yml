@@ -132,6 +132,15 @@ jobs:
           strip target/${{ matrix.target }}/release/agentpit || true
           strip target/${{ matrix.target }}/release/agentpit-dashboard || true
 
+      - name: Prepare bundled CLI sidecar
+        # Tauri resolves external binaries by the target-suffixed filename and
+        # removes the suffix inside the installed application bundle.
+        run: |
+          mkdir -p dashboard/src-tauri/binaries
+          cp \
+            target/${{ matrix.target }}/release/agentpit \
+            dashboard/src-tauri/binaries/agentpit-${{ matrix.target }}
+
       - name: Package binary (gzip only)
         # NOTE: We ship .gz (not .tar.gz). self_update detects .gz as
         # ArchiveKind::Plain(Gz) and streams the decompressed bytes straight
@@ -157,6 +166,17 @@ jobs:
             agentpit-dashboard-${{ matrix.target }}.gz
             agentpit-dashboard-${{ matrix.target }}.gz.sha256
           fail_on_unmatched_files: true
+
+      - name: Build and upload desktop installers
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: dashboard
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseDraft: true
+          uploadUpdaterJson: false
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.bundle.conf.json
 
   publish:
     name: publish release

@@ -1,19 +1,19 @@
 import { createRoot } from "react-dom/client";
-import StudioApp from "./studio/StudioApp.jsx";
+import SettingsApp from "./settings/SettingsApp.jsx";
+import { startAutoUpdater } from "./settings/app-update.js";
 import WorkflowRunApp from "./workflow-run/WorkflowRunApp.jsx";
 
 // Strangler bridge (Phase 2). The legacy vanilla dashboard (public/app.js) owns
 // the page — statusbar, cockpit, swarm, CLI rail — and renders first. React
-// owns only the Workflow Studio: app.js hands it the #settings surface by
-// calling window.__agentpitMountStudio(container). Dormant until called, so
-// this build stays behavior-identical to the old dashboard until Phase 2b wires
-// the call site.
+// owns the complete settings surface: app.js hands it #settings by calling the
+// legacy-named window.__agentpitMountStudio(container) bridge. Workflow Studio
+// now lives as one preserved section inside that shell.
 let root = null;
 
 window.__agentpitMountStudio = (container) => {
   if (!container) return;
   if (!root) root = createRoot(container);
-  root.render(<StudioApp />);
+  root.render(<SettingsApp />);
 };
 
 window.__agentpitUnmountStudio = () => {
@@ -31,3 +31,7 @@ const wrEl = document.createElement("div");
 wrEl.id = "agentpit-workflow-run";
 document.body.appendChild(wrEl);
 createRoot(wrEl).render(<WorkflowRunApp />);
+
+// Desktop is the release owner. Check the paired release after startup and, when
+// enabled in Settings, let the bundled CLI install it in the background.
+startAutoUpdater();

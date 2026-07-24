@@ -9,6 +9,7 @@
   background: radial-gradient(120% 100% at 50% -8%, #11151f 0%, #080b12 55%, var(--panel) 100%);
   font-family: "IBM Plex Sans JP", system-ui, sans-serif;
 }
+.sd-root.sd-embedded { background: #080b10; }
 .sd-top {
   flex: none;
   display: flex;
@@ -56,6 +57,24 @@
 }
 .sd-body { flex: 1 1 auto; min-height: 0; display: flex; }
 .sd-canvas { flex: 1 1 auto; min-width: 0; }
+.sd-canvas .react-flow__minimap {
+  overflow: hidden;
+  border: 1px solid var(--line-3);
+  border-radius: 9px;
+  background: #0a0e14 !important;
+}
+.sd-canvas .react-flow__minimap-mask { fill: rgba(105, 197, 176, 0.12); }
+.sd-canvas .react-flow__minimap-node { fill: #4d596a; stroke: none; }
+.sd-canvas .react-flow__controls { overflow: hidden; border: 1px solid var(--line-3); border-radius: 8px; box-shadow: none; }
+.sd-canvas .react-flow__controls-button {
+  border-bottom-color: var(--line-3);
+  background: #0d121a;
+  color: var(--muted);
+}
+.sd-canvas .react-flow__controls-button:hover { background: #151c26; }
+.sd-canvas .react-flow__controls-button svg { fill: currentColor; }
+.sd-canvas .react-flow__attribution { background: rgba(8, 11, 16, 0.72); }
+.sd-canvas .react-flow__attribution a { color: var(--faint); }
 
 /* StudioStepNode reuses legacy .ws-* class names for its self-contained styles.
    The globally-loaded legacy style.css sets `.ws-node { position:absolute; left:0;
@@ -232,6 +251,20 @@
   cursor: pointer; font-family: inherit; font-size: 11px;
 }
 .sd-mini-btn:hover { border-color: var(--ac-bd); color: var(--ac-tx); }
+
+@media (max-width: 900px) {
+  .sd-top .sd-hint { display: none; }
+  .sd-palette, .sd-cast { width: 178px; }
+  .sd-insp { width: 265px; padding-inline: 13px; }
+}
+
+@media (max-width: 760px) {
+  .sd-langs { display: none; }
+  .sd-palette, .sd-cast { width: 158px; }
+  .sd-insp { width: 235px; }
+  .sd-top { gap: 7px; padding-inline: 10px; }
+  .sd-top .sd-switch { max-width: 150px; }
+}
 /* worker chips in the step inspector */
 .sd-wchip {
   display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px;

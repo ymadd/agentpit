@@ -16,14 +16,23 @@ Different coding agents are good at different things: long-context reads on Gemi
 - **Model-driven workflows** — a manager backend decomposes a goal and dispatches sub-tasks to configured **roles** (the cast), then synthesizes
 - **Named workflows** — `agentpit workflow <type> "goal"` runs a saved preset; `workflow list` shows what's configured; `workflow new "<description>"` generates one for you
 - **Per-agent models** — pin a model per role or backend (`--model`, `[workflow.roles.<name>].model`, `[backends.<id>].model`), flowing through both one-shot and workflows
-- **Desktop dashboard** — a decision cockpit (one supervised window) plus a visual **Workflow Studio** to cast roles and design workflows
+- **Desktop-first app** — the decision cockpit, complete CLI settings, updates, and **Workflow Studio** in one install; the matching CLI ships inside it
 - **Auth-aware** — checks each backend's credentials before dispatching; `agentpit login <backend>` triggers the right login flow
-- **Self-updating** — `agentpit update` updates the CLI and an installed desktop dashboard together
+- **Self-updating** — the desktop app checks and installs paired app + CLI releases automatically; standalone CLI installs keep `agentpit update`
 - **Discoverable** — running `agentpit` with no args opens an interactive menu
 
 ## Install
 
-### From GitHub Releases (recommended)
+### Desktop app from GitHub Releases (recommended)
+
+Download the installer for your platform from the latest GitHub Release (`.dmg` on macOS,
+`.AppImage` / `.deb` on Linux). The desktop app is the primary distribution and already contains
+the matching `agentpit` CLI sidecar used for workflows, settings, and updates. Automatic updates
+are enabled by default and can be changed under **Settings → App & updates**.
+
+### Standalone CLI (optional)
+
+Use this only when you want `agentpit` directly on `PATH` without installing the desktop app:
 
 ```bash
 # macOS arm64 example — adjust target for your platform
@@ -36,9 +45,8 @@ agentpit --version
 
 Targets published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`.
 
-The same release also publishes `agentpit-dashboard-<target>.gz`. Install the
-decompressed `agentpit-dashboard` binary next to `agentpit` (or anywhere on `PATH`) to
-enable `agentpit dashboard` and the Agent CLI version manager.
+The release continues to publish `agentpit-dashboard-<target>.gz` for existing portable
+installations. New installs should use the desktop bundle, which packages both binaries together.
 
 > Releases ship plain gzipped binaries (not `.tar.gz`) because `self_update`'s tar entry-name matching is fragile across BSD/GNU tar — plain `.gz` lets the library stream decompress straight to the target path. `agentpit update` from v0.1.5 onward works against this format with no changes.
 
@@ -109,8 +117,8 @@ agentpit rescue "..." --role reviewer --model opus  # dispatch to a role, pinned
 
 agentpit status                       # config + per-backend auth state
 agentpit login antigravity            # opens `agy auth login` in a terminal
-agentpit dashboard                    # launch the desktop dashboard (needs the dashboard binary)
-agentpit update                       # update the CLI + an installed dashboard together
+agentpit dashboard                    # launch a separately installed desktop app
+agentpit update                       # update a standalone CLI / portable desktop pair
 ```
 
 When a workflow manager is not specified by `--manager`, a named workflow, a manager role, or
@@ -119,10 +127,11 @@ supported `[default].backend` is preferred; otherwise it tries Claude, then Code
 default Antigravity routing useful for one-shot work without selecting it for a manager role it
 cannot run.
 
-## Desktop dashboard
+## Desktop app
 
-`agentpit dashboard` launches a desktop app (install the `agentpit-dashboard` binary next to
-`agentpit`). It has two faces:
+The desktop app is the primary agentpit installation and includes the CLI it calls as a bundled
+sidecar. A separately installed CLI can still launch a portable desktop binary with
+`agentpit dashboard`. The app has three faces:
 
 **The decision cockpit** — one supervised window. A manager backend runs the swarm; the cockpit
 surfaces *exactly one* thing that needs a human at a time, and says so when nothing does (inbox
@@ -130,7 +139,10 @@ zero). Reversible work never stops while you decide.
 
 ![The decision cockpit — one manager, one decision at a time](assets/dashboard-cockpit.png)
 
-**The Workflow Studio** (⚙ → the node-graph above) — cast each agent CLI into a **role**, design a
+**Complete settings** (⚙) — edit the same XDG-aware `config.toml` the CLI reads: defaults,
+tool routes, automatic routing signals, backend transport/models, every ensemble, and workflows.
+
+**The Workflow Studio** (Settings → Workflow) — cast each agent CLI into a **role**, design a
 model-driven workflow visually, and pin a **model per agent**. Save named workflow *types* (presets
 over a shared cast) or hit **✨ 生成** to have an agent draft one from a description — everything
 writes back to `~/.config/agentpit/config.toml`.
@@ -141,7 +153,8 @@ writes back to `~/.config/agentpit/config.toml`.
 
 ## Configuration
 
-`agentpit` reads `~/.config/agentpit/config.toml` (XDG-aware). Run `agentpit config` for an interactive editor, or edit the file directly.
+`agentpit` reads `~/.config/agentpit/config.toml` (XDG-aware). Edit all supported fields in the
+desktop Settings screen, run `agentpit config` for the terminal editor, or edit the file directly.
 
 ```toml
 [default]

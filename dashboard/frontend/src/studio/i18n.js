@@ -76,6 +76,8 @@ export const JA = {
   "WORKFLOW · base [workflow]": "ワークフロー · base [workflow]",
   "Manager backend": "マネージャーのバックエンド",
   "default backend": "既定のバックエンド",
+  "Default worker agents": "既定のワーカーエージェント",
+  "None selected uses every available backend except the manager.": "未選択の場合は、マネージャー以外の利用可能なバックエンドをすべて使用します。",
   "Max depth": "最大深さ",
   "Max calls / manager": "最大呼び出し数／マネージャー",
   "use MCP": "MCP を使用",
@@ -91,6 +93,9 @@ export const JA = {
   "No CLI model list; enter an ID manually.": "CLI の一覧取得に未対応です。ID を直接入力してください。",
   "Candidates are suggestions; custom model IDs remain valid.": "候補は入力支援です。カスタムモデル ID も引き続き指定できます。",
   "Saved to config.toml `[workflow]` and `[backends.*].model` on Save.": "保存時に config.toml の `[workflow]` と `[backends.*].model` に書き込まれます。",
+  "Backend transport and default models are managed in Settings → Backends. Role models here still override those defaults.":
+    "バックエンドの接続方式と既定モデルは「設定 → バックエンド」で管理します。ここで指定したロールモデルが引き続き優先されます。",
+  "Saved to config.toml `[workflow]` on Save.": "保存時に config.toml の `[workflow]` に書き込まれます。",
   // type form
   "WORKFLOW TYPE ·": "ワークフロータイプ ·",
   "Workflow name": "ワークフロー名",

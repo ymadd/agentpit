@@ -135,6 +135,11 @@ pub struct UpdateOutcome {
     pub already_up_to_date: bool,
     pub installed_version: String,
     pub dashboard: DashboardUpdateOutcome,
+    /// macOS: replacing a binary inside a signed `.app` bundle breaks the bundle seal, and
+    /// Apple Silicon refuses to launch a broken-seal app. After an in-place update the touched
+    /// bundles are ad-hoc re-signed; this carries the error when that re-sign failed (the app
+    /// may not relaunch until `codesign --force --deep --sign - <app>` is run by hand).
+    pub resign_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -153,7 +158,7 @@ pub enum DashboardUpdateOutcome {
     },
 }
 
-pub fn perform_update() -> Result<UpdateOutcome> {
+pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
     let target = self_update::get_target();
     // A release contains both `agentpit-<target>` and
     // `agentpit-dashboard-<target>`. Include the target in the identifier so the CLI updater
@@ -166,7 +171,9 @@ pub fn perform_update() -> Result<UpdateOutcome> {
         .bin_path_in_archive(BIN_NAME)
         .target(target)
         .identifier(&asset_identifier)
-        .show_download_progress(true)
+        .show_download_progress(!quiet)
+        .show_output(!quiet)
+        .no_confirm(quiet)
         .current_version(current_version())
         .build()
         .map_err(|e| anyhow!("self_update config error: {e}"))?
@@ -174,11 +181,79 @@ pub fn perform_update() -> Result<UpdateOutcome> {
         .map_err(|e| anyhow!("update failed: {e}"))?;
     let installed_version = status.version().to_string();
     let dashboard = sync_installed_dashboard(&installed_version);
+    let resign_error = resign_touched_bundles(!status.uptodate(), &dashboard);
     Ok(UpdateOutcome {
         already_up_to_date: status.uptodate(),
         installed_version,
         dashboard,
+        resign_error,
     })
+}
+
+/// The nearest proper ancestor of the executable `path` that is a macOS `.app` bundle root.
+fn enclosing_app_bundle(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.extension() == Some(OsStr::new("app")))
+        .map(Path::to_path_buf)
+}
+
+/// Ad-hoc re-sign every `.app` bundle whose nested binaries this update replaced, restoring the
+/// bundle seal (see [`UpdateOutcome::resign_error`]). Returns the combined error text when any
+/// re-sign failed; `None` on success, off macOS, or when no bundle was touched.
+fn resign_touched_bundles(cli_updated: bool, dashboard: &DashboardUpdateOutcome) -> Option<String> {
+    let mut bundles: Vec<PathBuf> = Vec::new();
+    if cli_updated
+        && let Some(bundle) = std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(enclosing_app_bundle)
+    {
+        bundles.push(bundle);
+    }
+    if let DashboardUpdateOutcome::Updated { path, .. } = dashboard
+        && let Some(bundle) = enclosing_app_bundle(path)
+        && !bundles.contains(&bundle)
+    {
+        bundles.push(bundle);
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    for bundle in bundles {
+        if let Err(error) = resign_app_bundle(&bundle) {
+            errors.push(error);
+        }
+    }
+    (!errors.is_empty()).then(|| errors.join("; "))
+}
+
+#[cfg(target_os = "macos")]
+fn resign_app_bundle(bundle: &Path) -> std::result::Result<(), String> {
+    let output = std::process::Command::new("codesign")
+        .args([
+            OsStr::new("--force"),
+            OsStr::new("--deep"),
+            OsStr::new("--sign"),
+            OsStr::new("-"),
+        ])
+        .arg(bundle)
+        .output()
+        .map_err(|error| format!("failed to run codesign on {}: {error}", bundle.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "codesign failed on {} ({}): {}",
+        bundle.display(),
+        output.status,
+        stderr.trim()
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resign_app_bundle(_bundle: &Path) -> std::result::Result<(), String> {
+    Ok(())
 }
 
 fn asset_identifier(bin_name: &str, target: &str) -> String {
@@ -445,6 +520,23 @@ mod tests {
         assert_eq!(cli, "agentpit-aarch64-apple-darwin");
         assert_eq!(dashboard, "agentpit-dashboard-aarch64-apple-darwin");
         assert!(!format!("agentpit-dashboard-{target}.gz").contains(&cli));
+    }
+
+    #[test]
+    fn enclosing_app_bundle_finds_nearest_app_ancestor() {
+        assert_eq!(
+            enclosing_app_bundle(Path::new(
+                "/Applications/agentpit.app/Contents/MacOS/agentpit"
+            )),
+            Some(PathBuf::from("/Applications/agentpit.app"))
+        );
+        // Outside a bundle (Homebrew-style install) there is nothing to re-sign.
+        assert_eq!(
+            enclosing_app_bundle(Path::new("/Users/x/.local/bin/agentpit")),
+            None
+        );
+        // The binary itself never counts as a bundle root.
+        assert_eq!(enclosing_app_bundle(Path::new("/tmp/not-an.app")), None);
     }
 
     #[test]

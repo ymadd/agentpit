@@ -234,6 +234,9 @@ pub enum Command {
         /// Only check; do not download or replace the binary.
         #[arg(long)]
         check: bool,
+        /// Emit machine-readable update status. Primarily used by the desktop app.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Inspect or modify the config file (~/.config/agentpit/config.toml). Omit the
@@ -449,7 +452,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             refresh,
         } => init::run(scope, force, refresh).await,
 
-        Command::Update { check } => update::run(check).await,
+        Command::Update { check, json } => update::run(check, json).await,
 
         Command::Config { action } => match action {
             Some(a) => config::run(a).await,

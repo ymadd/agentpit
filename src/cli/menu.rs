@@ -440,7 +440,7 @@ async fn update_flow() -> anyhow::Result<()> {
     )?;
     match nav {
         Nav::Back => Ok(()),
-        Nav::Value(check_only) => super::update::run(check_only).await,
+        Nav::Value(check_only) => super::update::run(check_only, false).await,
     }
 }
 

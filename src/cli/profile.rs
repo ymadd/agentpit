@@ -272,21 +272,23 @@ fn replay(policy: &str) -> Result<()> {
         .collect();
 
     let pick_for: PolicyPicker = match policy {
-        "seeded" => profile_stage_picker(
-            seeded_profiles(),
-            available.clone(),
-            margin,
-            costs.clone(),
-        ),
+        "seeded" => {
+            profile_stage_picker(seeded_profiles(), available.clone(), margin, costs.clone())
+        }
         "learned" => {
             // The deployed auto-route chain: similarity stage first (when this build has
             // it and samples exist — leave-one-out, so a task never matches itself), then
             // the profile stage over the current profiles.toml.
-            let profile = profile_stage_picker(load_profiles(None)?, available.clone(), margin, costs.clone());
+            let profile = profile_stage_picker(
+                load_profiles(None)?,
+                available.clone(),
+                margin,
+                costs.clone(),
+            );
             match similarity_replay_picker(&available)? {
-                Some(sim) => Box::new(move |l: &crate::profile::learn::Label| {
-                    sim(l).or_else(|| profile(l))
-                }),
+                Some(sim) => {
+                    Box::new(move |l: &crate::profile::learn::Label| sim(l).or_else(|| profile(l)))
+                }
                 None => profile,
             }
         }
@@ -334,20 +336,22 @@ fn similarity_replay_picker(
     let samples = parse_samples(&raw);
     let cfg = super::load_context()?.loaded.config.auto_route.similarity;
     let available = available.clone();
-    Ok(Some(Box::new(move |label: &crate::profile::learn::Label| {
-        let hash = label.task_hash.as_deref()?;
-        let query = samples
-            .iter()
-            .find(|s| s.task_hash == hash)?
-            .embedding
-            .clone();
-        let others: Vec<_> = samples
-            .iter()
-            .filter(|s| s.task_hash != hash)
-            .cloned()
-            .collect();
-        pick_backend(&query, &others, &cfg, |b| available.contains(&b)).map(|p| p.backend)
-    })))
+    Ok(Some(Box::new(
+        move |label: &crate::profile::learn::Label| {
+            let hash = label.task_hash.as_deref()?;
+            let query = samples
+                .iter()
+                .find(|s| s.task_hash == hash)?
+                .embedding
+                .clone();
+            let others: Vec<_> = samples
+                .iter()
+                .filter(|s| s.task_hash != hash)
+                .cloned()
+                .collect();
+            pick_backend(&query, &others, &cfg, |b| available.contains(&b)).map(|p| p.backend)
+        },
+    )))
 }
 
 #[cfg(not(feature = "similarity"))]
@@ -1184,7 +1188,7 @@ mod tests {
     #[test]
     fn fold_verdicts_uses_weighted_majority_with_latest_tie_break() {
         let labels = vec![
-            lbl(BackendId::Gemini, "h1", true, 0.5, 1), // exit ok
+            lbl(BackendId::Gemini, "h1", true, 0.5, 1),  // exit ok
             lbl(BackendId::Gemini, "h1", false, 3.0, 2), // human verdict: bad
             lbl(BackendId::Codex, "h1", true, 1.0, 3),
             lbl(BackendId::Codex, "h1", false, 1.0, 4), // tie by weight → latest wins
@@ -1228,7 +1232,8 @@ mod tests {
         gemini.scores.insert(TaskCategory::Coding, cell(87));
         let set = ProfileSet::from_profiles([claude, gemini]);
         let available: HashSet<BackendId> = [BackendId::Claude, BackendId::Gemini].into();
-        let costs: HashMap<BackendId, u8> = [(BackendId::Claude, 80), (BackendId::Gemini, 20)].into();
+        let costs: HashMap<BackendId, u8> =
+            [(BackendId::Claude, 80), (BackendId::Gemini, 20)].into();
 
         let label = lbl(BackendId::Gemini, "h1", true, 1.0, 0);
         // Margin 5: Gemini (87, cost 20) is within reach of Claude (90, cost 80) → cheaper wins.

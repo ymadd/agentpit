@@ -14,8 +14,8 @@ agentpit を「能力プロファイルに基づき、タスクに適任のエ�
 |----|------|------|
 | **① 能力プロファイル + タスク診断ルーティング** | backend×TaskCategory のスコア行列で動的ルーティング | 設計確定 |
 | **② gold ベンチ課題集** | プロファイルを実測で埋める決定的採点スイート | 設計確定（合議） |
-| **③ ボス仲介の階層エスカレーション** | 既存 workflow + guard を拡張、群れが群れを呼ぶ | 設計確定 |
-| **④ 群れ間コミュニケーション層** | handoff / clarify / board / 反証、Conductor仲介 | 設計確定（ディベート） |
+| **③ ボス仲介のエスカレーション** | 既存 workflow + guard を拡張、群れが群れを呼ぶ | 設計確定・**実装は深さガードのみ**（§3.2の3差分と§3.3の追加4ガードは未実装） |
+| **④ 群れ間コミュニケーション層** | handoff / clarify / board / 反証、Conductor仲介 | 設計確定（ディベート）・会話層は `enable_ask_human`（既定 false）に相乗り＝**既定では無効** |
 
 ---
 
@@ -170,6 +170,13 @@ best fit な worker に動的ディスパッチ（`rescue`/`ensemble`）。静�
 | ループ(A→B→A) | ❌ | 訪問済みカテゴリ集合 / 同一カテゴリ再昇格禁止 |
 | コスト爆発 | ❌ | workflow全体の累積トークン/コール予算（env継承） |
 | 重複発見 | ❌ | ボス側 findings dedup |
+
+**脅威モデル（明示）**: 上のガード群は**事故抑止**であり、敵対的な backend/プロセスに対する
+セキュリティ境界ではない。exec 系バックエンドは full-autonomy で起動され、`ENV_DEPTH` は子が
+リセットでき、ask 応答側は無認証。sandbox（gold-bench）も file-read 全許可＋env 継承で、
+保証は network 遮断一枚。信頼できないモデル/バイナリを組み込む場合は OS レベルの隔離
+（別ユーザー・コンテナ・VM）を別途用意すること。guard.rs の doc をこれ以上の保証として
+読んではならない。
 
 ### 3.4 ロール（キャスティング設定）
 
@@ -333,10 +340,13 @@ public surface 破壊なし: `agentpit ask` と `ask_human` MCP は human専用�
 
 1. ~~statelessでの**反証品質**~~ — **決着（2026-07-01, `agentpit refute-bench`）**: critic=codex /
    defender=antigravity で3probe（binary_search_bounds / mutable_default_arg / parse_duration）
-   全て before=0.00 → after=1.00（delta margin 0.20 を全probe通過、GATE: PASS）。プロンプト注入
-   再dispatchは劣化版ではなく本物の defense ターンとして機能した。`docs/agent-hub-design.md`
-   §5.1 の境目はこれで実証済み。3probeのみ・1backend-pairのみなので一般化の余地は残る
-   （複数backend-pair・敵対的に難しいprobeでの再測定は今後の回帰ゲート運用に委ねる）。
+   before は全probeで低スコア → after=1.00（delta margin 0.20 を全probe通過、GATE: PASS）。
+   before の正確な不変条件は「各 stuck 候補がオフライン採点で 1.0 を有意に下回る」で、回帰テスト
+   `each_stuck_candidate_scores_meaningfully_below_one_offline`（<0.9 を強制）が固定している。
+   プロンプト注入再dispatchは劣化版ではなく本物の defense ターンとして機能した。§5.1 の境目は
+   これで実証済み。**既知の限界**: 3probeのみ・1backend-pairのみで、かつ「健全な候補を壊さない」
+   方向のプローブ（正しい解に反証をかけて劣化しないことの検証）は未整備 — 一般化と偽陽性耐性の
+   再測定は今後の回帰ゲート運用に委ねる。
 2. Event variant を**今作るか dogfood 後か**（形は合意、YAGNI の時期だけ対立）。
 3. durable transcript に明示的 recipient/cursor が**いつか要るか**（群れトポロジが1manager×多leafのままか）。
 4. ④の adjudication 裁定者は **manager 自身か別dispatchの中立群れか**（manager は単一 --print/exec 窓）。

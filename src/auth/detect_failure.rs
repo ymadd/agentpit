@@ -28,6 +28,28 @@ pub fn is_auth_failure(text: &str) -> bool {
     patterns().is_match(text)
 }
 
+/// Genuine auth failures are terse error dumps; anything longer is work product that may
+/// merely *mention* an auth phrase (a review of auth-handling code, a log excerpt).
+const AUTH_SCAN_MAX_BYTES: usize = 2048;
+
+/// Classify a finished dispatch's output as an auth failure.
+///
+/// The raw regex scan misfired on successful runs whose *content* legitimately contained
+/// phrases like "401 Unauthorized" (e.g. a security review of auth code), discarding real
+/// output and aborting workflows. Two gates fix that:
+/// - `exit_ok == Some(true)` (the backend reported success) is never an auth failure —
+///   the text is an answer, not an error.
+/// - Otherwise the regex only applies to short outputs; a long transcript that failed for
+///   another reason is not re-labelled auth just because it quotes an auth phrase.
+///
+/// Pass `exit_ok: None` for transports without an exit signal (ACP).
+pub fn is_auth_failure_outcome(text: &str, exit_ok: Option<bool>) -> bool {
+    if exit_ok == Some(true) {
+        return false;
+    }
+    text.len() <= AUTH_SCAN_MAX_BYTES && is_auth_failure(text)
+}
+
 pub fn format_auth_failure_message(
     backend: BackendId,
     login_command: &str,
@@ -73,6 +95,25 @@ mod tests {
         ] {
             assert!(!is_auth_failure(sample), "unexpected match: {sample}");
         }
+    }
+
+    /// Eval finding 1 (2026-07): a successful run whose *content* mentions auth phrases
+    /// (e.g. a security review of auth code) must not be discarded as an auth failure.
+    #[test]
+    fn successful_or_long_output_is_never_an_auth_failure() {
+        let review = "Found issue: the handler returns 401 Unauthorized without logging. \
+                      Recommend adding authentication failed telemetry.";
+        // Backend reported success: content wins regardless of phrasing.
+        assert!(!is_auth_failure_outcome(review, Some(true)));
+        // Long output that failed for another reason is not re-labelled auth.
+        let long = format!("{}{}", "x".repeat(AUTH_SCAN_MAX_BYTES), " 401 unauthorized");
+        assert!(!is_auth_failure_outcome(&long, Some(false)));
+        // A genuine terse auth error on a failed / exit-less run still classifies.
+        assert!(is_auth_failure_outcome(
+            "stream error: Failed to refresh token: 401 Unauthorized",
+            Some(false)
+        ));
+        assert!(is_auth_failure_outcome("Please log in to continue.", None));
     }
 
     #[test]

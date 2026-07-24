@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::{AcpAdapter, opencode::OpencodeAdapter};
-use crate::auth::is_auth_failure;
+use crate::auth::is_auth_failure_outcome;
 use crate::config::HubConfig;
 use crate::exec::{
     ExecAdapter, ExecRunOptions, antigravity::AntigravityExec, claude::ClaudeExec,
@@ -165,7 +165,10 @@ pub async fn dispatch(
         return Ok(DispatchResult {
             backend,
             transport: Transport::Exec,
-            auth_failed: is_auth_failure(&outcome.output),
+            auth_failed: is_auth_failure_outcome(
+                &outcome.output,
+                outcome.exit_code.map(|code| code == 0),
+            ),
             output: outcome.output,
         });
     }
@@ -175,7 +178,7 @@ pub async fn dispatch(
         return Ok(DispatchResult {
             backend,
             transport: Transport::Acp,
-            auth_failed: is_auth_failure(&outcome.output),
+            auth_failed: is_auth_failure_outcome(&outcome.output, None),
             output: outcome.output,
         });
     }

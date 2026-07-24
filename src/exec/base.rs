@@ -17,6 +17,13 @@ use super::stream::{DecodedChunk, StreamDecoder, StreamFormat};
 /// so one run can't exhaust hub memory. ~8 MiB is far above any real agent transcript.
 const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
 
+/// Per-`read_until` cap for the line-oriented readers. A backend that streams forever
+/// without a newline would otherwise grow the line buffer unboundedly *before*
+/// [`MAX_CAPTURED_BYTES`] ever applies (that cap guards the collected transcript, not the
+/// in-flight line). Hitting the cap simply yields the bytes read so far as one chunk; a
+/// genuine line that long has no decodable meaning anyway.
+const MAX_LINE_BYTES: u64 = 1024 * 1024;
+
 /// Callback invoked with each streamed stdout chunk (e.g. tee to terminal + capture file).
 pub type OutputSink = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
@@ -130,7 +137,10 @@ pub async fn run_spec(
             let mut buf = Vec::with_capacity(1024);
             loop {
                 buf.clear();
-                let n = reader.read_until(b'\n', &mut buf).await?;
+                let n = (&mut reader)
+                    .take(MAX_LINE_BYTES)
+                    .read_until(b'\n', &mut buf)
+                    .await?;
                 if n == 0 {
                     break;
                 }
@@ -153,7 +163,10 @@ pub async fn run_spec(
         let mut buf = Vec::with_capacity(1024);
         loop {
             buf.clear();
-            let n = reader.read_until(b'\n', &mut buf).await?;
+            let n = (&mut reader)
+                .take(MAX_LINE_BYTES)
+                .read_until(b'\n', &mut buf)
+                .await?;
             if n == 0 {
                 break;
             }

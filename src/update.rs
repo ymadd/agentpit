@@ -159,35 +159,99 @@ pub enum DashboardUpdateOutcome {
 }
 
 pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
+    let latest = fetch_latest_tag()?;
+    if !version_is_newer(&latest, current_version()) {
+        // CLI already current — still co-heal an installed dashboard (its binary can lag
+        // after a partial earlier update) and report cleanly.
+        let dashboard = sync_installed_dashboard(current_version());
+        let resign_error = resign_touched_bundles(false, &dashboard, current_version());
+        return Ok(UpdateOutcome {
+            already_up_to_date: true,
+            installed_version: current_version().to_string(),
+            dashboard,
+            resign_error,
+        });
+    }
+
+    let tag = format!("v{}", normalized_version(&latest));
     let target = self_update::get_target();
-    // A release contains both `agentpit-<target>` and
-    // `agentpit-dashboard-<target>`. Include the target in the identifier so the CLI updater
-    // cannot accidentally select the dashboard asset (both names contain "agentpit").
-    let asset_identifier = asset_identifier(BIN_NAME, target);
-    let status = self_update::backends::github::Update::configure()
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
-        .bin_name(BIN_NAME)
-        .bin_path_in_archive(BIN_NAME)
-        .target(target)
-        .identifier(&asset_identifier)
-        .show_download_progress(!quiet)
-        .show_output(!quiet)
-        .no_confirm(quiet)
-        .current_version(current_version())
-        .build()
-        .map_err(|e| anyhow!("self_update config error: {e}"))?
-        .update()
-        .map_err(|e| anyhow!("update failed: {e}"))?;
-    let installed_version = status.version().to_string();
+    let asset_name = format!("{}.gz", asset_identifier(BIN_NAME, target));
+    if !quiet {
+        eprintln!("downloading {asset_name} ({tag}) with checksum verification…");
+    }
+    let binary = fetch_verified_binary(&tag, &asset_name)?;
+
+    // Stage next to the current exe (same filesystem) and swap in via self-replace — the
+    // same mechanism self_update used, minus its unverified download.
+    let current_exe = std::env::current_exe().context("cannot locate the running executable")?;
+    let staged = current_exe.with_extension(format!("update.{}", std::process::id()));
+    std::fs::write(&staged, &binary)
+        .with_context(|| format!("failed to stage update at {}", staged.display()))?;
+    let _ = ensure_executable(&staged);
+    let replaced = self_replace::self_replace(&staged);
+    let _ = std::fs::remove_file(&staged);
+    replaced.context("failed to replace the running executable")?;
+
+    let installed_version = normalized_version(&latest).to_string();
     let dashboard = sync_installed_dashboard(&installed_version);
-    let resign_error = resign_touched_bundles(!status.uptodate(), &dashboard, &installed_version);
+    let resign_error = resign_touched_bundles(true, &dashboard, &installed_version);
     Ok(UpdateOutcome {
-        already_up_to_date: status.uptodate(),
+        already_up_to_date: false,
         installed_version,
         dashboard,
         resign_error,
     })
+}
+
+/// Download a release asset plus its `.sha256` sibling, verify the digest, and gunzip.
+/// Any mismatch aborts before a single byte is installed — a tampered or truncated asset
+/// (2026-07 eval, finding 7: the old flow installed unverified downloads) never replaces
+/// a working binary.
+fn fetch_verified_binary(tag: &str, asset_name: &str) -> Result<Vec<u8>> {
+    let gz = download_bytes(&asset_url(tag, asset_name))?;
+    let sha_bytes = download_bytes(&asset_url(tag, &format!("{asset_name}.sha256")))?;
+    let sha_line = String::from_utf8_lossy(&sha_bytes).into_owned();
+    let expected = parse_sha256_line(&sha_line)
+        .ok_or_else(|| anyhow!("malformed .sha256 asset for {asset_name}: {sha_line:?}"))?;
+    let actual = sha256_hex(&gz);
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(anyhow!(
+            "checksum mismatch for {asset_name}: expected {expected}, got {actual} — refusing to install"
+        ));
+    }
+    gunzip(&gz).with_context(|| format!("failed to decompress {asset_name}"))
+}
+
+fn asset_url(tag: &str, asset_name: &str) -> String {
+    format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/{tag}/{asset_name}")
+}
+
+fn download_bytes(url: &str) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    self_update::Download::from_url(url)
+        .download_to(&mut buf)
+        .map_err(|e| anyhow!("download failed for {url}: {e}"))?;
+    Ok(buf)
+}
+
+/// First token of a `shasum -a 256` output line (`<hex>  <filename>`), if it looks like a
+/// SHA-256 digest.
+fn parse_sha256_line(line: &str) -> Option<String> {
+    let token = line.split_whitespace().next()?;
+    (token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit())).then(|| token.to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn gunzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(bytes).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// The nearest proper ancestor of the executable `path` that is a macOS `.app` bundle root.
@@ -266,10 +330,7 @@ fn update_bundle_version_plist(bundle: &Path, version: &str) -> std::result::Res
 }
 
 #[cfg(not(target_os = "macos"))]
-fn update_bundle_version_plist(
-    _bundle: &Path,
-    _version: &str,
-) -> std::result::Result<(), String> {
+fn update_bundle_version_plist(_bundle: &Path, _version: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
@@ -456,34 +517,24 @@ fn sync_installed_dashboard(version: &str) -> DashboardUpdateOutcome {
     }
 
     let target = self_update::get_target();
-    let asset_identifier = asset_identifier(DASHBOARD_BIN_NAME, target);
+    let asset_name = format!("{}.gz", asset_identifier(DASHBOARD_BIN_NAME, target));
     let tag = format!("v{}", normalized_version(version));
-    let result = self_update::backends::github::Update::configure()
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
-        .bin_name(DASHBOARD_BIN_NAME)
-        .bin_path_in_archive(DASHBOARD_BIN_NAME)
-        .bin_install_path(&path)
-        .target(target)
-        .identifier(&asset_identifier)
-        .target_version_tag(&tag)
-        // A target tag forces this exact release; use a synthetic old version so the library's
-        // status remains an update rather than depending on desktop binary introspection.
-        .current_version("0.0.0")
-        .show_download_progress(true)
-        .show_output(false)
-        .no_confirm(true)
-        .build()
-        .map_err(|error| anyhow!("self_update config error: {error}"))
-        .and_then(|updater| {
-            updater
-                .update()
-                .map_err(|error| anyhow!("update failed: {error}"))
-        });
+    let result = fetch_verified_binary(&tag, &asset_name).and_then(|binary| {
+        // Stage as a sibling (same filesystem) and rename into place so a crash mid-write
+        // never leaves a half-written dashboard binary.
+        let staged = path.with_extension(format!("update.{}", std::process::id()));
+        std::fs::write(&staged, &binary)
+            .with_context(|| format!("failed to stage {}", staged.display()))?;
+        std::fs::rename(&staged, &path).map_err(|error| {
+            let _ = std::fs::remove_file(&staged);
+            anyhow!("failed to install {}: {error}", path.display())
+        })?;
+        Ok(())
+    });
 
     match result {
-        Ok(status) => {
-            let installed_version = status.version().to_string();
+        Ok(()) => {
+            let installed_version = normalized_version(version).to_string();
             if let Err(error) = ensure_executable(&path) {
                 return DashboardUpdateOutcome::Failed {
                     path,
@@ -622,6 +673,49 @@ mod tests {
     fn version_normalization_accepts_release_tags() {
         assert_eq!(normalized_version("v0.1.21\n"), "0.1.21");
         assert_eq!(normalized_version("0.1.21"), "0.1.21");
+    }
+
+    #[test]
+    fn sha256_verification_helpers_work() {
+        // Digest of the empty input is a well-known constant.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // shasum output line parses to its digest token; junk does not.
+        let line =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  agentpit-x.gz\n";
+        assert_eq!(
+            parse_sha256_line(line).as_deref(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        assert_eq!(parse_sha256_line("not a digest"), None);
+        assert_eq!(parse_sha256_line(""), None);
+    }
+
+    #[test]
+    fn gunzip_round_trips() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"agentpit binary bytes").unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(gunzip(&gz).unwrap(), b"agentpit binary bytes");
+        assert!(gunzip(b"definitely not gzip").is_err());
+    }
+
+    /// Live network check of the full verified-download path against the real latest
+    /// release: asset + .sha256 fetched, digest matches, payload gunzips to a Mach-O/ELF
+    /// binary. `#[ignore]` so CI stays offline; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "hits github.com"]
+    fn live_fetch_verified_binary_for_latest_release() {
+        let latest = fetch_latest_tag().expect("latest tag");
+        let tag = format!("v{}", normalized_version(&latest));
+        let target = self_update::get_target();
+        let asset = format!("{}.gz", asset_identifier(BIN_NAME, target));
+        let binary = fetch_verified_binary(&tag, &asset).expect("verified download");
+        assert!(binary.len() > 1_000_000, "implausibly small CLI binary");
     }
 
     #[cfg(target_os = "macos")]

@@ -295,9 +295,24 @@ pub enum Event {
         /// "handoff" (a 1→1 context pass to the next leg) or "board" (a shared scratch entry).
         /// Free-form; any other value is treated as a generic note.
         kind: String,
-        /// The note body — the handed-off context or board entry. Clamped by the caller.
+        /// The note body — the handed-off context or board entry. Clamped by
+        /// [`RunLogger::note`] to [`NOTE_BODY_MAX_BYTES`].
         body: String,
     },
+}
+
+/// Note bodies are clamped to this many bytes before hitting the log: `events.jsonl` is a
+/// line-oriented append channel shared by concurrent processes, and one enormous line both
+/// bloats every future parse and raises the odds of interleaved partial writes.
+pub const NOTE_BODY_MAX_BYTES: usize = 4096;
+
+/// `text` truncated to at most `max` bytes on a `char` boundary.
+fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 pub fn now_ms() -> u64 {
@@ -369,12 +384,11 @@ pub fn record_task_text(task: &str) -> String {
         return hash;
     }
     let normalized = normalize_task(task);
-    let mut end = normalized.len().min(TASK_TEXT_MAX_BYTES);
-    while end > 0 && !normalized.is_char_boundary(end) {
-        end -= 1;
-    }
     if fs::create_dir_all(tasks_dir()).is_ok() {
-        let _ = fs::write(&path, &normalized[..end]);
+        let _ = fs::write(
+            &path,
+            truncate_on_char_boundary(&normalized, TASK_TEXT_MAX_BYTES),
+        );
     }
     hash
 }
@@ -557,7 +571,11 @@ fn compact_events_log(max_bytes: u64, keep_runs: usize) {
         }
     }
 
-    let tmp = path.with_extension("jsonl.compact");
+    // Pid in the temp name: two agentpit processes can start (and compact) concurrently, and
+    // a shared temp path would let them clobber each other's half-written snapshot before the
+    // rename. The rename itself stays atomic per process; last writer wins, which is fine —
+    // both snapshots are valid compactions of the same log.
+    let tmp = path.with_extension(format!("jsonl.compact.{}", process::id()));
     if fs::write(&tmp, out).is_ok() {
         let _ = fs::rename(&tmp, &path);
     } else {
@@ -781,14 +799,16 @@ impl RunLogger {
 
     /// Emit a `Note` — a durable transcript entry for ① handoff or ③ the shared board. `from`
     /// is the authoring backend (the handed-off worker, or the manager); `kind` is "handoff" or
-    /// "board". Fire-and-forget: it reuses the same best-effort append path as every other event.
+    /// "board". The body is clamped here (the single choke point for every caller — MCP tool,
+    /// CLI, workflow) to [`NOTE_BODY_MAX_BYTES`] on a char boundary. Fire-and-forget: it reuses
+    /// the same best-effort append path as every other event.
     pub fn note(&self, from: Option<BackendId>, kind: &str, body: &str) {
         self.emit(Event::Note {
             ts: now_ms(),
             run_id: self.run_id.clone(),
             from,
             kind: kind.to_string(),
-            body: body.to_string(),
+            body: truncate_on_char_boundary(body, NOTE_BODY_MAX_BYTES).to_string(),
         });
     }
 
@@ -1287,10 +1307,24 @@ mod tests {
             "handoff",
             "context for the next leg",
         );
+        // Eval finding 5 (2026-07): an unclamped body wrote arbitrarily large single lines.
+        // Multibyte payload: the clamp must land on a char boundary.
+        let huge = "あ".repeat(NOTE_BODY_MAX_BYTES);
+        logger.note(None, "board", &huge);
         let contents = std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap();
         assert!(contents.contains("\"event\":\"note\""), "got: {contents}");
         assert!(contents.contains("\"run_id\":\"run-note\""));
         assert!(contents.contains("context for the next leg"));
+        let clamped = contents
+            .lines()
+            .find(|l| l.contains("\"kind\":\"board\""))
+            .and_then(|l| serde_json::from_str::<Event>(l).ok())
+            .expect("clamped note parses back");
+        let Event::Note { body, .. } = clamped else {
+            panic!("expected a note event");
+        };
+        assert!(body.len() <= NOTE_BODY_MAX_BYTES);
+        assert!(!body.is_empty() && body.chars().all(|c| c == 'あ'));
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
         }

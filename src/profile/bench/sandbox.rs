@@ -39,6 +39,17 @@ pub fn run_hidden_tests(tests: &HiddenTests, output: &str) -> SandboxOutcome {
         log_skip("sandboxed grade");
         return SandboxOutcome::Skipped;
     }
+    // A missing host toolchain is *our* environment's problem, not the backend's answer —
+    // grading anyway would misattribute "python3/cargo not installed" as the backend
+    // scoring 0 and poison the profile (2026-07 eval, finding 2).
+    if !lang_tool_available(tests.lang) {
+        eprintln!(
+            "agentpit: `{}` not found on PATH — skipping sandboxed grade (not counted as \
+             pass or fail)",
+            lang_tool(tests.lang)
+        );
+        return SandboxOutcome::Skipped;
+    }
     let tag = lang_tag(tests.lang);
     let Some(code) = extract_last_fence(output, tag) else {
         eprintln!("agentpit: no ```{tag} code block in candidate output — scoring 0");
@@ -78,8 +89,26 @@ pub(super) fn sandbox_exec_available() -> bool {
     if Path::new("/usr/bin/sandbox-exec").is_file() {
         return true;
     }
+    on_path("sandbox-exec")
+}
+
+/// The host toolchain a fixture language needs inside the jail.
+fn lang_tool(lang: FixtureLang) -> &'static str {
+    match lang {
+        FixtureLang::Python => "python3",
+        FixtureLang::Rust => "cargo",
+    }
+}
+
+/// Is the fixture language's toolchain on PATH? (The jail inherits PATH, so a PATH scan
+/// mirrors what `sandbox-exec` will resolve.)
+fn lang_tool_available(lang: FixtureLang) -> bool {
+    on_path(lang_tool(lang))
+}
+
+fn on_path(bin: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|d| d.join("sandbox-exec").is_file()))
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(bin).is_file()))
         .unwrap_or(false)
 }
 
@@ -236,8 +265,18 @@ fn sb_escape(p: &Path) -> String {
 type ProcOutput = (ExitStatus, Vec<u8>, Vec<u8>);
 
 /// Spawn `cmd`, draining stdout/stderr on threads, and either return its `(status, out, err)` or
-/// `None` if it overran `timeout` (in which case the child is killed).
+/// `None` if it overran `timeout` (in which case the whole process *group* is killed).
+///
+/// The child gets its own process group: killing only the direct `sandbox-exec` child would
+/// leave grandchildren (`cargo` → `rustc`, `python3`) alive holding the inherited pipe write
+/// ends, and the reader threads' `read_to_end` joins below would then block forever
+/// (2026-07 eval, finding 3).
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Option<ProcOutput>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -262,8 +301,9 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Option<Pr
             break status;
         }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
+            kill_process_group(&mut child);
             let _ = child.wait();
+            // Safe to join now: every writer in the group is dead, so the pipes hit EOF.
             let _ = out_reader.join();
             let _ = err_reader.join();
             return Ok(None);
@@ -273,6 +313,21 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Option<Pr
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
     Ok(Some((status, stdout, stderr)))
+}
+
+/// Kill the child's whole process group (`kill -KILL -<pgid>`; the child was spawned with
+/// `process_group(0)` so its pgid is its own pid), then the child itself as a fallback.
+#[cfg(unix)]
+fn kill_process_group(child: &mut std::process::Child) {
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 /// Parse a pytest (or fallback-driver) summary into `(passed, total)`.
@@ -378,6 +433,24 @@ mod tests {
                      test result: FAILED. 1 passed; 1 failed; 0 ignored;";
         assert_eq!(parse_cargo(multi), Some((1, 2)));
         assert!(parse_cargo("error[E0425]: cannot find value").is_none());
+    }
+
+    /// Eval finding 3 (2026-07): killing only the direct child left grandchildren holding
+    /// the pipe write ends, so the reader joins blocked forever. `sh -c 'sleep 30; :'`
+    /// keeps `sh` as the child and `sleep` as a grandchild on the same inherited pipes —
+    /// with the old code this test hangs; with the group kill it returns promptly.
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_the_whole_process_group_and_returns_none() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30; :");
+        let start = Instant::now();
+        let result = run_with_timeout(cmd, Duration::from_millis(200)).unwrap();
+        assert!(result.is_none(), "a timed-out run reports None");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "reader joins must not block on surviving grandchildren"
+        );
     }
 
     // ---- live sandbox (skips cleanly when sandbox-exec / python3 are unavailable) --------

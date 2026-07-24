@@ -270,12 +270,11 @@ fn review_tasks() -> Vec<GoldTask> {
             "review/api_handler_bug",
             TaskCategory::Review,
             "Review this request handler and report defects as a final JSON array of \
-             {line, kind} objects:\n```python\n\
+             {line, kind} objects. If there are none, return []:\n```python\n\
              1  def get_user(req, db):\n\
              2      uid = req.args.get(\"id\")\n\
              3      row = db.query(uid)\n\
-             4      return {\"name\": row.name}\n```\n\
-             (line 4 dereferences `row` which may be None when the id is unknown).",
+             4      return {\"name\": row.name}\n```",
             Grading::Review {
                 defects: vec![Defect {
                     line: 4,
@@ -288,7 +287,8 @@ fn review_tasks() -> Vec<GoldTask> {
             "review/spec_violation",
             TaskCategory::Review,
             "The spec says `withdraw(balance, amount)` must reject overdrafts. Review the code and \
-             report defects as a final JSON array of {line, kind} objects:\n```python\n\
+             report defects as a final JSON array of {line, kind} objects. If there are none, \
+             return []:\n```python\n\
              1  def withdraw(balance, amount):\n\
              2      balance -= amount\n\
              3      return balance\n```",
@@ -328,7 +328,7 @@ fn securityreview_injection_set() -> GoldTask {
         "securityreview/injection_set",
         TaskCategory::SecurityReview,
         "Audit this code and report security defects as a final JSON array of \
-         {line, kind, cwe} objects:\n```python\n\
+         {line, kind, cwe} objects. If there are none, return []:\n```python\n\
          1  def search(db, q):\n\
          2      return db.execute(\"SELECT * FROM t WHERE n='\" + q + \"'\")\n\
          3  def run(cmd):\n\
@@ -366,7 +366,7 @@ fn securityreview_auth_secret_set() -> GoldTask {
         "securityreview/auth_secret_set",
         TaskCategory::SecurityReview,
         "Audit this code and report security defects as a final JSON array of \
-         {line, kind, cwe} objects:\n```python\n\
+         {line, kind, cwe} objects. If there are none, return []:\n```python\n\
          1  API_KEY = \"sk-live-9f3a2b\"\n\
          2  def admin(req):\n\
          3      if req.user:\n\
@@ -396,8 +396,7 @@ fn securityreview_false_positive_resistance() -> GoldTask {
         "securityreview/false_positive_resistance",
         TaskCategory::SecurityReview,
         "Audit this code and report security defects as a final JSON array of \
-         {line, kind, cwe} objects. The query is already parameterised; if there are no \
-         defects, return []:\n```python\n\
+         {line, kind, cwe} objects. If there are none, return []:\n```python\n\
          1  def search(db, q):\n\
          2      return db.execute(\"SELECT * FROM t WHERE n=?\", (q,))\n```",
         Grading::SecurityReview { defects: vec![] },
@@ -416,10 +415,11 @@ fn adversarial_lying_comment() -> GoldTask {
         "adversarialreview/lying_comment",
         TaskCategory::AdversarialReview,
         "Review this code. A comment claims correctness — do not trust comments. Report real \
-         defects as a final JSON array of {line, kind} objects:\n```python\n\
+         defects as a final JSON array of {line, kind} objects. If there are none, return \
+         []:\n```python\n\
          1  # validated and safe\n\
          2  def transfer(a, b, amt):\n\
-         3      a.bal -= amt   # no check that amt > 0\n\
+         3      a.bal -= amt\n\
          4      b.bal += amt\n```",
         Grading::Adversarial {
             items: vec![
@@ -446,11 +446,12 @@ fn adversarial_subtle_plus_decoy() -> GoldTask {
         "adversarialreview/subtle_plus_decoy",
         TaskCategory::AdversarialReview,
         "Review this code and report real defects as a final JSON array of {line, kind} \
-         objects. Some lines look suspicious but are correct:\n```python\n\
+         objects. Some lines look suspicious but are correct. If there are none, return \
+         []:\n```python\n\
          1  def avg(xs):\n\
-         2      return sum(xs) / len(xs)   # ZeroDivisionError when xs is empty\n\
+         2      return sum(xs) / len(xs)\n\
          3  def clamp(x):\n\
-         4      return max(0, min(100, x)) # idiomatic, correct\n```",
+         4      return max(0, min(100, x))\n```",
         Grading::Adversarial {
             items: vec![
                 AdversarialItem {
@@ -471,17 +472,20 @@ fn adversarial_subtle_plus_decoy() -> GoldTask {
 }
 
 /// Long-context probes (design §2.2: needle extraction / set-then-win / lost-in-the-middle).
-/// All graded by exact string match — no LLM judge.
+/// All graded by exact string match — no LLM judge. The filler is real: each probe carries
+/// hundreds of generated distractor lines, so a backend that cannot actually hold the
+/// document cannot answer by pattern-matching a five-line prompt.
 fn long_context_tasks() -> Vec<GoldTask> {
     vec![
         GoldTask::new(
             "longcontext/needle_extraction",
             TaskCategory::LongContext,
-            "Among the configuration lines below, find the deploy region.\n\
-             ...many lines...\n\
-             deploy.region = ap-northeast-1\n\
-             ...many lines...\n\
-             Answer with only the value.",
+            &format!(
+                "Among the configuration lines below, find the deploy region. Answer with \
+                 only the value.\n{}\ndeploy.region = ap-northeast-1\n{}",
+                filler_config_lines(0, 220),
+                filler_config_lines(220, 220),
+            ),
             Grading::LongContext {
                 needles: vec![Needle {
                     needle: "deploy.region".to_string(),
@@ -492,9 +496,15 @@ fn long_context_tasks() -> Vec<GoldTask> {
         GoldTask::new(
             "longcontext/set_then_win",
             TaskCategory::LongContext,
-            "The document sets `timeout` several times. The last assignment wins.\n\
-             timeout = 10\n...\ntimeout = 30\n...\ntimeout = 45\n\
-             What is the effective timeout? Answer with only the number.",
+            &format!(
+                "The document below sets `request.timeout` several times; the last assignment \
+                 wins. What is the effective timeout? Answer with only the number.\n\
+                 {}\nrequest.timeout = 10\n{}\nrequest.timeout = 30\n{}\nrequest.timeout = 45\n{}",
+                filler_config_lines(500, 150),
+                filler_config_lines(650, 150),
+                filler_config_lines(800, 150),
+                filler_config_lines(950, 60),
+            ),
             Grading::LongContext {
                 needles: vec![Needle {
                     needle: "effective timeout".to_string(),
@@ -505,11 +515,12 @@ fn long_context_tasks() -> Vec<GoldTask> {
         GoldTask::new(
             "longcontext/lost_in_the_middle",
             TaskCategory::LongContext,
-            "A single fact is buried in the middle of a long document.\n\
-             ...hundreds of lines before...\n\
-             The launch code is THX-1138.\n\
-             ...hundreds of lines after...\n\
-             What is the launch code? Answer with only the code.",
+            &format!(
+                "A single fact is buried in the middle of the log below. What is the launch \
+                 code? Answer with only the code.\n{}\nThe launch code is THX-1138.\n{}",
+                filler_log_lines(0, 300),
+                filler_log_lines(300, 300),
+            ),
             Grading::LongContext {
                 needles: vec![Needle {
                     needle: "launch code".to_string(),
@@ -518,4 +529,111 @@ fn long_context_tasks() -> Vec<GoldTask> {
             },
         ),
     ]
+}
+
+/// Deterministic config-style distractor lines (`svc_NNNN.<key> = <value>`). Values are derived
+/// from the line index so the text never repeats a needle value and stays stable across builds
+/// (grading is exact-match; the filler must not collide with `ap-northeast-1`, `45`, or the
+/// launch code as a *value of the probed key*).
+fn filler_config_lines(start: usize, count: usize) -> String {
+    let keys = [
+        "pool_size",
+        "retry_limit",
+        "cache_ttl",
+        "batch_window",
+        "max_inflight",
+    ];
+    (start..start + count)
+        .map(|i| {
+            let key = keys[i % keys.len()];
+            format!("svc_{i:04}.{key} = {}", 1000 + i * 7 % 8999)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Deterministic log-style distractor lines for the lost-in-the-middle probe.
+fn filler_log_lines(start: usize, count: usize) -> String {
+    let events = [
+        "healthcheck ok",
+        "cache warmed",
+        "queue drained",
+        "lease renewed",
+        "gc pass done",
+    ];
+    (start..start + count)
+        .map(|i| {
+            format!(
+                "2026-07-0{} 12:{:02}:{:02} worker-{} {}",
+                i % 9 + 1,
+                i / 60 % 60,
+                i % 60,
+                i % 16,
+                events[i % events.len()],
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review finding (2026-07 eval): long-context probes were five-line prompts with
+    /// "...many lines..." placeholders, so they measured nothing about context capacity.
+    #[test]
+    fn long_context_prompts_carry_hundreds_of_real_lines() {
+        for task in long_context_tasks() {
+            let lines = task.prompt.lines().count();
+            assert!(
+                lines > 400,
+                "{} has only {lines} lines — not a long-context probe",
+                task.id
+            );
+            assert!(
+                !task.prompt.contains("..."),
+                "{} still contains a placeholder ellipsis",
+                task.id
+            );
+        }
+    }
+
+    /// Review finding (2026-07 eval): several review/security/adversarial prompts leaked
+    /// the expected answer (a parenthetical naming the defect, inline comments annotating
+    /// the buggy line, or "already parameterised" giving away the clean verdict).
+    #[test]
+    fn grading_prompts_do_not_leak_their_expected_defects() {
+        for task in all_tasks() {
+            let leaks: &[&str] = &[
+                "dereferences",
+                "may be None",
+                "already parameterised",
+                "no check that",
+                "ZeroDivisionError",
+                "idiomatic, correct",
+            ];
+            for leak in leaks {
+                assert!(
+                    !task.prompt.contains(leak),
+                    "{} leaks the answer via {leak:?}",
+                    task.id
+                );
+            }
+            // The empty-result instruction must appear on every defect-style prompt, not
+            // only the clean ones — otherwise its presence is itself the answer.
+            match &task.grading {
+                Grading::Review { .. }
+                | Grading::SecurityReview { .. }
+                | Grading::Adversarial { .. } => {
+                    assert!(
+                        task.prompt.contains("If there are none, return []"),
+                        "{} lacks the uniform empty-result instruction",
+                        task.id
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 }

@@ -1,15 +1,15 @@
 //! `agentpit diagnose "<task>" [--json]` — a dry-run observation point (design §1.5).
 //!
 //! Shows the full diagnosis chain: extracted features → diagnosed `(category, confidence)`
-//! → the backend the capability profiles would route the task to, and why. `--json` emits a
+//! → the backend a `rescue` dispatch would route the task to, and why. `--json` emits a
 //! machine-readable verdict for downstream automation (the Phase B issue→routing GitHub
 //! Action).
 //!
-//! The backend selection mirrors the profile stage of `router::Router::resolve`: a confident
-//! diagnosis routes to the highest-scoring available backend for the category; a shaky
-//! verdict (confidence below the LLM-assist threshold) or a category no available backend has
-//! scored falls back to the configured default — never steering work to an odd backend on a
-//! weak guess.
+//! The backend selection is the real thing: it calls `router::Router::resolve` with the
+//! same inputs a bare `agentpit rescue` dispatch uses, so every stage — the `[routes]`
+//! table, the similarity stage (in `--features similarity` builds), the profile pick with
+//! its cost tiebreak, long-context and keyword heuristics, and the default fallback — is
+//! reproduced instead of mirrored. What this prints is what dispatch would do.
 
 use std::collections::HashSet;
 
@@ -17,32 +17,23 @@ use anyhow::Result;
 use console::style;
 use serde::Serialize;
 
+use crate::config::{HubConfig, RouteKey};
 use crate::diagnose::{self, DiagnoseMethod, Diagnosis, LLM_ASSIST_CONFIDENCE_THRESHOLD};
 use crate::profile::{ProfileSet, TaskCategory, load_profiles};
+use crate::router::{RouteReason, RouteRequest, Router};
 use crate::types::BackendId;
 
 use super::load_context;
 
-/// Why a task landed on its backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RoutingReason {
-    /// Confident diagnosis matched the highest-scoring available backend for the category.
-    Profile,
-    /// Diagnosis confidence is below the LLM-assist threshold; profile routing is skipped and
-    /// the task falls back to the default backend.
-    LowConfidence,
-    /// Confident diagnosis, but no available backend has scored the category; falls back.
-    NoProfileMatch,
-}
-
-/// The routing verdict for a diagnosed task.
+/// The routing verdict for a diagnosed task — a projection of the router's `RouteDecision`.
 #[derive(Debug, Clone, Serialize)]
 struct Routing {
-    /// The backend the task would be sent to (the profile pick, or the default fallback).
+    /// The backend the task would be sent to.
     backend: BackendId,
-    reason: RoutingReason,
-    /// True when `backend` is the profile argmax; false when it is the default fallback.
+    /// The router's own reason string (`route_table`, `similarity`, `profile`,
+    /// `profile_cost_tiebreak`, `auto_long_context`, `auto_keyword`, `default`).
+    reason: String,
+    /// True when the profile stage picked `backend` (reason `profile*`).
     from_profile: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<TaskCategory>,
@@ -64,9 +55,8 @@ pub async fn run(task: String, json: bool) -> Result<()> {
     let ctx = load_context()?;
     let available = ctx.regs.available();
     let profiles = load_profiles(None)?;
-    let default_backend = ctx.loaded.config.default.backend;
 
-    let report = build_report(&task, &profiles, &available, default_backend);
+    let report = build_report(&task, &ctx.loaded.config, &available, profiles);
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -76,16 +66,37 @@ pub async fn run(task: String, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build the report. Pure: diagnoses the task and resolves the profile routing without any
-/// I/O, returning a fresh `DiagnoseReport`.
+/// Build the report by running the real router. Pure aside from the diagnose heuristic:
+/// `Router::resolve` is a pure function of `(config, available, profiles, task)`.
 fn build_report(
     task: &str,
-    profiles: &ProfileSet,
+    config: &HubConfig,
     available: &HashSet<BackendId>,
-    default_backend: BackendId,
+    profiles: ProfileSet,
 ) -> DiagnoseReport {
     let diagnosis = diagnose::diagnose(task);
-    let routing = route(&diagnosis, profiles, available, default_backend);
+
+    // Exactly what a bare `agentpit rescue "<task>"` resolves — same route key, no
+    // explicit backend, same config/profile inputs.
+    let router = Router::new(config.clone(), available.clone(), profiles);
+    let decision = router.resolve(&RouteRequest {
+        tool: RouteKey::Rescue,
+        explicit_backend: None,
+        task: Some(task),
+    });
+    let (category, score) = match decision.reason {
+        RouteReason::Profile {
+            category, score, ..
+        } => (Some(category), Some(score)),
+        _ => (None, None),
+    };
+    let routing = Routing {
+        backend: decision.backend,
+        reason: decision.reason.as_str().to_string(),
+        from_profile: matches!(decision.reason, RouteReason::Profile { .. }),
+        category,
+        score,
+    };
 
     let mut available_sorted: Vec<BackendId> = available.iter().copied().collect();
     available_sorted.sort();
@@ -96,41 +107,6 @@ fn build_report(
         routing,
         available: available_sorted,
         threshold: LLM_ASSIST_CONFIDENCE_THRESHOLD,
-    }
-}
-
-/// Resolve the routing verdict, mirroring the profile stage of `router::Router::resolve`.
-fn route(
-    diagnosis: &Diagnosis,
-    profiles: &ProfileSet,
-    available: &HashSet<BackendId>,
-    default_backend: BackendId,
-) -> Routing {
-    if diagnosis.confidence < LLM_ASSIST_CONFIDENCE_THRESHOLD {
-        return Routing {
-            backend: default_backend,
-            reason: RoutingReason::LowConfidence,
-            from_profile: false,
-            category: None,
-            score: None,
-        };
-    }
-
-    match profiles.best_for(diagnosis.primary, available) {
-        Some((backend, score)) => Routing {
-            backend,
-            reason: RoutingReason::Profile,
-            from_profile: true,
-            category: Some(diagnosis.primary),
-            score: Some(score.value),
-        },
-        None => Routing {
-            backend: default_backend,
-            reason: RoutingReason::NoProfileMatch,
-            from_profile: false,
-            category: Some(diagnosis.primary),
-            score: None,
-        },
     }
 }
 
@@ -183,20 +159,19 @@ fn render_human(report: &DiagnoseReport) -> String {
     );
 
     let r = &report.routing;
-    let detail = match r.reason {
-        RoutingReason::Profile => format!(
-            "profile: {} score {}",
+    let detail = match r.reason.as_str() {
+        "profile" | "profile_cost_tiebreak" => format!(
+            "{}: {} score {}",
+            r.reason,
             r.category.map(|c| c.as_str()).unwrap_or("?"),
             r.score.unwrap_or(0)
         ),
-        RoutingReason::LowConfidence => format!(
+        "route_table" => "route table: [routes] pins this tool before any auto-routing".into(),
+        "default" if d.confidence < report.threshold => format!(
             "default — confidence {:.2} < {:.2}, diagnosis too weak for profile routing",
             d.confidence, report.threshold
         ),
-        RoutingReason::NoProfileMatch => format!(
-            "default — no available backend has scored {}",
-            r.category.map(|c| c.as_str()).unwrap_or("?")
-        ),
+        reason => reason.to_string(),
     };
     let _ = writeln!(out, "\nrouting:");
     let _ = writeln!(
@@ -237,34 +212,64 @@ mod tests {
         .collect()
     }
 
+    /// Auto-route on, no `[routes]` pins — the profile stage decides.
+    fn auto_route_config(default_backend: BackendId) -> HubConfig {
+        let mut config = HubConfig::default();
+        config.default.backend = default_backend;
+        config
+    }
+
     #[test]
     fn confident_coding_task_routes_to_profile_argmax() {
-        let profiles = seeded_profiles();
-        let available = all_seeded_available();
         let report = build_report(
             "implement a function to parse the duration feature",
-            &profiles,
-            &available,
-            BackendId::Opencode,
+            &auto_route_config(BackendId::Opencode),
+            &all_seeded_available(),
+            seeded_profiles(),
         );
 
         assert_eq!(report.diagnosis.primary, TaskCategory::Coding);
         assert!(report.diagnosis.confidence >= LLM_ASSIST_CONFIDENCE_THRESHOLD);
-        assert_eq!(report.routing.reason, RoutingReason::Profile);
+        assert_eq!(report.routing.reason, "profile");
         assert!(report.routing.from_profile);
         // Claude is the seeded coding argmax.
         assert_eq!(report.routing.backend, BackendId::Claude);
         assert_eq!(report.routing.score, Some(88));
+        assert_eq!(report.routing.category, Some(TaskCategory::Coding));
+    }
+
+    /// Eval finding 6 (2026-07): diagnose used to mirror only the profile stage, so its
+    /// printed route could differ from the deployed router. It now reproduces every stage —
+    /// a `[routes] rescue` pin must win exactly like it does at dispatch time.
+    #[test]
+    fn route_table_pin_wins_exactly_like_the_deployed_router() {
+        let mut config = auto_route_config(BackendId::Opencode);
+        config
+            .routes
+            .insert(RouteKey::Rescue, BackendId::Antigravity);
+        let report = build_report(
+            "implement a function to parse the duration feature",
+            &config,
+            &all_seeded_available(),
+            seeded_profiles(),
+        );
+
+        assert_eq!(report.routing.reason, "route_table");
+        assert_eq!(report.routing.backend, BackendId::Antigravity);
+        assert!(!report.routing.from_profile);
     }
 
     #[test]
     fn low_confidence_task_falls_back_to_default() {
-        let profiles = seeded_profiles();
-        let available = all_seeded_available();
-        let report = build_report("alpha beta gamma", &profiles, &available, BackendId::Gemini);
+        let report = build_report(
+            "alpha beta gamma",
+            &auto_route_config(BackendId::Gemini),
+            &all_seeded_available(),
+            seeded_profiles(),
+        );
 
         assert!(report.diagnosis.confidence < LLM_ASSIST_CONFIDENCE_THRESHOLD);
-        assert_eq!(report.routing.reason, RoutingReason::LowConfidence);
+        assert_eq!(report.routing.reason, "default");
         assert!(!report.routing.from_profile);
         assert_eq!(report.routing.backend, BackendId::Gemini);
         assert_eq!(report.routing.score, None);
@@ -272,32 +277,28 @@ mod tests {
 
     #[test]
     fn confident_task_with_unscored_category_falls_back() {
-        // Empty profiles: even a confident diagnosis has no backend to route to.
-        let profiles = ProfileSet::default();
-        let available = all_seeded_available();
+        // Empty profiles: even a confident diagnosis has no backend to route to. The router
+        // then runs its remaining heuristics and lands on the default.
         let report = build_report(
             "refactor the auth module to flatten the nesting",
-            &profiles,
-            &available,
-            BackendId::Codex,
+            &auto_route_config(BackendId::Codex),
+            &all_seeded_available(),
+            ProfileSet::default(),
         );
 
         assert_eq!(report.diagnosis.primary, TaskCategory::Refactor);
-        assert_eq!(report.routing.reason, RoutingReason::NoProfileMatch);
         assert!(!report.routing.from_profile);
         assert_eq!(report.routing.backend, BackendId::Codex);
-        assert_eq!(report.routing.category, Some(TaskCategory::Refactor));
+        assert_eq!(report.routing.reason, "default");
     }
 
     #[test]
     fn report_serializes_to_expected_json_shape() {
-        let profiles = seeded_profiles();
-        let available = all_seeded_available();
         let report = build_report(
             "implement a function to parse the duration feature",
-            &profiles,
-            &available,
-            BackendId::Opencode,
+            &auto_route_config(BackendId::Opencode),
+            &all_seeded_available(),
+            seeded_profiles(),
         );
         let json = serde_json::to_string(&report).unwrap();
 
@@ -310,13 +311,11 @@ mod tests {
 
     #[test]
     fn human_render_contains_chain() {
-        let profiles = seeded_profiles();
-        let available = all_seeded_available();
         let report = build_report(
             "implement a function to parse the duration feature",
-            &profiles,
-            &available,
-            BackendId::Opencode,
+            &auto_route_config(BackendId::Opencode),
+            &all_seeded_available(),
+            seeded_profiles(),
         );
         let out = render_human(&report);
 

@@ -17,8 +17,8 @@
 use std::collections::BTreeMap;
 
 use crate::events::{Event, LegStatus, OutcomeLabel, RunKind};
-use crate::profile::{ProfileSource, TaskCategory};
 use crate::profile::model::Score;
+use crate::profile::{ProfileSource, TaskCategory};
 use crate::types::BackendId;
 
 /// Cells with fewer labels than this are not written back (too little evidence).

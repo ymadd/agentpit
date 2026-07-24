@@ -26,7 +26,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png"],
+    "icon": ["icons/agentpit-control-pit.png"],
     "category": "DeveloperTool",
     "shortDescription": "Desktop control plane for agentpit workflows and agent CLIs",
     "macOS": {

@@ -177,6 +177,11 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
         merged.insert(after);
     }
 
+    if !dry_run {
+        #[cfg(feature = "similarity")]
+        update_route_samples(&labels);
+    }
+
     if changed == 0 {
         println!("no cells changed.");
         return Ok(());
@@ -188,6 +193,88 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
     save_profiles(&merged, profiles)?;
     println!("wrote {} ({changed} cell(s) updated).", profiles.display());
     Ok(())
+}
+
+/// Grow the similarity layer's sample store from this fold's labels: embed each newly-seen
+/// `(task, backend)` outcome in bulk and append it to routes.jsonl, dropping expired samples.
+/// Best-effort — a missing model just prints a hint (`agentpit similarity init`).
+#[cfg(feature = "similarity")]
+fn update_route_samples(labels: &[crate::profile::learn::Label]) {
+    use crate::similarity::{
+        RouteSample, SAMPLE_TTL_MS, embed, parse_samples, routes_path, serialize_samples,
+    };
+
+    if !embed::model_ready() {
+        println!(
+            "similarity: model not installed; skipped sample ingestion (run `agentpit similarity init`)."
+        );
+        return;
+    }
+
+    let now = crate::events::now_ms();
+    let mut samples: Vec<RouteSample> = std::fs::read_to_string(routes_path())
+        .map(|raw| parse_samples(&raw))
+        .unwrap_or_default();
+    samples.retain(|s| now.saturating_sub(s.ts) <= SAMPLE_TTL_MS);
+    let known: std::collections::HashSet<(String, BackendId)> = samples
+        .iter()
+        .map(|s| (s.task_hash.clone(), s.backend))
+        .collect();
+
+    // One sample per newly-seen (task, backend); the freshest label wins for its verdict.
+    let mut pending: Vec<(&crate::profile::learn::Label, String)> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut seen_new: std::collections::HashSet<(String, BackendId)> = Default::default();
+    for label in labels.iter().rev() {
+        let Some(hash) = label.task_hash.clone() else {
+            continue;
+        };
+        if known.contains(&(hash.clone(), label.backend))
+            || !seen_new.insert((hash.clone(), label.backend))
+        {
+            continue;
+        }
+        let Ok(text) =
+            std::fs::read_to_string(crate::events::tasks_dir().join(format!("{hash}.txt")))
+        else {
+            continue;
+        };
+        pending.push((label, hash));
+        texts.push(text);
+    }
+    if pending.is_empty() {
+        return;
+    }
+
+    let embeddings = match embed::embed_texts(&texts) {
+        Ok(embeddings) => embeddings,
+        Err(error) => {
+            eprintln!("similarity: embedding failed, samples not updated: {error:#}");
+            return;
+        }
+    };
+    for ((label, hash), embedding) in pending.into_iter().zip(embeddings) {
+        samples.push(RouteSample {
+            task_hash: hash,
+            embedding,
+            backend: label.backend,
+            label: if label.success { "good" } else { "bad" }.into(),
+            category: Some(label.category.as_str().to_string()),
+            ts: if label.ts > 0 { label.ts } else { now },
+        });
+    }
+
+    let path = routes_path();
+    let tmp = path.with_extension("jsonl.tmp");
+    if std::fs::write(&tmp, serialize_samples(&samples)).is_ok()
+        && std::fs::rename(&tmp, &path).is_ok()
+    {
+        println!(
+            "similarity: {} sample(s) in {}.",
+            samples.len(),
+            path.display()
+        );
+    }
 }
 
 fn show() -> Result<()> {

@@ -27,6 +27,9 @@ clap = { version = "4.5", features = ["derive"] }
 cliclack = "0.5"
 console = "0.15"
 dirs = "5"
+# kNN similarity routing (feature `similarity`): local ONNX embeddings. Optional so the
+# default single-binary build carries no ONNX runtime.
+fastembed = { version = "5", optional = true }
 regex = "1"
 rmcp = { version = "=1.7.0", features = ["server", "macros", "transport-io"] }
 rustyline = "18"
@@ -45,3 +48,8 @@ tempfile = "3"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[features]
+# kNN similarity routing: embeds task texts locally (fastembed/ONNX). Off by default to
+# keep the shipped binary small; the model itself downloads via `agentpit similarity init`.
+similarity = ["dep:fastembed"]

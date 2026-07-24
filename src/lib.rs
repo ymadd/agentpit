@@ -10,6 +10,7 @@ pub mod exec;
 pub mod mcp;
 pub mod profile;
 pub mod router;
+pub mod similarity;
 pub mod types;
 pub mod update;
 pub mod workflow;

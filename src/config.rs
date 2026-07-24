@@ -78,6 +78,63 @@ pub struct AutoRouteSection {
     /// interchangeable on quality, and the cheapest (`[backends.<id>].cost`) wins.
     #[serde(default = "default_quality_margin")]
     pub quality_margin: u8,
+    /// kNN similarity routing (`[auto_route.similarity]`): route to the backend that won
+    /// similar past tasks. Only active in `--features similarity` builds with the embedding
+    /// model downloaded (`agentpit similarity init`).
+    #[serde(default)]
+    pub similarity: SimilaritySection,
+}
+
+/// Knobs for the kNN similarity routing layer. All thresholds deliberately conservative:
+/// when the evidence is thin the layer falls through to the profile route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimilaritySection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Neighbours consulted per lookup.
+    #[serde(default = "default_similarity_k")]
+    pub k: usize,
+    /// Cosine similarity below this is not "the same kind of task".
+    #[serde(default = "default_similarity_min_sim")]
+    pub min_sim: f32,
+    /// The winning backend needs at least this many similar samples.
+    #[serde(default = "default_similarity_min_samples")]
+    pub min_samples: usize,
+    /// The winner's win-rate lead over the runner-up must be at least this.
+    #[serde(default = "default_similarity_margin")]
+    pub margin: f32,
+    /// Give up on (lazy) model load + query embedding after this long and fall through.
+    #[serde(default = "default_similarity_load_timeout_ms")]
+    pub load_timeout_ms: u64,
+}
+
+impl Default for SimilaritySection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            k: default_similarity_k(),
+            min_sim: default_similarity_min_sim(),
+            min_samples: default_similarity_min_samples(),
+            margin: default_similarity_margin(),
+            load_timeout_ms: default_similarity_load_timeout_ms(),
+        }
+    }
+}
+
+fn default_similarity_k() -> usize {
+    8
+}
+fn default_similarity_min_sim() -> f32 {
+    0.80
+}
+fn default_similarity_min_samples() -> usize {
+    3
+}
+fn default_similarity_margin() -> f32 {
+    0.15
+}
+fn default_similarity_load_timeout_ms() -> u64 {
+    300
 }
 
 impl Default for AutoRouteSection {
@@ -88,6 +145,7 @@ impl Default for AutoRouteSection {
             review_keywords: default_review_keywords(),
             review_backend: default_review_backend(),
             quality_margin: default_quality_margin(),
+            similarity: SimilaritySection::default(),
         }
     }
 }

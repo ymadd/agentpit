@@ -26,6 +26,8 @@ pub mod repl;
 pub mod rescue;
 pub mod review;
 pub mod security_review;
+#[cfg(feature = "similarity")]
+pub mod similarity_cmd;
 pub mod status;
 pub mod update;
 pub mod workflow;
@@ -286,6 +288,13 @@ pub enum Command {
         from: Option<BackendId>,
     },
 
+    /// Manage the kNN similarity-routing layer's embedding model.
+    #[cfg(feature = "similarity")]
+    Similarity {
+        #[command(subcommand)]
+        action: similarity_cmd::Action,
+    },
+
     /// Record your good/bad verdict on a run — the strongest label the learned routing layer
     /// trains on. Omit the run id to label the most recent run.
     Outcome {
@@ -483,6 +492,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Note { body, kind, from } => note::run(body, kind, from).await,
 
         Command::Outcome { verdict, run_id } => outcome::run(verdict, run_id).await,
+
+        #[cfg(feature = "similarity")]
+        Command::Similarity { action } => similarity_cmd::run(action).await,
 
         Command::Refute {
             candidate,

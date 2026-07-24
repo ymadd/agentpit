@@ -25,6 +25,14 @@ pub enum RouteReason {
         score: u8,
         cost_tiebreak: bool,
     },
+    /// kNN similarity route: the backend that won sufficiently-similar past tasks
+    /// (`--features similarity` builds with the embedding model installed).
+    Similarity {
+        /// Best neighbour cosine similarity, as a 0–100 percentage.
+        sim_pct: u8,
+        /// Similar samples backing the winner.
+        samples: u16,
+    },
     AutoLongContext,
     AutoKeyword,
     Default,
@@ -43,6 +51,7 @@ impl RouteReason {
                 cost_tiebreak: true,
                 ..
             } => "profile_cost_tiebreak",
+            RouteReason::Similarity { .. } => "similarity",
             RouteReason::AutoLongContext => "auto_long_context",
             RouteReason::AutoKeyword => "auto_keyword",
             RouteReason::Default => "default",
@@ -128,6 +137,26 @@ impl Router {
         if self.config.default.auto_route
             && let Some(task) = request.task
         {
+            // Similarity stage (before any category diagnosis): a backend that won enough
+            // sufficiently-similar past tasks takes the dispatch directly. Compiled out of
+            // non-`similarity` builds; inside them every miss (no model, no samples, slow
+            // load, thin evidence) falls through to the profile stage below.
+            #[cfg(feature = "similarity")]
+            if let Some(pick) = crate::similarity::embed::route(
+                task,
+                &self.config.auto_route.similarity,
+                &self.available,
+            ) {
+                return RouteDecision {
+                    backend: pick.backend,
+                    reason: RouteReason::Similarity {
+                        sim_pct: (pick.sim.clamp(0.0, 1.0) * 100.0).round() as u8,
+                        samples: pick.samples.min(u16::MAX as usize) as u16,
+                    },
+                    diagnose_confidence: None,
+                };
+            }
+
             // Profile-driven diagnostic routing (design §1.6): diagnose the task, and when the
             // verdict is confident enough, send it to the highest-scoring available backend for
             // that category. A shaky diagnosis (low confidence) or a category no available
@@ -271,6 +300,7 @@ mod tests {
                 review_keywords: vec!["audit".into(), "review".into()],
                 review_backend: BackendId::Claude,
                 quality_margin: 5,
+                similarity: Default::default(),
             },
             ensemble: EnsembleSection::default(),
             workflow: WorkflowSection::default(),

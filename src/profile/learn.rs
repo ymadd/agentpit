@@ -67,13 +67,16 @@ impl RunRecord {
     }
 }
 
-/// One weighted outcome observation for a `(backend, category)` cell.
+/// One weighted outcome observation for a `(backend, category)` cell. `task_hash`/`ts`
+/// carry the source run's identity through to the similarity sample store (routes.jsonl).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Label {
     pub backend: BackendId,
     pub category: TaskCategory,
     pub success: bool,
     pub weight: f32,
+    pub task_hash: Option<String>,
+    pub ts: u64,
 }
 
 /// Group the log's event lines into per-run records, in first-seen order. Unparseable lines
@@ -204,6 +207,8 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                 category,
                 success: outcome == OutcomeLabel::Good,
                 weight: WEIGHT_OUTCOME,
+                task_hash: run.task_hash.clone(),
+                ts: run.route_ts,
             });
             continue;
         }
@@ -221,6 +226,8 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                     category,
                     success,
                     weight: WEIGHT_GRADE,
+                    task_hash: run.task_hash.clone(),
+                    ts: run.route_ts,
                 });
             }
             continue;
@@ -237,6 +244,8 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                 category,
                 success: false,
                 weight: WEIGHT_RERUN,
+                task_hash: run.task_hash.clone(),
+                ts: run.route_ts,
             });
             continue;
         }
@@ -248,12 +257,16 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                 category,
                 success: true,
                 weight: WEIGHT_EXIT,
+                task_hash: run.task_hash.clone(),
+                ts: run.route_ts,
             }),
             Some(LegStatus::Error) => labels.push(Label {
                 backend,
                 category,
                 success: false,
                 weight: WEIGHT_EXIT,
+                task_hash: run.task_hash.clone(),
+                ts: run.route_ts,
             }),
             Some(LegStatus::Skipped) | None => {}
         }
@@ -382,18 +395,24 @@ mod tests {
                     category: TaskCategory::Coding,
                     success: false,
                     weight: WEIGHT_OUTCOME,
+                    task_hash: Some("aa".into()),
+                    ts: 5,
                 },
                 Label {
                     backend: BackendId::Claude,
                     category: TaskCategory::Review,
                     success: true,
                     weight: WEIGHT_GRADE,
+                    task_hash: Some("bb".into()),
+                    ts: 6,
                 },
                 Label {
                     backend: BackendId::Codex,
                     category: TaskCategory::Review,
                     success: false,
                     weight: WEIGHT_GRADE,
+                    task_hash: Some("bb".into()),
+                    ts: 6,
                 },
             ]
         );
@@ -420,12 +439,16 @@ mod tests {
                     category: TaskCategory::Coding,
                     success: false,
                     weight: WEIGHT_RERUN,
+                    task_hash: Some("aa".into()),
+                    ts: 1_000,
                 },
                 Label {
                     backend: BackendId::Codex,
                     category: TaskCategory::Coding,
                     success: true,
                     weight: WEIGHT_EXIT,
+                    task_hash: Some("aa".into()),
+                    ts: 2_000,
                 },
             ]
         );
@@ -464,6 +487,8 @@ mod tests {
                     category: TaskCategory::Coding,
                     success: true,
                     weight: WEIGHT_OUTCOME,
+                    task_hash: None,
+                    ts: 0,
                 },
                 n,
             )
@@ -474,6 +499,8 @@ mod tests {
             category: TaskCategory::Coding,
             success: false,
             weight: WEIGHT_OUTCOME,
+            task_hash: None,
+            ts: 0,
         });
         // Claude has decent labels but too few of them.
         labels.extend(win(BackendId::Claude, 3));

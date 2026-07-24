@@ -292,6 +292,7 @@ mod tests {
             default: DefaultSection {
                 backend: BackendId::Gemini,
                 auto_route: true,
+                cascade: false,
             },
             routes,
             auto_route: AutoRouteSection {
@@ -305,6 +306,7 @@ mod tests {
             ensemble: EnsembleSection::default(),
             workflow: WorkflowSection::default(),
             backends: BTreeMap::new(),
+            cascade: Default::default(),
         }
     }
 
@@ -405,6 +407,7 @@ mod tests {
         cfg.default = DefaultSection {
             backend: BackendId::Opencode,
             auto_route: false,
+            cascade: false,
         };
         let r = Router::new(cfg, available(), ProfileSet::default());
         let d = r.resolve(&RouteRequest {

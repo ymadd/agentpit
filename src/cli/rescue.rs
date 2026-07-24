@@ -318,9 +318,225 @@ async fn run_with_route_inner(
     }
 }
 
+/// Build the cascade's escalation ladder: available backends whose profile score for
+/// `category` clears `min_score`, cheapest first (score-desc breaks cost ties), capped at
+/// `max_hops + 1` backends. Pure — tested without any dispatch.
+fn cascade_ladder(
+    candidates: &[(BackendId, crate::profile::Score)],
+    min_score: u8,
+    max_hops: u32,
+    cost_of: impl Fn(BackendId) -> u8,
+) -> Vec<BackendId> {
+    let mut qualifying: Vec<(BackendId, u8)> = candidates
+        .iter()
+        .filter(|(_, score)| score.value >= min_score)
+        .map(|(backend, score)| (*backend, score.value))
+        .collect();
+    qualifying.sort_by(|(a_backend, a_score), (b_backend, b_score)| {
+        cost_of(*a_backend)
+            .cmp(&cost_of(*b_backend))
+            .then(b_score.cmp(a_score))
+    });
+    qualifying.truncate(max_hops as usize + 1);
+    qualifying.into_iter().map(|(backend, _)| backend).collect()
+}
+
+/// Run the `[cascade].verify` command in `cwd`; `Ok(true)` = passed. No command = passed.
+async fn cascade_verify(verify: Option<&str>, cwd: &std::path::Path) -> bool {
+    let Some(command) = verify else {
+        return true;
+    };
+    match tokio::process::Command::new("sh")
+        .args(["-c", command])
+        .current_dir(cwd)
+        .status()
+        .await
+    {
+        Ok(status) => status.success(),
+        Err(error) => {
+            eprintln!("[cascade] verify command failed to launch: {error}");
+            false
+        }
+    }
+}
+
+/// `agentpit rescue --cascade`: dispatch to the cheapest qualifying backend and escalate up
+/// the ladder on failure. Every hop is its own run in the event log, so a failed hop's
+/// RunFinished(error) feeds the learn fold as a negative label with no extra plumbing.
+pub async fn run_cascade(task: String, cwd: Option<String>, model: Option<String>) -> Result<()> {
+    let ctx = load_context()?;
+    let available = ctx.regs.available();
+    let profiles = crate::profile::load_profiles(None).unwrap_or_default();
+    let cascade_cfg = ctx.loaded.config.cascade.clone();
+
+    let diagnosis = crate::diagnose::diagnose(&task);
+    let candidates = profiles.candidates_for(diagnosis.primary, &available);
+    let cost_of = |b: BackendId| {
+        ctx.loaded
+            .config
+            .backends
+            .get(&b)
+            .and_then(|o| o.cost)
+            .unwrap_or(50)
+    };
+    let ladder = cascade_ladder(
+        &candidates,
+        cascade_cfg.min_score,
+        cascade_cfg.max_hops,
+        cost_of,
+    );
+    if ladder.is_empty() {
+        eprintln!(
+            "[cascade] no backend clears min_score={} for {} — falling back to the normal route.",
+            cascade_cfg.min_score,
+            diagnosis.primary.as_str()
+        );
+        return run_with_route_inner(task, None, cwd, true, RouteKey::Rescue, None, model, None)
+            .await;
+    }
+
+    let resolved_cwd = resolve_cwd(cwd)?;
+    let total = ladder.len();
+    for (hop, backend_id) in ladder.into_iter().enumerate() {
+        println!(
+            "[cascade hop {}/{total} backend={backend_id} category={} cost={}]",
+            hop + 1,
+            diagnosis.primary.as_str(),
+            cost_of(backend_id),
+        );
+        let cancel = CancellationToken::new();
+        install_ctrlc_cancel(cancel.clone());
+        let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &resolved_cwd);
+        logger.route_decided(
+            backend_id,
+            "cascade",
+            Some(diagnosis.primary.as_str()),
+            None,
+            Some(diagnosis.confidence),
+            &task,
+        );
+        logger.member_started(backend_id, false);
+        let started = Instant::now();
+
+        let to_stdout = stdout_streamer();
+        let to_file = crate::events::output_streamer(logger.run_id(), backend_id, false);
+        let on_chunk: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+            std::sync::Arc::new(move |c: &str| {
+                to_stdout(c);
+                to_file(c);
+            });
+        let effective_model = crate::workflow::roles::resolve_model(
+            model.as_deref(),
+            None,
+            ctx.loaded
+                .config
+                .backends
+                .get(&backend_id)
+                .and_then(|o| o.model.as_deref()),
+        );
+
+        let outcome = dispatch(
+            backend_id,
+            &task,
+            &resolved_cwd,
+            cancel,
+            on_chunk,
+            &ctx.regs,
+            effective_model.as_deref(),
+        )
+        .await;
+        let elapsed = started.elapsed().as_millis() as u64;
+        let failure: Option<String> = match &outcome {
+            Ok(res) if res.auth_failed => Some("auth failure during execution".into()),
+            Ok(_) => {
+                if cascade_verify(cascade_cfg.verify.as_deref(), &resolved_cwd).await {
+                    None
+                } else {
+                    Some(format!(
+                        "verification failed: `{}`",
+                        cascade_cfg.verify.as_deref().unwrap_or_default()
+                    ))
+                }
+            }
+            Err(error) => Some(format!("{error:#}")),
+        };
+
+        match failure {
+            None => {
+                let chars = outcome.as_ref().ok().map(|r| r.output.len());
+                logger.member_finished(backend_id, false, LegStatus::Ok, elapsed, chars, None);
+                logger.finished(LegStatus::Ok);
+                if let Ok(res) = outcome
+                    && !res.output.ends_with('\n')
+                {
+                    println!();
+                }
+                return Ok(());
+            }
+            Some(reason) => {
+                eprintln!(
+                    "[cascade] hop {}/{total} [{backend_id}] failed: {reason}",
+                    hop + 1
+                );
+                logger.member_finished(
+                    backend_id,
+                    false,
+                    LegStatus::Error,
+                    elapsed,
+                    None,
+                    Some(reason),
+                );
+                logger.finished(LegStatus::Error);
+            }
+        }
+    }
+    anyhow::bail!("cascade exhausted: every hop failed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cascade_ladder_orders_qualifying_backends_by_cost() {
+        use crate::profile::Score;
+        let score = |v: u8| Score {
+            value: v,
+            samples: 5,
+            confidence: 0.6,
+        };
+        let candidates = vec![
+            (BackendId::Claude, score(88)),   // cost 80
+            (BackendId::Opencode, score(65)), // cost 0
+            (BackendId::Gemini, score(75)),   // cost 20
+            (BackendId::Codex, score(55)),    // below min_score, out
+        ];
+        let cost = |b: BackendId| match b {
+            BackendId::Opencode => 0,
+            BackendId::Gemini => 20,
+            BackendId::Claude => 80,
+            _ => 50,
+        };
+        // Cheapest-first ladder, capped at max_hops+1 entries.
+        assert_eq!(
+            cascade_ladder(&candidates, 60, 2, cost),
+            vec![BackendId::Opencode, BackendId::Gemini, BackendId::Claude]
+        );
+        assert_eq!(
+            cascade_ladder(&candidates, 60, 0, cost),
+            vec![BackendId::Opencode]
+        );
+        // Nobody qualifies → empty (caller falls back to the normal route).
+        assert!(cascade_ladder(&candidates, 90, 2, cost).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cascade_verify_maps_exit_status() {
+        let dir = std::env::temp_dir();
+        assert!(cascade_verify(None, &dir).await);
+        assert!(cascade_verify(Some("true"), &dir).await);
+        assert!(!cascade_verify(Some("false"), &dir).await);
+    }
 
     #[test]
     fn no_role_no_backend_plans_a_direct_default_dispatch() {

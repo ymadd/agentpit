@@ -65,6 +65,15 @@ pub enum Action {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Replay past telemetry against a routing policy and report its would-have-been
+    /// accuracy: for each labelled run, where would the policy have routed, and does a
+    /// recorded label for that (task, backend) say it went well?
+    Replay {
+        /// `seeded` (hand-seeded priors), `learned` (current profiles.toml), or
+        /// `similarity` (kNN over routes.jsonl; needs a `--features similarity` build).
+        #[arg(long, default_value = "learned")]
+        policy: String,
+    },
     /// Fold runtime telemetry (events.jsonl) into Learned scores and merge them into
     /// profiles.toml. Benchmarked cells are never overwritten; cells with fewer than
     /// --min-samples labels are skipped.
@@ -105,7 +114,132 @@ pub async fn run(action: Option<Action>) -> Result<()> {
             dry_run,
             min_samples,
         } => learn(dry_run, min_samples, &profiles_path()),
+        Action::Replay { policy } => replay(&policy),
     }
+}
+
+/// A replay policy's routing choice for one labelled run.
+type PolicyPicker = Box<dyn Fn(&crate::profile::learn::Label) -> Option<BackendId>>;
+
+/// `agentpit profile replay`: score a routing policy against the recorded labels.
+///
+/// Honest scoring caveat: we only know how backends that actually ran performed, so a pick
+/// is *evaluable* only when some label exists for the same task on the picked backend.
+/// The report separates coverage (evaluable/total) from accuracy (correct/evaluable).
+fn replay(policy: &str) -> Result<()> {
+    use crate::profile::learn::{
+        DEFAULT_RERUN_WINDOW_MS, Label, derive_labels, parse_runs, resolve_categories,
+    };
+
+    let events = crate::events::events_path();
+    let log = fs::read_to_string(&events)
+        .with_context(|| format!("no telemetry at {}", events.display()))?;
+    let mut runs = parse_runs(&log);
+    resolve_categories(&mut runs, |task_hash| {
+        let text =
+            fs::read_to_string(crate::events::tasks_dir().join(format!("{task_hash}.txt"))).ok()?;
+        Some(crate::diagnose::diagnose(&text).primary)
+    });
+    let labels = derive_labels(&runs, DEFAULT_RERUN_WINDOW_MS);
+    if labels.is_empty() {
+        bail!("no labelled runs to replay yet");
+    }
+
+    // Every backend ever labelled counts as available for the what-if.
+    let available: std::collections::HashSet<BackendId> =
+        labels.iter().map(|l| l.backend).collect();
+    // (task_hash, backend) → did any label call it good? (positive evidence wins ties)
+    let mut verdicts: std::collections::HashMap<(String, BackendId), bool> = Default::default();
+    for label in &labels {
+        if let Some(hash) = &label.task_hash {
+            let entry = verdicts
+                .entry((hash.clone(), label.backend))
+                .or_insert(false);
+            *entry = *entry || label.success;
+        }
+    }
+
+    let pick_for: PolicyPicker = match policy {
+        "seeded" => {
+            let set = seeded_profiles();
+            let available = available.clone();
+            Box::new(move |l: &Label| set.best_for(l.category, &available).map(|(b, _)| b))
+        }
+        "learned" => {
+            let set = load_profiles(None)?;
+            let available = available.clone();
+            Box::new(move |l: &Label| set.best_for(l.category, &available).map(|(b, _)| b))
+        }
+        "similarity" => similarity_replay_picker(&available)?,
+        other => bail!("unknown policy `{other}` (expected seeded|learned|similarity)"),
+    };
+
+    let (mut evaluable, mut correct) = (0usize, 0usize);
+    for label in &labels {
+        let Some(pick) = pick_for(label) else {
+            continue;
+        };
+        let Some(hash) = &label.task_hash else {
+            continue;
+        };
+        let Some(went_well) = verdicts.get(&(hash.clone(), pick)) else {
+            continue; // the policy picked a backend nobody ever ran on this task
+        };
+        evaluable += 1;
+        if *went_well {
+            correct += 1;
+        }
+    }
+
+    println!(
+        "policy={policy}: {} labelled runs, {} evaluable, {} would-have-gone-well ({}%)",
+        labels.len(),
+        evaluable,
+        correct,
+        (correct * 100).checked_div(evaluable).unwrap_or(0),
+    );
+    if evaluable < labels.len() {
+        println!(
+            "(coverage note: {} runs had no label for the policy's pick and were skipped)",
+            labels.len() - evaluable
+        );
+    }
+    Ok(())
+}
+
+/// The similarity policy's picker: leave-one-out kNN over the stored samples.
+#[cfg(feature = "similarity")]
+fn similarity_replay_picker(
+    available: &std::collections::HashSet<BackendId>,
+) -> Result<PolicyPicker> {
+    use crate::similarity::{parse_samples, pick_backend, routes_path};
+
+    let raw = fs::read_to_string(routes_path())
+        .with_context(|| format!("no similarity samples at {}", routes_path().display()))?;
+    let samples = parse_samples(&raw);
+    let cfg = super::load_context()?.loaded.config.auto_route.similarity;
+    let available = available.clone();
+    Ok(Box::new(move |label: &crate::profile::learn::Label| {
+        let hash = label.task_hash.as_deref()?;
+        let query = samples
+            .iter()
+            .find(|s| s.task_hash == hash)?
+            .embedding
+            .clone();
+        let others: Vec<_> = samples
+            .iter()
+            .filter(|s| s.task_hash != hash)
+            .cloned()
+            .collect();
+        pick_backend(&query, &others, &cfg, |b| available.contains(&b)).map(|p| p.backend)
+    }))
+}
+
+#[cfg(not(feature = "similarity"))]
+fn similarity_replay_picker(
+    _available: &std::collections::HashSet<BackendId>,
+) -> Result<PolicyPicker> {
+    bail!("this build has no similarity support (rebuild with --features similarity)")
 }
 
 /// `agentpit profile learn`: fold the event log into Learned scores and merge them into
@@ -337,19 +471,33 @@ fn render_backend_section(backend: BackendId, profile: &CapabilityProfile) -> St
         return out;
     }
 
+    // Per-cell provenance: `src` is the profile's source initial (S/L/B) for measured cells
+    // (samples > 0) and `s` (seeded prior) for cells no measurement has touched yet — so a
+    // Learned profile still shows which cells the fold actually backed with data.
+    let source_initial = match profile.source {
+        crate::profile::ProfileSource::Seeded => "S",
+        crate::profile::ProfileSource::Learned => "L",
+        crate::profile::ProfileSource::Benchmarked => "B",
+    };
     let _ = writeln!(
         out,
-        "  {:<18} {:>5}  {:>5}  {:>7}",
-        "category", "score", "conf", "samples"
+        "  {:<18} {:>5}  {:>5}  {:>7}  {:>3}",
+        "category", "score", "conf", "samples", "src"
     );
     for (category, score) in &profile.scores {
+        let cell_source = if score.samples > 0 {
+            source_initial
+        } else {
+            "s"
+        };
         let _ = writeln!(
             out,
-            "  {:<18} {:>5}  {:>5.2}  {:>7}",
+            "  {:<18} {:>5}  {:>5.2}  {:>7}  {:>3}",
             category.as_str(),
             score.value,
             score.confidence,
-            score.samples
+            score.samples,
+            cell_source
         );
     }
 

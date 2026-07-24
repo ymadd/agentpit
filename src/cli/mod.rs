@@ -69,6 +69,10 @@ pub enum Command {
         /// Disable auto-login on auth failure.
         #[arg(long, default_value_t = false)]
         no_auto_login: bool,
+        /// Cost-ladder cascade: dispatch to the cheapest qualifying backend and escalate on
+        /// failure (see `[cascade]` in config.toml). Mutually exclusive with --role/--backend.
+        #[arg(long, default_value_t = false)]
+        cascade: bool,
     },
 
     /// Run a multi-agent code review (defaults to antigravity + opencode).
@@ -352,7 +356,21 @@ pub async fn run(cli: Cli) -> Result<()> {
             model,
             cwd,
             no_auto_login,
-        } => rescue::run_with_role(task, role, backend, model, cwd, !no_auto_login).await,
+            cascade,
+        } => {
+            let ctx_cascade = cascade
+                || crate::config::load_config(None)
+                    .map(|c| c.config.default.cascade)
+                    .unwrap_or(false);
+            if ctx_cascade && role.is_none() && backend.is_none() {
+                rescue::run_cascade(task, cwd, model).await
+            } else {
+                if cascade && (role.is_some() || backend.is_some()) {
+                    anyhow::bail!("--cascade is mutually exclusive with --role/--backend");
+                }
+                rescue::run_with_role(task, role, backend, model, cwd, !no_auto_login).await
+            }
+        }
 
         Command::Review {
             target,

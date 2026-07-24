@@ -53,6 +53,9 @@ pub struct DefaultSection {
     pub backend: BackendId,
     #[serde(default = "default_true")]
     pub auto_route: bool,
+    /// Run every `agentpit rescue` as a cost-ladder cascade (same as `rescue --cascade`).
+    #[serde(default)]
+    pub cascade: bool,
 }
 
 impl Default for DefaultSection {
@@ -60,6 +63,7 @@ impl Default for DefaultSection {
         Self {
             backend: default_backend(),
             auto_route: true,
+            cascade: false,
         }
     }
 }
@@ -337,6 +341,8 @@ pub struct HubConfig {
     pub workflow: WorkflowSection,
     #[serde(default)]
     pub backends: BTreeMap<BackendId, BackendOverride>,
+    #[serde(default)]
+    pub cascade: CascadeSection,
 }
 
 fn default_backend() -> BackendId {
@@ -347,6 +353,38 @@ fn default_review_backend() -> BackendId {
 }
 fn default_quality_margin() -> u8 {
     5
+}
+
+/// `[cascade]`: escalate a failed cheap dispatch up the quality ladder (`rescue --cascade`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CascadeSection {
+    /// Shell command run in the task's cwd after a hop succeeds; a non-zero exit fails the
+    /// hop anyway (e.g. "cargo test"). Unset = trust the dispatch outcome.
+    #[serde(default)]
+    pub verify: Option<String>,
+    /// Escalations after the first hop (2 = up to three backends total).
+    #[serde(default = "default_cascade_max_hops")]
+    pub max_hops: u32,
+    /// Only backends scoring at least this on the diagnosed category join the ladder.
+    #[serde(default = "default_cascade_min_score")]
+    pub min_score: u8,
+}
+
+impl Default for CascadeSection {
+    fn default() -> Self {
+        Self {
+            verify: None,
+            max_hops: default_cascade_max_hops(),
+            min_score: default_cascade_min_score(),
+        }
+    }
+}
+
+fn default_cascade_max_hops() -> u32 {
+    2
+}
+fn default_cascade_min_score() -> u8 {
+    60
 }
 fn default_true() -> bool {
     true

@@ -28,6 +28,9 @@
     "targets": "all",
     "icon": ["icons/icon.png"],
     "category": "DeveloperTool",
-    "shortDescription": "Desktop control plane for agentpit workflows and agent CLIs"
+    "shortDescription": "Desktop control plane for agentpit workflows and agent CLIs",
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }

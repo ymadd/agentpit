@@ -49,6 +49,8 @@ pub async fn run(
         vec![critic, defender]
     };
     let logger = RunLogger::start(RunKind::AdversarialReview, &members, &cwd);
+    // The critic leg carries the refutation; log it as the run's routed backend.
+    logger.route_decided(critic, "refute", None, None, None, &task);
 
     let bundle = run_refute(
         &task,

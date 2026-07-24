@@ -100,6 +100,7 @@ pub async fn dispatch_free_text(
     );
 
     let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &state.cwd);
+    decision.log(&logger, &task);
     logger.member_started(backend_id, false);
     let started = Instant::now();
 

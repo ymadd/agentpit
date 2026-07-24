@@ -189,6 +189,9 @@ pub(crate) async fn run_capture(
     // 8. Start the run first: the prompt (step 9) and the child_env (step 10) both need the
     //    run id, which only exists once the logger has started.
     let logger = RunLogger::start(RunKind::Workflow, &[manager], &cwd);
+    // The manager backend comes from config/flags, not the router; the RouteDecided line exists
+    // for its task_hash (re-run detection, kNN) and for the learning fold's per-run coverage.
+    logger.route_decided(manager, "workflow_manager", None, None, None, &goal);
     logger.member_started(manager, false);
 
     // 9. Build the manager prompt (needs the run id from step 8 as the parent run id). MCP mode

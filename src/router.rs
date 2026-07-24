@@ -45,6 +45,28 @@ impl RouteReason {
 pub struct RouteDecision {
     pub backend: BackendId,
     pub reason: RouteReason,
+    /// Diagnose confidence when a diagnosis ran during this resolve (any auto-route path,
+    /// whichever stage ultimately won). `None` when routing never looked at the task.
+    pub diagnose_confidence: Option<f32>,
+}
+
+impl RouteDecision {
+    /// Emit this decision as a `RouteDecided` event on `logger` (and save the task text under
+    /// `tasks/<hash>.txt`). One call per run, right after the run starts.
+    pub fn log(&self, logger: &crate::events::RunLogger, task: &str) {
+        let (category, score) = match self.reason {
+            RouteReason::Profile { category, score } => (Some(category.as_str()), Some(score)),
+            _ => (None, None),
+        };
+        logger.route_decided(
+            self.backend,
+            self.reason.as_str(),
+            category,
+            score,
+            self.diagnose_confidence,
+            task,
+        );
+    }
 }
 
 pub struct Router {
@@ -77,6 +99,7 @@ impl Router {
             return RouteDecision {
                 backend: explicit,
                 reason: RouteReason::Explicit,
+                diagnose_confidence: None,
             };
         }
 
@@ -86,9 +109,11 @@ impl Router {
             return RouteDecision {
                 backend: *routed,
                 reason: RouteReason::RouteTable,
+                diagnose_confidence: None,
             };
         }
 
+        let mut diagnose_confidence = None;
         if self.config.default.auto_route
             && let Some(task) = request.task
         {
@@ -99,6 +124,7 @@ impl Router {
             // and ultimately `default` — we never let an uncertain guess steer work to an odd
             // backend.
             let diagnosis = diagnose::diagnose(task);
+            diagnose_confidence = Some(diagnosis.confidence);
             if diagnosis.confidence >= LLM_ASSIST_CONFIDENCE_THRESHOLD
                 && let Some((backend, score)) =
                     self.profiles.best_for(diagnosis.primary, &self.available)
@@ -109,6 +135,7 @@ impl Router {
                         category: diagnosis.primary,
                         score: score.value,
                     },
+                    diagnose_confidence,
                 };
             }
 
@@ -119,6 +146,7 @@ impl Router {
                 return RouteDecision {
                     backend: auto.long_context_backend,
                     reason: RouteReason::AutoLongContext,
+                    diagnose_confidence,
                 };
             }
             if self.available.contains(&auto.review_backend)
@@ -127,6 +155,7 @@ impl Router {
                 return RouteDecision {
                     backend: auto.review_backend,
                     reason: RouteReason::AutoKeyword,
+                    diagnose_confidence,
                 };
             }
         }
@@ -144,6 +173,7 @@ impl Router {
         RouteDecision {
             backend: final_backend,
             reason: RouteReason::Default,
+            diagnose_confidence,
         }
     }
 }
@@ -369,6 +399,29 @@ mod tests {
                 score: 80,
             }
         );
+    }
+
+    #[test]
+    fn diagnose_confidence_is_carried_only_when_a_diagnosis_ran() {
+        // Explicit route: routing never looked at the task → None.
+        let r = Router::new(base_config(), available(), ProfileSet::default());
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: Some(BackendId::Claude),
+            task: Some("x"),
+        });
+        assert_eq!(d.diagnose_confidence, None);
+
+        // Auto-route path (profile or fall-through): the diagnosis ran → Some.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        let r = Router::new(cfg, available(), ProfileSet::default());
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("implement a function to parse the duration feature"),
+        });
+        assert!(d.diagnose_confidence.is_some());
     }
 
     #[test]

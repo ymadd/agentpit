@@ -17,6 +17,7 @@ pub mod login;
 pub mod mcp_cmd;
 mod menu;
 pub mod note;
+pub mod outcome;
 pub mod profile;
 pub mod refactor;
 pub mod refute;
@@ -285,6 +286,15 @@ pub enum Command {
         from: Option<BackendId>,
     },
 
+    /// Record your good/bad verdict on a run — the strongest label the learned routing layer
+    /// trains on. Omit the run id to label the most recent run.
+    Outcome {
+        /// `good` or `bad`.
+        verdict: String,
+        /// The run to label (from the dashboard or the event log). Defaults to the latest run.
+        run_id: Option<String>,
+    },
+
     /// Run a refutation (④): dispatch an adversarial critic at a stuck candidate, then a defender
     /// carrying that critique, and print both for the manager to adjudicate. One depth-guarded
     /// pass — not a loop.
@@ -471,6 +481,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         } => ask::run(prompt, options, kind, timeout_secs).await,
 
         Command::Note { body, kind, from } => note::run(body, kind, from).await,
+
+        Command::Outcome { verdict, run_id } => outcome::run(verdict, run_id).await,
 
         Command::Refute {
             candidate,

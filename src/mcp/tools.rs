@@ -274,6 +274,15 @@ impl AgentpitTools {
         // label it "reviewer · codex" rather than just the backend.
         let logger =
             RunLogger::start_with_role(RunKind::Rescue, &[backend], &self.cwd, role.as_deref());
+        // MCP dispatches pin their backend explicitly (by id or via a role) — no router involved.
+        logger.route_decided(
+            backend,
+            if role.is_some() { "role" } else { "explicit" },
+            None,
+            None,
+            None,
+            &task,
+        );
         let outcome = dispatch_member_logged(
             backend,
             task,
@@ -340,6 +349,11 @@ impl AgentpitTools {
         // Surface the fan-out in the dashboard swarm as an `ensemble` run, like the CLI ensemble —
         // each member streams to the run's capture file. Started before the loop moves `members`.
         let logger = RunLogger::start(RunKind::Ensemble, &members, &self.cwd);
+        // Same shape as the CLI ensemble: no router ran; the line carries the task_hash and
+        // names the aggregator — else the first member — as "the" backend.
+        if let Some(primary) = aggregator.or_else(|| members.first().copied()) {
+            logger.route_decided(primary, "ensemble", None, None, None, &req.prompt);
+        }
         let mut set = tokio::task::JoinSet::new();
         for b in members {
             let prompt = req.prompt.clone();
@@ -625,6 +639,8 @@ impl AgentpitTools {
             &members,
             &self.cwd,
         );
+        // The critic leg carries the refutation; log it as the run's routed backend.
+        logger.route_decided(critic, "refute", None, None, None, &req.task);
 
         let bundle = crate::workflow::converse::run_refute(
             &req.task,

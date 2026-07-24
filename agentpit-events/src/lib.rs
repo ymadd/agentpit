@@ -138,6 +138,23 @@ impl LegStatus {
     }
 }
 
+/// A human's explicit verdict on a finished run, attached by `agentpit outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeLabel {
+    Good,
+    Bad,
+}
+
+impl OutcomeLabel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OutcomeLabel::Good => "good",
+            OutcomeLabel::Bad => "bad",
+        }
+    }
+}
+
 /// One line in the event log. The `event` tag distinguishes variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -227,6 +244,47 @@ pub enum Event {
     /// to record a worker→manager handoff or a shared-board entry before it re-seeds or discards
     /// context. Best-effort and audit-only: the dashboard renders it for context but keeps no
     /// run-view state for it, and compaction may drop old runs' notes just like any other line.
+    /// The router's (or a fan-out path's) backend choice for this run, emitted right after the
+    /// run starts. One per run. The learning fold (design: learned routing layer, Phase 1)
+    /// aggregates these against outcome labels; `task_hash` keys the saved task text under
+    /// `tasks/<hash>.txt` and lets a quick re-dispatch of the same task be detected.
+    RouteDecided {
+        ts: u64,
+        run_id: String,
+        backend: BackendId,
+        /// `RouteReason::as_str()` on router paths ("explicit", "profile", ...); fan-out paths
+        /// that never consult the router use their own tags ("ensemble", "workflow_manager", ...).
+        reason: String,
+        /// Diagnosed task category (`TaskCategory::as_str()`), present on the profile route only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+        /// The winning profile score, present on the profile route only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        score: Option<u8>,
+        /// Diagnose confidence when a diagnosis ran for this resolve (auto-route paths).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnose_confidence: Option<f32>,
+        task_hash: String,
+    },
+    /// A per-member grade extracted from an ensemble aggregator's structured verdict
+    /// (design: learned routing layer, Phase 2). Best-effort oracle data.
+    MemberGraded {
+        ts: u64,
+        run_id: String,
+        backend: BackendId,
+        /// 0–100.
+        grade: u8,
+        /// 1 = best among the run's members, when the aggregator ranked them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rank: Option<u8>,
+    },
+    /// The human's explicit good/bad verdict on a run (`agentpit outcome`). Highest-weight
+    /// label source for the learning fold.
+    OutcomeNoted {
+        ts: u64,
+        run_id: String,
+        outcome: OutcomeLabel,
+    },
     Note {
         ts: u64,
         run_id: String,
@@ -269,6 +327,56 @@ pub fn events_path() -> PathBuf {
 /// Directory holding per-run captured output, one subdir per run id.
 pub fn runs_dir() -> PathBuf {
     state_dir().join("runs")
+}
+
+/// Directory holding normalized task texts, one file per task hash (`tasks/<hash>.txt`).
+/// Written by [`record_task_text`]; read back by the learning fold and (later) the kNN layer.
+pub fn tasks_dir() -> PathBuf {
+    state_dir().join("tasks")
+}
+
+/// Task text saved per hash is clamped to this many bytes (design: privacy / size bound).
+const TASK_TEXT_MAX_BYTES: usize = 4096;
+
+/// Collapse whitespace runs and trim, so trivial formatting differences hash identically.
+fn normalize_task(task: &str) -> String {
+    task.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// FNV-1a 64-bit over the normalized task text, hex-encoded. Deterministic and dependency-free;
+/// at personal-use scale a 64-bit space makes collisions a non-issue. (std's DefaultHasher is
+/// explicitly not stable across releases, so it can't key on-disk state.)
+pub fn task_hash(task: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in normalize_task(task).as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Save the normalized task text under `tasks/<hash>.txt` (truncated to 4KB on a char boundary)
+/// and return the hash. Best-effort: any write failure still returns the hash, and
+/// `AGENTPIT_NO_EVENTS=1` skips the write entirely. An existing file is left as-is — same
+/// normalized text, same content.
+pub fn record_task_text(task: &str) -> String {
+    let hash = task_hash(task);
+    if !events_enabled() {
+        return hash;
+    }
+    let path = tasks_dir().join(format!("{hash}.txt"));
+    if path.exists() {
+        return hash;
+    }
+    let normalized = normalize_task(task);
+    let mut end = normalized.len().min(TASK_TEXT_MAX_BYTES);
+    while end > 0 && !normalized.is_char_boundary(end) {
+        end -= 1;
+    }
+    if fs::create_dir_all(tasks_dir()).is_ok() {
+        let _ = fs::write(&path, &normalized[..end]);
+    }
+    hash
 }
 
 /// Per-ask request/response mailbox, a sibling of `runs/`. Files here are deliberately kept
@@ -593,6 +701,51 @@ impl RunLogger {
         });
     }
 
+    /// Emit a `RouteDecided` and save the task text under `tasks/<hash>.txt`. Call once per run,
+    /// right after the run starts. `category`/`score` are set on the profile route only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_decided(
+        &self,
+        backend: BackendId,
+        reason: &str,
+        category: Option<&str>,
+        score: Option<u8>,
+        diagnose_confidence: Option<f32>,
+        task: &str,
+    ) {
+        let task_hash = record_task_text(task);
+        self.emit(Event::RouteDecided {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            backend,
+            reason: reason.to_string(),
+            category: category.map(str::to_string),
+            score,
+            diagnose_confidence,
+            task_hash,
+        });
+    }
+
+    /// Emit a `MemberGraded` — the aggregator's structured grade for one member leg.
+    pub fn member_graded(&self, backend: BackendId, grade: u8, rank: Option<u8>) {
+        self.emit(Event::MemberGraded {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            backend,
+            grade,
+            rank,
+        });
+    }
+
+    /// Emit an `OutcomeNoted` — the human's explicit good/bad verdict on this run.
+    pub fn outcome(&self, outcome: OutcomeLabel) {
+        self.emit(Event::OutcomeNoted {
+            ts: now_ms(),
+            run_id: self.run_id.clone(),
+            outcome,
+        });
+    }
+
     /// Emit an `Ask` — the manager is now blocked waiting on the human.
     pub fn ask(
         &self,
@@ -889,6 +1042,108 @@ mod tests {
         assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("run_started"));
         assert!(lines[3].contains("run_finished"));
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    #[test]
+    fn learning_events_round_trip_through_json() {
+        // Wire contract for the learning fold (design Phase 0/1): the CLI and the fold both
+        // read these exact tags and keys back out of events.jsonl.
+        let route = Event::RouteDecided {
+            ts: 1,
+            run_id: "1-0".into(),
+            backend: BackendId::Codex,
+            reason: "profile".into(),
+            category: Some("coding".into()),
+            score: Some(90),
+            diagnose_confidence: Some(0.7),
+            task_hash: "deadbeefdeadbeef".into(),
+        };
+        let json = serde_json::to_string(&route).unwrap();
+        assert!(json.contains("\"event\":\"route_decided\""), "got: {json}");
+        assert!(json.contains("\"task_hash\":\"deadbeefdeadbeef\""));
+        match serde_json::from_str::<Event>(&json).unwrap() {
+            Event::RouteDecided {
+                backend, category, ..
+            } => {
+                assert_eq!(backend, BackendId::Codex);
+                assert_eq!(category.as_deref(), Some("coding"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // A non-profile route omits the optional keys on the wire and reads back as None.
+        let sparse = r#"{"event":"route_decided","ts":2,"run_id":"1-1","backend":"claude","reason":"explicit","task_hash":"aa"}"#;
+        match serde_json::from_str::<Event>(sparse).unwrap() {
+            Event::RouteDecided {
+                category,
+                score,
+                diagnose_confidence,
+                ..
+            } => {
+                assert_eq!(category, None);
+                assert_eq!(score, None);
+                assert_eq!(diagnose_confidence, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let graded = Event::MemberGraded {
+            ts: 3,
+            run_id: "1-2".into(),
+            backend: BackendId::Gemini,
+            grade: 85,
+            rank: Some(1),
+        };
+        let json = serde_json::to_string(&graded).unwrap();
+        assert!(json.contains("\"event\":\"member_graded\""), "got: {json}");
+        match serde_json::from_str::<Event>(&json).unwrap() {
+            Event::MemberGraded { grade, rank, .. } => {
+                assert_eq!(grade, 85);
+                assert_eq!(rank, Some(1));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let outcome = Event::OutcomeNoted {
+            ts: 4,
+            run_id: "1-3".into(),
+            outcome: OutcomeLabel::Good,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"outcome\":\"good\""), "got: {json}");
+        match serde_json::from_str::<Event>(&json).unwrap() {
+            Event::OutcomeNoted { outcome, .. } => assert_eq!(outcome, OutcomeLabel::Good),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn task_hash_normalizes_whitespace_and_is_stable() {
+        assert_eq!(task_hash("fix  the\n bug"), task_hash(" fix the bug "));
+        assert_ne!(task_hash("fix the bug"), task_hash("fix the bugs"));
+        // Pinned value: the hash keys on-disk files, so it must never drift across releases.
+        assert_eq!(task_hash(""), format!("{:016x}", 0xcbf29ce484222325u64));
+    }
+
+    #[test]
+    fn record_task_text_writes_truncated_normalized_text() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under lock_env.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+        // Multibyte text longer than 4KB must truncate on a char boundary, not mid-char.
+        let long = "タスクの説明 ".repeat(400);
+        let hash = record_task_text(&long);
+        let saved =
+            std::fs::read_to_string(tmp.path().join(format!("agentpit/tasks/{hash}.txt"))).unwrap();
+        assert!(saved.len() <= 4096);
+        assert!(saved.starts_with("タスクの説明"));
+        assert!(!saved.contains('\n'));
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
         }

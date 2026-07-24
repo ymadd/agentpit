@@ -248,7 +248,14 @@ impl Tracker {
             // straight from the asks/ sidecar files (see `asks.rs`), and notes (① handoff /
             // ③ board, design §4.5) are a durable transcript the workflow manager consumes —
             // neither is reflected into the Tracker's per-run member views.
-            Event::Ask { .. } | Event::AskAnswered { .. } | Event::Note { .. } => {}
+            // The learned-routing telemetry (route decisions, aggregator grades, human
+            // verdicts) is fold-time input for `agentpit profile learn`, not run-view state.
+            Event::Ask { .. }
+            | Event::AskAnswered { .. }
+            | Event::Note { .. }
+            | Event::RouteDecided { .. }
+            | Event::MemberGraded { .. }
+            | Event::OutcomeNoted { .. } => {}
         }
     }
 

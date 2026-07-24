@@ -613,6 +613,7 @@ mod tests {
             value: v,
             samples: 5,
             confidence: 0.6,
+            source: crate::profile::ProfileSource::Learned,
         };
         let candidates = vec![
             (BackendId::Claude, score(88)),   // cost 80

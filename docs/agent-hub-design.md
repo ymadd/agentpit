@@ -48,7 +48,7 @@ struct CapabilityProfile {
     source: ProfileSource,                  // Seeded | Benchmarked | Learned
     measured_at: Option<String>,
 }
-struct Score { value: u8, samples: u16, confidence: f32 }  // 0–100
+struct Score { value: u8, samples: u16, confidence: f32, source: ProfileSource }  // 0–100
 ```
 
 immutable 方針: 補正は純関数 `apply_benchmark(profile, results) -> CapabilityProfile`。
@@ -57,6 +57,9 @@ immutable 方針: 補正は純関数 `apply_benchmark(profile, results) -> Capab
 
 config.toml と**分離**（手書き設定＝config / 機械生成値＝profiles）。
 `[routes]` を機械が上書きする事故を防ぐ。`source` 優先度: `benchmarked > learned > seeded`。
+provenance は**セル単位**（`Score.source`）: 部分ベンチが未計測カテゴリの learned 更新を
+凍結しない。profile 単位の `source` は最高優先セルのサマリ表示のみ（マージのゲートには不使用）。
+旧形式ファイル（セル source 無し）は load 時に samples>0 のセルへ profile 単位 source を継承。
 
 ### 1.5 タスク診断（ヒューリスティック → 低confidence時のみLLM）
 

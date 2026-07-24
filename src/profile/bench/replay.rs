@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::profile::ProfileSource;
+
 use super::suite::GoldTask;
 use crate::profile::category::TaskCategory;
 use crate::profile::model::{BenchmarkResult, Score};
@@ -118,6 +120,7 @@ fn aggregate_score(sum: f64, samples: u16) -> Score {
         value,
         samples,
         confidence,
+        source: ProfileSource::Benchmarked,
     }
 }
 

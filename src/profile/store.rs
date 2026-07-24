@@ -46,9 +46,50 @@ struct ProfileEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     measured_at: Option<String>,
     #[serde(default)]
-    scores: BTreeMap<TaskCategory, Score>,
+    scores: BTreeMap<TaskCategory, WireScore>,
     #[serde(default, skip_serializing_if = "telemetry_is_empty")]
     telemetry: TelemetryStats,
+}
+
+/// One cell on the wire. `source` is optional because files written before per-cell
+/// provenance existed only carried the profile-level `source`; [`WireScore::resolve`]
+/// migrates those on load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireScore {
+    value: u8,
+    samples: u16,
+    confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<ProfileSource>,
+}
+
+impl WireScore {
+    fn from_score(score: &Score) -> Self {
+        Self {
+            value: score.value,
+            samples: score.samples,
+            confidence: score.confidence,
+            source: Some(score.source),
+        }
+    }
+
+    /// Migration for pre-per-cell files: a cell with samples inherits the profile-level
+    /// source (that measurement is what set the profile's source in the first place); a
+    /// zero-sample cell is an untouched seeded prior regardless of the profile's source —
+    /// the same distinction the old `profile show` src column drew.
+    fn resolve(self, entry_source: ProfileSource) -> Score {
+        let source = self.source.unwrap_or(if self.samples > 0 {
+            entry_source
+        } else {
+            ProfileSource::Seeded
+        });
+        Score {
+            value: self.value,
+            samples: self.samples,
+            confidence: self.confidence,
+            source,
+        }
+    }
 }
 
 /// Whole-file wire shape: a table of per-backend entries keyed by backend name.
@@ -75,7 +116,11 @@ impl ProfilesFile {
                     ProfileEntry {
                         source: p.source,
                         measured_at: p.measured_at.clone(),
-                        scores: p.scores.clone(),
+                        scores: p
+                            .scores
+                            .iter()
+                            .map(|(category, score)| (*category, WireScore::from_score(score)))
+                            .collect(),
                         telemetry: p.telemetry.clone(),
                     },
                 )
@@ -91,7 +136,11 @@ impl ProfilesFile {
             .into_iter()
             .map(|(backend, entry)| CapabilityProfile {
                 backend,
-                scores: entry.scores,
+                scores: entry
+                    .scores
+                    .into_iter()
+                    .map(|(category, wire)| (category, wire.resolve(entry.source)))
+                    .collect(),
                 telemetry: entry.telemetry,
                 source: entry.source,
                 measured_at: entry.measured_at,
@@ -219,6 +268,7 @@ mod tests {
                 value: 91,
                 samples: 24,
                 confidence: 0.82,
+                source: ProfileSource::Benchmarked,
             },
         );
         profile.telemetry = TelemetryStats {
@@ -248,6 +298,49 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "temp file should be renamed away");
+    }
+
+    /// Files written before per-cell provenance carry only the profile-level `source`.
+    /// On load, measured cells (samples > 0) inherit it; zero-sample cells stay seeded.
+    #[test]
+    fn legacy_file_without_cell_source_migrates_on_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        fs::write(
+            &path,
+            r#"
+[profile.codex]
+source = "benchmarked"
+
+[profile.codex.scores.review]
+value = 91
+samples = 24
+confidence = 0.82
+
+[profile.codex.scores.coding]
+value = 60
+samples = 0
+confidence = 0.4
+"#,
+        )
+        .unwrap();
+
+        let set = load_profiles(Some(&path)).unwrap();
+        let codex = set.get(BackendId::Codex).unwrap();
+        assert_eq!(
+            codex.score(TaskCategory::Review).unwrap().source,
+            ProfileSource::Benchmarked
+        );
+        assert_eq!(
+            codex.score(TaskCategory::Coding).unwrap().source,
+            ProfileSource::Seeded
+        );
+
+        // Saving re-writes with explicit per-cell sources that round-trip unchanged.
+        save_profiles(&set, &path).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("source"));
+        let reloaded = load_profiles(Some(&path)).unwrap();
+        assert_eq!(reloaded.get(BackendId::Codex).unwrap(), codex);
     }
 
     #[test]

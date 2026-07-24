@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use crate::events::{Event, LegStatus, OutcomeLabel, RunKind};
-use crate::profile::TaskCategory;
+use crate::profile::{ProfileSource, TaskCategory};
 use crate::profile::model::Score;
 use crate::types::BackendId;
 
@@ -321,6 +321,7 @@ pub fn fold_scores(
                 value,
                 samples: cell.samples,
                 confidence,
+                source: ProfileSource::Learned,
             },
         );
     }

@@ -22,6 +22,7 @@ fn seed(value: u8) -> Score {
         value,
         samples: 0,
         confidence: SEED_CONFIDENCE,
+        source: ProfileSource::Seeded,
     }
 }
 

@@ -24,6 +24,11 @@ pub struct Score {
     pub samples: u16,
     /// 0.0–1.0 confidence in `value` (low when `samples` is small or variance is high).
     pub confidence: f32,
+    /// Where this cell's value came from. Provenance is per-cell, not per-profile: a
+    /// partial benchmark (say, Review only) must not freeze learned updates to the other
+    /// categories. The merge gates in [`apply_benchmark`]/[`apply_learned`] compare against
+    /// this field.
+    pub source: ProfileSource,
 }
 
 impl Score {
@@ -33,11 +38,14 @@ impl Score {
             value,
             samples: 0,
             confidence: 0.2,
+            source: ProfileSource::Seeded,
         }
     }
 }
 
-/// Where a profile's numbers came from. Priority for merges: benchmarked > learned > seeded.
+/// Where a score came from. Priority for merges: benchmarked > learned > seeded.
+/// Carried per cell on [`Score`]; the profile-level copy on [`CapabilityProfile`] is a
+/// display/legacy summary (highest-priority cell) and no longer gates merges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileSource {
@@ -134,30 +142,59 @@ pub struct BenchmarkResult {
     pub measured_at: Option<String>,
 }
 
+/// Merge incoming cells into a copy of `base.scores`, gating **per cell**: an incoming
+/// reading overwrites a category only when `incoming` priority >= that cell's own source
+/// priority (missing cells always accept). The stored cell's `source` is forced to
+/// `incoming` regardless of what the caller put in the `Score`, so provenance can never
+/// be spoofed by a constructor site.
+fn merge_cells(
+    base: &CapabilityProfile,
+    incoming_scores: &BTreeMap<TaskCategory, Score>,
+    incoming: ProfileSource,
+) -> BTreeMap<TaskCategory, Score> {
+    let mut scores = base.scores.clone();
+    for (category, score) in incoming_scores {
+        let allowed = scores
+            .get(category)
+            .is_none_or(|existing| incoming.priority() >= existing.source.priority());
+        if allowed {
+            scores.insert(
+                *category,
+                Score {
+                    source: incoming,
+                    ..*score
+                },
+            );
+        }
+    }
+    scores
+}
+
+/// The profile-level summary source: the highest-priority provenance present in any cell.
+/// Kept for display and so an older binary reading the file stays conservative; merges
+/// gate on the per-cell source instead.
+fn summary_source(scores: &BTreeMap<TaskCategory, Score>) -> ProfileSource {
+    scores
+        .values()
+        .map(|s| s.source)
+        .max_by_key(ProfileSource::priority)
+        .unwrap_or(ProfileSource::Seeded)
+}
+
 /// Fold a benchmark result into a profile, returning a brand-new profile (the input is
 /// never mutated).
 ///
-/// Merge foundation: a benchmark reading overwrites a category only when its source
-/// (`Benchmarked`) has priority >= the profile's current source. Benchmarked is the
-/// highest priority, so in practice it always wins here — but the rule is written out so
-/// the later `learned`/`seeded` merges reuse the same gate. Categories the benchmark did
-/// not cover keep their existing scores.
+/// Gating is per cell (see [`merge_cells`]): `Benchmarked` is the highest priority, so in
+/// practice every measured category wins here. Categories the benchmark did not cover keep
+/// their existing scores *and* their existing provenance — a partial bench must not freeze
+/// learned updates to the categories it never measured.
 pub fn apply_benchmark(base: &CapabilityProfile, result: &BenchmarkResult) -> CapabilityProfile {
-    let incoming = ProfileSource::Benchmarked;
-    let overwrite = incoming.priority() >= base.source.priority();
-
-    let mut scores = base.scores.clone();
-    if overwrite {
-        for (category, score) in &result.scores {
-            scores.insert(*category, *score);
-        }
-    }
-
+    let scores = merge_cells(base, &result.scores, ProfileSource::Benchmarked);
     CapabilityProfile {
         backend: base.backend,
+        source: summary_source(&scores),
         scores,
         telemetry: base.telemetry.clone(),
-        source: if overwrite { incoming } else { base.source },
         measured_at: result
             .measured_at
             .clone()
@@ -165,29 +202,20 @@ pub fn apply_benchmark(base: &CapabilityProfile, result: &BenchmarkResult) -> Ca
     }
 }
 
-/// Fold telemetry-learned scores into a profile, returning a brand-new profile. Same gate as
-/// [`apply_benchmark`] with `Learned` as the incoming source: it refreshes Seeded or Learned
-/// profiles but never touches a Benchmarked one, and categories the fold did not cover keep
-/// their existing scores.
+/// Fold telemetry-learned scores into a profile, returning a brand-new profile. Same
+/// per-cell gate as [`apply_benchmark`] with `Learned` as the incoming source: it refreshes
+/// seeded or learned cells but never overwrites a benchmarked cell, and categories the fold
+/// did not cover keep their existing scores.
 pub fn apply_learned(
     base: &CapabilityProfile,
     learned: &BTreeMap<TaskCategory, Score>,
 ) -> CapabilityProfile {
-    let incoming = ProfileSource::Learned;
-    let overwrite = incoming.priority() >= base.source.priority();
-
-    let mut scores = base.scores.clone();
-    if overwrite {
-        for (category, score) in learned {
-            scores.insert(*category, *score);
-        }
-    }
-
+    let scores = merge_cells(base, learned, ProfileSource::Learned);
     CapabilityProfile {
         backend: base.backend,
+        source: summary_source(&scores),
         scores,
         telemetry: base.telemetry.clone(),
-        source: if overwrite { incoming } else { base.source },
         measured_at: base.measured_at.clone(),
     }
 }
@@ -215,6 +243,7 @@ mod tests {
                 value: 90,
                 samples: 12,
                 confidence: 0.8,
+                source: ProfileSource::Seeded, // spoof attempt: merge must force Benchmarked
             },
         );
         result.measured_at = Some("2026-06-30T00:00:00Z".into());
@@ -227,24 +256,26 @@ mod tests {
 
         // benchmark overwrote the measured category, preserved the untouched one
         assert_eq!(updated.source, ProfileSource::Benchmarked);
-        assert_eq!(updated.score(TaskCategory::Coding).unwrap().value, 90);
-        assert_eq!(updated.score(TaskCategory::Docs).unwrap().value, 55);
+        let coding = updated.score(TaskCategory::Coding).unwrap();
+        assert_eq!(coding.value, 90);
+        assert_eq!(coding.source, ProfileSource::Benchmarked);
+        let docs = updated.score(TaskCategory::Docs).unwrap();
+        assert_eq!(docs.value, 55);
+        assert_eq!(docs.source, ProfileSource::Seeded);
         assert_eq!(updated.measured_at.as_deref(), Some("2026-06-30T00:00:00Z"));
     }
 
     #[test]
-    fn apply_learned_refreshes_seeded_but_never_a_benchmarked_profile() {
-        let learned: BTreeMap<TaskCategory, Score> = [(
-            TaskCategory::Coding,
-            Score {
-                value: 85,
-                samples: 12,
-                confidence: 0.85,
-            },
-        )]
-        .into();
+    fn apply_learned_refreshes_seeded_but_never_a_benchmarked_cell() {
+        let learned_cell = Score {
+            value: 85,
+            samples: 12,
+            confidence: 0.85,
+            source: ProfileSource::Learned,
+        };
+        let learned: BTreeMap<TaskCategory, Score> = [(TaskCategory::Coding, learned_cell)].into();
 
-        // Seeded profile: the learned cell wins, untouched cells survive, source flips.
+        // Seeded cells: the learned cell wins, untouched cells survive, summary flips.
         let mut seeded = CapabilityProfile::seeded(BackendId::Gemini);
         seeded
             .scores
@@ -253,17 +284,81 @@ mod tests {
         let updated = apply_learned(&seeded, &learned);
         assert_eq!(updated.source, ProfileSource::Learned);
         assert_eq!(updated.score(TaskCategory::Coding).unwrap().value, 85);
+        assert_eq!(
+            updated.score(TaskCategory::Coding).unwrap().source,
+            ProfileSource::Learned
+        );
         assert_eq!(updated.score(TaskCategory::Docs).unwrap().value, 70);
 
-        // Benchmarked profile: nothing moves.
+        // Benchmarked cell: it alone stays frozen.
         let mut benched = CapabilityProfile::seeded(BackendId::Gemini);
         benched.source = ProfileSource::Benchmarked;
-        benched
-            .scores
-            .insert(TaskCategory::Coding, Score::seeded(90));
+        benched.scores.insert(
+            TaskCategory::Coding,
+            Score {
+                value: 90,
+                samples: 24,
+                confidence: 0.8,
+                source: ProfileSource::Benchmarked,
+            },
+        );
         let untouched = apply_learned(&benched, &learned);
         assert_eq!(untouched.source, ProfileSource::Benchmarked);
         assert_eq!(untouched.score(TaskCategory::Coding).unwrap().value, 90);
+    }
+
+    /// Review finding M8: a partial benchmark (one category measured) must not freeze
+    /// learned updates to the categories it never touched.
+    #[test]
+    fn partial_benchmark_does_not_freeze_learned_updates_to_other_cells() {
+        let mut base = CapabilityProfile::seeded(BackendId::Codex);
+        base.scores.insert(TaskCategory::Coding, Score::seeded(60));
+
+        // Bench only Review.
+        let mut result = BenchmarkResult::default();
+        result.scores.insert(
+            TaskCategory::Review,
+            Score {
+                value: 92,
+                samples: 24,
+                confidence: 0.8,
+                source: ProfileSource::Benchmarked,
+            },
+        );
+        let benched = apply_benchmark(&base, &result);
+        assert_eq!(benched.source, ProfileSource::Benchmarked);
+
+        // Learned still updates Coding (seeded cell), while Review stays benchmarked.
+        let learned: BTreeMap<TaskCategory, Score> = [
+            (
+                TaskCategory::Coding,
+                Score {
+                    value: 81,
+                    samples: 10,
+                    confidence: 0.7,
+                    source: ProfileSource::Learned,
+                },
+            ),
+            (
+                TaskCategory::Review,
+                Score {
+                    value: 10,
+                    samples: 10,
+                    confidence: 0.7,
+                    source: ProfileSource::Learned,
+                },
+            ),
+        ]
+        .into();
+        let merged = apply_learned(&benched, &learned);
+        let coding = merged.score(TaskCategory::Coding).unwrap();
+        assert_eq!(coding.value, 81);
+        assert_eq!(coding.source, ProfileSource::Learned);
+        let review = merged.score(TaskCategory::Review).unwrap();
+        assert_eq!(review.value, 92);
+        assert_eq!(review.source, ProfileSource::Benchmarked);
+        // Summary stays at the highest-priority cell present.
+        assert_eq!(merged.source, ProfileSource::Benchmarked);
     }
 
     #[test]

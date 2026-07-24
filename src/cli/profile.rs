@@ -312,8 +312,15 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
                 score.confidence,
             );
         }
-        if before.source == crate::profile::ProfileSource::Benchmarked {
-            println!("  [{backend}] benchmarked — left untouched");
+        let frozen = learned
+            .keys()
+            .filter(|category| {
+                before.score(**category).map(|s| s.source)
+                    == Some(crate::profile::ProfileSource::Benchmarked)
+            })
+            .count();
+        if frozen > 0 {
+            println!("  [{backend}] {frozen} benchmarked cell(s) left untouched");
         }
         merged.insert(after);
     }
@@ -504,24 +511,18 @@ fn render_backend_section(backend: BackendId, profile: &CapabilityProfile) -> St
         return out;
     }
 
-    // Per-cell provenance: `src` is the profile's source initial (S/L/B) for measured cells
-    // (samples > 0) and `s` (seeded prior) for cells no measurement has touched yet — so a
-    // Learned profile still shows which cells the fold actually backed with data.
-    let source_initial = match profile.source {
-        crate::profile::ProfileSource::Seeded => "S",
-        crate::profile::ProfileSource::Learned => "L",
-        crate::profile::ProfileSource::Benchmarked => "B",
-    };
+    // `src` is each cell's own provenance: s = seeded prior, L = telemetry-learned,
+    // B = benchmarked. The header's `source=` is just the highest-priority cell present.
     let _ = writeln!(
         out,
         "  {:<18} {:>5}  {:>5}  {:>7}  {:>3}",
         "category", "score", "conf", "samples", "src"
     );
     for (category, score) in &profile.scores {
-        let cell_source = if score.samples > 0 {
-            source_initial
-        } else {
-            "s"
+        let cell_source = match score.source {
+            crate::profile::ProfileSource::Seeded => "s",
+            crate::profile::ProfileSource::Learned => "L",
+            crate::profile::ProfileSource::Benchmarked => "B",
         };
         let _ = writeln!(
             out,
@@ -884,6 +885,7 @@ mod tests {
                 value: 91,
                 samples: 24,
                 confidence: 0.82,
+                source: ProfileSource::Benchmarked,
             },
         );
         let measured = ProfileSet::from_profiles([profile]);

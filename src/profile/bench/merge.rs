@@ -26,7 +26,9 @@ use anyhow::Result;
 
 use crate::profile::ProfileSet;
 use crate::profile::category::TaskCategory;
-use crate::profile::model::{BenchmarkResult, CapabilityProfile, Score, apply_benchmark};
+use crate::profile::model::{
+    BenchmarkResult, CapabilityProfile, ProfileSource, Score, apply_benchmark,
+};
 use crate::profile::store::{load_profiles, save_profiles};
 use crate::types::BackendId;
 
@@ -86,6 +88,7 @@ fn score_for_bucket(fractions: &[f64]) -> Score {
             value: 0,
             samples: 0,
             confidence: 0.0,
+            source: ProfileSource::Benchmarked,
         };
     }
 
@@ -97,6 +100,7 @@ fn score_for_bucket(fractions: &[f64]) -> Score {
         value: (mean * 100.0).round().clamp(0.0, 100.0) as u8,
         samples,
         confidence: confidence(samples, variance),
+        source: ProfileSource::Benchmarked,
     }
 }
 

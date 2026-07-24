@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agentpit"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "agent-client-protocol",
  "agentpit-events",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "agentpit-dashboard"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "agentpit-events",
  "dirs 5.0.1",

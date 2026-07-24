@@ -18,10 +18,12 @@ pub enum RouteReason {
     RouteTable,
     /// Diagnosed task category routed to the highest-scoring available backend via the
     /// capability profiles (design §1.6). Carries the category and the winning score for
-    /// observability.
+    /// observability. `cost_tiebreak` marks that a cheaper backend within the quality
+    /// margin was picked over the raw argmax.
     Profile {
         category: TaskCategory,
         score: u8,
+        cost_tiebreak: bool,
     },
     AutoLongContext,
     AutoKeyword,
@@ -33,7 +35,14 @@ impl RouteReason {
         match self {
             RouteReason::Explicit => "explicit",
             RouteReason::RouteTable => "route_table",
-            RouteReason::Profile { .. } => "profile",
+            RouteReason::Profile {
+                cost_tiebreak: false,
+                ..
+            } => "profile",
+            RouteReason::Profile {
+                cost_tiebreak: true,
+                ..
+            } => "profile_cost_tiebreak",
             RouteReason::AutoLongContext => "auto_long_context",
             RouteReason::AutoKeyword => "auto_keyword",
             RouteReason::Default => "default",
@@ -55,7 +64,9 @@ impl RouteDecision {
     /// `tasks/<hash>.txt`). One call per run, right after the run starts.
     pub fn log(&self, logger: &crate::events::RunLogger, task: &str) {
         let (category, score) = match self.reason {
-            RouteReason::Profile { category, score } => (Some(category.as_str()), Some(score)),
+            RouteReason::Profile {
+                category, score, ..
+            } => (Some(category.as_str()), Some(score)),
             _ => (None, None),
         };
         logger.route_decided(
@@ -125,18 +136,31 @@ impl Router {
             // backend.
             let diagnosis = diagnose::diagnose(task);
             diagnose_confidence = Some(diagnosis.confidence);
-            if diagnosis.confidence >= LLM_ASSIST_CONFIDENCE_THRESHOLD
-                && let Some((backend, score)) =
-                    self.profiles.best_for(diagnosis.primary, &self.available)
-            {
-                return RouteDecision {
-                    backend,
-                    reason: RouteReason::Profile {
-                        category: diagnosis.primary,
-                        score: score.value,
-                    },
-                    diagnose_confidence,
+            if diagnosis.confidence >= LLM_ASSIST_CONFIDENCE_THRESHOLD {
+                let candidates = self
+                    .profiles
+                    .candidates_for(diagnosis.primary, &self.available);
+                let margin = self.config.auto_route.quality_margin;
+                let cost_of = |b: BackendId| {
+                    self.config
+                        .backends
+                        .get(&b)
+                        .and_then(|o| o.cost)
+                        .unwrap_or(50)
                 };
+                if let Some((backend, score, cost_tiebreak)) =
+                    pick_with_cost_tiebreak(&candidates, margin, cost_of)
+                {
+                    return RouteDecision {
+                        backend,
+                        reason: RouteReason::Profile {
+                            category: diagnosis.primary,
+                            score: score.value,
+                            cost_tiebreak,
+                        },
+                        diagnose_confidence,
+                    };
+                }
             }
 
             let auto = &self.config.auto_route;
@@ -178,6 +202,39 @@ impl Router {
     }
 }
 
+/// The profile route's winner with the cost tiebreak applied: among candidates whose score
+/// is within `margin` of the best, the cheapest backend wins (ties prefer the higher score,
+/// then higher confidence/samples, matching `best_for`'s quality ordering). Returns the
+/// picked `(backend, score, tiebreak_applied)`; `None` when there are no candidates.
+fn pick_with_cost_tiebreak(
+    candidates: &[(crate::types::BackendId, crate::profile::Score)],
+    margin: u8,
+    cost_of: impl Fn(crate::types::BackendId) -> u8,
+) -> Option<(crate::types::BackendId, crate::profile::Score, bool)> {
+    let (best_backend, best_score) = candidates
+        .iter()
+        .max_by(|(_, a), (_, b)| {
+            a.value
+                .cmp(&b.value)
+                .then(a.confidence.total_cmp(&b.confidence))
+                .then(a.samples.cmp(&b.samples))
+        })
+        .copied()?;
+
+    let (backend, score) = candidates
+        .iter()
+        .filter(|(_, s)| best_score.value.saturating_sub(s.value) <= margin)
+        .min_by(|(a_backend, a), (b_backend, b)| {
+            cost_of(*a_backend)
+                .cmp(&cost_of(*b_backend))
+                .then(b.value.cmp(&a.value))
+                .then(b.confidence.total_cmp(&a.confidence))
+                .then(b.samples.cmp(&a.samples))
+        })
+        .copied()?;
+    Some((backend, score, backend != best_backend))
+}
+
 fn estimate_tokens(text: &str) -> u64 {
     text.len().div_ceil(4) as u64
 }
@@ -213,6 +270,7 @@ mod tests {
                 long_context_backend: BackendId::Gemini,
                 review_keywords: vec!["audit".into(), "review".into()],
                 review_backend: BackendId::Claude,
+                quality_margin: 5,
             },
             ensemble: EnsembleSection::default(),
             workflow: WorkflowSection::default(),
@@ -367,6 +425,7 @@ mod tests {
             RouteReason::Profile {
                 category: TaskCategory::Coding,
                 score: 90,
+                cost_tiebreak: false,
             }
         );
         assert_eq!(d.reason.as_str(), "profile");
@@ -397,8 +456,94 @@ mod tests {
             RouteReason::Profile {
                 category: TaskCategory::Coding,
                 score: 80,
+                cost_tiebreak: false,
             }
         );
+    }
+
+    #[test]
+    fn cost_tiebreak_picks_cheapest_within_margin_only() {
+        use crate::config::BackendOverride;
+
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        cfg.auto_route.quality_margin = 5;
+        // Codex is the argmax (90) but pricey; Gemini scores within the margin (88) and is
+        // nearly free; Claude is also cheap but out of margin (70).
+        for (backend, cost) in [
+            (BackendId::Codex, 80u8),
+            (BackendId::Gemini, 5),
+            (BackendId::Claude, 5),
+        ] {
+            cfg.backends.insert(
+                backend,
+                BackendOverride {
+                    cost: Some(cost),
+                    ..BackendOverride::default()
+                },
+            );
+        }
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Claude, TaskCategory::Coding, 70),
+            profile_with(BackendId::Codex, TaskCategory::Coding, 90),
+            profile_with(BackendId::Gemini, TaskCategory::Coding, 88),
+        ]);
+        let r = Router::new(cfg.clone(), available_with_codex(), profiles.clone());
+
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("implement a function to parse the duration feature"),
+        });
+        assert_eq!(d.backend, BackendId::Gemini);
+        assert_eq!(
+            d.reason,
+            RouteReason::Profile {
+                category: TaskCategory::Coding,
+                score: 88,
+                cost_tiebreak: true,
+            }
+        );
+        assert_eq!(d.reason.as_str(), "profile_cost_tiebreak");
+
+        // Margin 0: only true score ties are interchangeable — the argmax stays.
+        let mut tight = cfg;
+        tight.auto_route.quality_margin = 0;
+        let r = Router::new(tight, available_with_codex(), profiles);
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("implement a function to parse the duration feature"),
+        });
+        assert_eq!(d.backend, BackendId::Codex);
+        assert_eq!(d.reason.as_str(), "profile");
+    }
+
+    #[test]
+    fn cost_tiebreak_on_equal_scores_prefers_cheaper_backend() {
+        use crate::config::BackendOverride;
+
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        cfg.backends.insert(
+            BackendId::Gemini,
+            BackendOverride {
+                cost: Some(0),
+                ..BackendOverride::default()
+            },
+        );
+        // Codex has no configured cost → mid-range 50; equal score → free Gemini wins.
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Codex, TaskCategory::Coding, 90),
+            profile_with(BackendId::Gemini, TaskCategory::Coding, 90),
+        ]);
+        let r = Router::new(cfg, available_with_codex(), profiles);
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("implement a function to parse the duration feature"),
+        });
+        assert_eq!(d.backend, BackendId::Gemini);
     }
 
     #[test]

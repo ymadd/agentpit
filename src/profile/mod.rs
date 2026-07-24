@@ -63,6 +63,20 @@ impl ProfileSet {
         self.profiles.iter()
     }
 
+    /// Every available backend's score for `category`, in backend order. The router's cost
+    /// tiebreak needs the full candidate set, not just the argmax.
+    pub fn candidates_for(
+        &self,
+        category: TaskCategory,
+        available: &HashSet<BackendId>,
+    ) -> Vec<(BackendId, Score)> {
+        self.profiles
+            .iter()
+            .filter(|(backend, _)| available.contains(*backend))
+            .filter_map(|(backend, profile)| profile.score(category).map(|score| (*backend, score)))
+            .collect()
+    }
+
     /// Argmax over the backends in `available` that have a score for `category`.
     ///
     /// Returns the highest-scoring `(backend, score)`, or `None` when no available backend

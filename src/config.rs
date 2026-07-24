@@ -74,6 +74,10 @@ pub struct AutoRouteSection {
     pub review_keywords: Vec<String>,
     #[serde(default = "default_review_backend")]
     pub review_backend: BackendId,
+    /// Profile-route cost tiebreak: candidates scoring within this margin of the best are
+    /// interchangeable on quality, and the cheapest (`[backends.<id>].cost`) wins.
+    #[serde(default = "default_quality_margin")]
+    pub quality_margin: u8,
 }
 
 impl Default for AutoRouteSection {
@@ -83,6 +87,7 @@ impl Default for AutoRouteSection {
             long_context_backend: default_backend(),
             review_keywords: default_review_keywords(),
             review_backend: default_review_backend(),
+            quality_margin: default_quality_margin(),
         }
     }
 }
@@ -253,6 +258,11 @@ pub struct BackendOverride {
     /// default. This is the lowest-precedence source: `--model` and a role's `model` both win.
     #[serde(default)]
     pub model: Option<String>,
+    /// Relative cost on a 0–100 scale (0 = free, e.g. a local model). `None` = unranked:
+    /// the router's cost tiebreak treats it as mid-range (50) so an unconfigured backend
+    /// neither wins nor loses on cost alone.
+    #[serde(default)]
+    pub cost: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -276,6 +286,9 @@ fn default_backend() -> BackendId {
 }
 fn default_review_backend() -> BackendId {
     BackendId::Claude
+}
+fn default_quality_margin() -> u8 {
+    5
 }
 fn default_true() -> bool {
     true

@@ -235,7 +235,8 @@ impl Router {
 /// is within `margin` of the best, the cheapest backend wins (ties prefer the higher score,
 /// then higher confidence/samples, matching `best_for`'s quality ordering). Returns the
 /// picked `(backend, score, tiebreak_applied)`; `None` when there are no candidates.
-fn pick_with_cost_tiebreak(
+/// `pub(crate)` so `profile replay` can reproduce the deployed profile stage exactly.
+pub(crate) fn pick_with_cost_tiebreak(
     candidates: &[(crate::types::BackendId, crate::profile::Score)],
     margin: u8,
     cost_of: impl Fn(crate::types::BackendId) -> u8,

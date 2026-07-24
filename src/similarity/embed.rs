@@ -63,9 +63,7 @@ pub fn embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>> {
         "embedding model not downloaded — run `agentpit similarity init` first"
     );
     let mut model = load_model(false)?;
-    model
-        .embed(texts.to_vec(), None)
-        .context("embedding failed")
+    model.embed(texts, None).context("embedding failed")
 }
 
 /// Process-wide model instance so repeated resolves (REPL, MCP server) pay the ONNX session

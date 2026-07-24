@@ -100,7 +100,8 @@ pub fn build_aggregator_prompt(original: &str, outcomes: &[MemberOutcome]) -> St
 }
 
 /// Extract the aggregator's per-member grades from its reply: the last fenced ```json block
-/// (or bare trailing JSON object) containing a `grades` array. Entries are kept only when the
+/// containing a `grades` array (a reply that is in its entirety one JSON object also
+/// parses; a bare object *appended* to prose does not — the prompt asks for a fenced block). Entries are kept only when the
 /// backend is one of `graded` (a member that actually produced output) and the grade is 0–100;
 /// duplicates keep the first entry. Any parse failure returns an empty list — grading is
 /// best-effort oracle collection and must never break an ensemble run.

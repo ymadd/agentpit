@@ -46,6 +46,14 @@ jobs:
       - name: Test
         run: cargo test --workspace --exclude agentpit-dashboard --locked
 
+      # The similarity feature (fastembed/ONNX) is off by default, so without this it would
+      # never be linted or tested in CI. Tests never download the model — the embedder is
+      # gated behind `agentpit similarity init` — so this stays network-free.
+      - name: Clippy + Test (similarity feature)
+        run: |
+          cargo clippy -p agentpit --features similarity --all-targets --locked -- -D warnings
+          cargo test -p agentpit --features similarity --locked
+
   dashboard:
     name: frontend · fmt · clippy · test (dashboard)
     runs-on: ubuntu-latest

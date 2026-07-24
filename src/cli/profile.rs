@@ -274,6 +274,13 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
         scores.values().map(|c| c.len()).sum::<usize>(),
         min_samples,
     );
+    // The similarity store accrues from the labels directly — its evidence thresholds are
+    // its own ([auto_route.similarity].min_samples), independent of whether any profile
+    // cell reached --min-samples this time.
+    if !dry_run {
+        #[cfg(feature = "similarity")]
+        update_route_samples(&labels);
+    }
     if scores.is_empty() {
         println!("nothing to write yet.");
         return Ok(());
@@ -311,11 +318,6 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
         merged.insert(after);
     }
 
-    if !dry_run {
-        #[cfg(feature = "similarity")]
-        update_route_samples(&labels);
-    }
-
     if changed == 0 {
         println!("no cells changed.");
         return Ok(());
@@ -329,14 +331,20 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Grow the similarity layer's sample store from this fold's labels: embed each newly-seen
-/// `(task, backend)` outcome in bulk and append it to routes.jsonl, dropping expired samples.
-/// Best-effort — a missing model just prints a hint (`agentpit similarity init`).
+/// Sync the similarity layer's sample store with this fold's labels.
+///
+/// - The strongest label per `(task, backend)` wins (existing verdicts are *updated*, not
+///   frozen — a later human verdict overrides a stored exit-status sample; the embedding
+///   is reused so only genuinely new tasks are embedded).
+/// - Expired evidence stays expired: samples past the TTL are dropped, and labels whose
+///   own timestamp is past the TTL are never (re-)ingested.
+/// - Best-effort — a missing model just prints a hint (`agentpit similarity init`).
 #[cfg(feature = "similarity")]
 fn update_route_samples(labels: &[crate::profile::learn::Label]) {
     use crate::similarity::{
         RouteSample, SAMPLE_TTL_MS, embed, parse_samples, routes_path, serialize_samples,
     };
+    type Key = (String, BackendId);
 
     if !embed::model_ready() {
         println!(
@@ -346,58 +354,83 @@ fn update_route_samples(labels: &[crate::profile::learn::Label]) {
     }
 
     let now = crate::events::now_ms();
-    let mut samples: Vec<RouteSample> = std::fs::read_to_string(routes_path())
+    let existing = std::fs::read_to_string(routes_path())
         .map(|raw| parse_samples(&raw))
         .unwrap_or_default();
-    samples.retain(|s| now.saturating_sub(s.ts) <= SAMPLE_TTL_MS);
-    let known: std::collections::HashSet<(String, BackendId)> = samples
-        .iter()
-        .map(|s| (s.task_hash.clone(), s.backend))
+    let mut store: std::collections::BTreeMap<Key, RouteSample> = existing
+        .into_iter()
+        .filter(|s| now.saturating_sub(s.ts) <= SAMPLE_TTL_MS)
+        .map(|s| ((s.task_hash.clone(), s.backend), s))
         .collect();
 
-    // One sample per newly-seen (task, backend); the freshest label wins for its verdict.
-    let mut pending: Vec<(&crate::profile::learn::Label, String)> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
-    let mut seen_new: std::collections::HashSet<(String, BackendId)> = Default::default();
-    for label in labels.iter().rev() {
+    // Strongest label per (task, backend) — weight first (human > grade > exit), then
+    // recency. This is what may overwrite a stored verdict.
+    let mut best: std::collections::BTreeMap<Key, &crate::profile::learn::Label> =
+        Default::default();
+    for label in labels {
         let Some(hash) = label.task_hash.clone() else {
             continue;
         };
-        if known.contains(&(hash.clone(), label.backend))
-            || !seen_new.insert((hash.clone(), label.backend))
-        {
+        if label.ts > 0 && now.saturating_sub(label.ts) > SAMPLE_TTL_MS {
+            continue; // an expired sample must not resurrect from its old event lines
+        }
+        best.entry((hash, label.backend))
+            .and_modify(|held| {
+                if (label.weight, label.ts) > (held.weight, held.ts) {
+                    *held = label;
+                }
+            })
+            .or_insert(label);
+    }
+
+    let mut pending: Vec<(Key, &crate::profile::learn::Label)> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    for (key, label) in best {
+        let verdict = if label.success { "good" } else { "bad" };
+        if let Some(sample) = store.get_mut(&key) {
+            // Update in place only when the new evidence is at least as strong.
+            if label.weight >= sample.weight {
+                sample.label = verdict.into();
+                sample.weight = label.weight;
+                sample.category = Some(label.category.as_str().to_string());
+                sample.ts = if label.ts > 0 { label.ts } else { sample.ts };
+            }
             continue;
         }
         let Ok(text) =
-            std::fs::read_to_string(crate::events::tasks_dir().join(format!("{hash}.txt")))
+            std::fs::read_to_string(crate::events::tasks_dir().join(format!("{}.txt", key.0)))
         else {
             continue;
         };
-        pending.push((label, hash));
+        pending.push((key, label));
         texts.push(text);
     }
-    if pending.is_empty() {
-        return;
-    }
 
-    let embeddings = match embed::embed_texts(&texts) {
-        Ok(embeddings) => embeddings,
-        Err(error) => {
-            eprintln!("similarity: embedding failed, samples not updated: {error:#}");
-            return;
+    if !pending.is_empty() {
+        let embeddings = match embed::embed_texts(&texts) {
+            Ok(embeddings) => embeddings,
+            Err(error) => {
+                eprintln!("similarity: embedding failed, new samples not added: {error:#}");
+                Vec::new()
+            }
+        };
+        for (((hash, backend), label), embedding) in pending.into_iter().zip(embeddings) {
+            store.insert(
+                (hash.clone(), backend),
+                RouteSample {
+                    task_hash: hash,
+                    embedding,
+                    backend,
+                    label: if label.success { "good" } else { "bad" }.into(),
+                    weight: label.weight,
+                    category: Some(label.category.as_str().to_string()),
+                    ts: if label.ts > 0 { label.ts } else { now },
+                },
+            );
         }
-    };
-    for ((label, hash), embedding) in pending.into_iter().zip(embeddings) {
-        samples.push(RouteSample {
-            task_hash: hash,
-            embedding,
-            backend: label.backend,
-            label: if label.success { "good" } else { "bad" }.into(),
-            category: Some(label.category.as_str().to_string()),
-            ts: if label.ts > 0 { label.ts } else { now },
-        });
     }
 
+    let samples: Vec<RouteSample> = store.into_values().collect();
     let path = routes_path();
     let tmp = path.with_extension("jsonl.tmp");
     if std::fs::write(&tmp, serialize_samples(&samples)).is_ok()

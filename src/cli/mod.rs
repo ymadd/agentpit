@@ -363,7 +363,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .map(|c| c.config.default.cascade)
                     .unwrap_or(false);
             if ctx_cascade && role.is_none() && backend.is_none() {
-                rescue::run_cascade(task, cwd, model).await
+                rescue::run_cascade(task, cwd, model, !no_auto_login).await
             } else {
                 if cascade && (role.is_some() || backend.is_some()) {
                     anyhow::bail!("--cascade is mutually exclusive with --role/--backend");

@@ -213,9 +213,16 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
             continue;
         }
 
-        // Source 2: aggregator grades — one label per decisively-graded member.
+        // Source 2: aggregator grades — one label per decisively-graded member. The emitter
+        // (`parse_member_grades`) already validates range/duplicates, but the log is plain
+        // text on disk, so re-verify here: out-of-range grades drop, duplicates keep the
+        // first entry (defense in depth against hand-edited or corrupted lines).
         if !run.grades.is_empty() {
+            let mut graded_backends: std::collections::HashSet<BackendId> = Default::default();
             for (backend, grade) in &run.grades {
+                if *grade > 100 || !graded_backends.insert(*backend) {
+                    continue;
+                }
                 let success = match *grade {
                     g if g >= GRADE_PASS => true,
                     g if g < GRADE_FAIL => false,

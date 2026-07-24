@@ -217,7 +217,44 @@ fn spawn_watcher(app: AppHandle) {
     });
 }
 
+/// GUI apps launched from Finder/Dock inherit launchd's minimal PATH
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`), which misses the directories where the agent
+/// CLIs live (e.g. `~/.local/bin/claude`). The sidecar `agentpit` CLI inherits this
+/// process's environment, so its auth probes and spawns would fail with exit 127 and
+/// surface as "[claude] not authenticated". Ask the user's login shell for its PATH
+/// once at startup and adopt it. Markers guard against shell startup noise on stdout.
+#[cfg(unix)]
+fn adopt_login_shell_path() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let Ok(output) = std::process::Command::new(&shell)
+        .args([
+            "-ilc",
+            "printf '__AGENTPIT_PATH__%s__AGENTPIT_PATH__' \"$PATH\"",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(path) = extract_marked_path(&stdout) {
+        std::env::set_var("PATH", path);
+    }
+}
+
+fn extract_marked_path(stdout: &str) -> Option<&str> {
+    const MARKER: &str = "__AGENTPIT_PATH__";
+    let start = stdout.find(MARKER)? + MARKER.len();
+    let end = stdout[start..].find(MARKER)? + start;
+    let path = &stdout[start..end];
+    (!path.is_empty()).then_some(path)
+}
+
 fn main() {
+    #[cfg(unix)]
+    adopt_login_shell_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
@@ -324,5 +361,24 @@ mod tests {
         let b = read_delta(f.path(), a.offset, 1024);
         assert_eq!(b.text, "あ");
         assert_eq!(b.offset, 4);
+    }
+
+    #[test]
+    fn marked_path_survives_shell_startup_noise() {
+        let noisy =
+            "welcome banner\n__AGENTPIT_PATH__/Users/x/.local/bin:/usr/bin__AGENTPIT_PATH__";
+        assert_eq!(
+            extract_marked_path(noisy),
+            Some("/Users/x/.local/bin:/usr/bin")
+        );
+    }
+
+    #[test]
+    fn marked_path_rejects_missing_or_empty() {
+        assert_eq!(extract_marked_path("no markers here"), None);
+        assert_eq!(
+            extract_marked_path("__AGENTPIT_PATH____AGENTPIT_PATH__"),
+            None
+        );
     }
 }

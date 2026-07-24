@@ -27,9 +27,17 @@ pub struct RouteSample {
     pub backend: BackendId,
     /// "good" | "bad" (mirrors `OutcomeLabel` wire values).
     pub label: String,
+    /// The source label's fold weight (human verdict 3.0 … exit status 0.5), so weak
+    /// evidence stays weak in the kNN vote too. Older stores default to 1.0.
+    #[serde(default = "default_sample_weight")]
+    pub weight: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
     pub ts: u64,
+}
+
+fn default_sample_weight() -> f32 {
+    1.0
 }
 
 impl RouteSample {
@@ -121,10 +129,13 @@ pub fn pick_backend(
     let mut stats: std::collections::BTreeMap<BackendId, Stat> = Default::default();
     for (sim, sample) in &hits {
         let stat = stats.entry(sample.backend).or_default();
+        // Votes carry both closeness and label strength: a 0.95-similar human verdict
+        // (weight 3.0) outweighs several 0.80-similar exit statuses (weight 0.5).
+        let vote = sim * sample.weight.max(0.0);
         if sample.is_good() {
-            stat.wins += sim;
+            stat.wins += vote;
         } else {
-            stat.losses += sim;
+            stat.losses += vote;
         }
         stat.count += 1;
         stat.best_sim = stat.best_sim.max(*sim);
@@ -143,7 +154,13 @@ pub fn pick_backend(
         .map(|(_, s)| win_rate(s))
         .fold(0.0f32, f32::max);
 
-    if best_stat.count < cfg.min_samples || win_rate(best_stat) - runner_up_rate < cfg.margin {
+    // Three gates: enough similar samples, a real lead over the runner-up, and a positive
+    // track record in absolute terms — being the least-bad option is not a reason to route
+    // here (fall through to the profile stage instead).
+    if best_stat.count < cfg.min_samples
+        || win_rate(best_stat) - runner_up_rate < cfg.margin
+        || win_rate(best_stat) < 0.5
+    {
         return None;
     }
     Some(SimilarityPick {
@@ -163,6 +180,7 @@ mod tests {
             embedding,
             backend,
             label: label.into(),
+            weight: 1.0,
             category: None,
             ts: 1,
         }
@@ -236,5 +254,29 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].backend, BackendId::Claude);
         assert!(parsed[0].is_good());
+
+        // A pre-weight store line still parses, defaulting to weight 1.0.
+        let legacy =
+            r#"{"task_hash":"h","embedding":[1.0],"backend":"codex","label":"good","ts":1}"#;
+        let parsed = parse_samples(legacy);
+        assert_eq!(parsed[0].weight, 1.0);
+    }
+
+    #[test]
+    fn label_weight_shifts_the_vote() {
+        // One weight-3.0 human "bad" on Codex vs three weight-0.5 exit-ok "good"s: the
+        // weighted loss (3.0) dominates the weighted wins (1.5) → win-rate 1.5/4.5 = 0.33,
+        // so Codex must NOT be picked even though good samples outnumber bad ones.
+        let mut samples: Vec<RouteSample> = (0..3)
+            .map(|_| {
+                let mut s = sample(BackendId::Codex, "good", vec![1.0, 0.0]);
+                s.weight = 0.5;
+                s
+            })
+            .collect();
+        let mut human_bad = sample(BackendId::Codex, "bad", vec![1.0, 0.0]);
+        human_bad.weight = 3.0;
+        samples.push(human_bad);
+        assert!(pick_backend(&[1.0, 0.0], &samples, &cfg(), |_| true).is_none());
     }
 }

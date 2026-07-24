@@ -341,20 +341,40 @@ fn cascade_ladder(
     qualifying.into_iter().map(|(backend, _)| backend).collect()
 }
 
+/// Cap on a `[cascade].verify` command so a hanging verifier can't stall the cascade forever.
+const CASCADE_VERIFY_TIMEOUT_SECS: u64 = 600;
+
 /// Run the `[cascade].verify` command in `cwd`; `Ok(true)` = passed. No command = passed.
-async fn cascade_verify(verify: Option<&str>, cwd: &std::path::Path) -> bool {
+/// Bounded by [`CASCADE_VERIFY_TIMEOUT_SECS`] and aborted (child killed) on cancellation —
+/// a Ctrl-C during verification must stop the cascade, not hang or escalate past it.
+async fn cascade_verify(
+    verify: Option<&str>,
+    cwd: &std::path::Path,
+    cancel: &CancellationToken,
+) -> bool {
     let Some(command) = verify else {
         return true;
     };
-    match tokio::process::Command::new("sh")
+    let mut child = match tokio::process::Command::new("sh")
         .args(["-c", command])
         .current_dir(cwd)
-        .status()
-        .await
+        .kill_on_drop(true)
+        .spawn()
     {
-        Ok(status) => status.success(),
+        Ok(child) => child,
         Err(error) => {
             eprintln!("[cascade] verify command failed to launch: {error}");
+            return false;
+        }
+    };
+    tokio::select! {
+        status = child.wait() => status.map(|s| s.success()).unwrap_or(false),
+        _ = cancel.cancelled() => {
+            eprintln!("[cascade] verify cancelled");
+            false
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(CASCADE_VERIFY_TIMEOUT_SECS)) => {
+            eprintln!("[cascade] verify timed out after {CASCADE_VERIFY_TIMEOUT_SECS}s");
             false
         }
     }
@@ -363,13 +383,43 @@ async fn cascade_verify(verify: Option<&str>, cwd: &std::path::Path) -> bool {
 /// `agentpit rescue --cascade`: dispatch to the cheapest qualifying backend and escalate up
 /// the ladder on failure. Every hop is its own run in the event log, so a failed hop's
 /// RunFinished(error) feeds the learn fold as a negative label with no extra plumbing.
-pub async fn run_cascade(task: String, cwd: Option<String>, model: Option<String>) -> Result<()> {
+/// Auth problems are the exception: an unauthenticated backend is *skipped* (LegStatus::
+/// Skipped, which the fold ignores) rather than failed — an expired login says nothing
+/// about the backend's capability and must not poison the learned scores.
+pub async fn run_cascade(
+    task: String,
+    cwd: Option<String>,
+    model: Option<String>,
+    auto_login: bool,
+) -> Result<()> {
     let ctx = load_context()?;
     let available = ctx.regs.available();
     let profiles = crate::profile::load_profiles(None).unwrap_or_default();
     let cascade_cfg = ctx.loaded.config.cascade.clone();
 
+    // Same confidence gate as the router's profile stage: a no-signal task diagnoses to an
+    // arbitrary category at ~0.1 confidence, and climbing that category's cost ladder would
+    // be routing on noise. Fall through to the normal route instead.
     let diagnosis = crate::diagnose::diagnose(&task);
+    if diagnosis.confidence < crate::diagnose::LLM_ASSIST_CONFIDENCE_THRESHOLD {
+        eprintln!(
+            "[cascade] diagnosis too uncertain ({} at {:.2}) — falling back to the normal route.",
+            diagnosis.primary.as_str(),
+            diagnosis.confidence
+        );
+        return run_with_route_inner(
+            task,
+            None,
+            cwd,
+            auto_login,
+            RouteKey::Rescue,
+            None,
+            model,
+            None,
+        )
+        .await;
+    }
+
     let candidates = profiles.candidates_for(diagnosis.primary, &available);
     let cost_of = |b: BackendId| {
         ctx.loaded
@@ -391,21 +441,46 @@ pub async fn run_cascade(task: String, cwd: Option<String>, model: Option<String
             cascade_cfg.min_score,
             diagnosis.primary.as_str()
         );
-        return run_with_route_inner(task, None, cwd, true, RouteKey::Rescue, None, model, None)
-            .await;
+        return run_with_route_inner(
+            task,
+            None,
+            cwd,
+            auto_login,
+            RouteKey::Rescue,
+            None,
+            model,
+            None,
+        )
+        .await;
     }
 
     let resolved_cwd = resolve_cwd(cwd)?;
+    // One token + one Ctrl-C handler for the whole cascade (a per-hop install would stack
+    // signal listeners); a cancelled cascade aborts instead of escalating.
+    let cancel = CancellationToken::new();
+    install_ctrlc_cancel(cancel.clone());
     let total = ladder.len();
     for (hop, backend_id) in ladder.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            anyhow::bail!("cascade cancelled");
+        }
+        // Auth preflight, mirroring the normal route: an unauthenticated hop is skipped, not
+        // failed (and never negative-labelled).
+        let auth = check_auth(backend_id).await;
+        if !auth.ok {
+            eprintln!(
+                "[cascade] hop {}/{total} [{backend_id}] skipped: not authenticated ({})",
+                hop + 1,
+                auth.login_command
+            );
+            continue;
+        }
         println!(
             "[cascade hop {}/{total} backend={backend_id} category={} cost={}]",
             hop + 1,
             diagnosis.primary.as_str(),
             cost_of(backend_id),
         );
-        let cancel = CancellationToken::new();
-        install_ctrlc_cancel(cancel.clone());
         let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &resolved_cwd);
         logger.route_decided(
             backend_id,
@@ -439,17 +514,37 @@ pub async fn run_cascade(task: String, cwd: Option<String>, model: Option<String
             backend_id,
             &task,
             &resolved_cwd,
-            cancel,
+            cancel.clone(),
             on_chunk,
             &ctx.regs,
             effective_model.as_deref(),
         )
         .await;
         let elapsed = started.elapsed().as_millis() as u64;
+
+        // A runtime auth failure is a skip (no capability signal), like the preflight above.
+        if let Ok(res) = &outcome
+            && res.auth_failed
+        {
+            eprintln!(
+                "[cascade] hop {}/{total} [{backend_id}] skipped: auth failure during execution",
+                hop + 1
+            );
+            logger.member_finished(
+                backend_id,
+                false,
+                LegStatus::Skipped,
+                elapsed,
+                None,
+                Some("auth failure during execution".into()),
+            );
+            logger.finished(LegStatus::Skipped);
+            continue;
+        }
+
         let failure: Option<String> = match &outcome {
-            Ok(res) if res.auth_failed => Some("auth failure during execution".into()),
             Ok(_) => {
-                if cascade_verify(cascade_cfg.verify.as_deref(), &resolved_cwd).await {
+                if cascade_verify(cascade_cfg.verify.as_deref(), &resolved_cwd, &cancel).await {
                     None
                 } else {
                     Some(format!(
@@ -474,6 +569,20 @@ pub async fn run_cascade(task: String, cwd: Option<String>, model: Option<String
                 return Ok(());
             }
             Some(reason) => {
+                // A cancelled hop must abort the cascade, never escalate to a pricier
+                // backend the human just tried to stop.
+                if cancel.is_cancelled() {
+                    logger.member_finished(
+                        backend_id,
+                        false,
+                        LegStatus::Skipped,
+                        elapsed,
+                        None,
+                        Some("cancelled".into()),
+                    );
+                    logger.finished(LegStatus::Skipped);
+                    anyhow::bail!("cascade cancelled");
+                }
                 eprintln!(
                     "[cascade] hop {}/{total} [{backend_id}] failed: {reason}",
                     hop + 1
@@ -490,7 +599,7 @@ pub async fn run_cascade(task: String, cwd: Option<String>, model: Option<String
             }
         }
     }
-    anyhow::bail!("cascade exhausted: every hop failed")
+    anyhow::bail!("cascade exhausted: every hop failed or was skipped")
 }
 
 #[cfg(test)]
@@ -531,11 +640,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cascade_verify_maps_exit_status() {
+    async fn cascade_verify_maps_exit_status_and_honors_cancellation() {
         let dir = std::env::temp_dir();
-        assert!(cascade_verify(None, &dir).await);
-        assert!(cascade_verify(Some("true"), &dir).await);
-        assert!(!cascade_verify(Some("false"), &dir).await);
+        let live = CancellationToken::new();
+        assert!(cascade_verify(None, &dir, &live).await);
+        assert!(cascade_verify(Some("true"), &dir, &live).await);
+        assert!(!cascade_verify(Some("false"), &dir, &live).await);
+
+        // A cancelled token fails a would-be-hanging verifier promptly instead of waiting.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let started = std::time::Instant::now();
+        assert!(!cascade_verify(Some("sleep 30"), &dir, &cancelled).await);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

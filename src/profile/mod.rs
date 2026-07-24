@@ -3,6 +3,7 @@
 
 pub mod bench;
 pub mod category;
+pub mod learn;
 pub mod model;
 pub mod seed;
 pub mod store;
@@ -12,6 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 pub use category::TaskCategory;
 pub use model::{
     BenchmarkResult, CapabilityProfile, ProfileSource, Score, TelemetryStats, apply_benchmark,
+    apply_learned,
 };
 pub use seed::seeded_profiles;
 pub use store::{load_profiles, profiles_path, save_profiles};

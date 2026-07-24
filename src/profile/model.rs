@@ -165,6 +165,33 @@ pub fn apply_benchmark(base: &CapabilityProfile, result: &BenchmarkResult) -> Ca
     }
 }
 
+/// Fold telemetry-learned scores into a profile, returning a brand-new profile. Same gate as
+/// [`apply_benchmark`] with `Learned` as the incoming source: it refreshes Seeded or Learned
+/// profiles but never touches a Benchmarked one, and categories the fold did not cover keep
+/// their existing scores.
+pub fn apply_learned(
+    base: &CapabilityProfile,
+    learned: &BTreeMap<TaskCategory, Score>,
+) -> CapabilityProfile {
+    let incoming = ProfileSource::Learned;
+    let overwrite = incoming.priority() >= base.source.priority();
+
+    let mut scores = base.scores.clone();
+    if overwrite {
+        for (category, score) in learned {
+            scores.insert(*category, *score);
+        }
+    }
+
+    CapabilityProfile {
+        backend: base.backend,
+        scores,
+        telemetry: base.telemetry.clone(),
+        source: if overwrite { incoming } else { base.source },
+        measured_at: base.measured_at.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +230,40 @@ mod tests {
         assert_eq!(updated.score(TaskCategory::Coding).unwrap().value, 90);
         assert_eq!(updated.score(TaskCategory::Docs).unwrap().value, 55);
         assert_eq!(updated.measured_at.as_deref(), Some("2026-06-30T00:00:00Z"));
+    }
+
+    #[test]
+    fn apply_learned_refreshes_seeded_but_never_a_benchmarked_profile() {
+        let learned: BTreeMap<TaskCategory, Score> = [(
+            TaskCategory::Coding,
+            Score {
+                value: 85,
+                samples: 12,
+                confidence: 0.85,
+            },
+        )]
+        .into();
+
+        // Seeded profile: the learned cell wins, untouched cells survive, source flips.
+        let mut seeded = CapabilityProfile::seeded(BackendId::Gemini);
+        seeded
+            .scores
+            .insert(TaskCategory::Coding, Score::seeded(60));
+        seeded.scores.insert(TaskCategory::Docs, Score::seeded(70));
+        let updated = apply_learned(&seeded, &learned);
+        assert_eq!(updated.source, ProfileSource::Learned);
+        assert_eq!(updated.score(TaskCategory::Coding).unwrap().value, 85);
+        assert_eq!(updated.score(TaskCategory::Docs).unwrap().value, 70);
+
+        // Benchmarked profile: nothing moves.
+        let mut benched = CapabilityProfile::seeded(BackendId::Gemini);
+        benched.source = ProfileSource::Benchmarked;
+        benched
+            .scores
+            .insert(TaskCategory::Coding, Score::seeded(90));
+        let untouched = apply_learned(&benched, &learned);
+        assert_eq!(untouched.source, ProfileSource::Benchmarked);
+        assert_eq!(untouched.score(TaskCategory::Coding).unwrap().value, 90);
     }
 
     #[test]

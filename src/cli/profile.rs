@@ -65,6 +65,17 @@ pub enum Action {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Fold runtime telemetry (events.jsonl) into Learned scores and merge them into
+    /// profiles.toml. Benchmarked cells are never overwritten; cells with fewer than
+    /// --min-samples labels are skipped.
+    Learn {
+        /// Print the would-be changes without writing profiles.toml.
+        #[arg(long)]
+        dry_run: bool,
+        /// Minimum labels a (backend, category) cell needs before it is written.
+        #[arg(long, default_value_t = crate::profile::learn::DEFAULT_MIN_SAMPLES)]
+        min_samples: u16,
+    },
 }
 
 /// Entry point. A bare `agentpit profile` (no sub-action) defaults to `show`.
@@ -90,7 +101,93 @@ pub async fn run(action: Option<Action>) -> Result<()> {
             )
             .await
         }
+        Action::Learn {
+            dry_run,
+            min_samples,
+        } => learn(dry_run, min_samples, &profiles_path()),
     }
+}
+
+/// `agentpit profile learn`: fold the event log into Learned scores and merge them into
+/// `profiles.toml` under the `benchmarked > learned > seeded` gate.
+fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
+    use crate::profile::learn::{
+        DEFAULT_RERUN_WINDOW_MS, derive_labels, fold_scores, parse_runs, resolve_categories,
+    };
+
+    let events = crate::events::events_path();
+    let log = fs::read_to_string(&events).with_context(|| {
+        format!(
+            "no telemetry at {} — dispatch some runs first (or check AGENTPIT_NO_EVENTS)",
+            events.display()
+        )
+    })?;
+
+    let mut runs = parse_runs(&log);
+    // Runs routed without a category (route table / default / ensemble) get one by
+    // re-diagnosing the task text saved at dispatch time.
+    resolve_categories(&mut runs, |task_hash| {
+        let text =
+            fs::read_to_string(crate::events::tasks_dir().join(format!("{task_hash}.txt"))).ok()?;
+        Some(crate::diagnose::diagnose(&text).primary)
+    });
+    let labels = derive_labels(&runs, DEFAULT_RERUN_WINDOW_MS);
+    let scores = fold_scores(&labels, min_samples);
+    println!(
+        "telemetry: {} runs, {} labels -> {} cell(s) with >= {} samples",
+        runs.len(),
+        labels.len(),
+        scores.values().map(|c| c.len()).sum::<usize>(),
+        min_samples,
+    );
+    if scores.is_empty() {
+        println!("nothing to write yet.");
+        return Ok(());
+    }
+
+    let base = load_profiles(Some(profiles))?;
+    let mut merged = base.clone();
+    let mut changed = 0usize;
+    for (backend, learned) in &scores {
+        let before = base
+            .get(*backend)
+            .cloned()
+            .unwrap_or_else(|| CapabilityProfile::seeded(*backend));
+        let after = crate::profile::apply_learned(&before, learned);
+        for (category, score) in learned {
+            let old = before.score(*category);
+            let new = after.score(*category);
+            if old == new {
+                continue;
+            }
+            changed += 1;
+            println!(
+                "  [{backend}] {:<18} {} -> {}  (samples={}, conf={:.2})",
+                category.as_str(),
+                old.map(|s| s.value.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                score.value,
+                score.samples,
+                score.confidence,
+            );
+        }
+        if before.source == crate::profile::ProfileSource::Benchmarked {
+            println!("  [{backend}] benchmarked — left untouched");
+        }
+        merged.insert(after);
+    }
+
+    if changed == 0 {
+        println!("no cells changed.");
+        return Ok(());
+    }
+    if dry_run {
+        println!("(dry run: {} not written)", profiles.display());
+        return Ok(());
+    }
+    save_profiles(&merged, profiles)?;
+    println!("wrote {} ({changed} cell(s) updated).", profiles.display());
+    Ok(())
 }
 
 fn show() -> Result<()> {
@@ -678,5 +775,66 @@ mod tests {
             format!("{err:#}").contains("specify a target"),
             "got: {err:#}"
         );
+    }
+
+    #[test]
+    fn learn_flips_best_for_after_ten_good_labels_and_respects_dry_run() {
+        use crate::profile::{ProfileSource, TaskCategory, seeded_profiles};
+        use std::collections::HashSet;
+
+        // Serialize XDG_STATE_HOME mutation with the other state-dir tests.
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+        }
+
+        // Synthesize 10 human-verdict-good Gemini coding runs (seeded: Claude 88 > Gemini 72).
+        let mut log = String::new();
+        for i in 0..10 {
+            log.push_str(&format!(
+                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r-{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/x\"}}\n\
+                 {{\"event\":\"route_decided\",\"ts\":{i},\"run_id\":\"r-{i}\",\"backend\":\"gemini\",\"reason\":\"profile\",\"category\":\"coding\",\"task_hash\":\"h{i}\"}}\n\
+                 {{\"event\":\"run_finished\",\"ts\":{i},\"run_id\":\"r-{i}\",\"status\":\"ok\"}}\n\
+                 {{\"event\":\"outcome_noted\",\"ts\":{i},\"run_id\":\"r-{i}\",\"outcome\":\"good\"}}\n",
+            ));
+        }
+        let state = dir.path().join("agentpit");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("events.jsonl"), log).unwrap();
+
+        let profiles = dir.path().join("profiles.toml");
+        let available: HashSet<BackendId> = BackendId::ALL.iter().copied().collect();
+        assert_eq!(
+            seeded_profiles()
+                .best_for(TaskCategory::Coding, &available)
+                .unwrap()
+                .0,
+            BackendId::Claude,
+            "precondition: Claude leads Coding in the seed"
+        );
+
+        // Dry run reports but writes nothing.
+        learn(true, 5, &profiles).unwrap();
+        assert!(!profiles.exists());
+
+        learn(false, 5, &profiles).unwrap();
+        let merged = load_profiles(Some(&profiles)).unwrap();
+        let gemini = merged.get(BackendId::Gemini).unwrap();
+        assert_eq!(gemini.source, ProfileSource::Learned);
+        let (best, score) = merged
+            .best_for(TaskCategory::Coding, &available)
+            .expect("coding is scored");
+        assert_eq!(best, BackendId::Gemini, "10 good labels flip the argmax");
+        assert!(score.value > 88, "beta posterior beats Claude's seed");
+        assert_eq!(score.samples, 10);
+        assert!(score.confidence <= 0.85);
+
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
     }
 }

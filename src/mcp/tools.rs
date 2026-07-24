@@ -426,6 +426,7 @@ impl AgentpitTools {
                             Some(res.output.len()),
                             None,
                         );
+                        crate::cli::ensemble::emit_member_grades(&logger, &res.output, &outcomes);
                         combined.push_str(&format!(
                             "\n\n=== aggregator [{agg}] (transport={}) ===\n{}",
                             res.transport.as_str(),

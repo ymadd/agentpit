@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -68,18 +69,107 @@ pub fn build_aggregator_prompt(original: &str, outcomes: &[MemberOutcome]) -> St
         String::new(),
         "# Responses".to_string(),
     ];
+    let mut graded: Vec<&str> = Vec::new();
     for o in outcomes {
         if let Some(out) = &o.output {
             lines.push(String::new());
             lines.push(format!("## [{}]", o.backend));
             lines.push(clamp_for_prompt(out.trim(), MAX_MEMBER_PROMPT_BYTES));
+            graded.push(o.backend.as_str());
         } else if let Some(err) = &o.error {
             lines.push(String::new());
             lines.push(format!("## [{}] (failed)", o.backend));
             lines.push(clamp_for_prompt(err, MAX_MEMBER_PROMPT_BYTES));
         }
     }
+    // Structured per-member grading (learned routing, Phase 2): the fenced JSON is parsed
+    // back out by `parse_member_grades` and recorded as MemberGraded events — oracle labels
+    // for `agentpit profile learn`. Best-effort: an aggregator that ignores this still works.
+    if !graded.is_empty() {
+        lines.push(String::new());
+        lines.push("# Grading".to_string());
+        lines.push(format!(
+            "After the synthesis, grade each response's quality on the original task. End your \
+             reply with exactly one fenced json block of the form \
+             {{\"grades\": [{{\"backend\": \"<id>\", \"grade\": <0-100>, \"rank\": <1=best>}}]}} \
+             covering these backends: {}.",
+            graded.join(", ")
+        ));
+    }
     lines.join("\n")
+}
+
+/// Extract the aggregator's per-member grades from its reply: the last fenced ```json block
+/// (or bare trailing JSON object) containing a `grades` array. Entries are kept only when the
+/// backend is one of `graded` (a member that actually produced output) and the grade is 0–100;
+/// duplicates keep the first entry. Any parse failure returns an empty list — grading is
+/// best-effort oracle collection and must never break an ensemble run.
+pub fn parse_member_grades(reply: &str, graded: &[BackendId]) -> Vec<(BackendId, u8, Option<u8>)> {
+    #[derive(serde::Deserialize)]
+    struct GradesBlock {
+        grades: Vec<GradeEntry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct GradeEntry {
+        backend: String,
+        grade: i64,
+        #[serde(default)]
+        rank: Option<i64>,
+    }
+
+    // Candidate JSON texts, later ones preferred: every fenced block, then the reply itself
+    // (an aggregator that answers with bare JSON).
+    let mut candidates: Vec<&str> = Vec::new();
+    let mut rest = reply;
+    while let Some(open) = rest.find("```") {
+        let after = &rest[open + 3..];
+        let body_start = after.find('\n').map(|i| i + 1).unwrap_or(0);
+        let Some(close) = after[body_start..].find("```") else {
+            break;
+        };
+        candidates.push(&after[body_start..body_start + close]);
+        rest = &after[body_start + close + 3..];
+    }
+    candidates.push(reply.trim());
+
+    let block = candidates
+        .into_iter()
+        .rev()
+        .find_map(|text| serde_json::from_str::<GradesBlock>(text.trim()).ok());
+    let Some(block) = block else {
+        return Vec::new();
+    };
+
+    let mut seen: HashSet<BackendId> = HashSet::new();
+    block
+        .grades
+        .into_iter()
+        .filter_map(|entry| {
+            let backend: BackendId = entry.backend.parse().ok()?;
+            if !graded.contains(&backend) || !seen.insert(backend) {
+                return None;
+            }
+            let grade = u8::try_from(entry.grade).ok().filter(|g| *g <= 100)?;
+            let rank = entry
+                .rank
+                .and_then(|r| u8::try_from(r).ok())
+                .filter(|r| *r >= 1);
+            Some((backend, grade, rank))
+        })
+        .collect()
+}
+
+/// Parse the aggregator's grades out of `reply` and emit one `MemberGraded` per graded member
+/// (learned routing, Phase 2). Shared by the CLI and MCP ensemble paths.
+pub(crate) fn emit_member_grades(logger: &RunLogger, reply: &str, outcomes: &[MemberOutcome]) {
+    let graded: Vec<BackendId> = outcomes
+        .iter()
+        .filter(|o| o.output.is_some())
+        .map(|o| o.backend)
+        .collect();
+    for (backend, grade, rank) in parse_member_grades(reply, &graded) {
+        logger.member_graded(backend, grade, rank);
+    }
 }
 
 /// Run one backend dispatch and map the result into a [`MemberOutcome`]: `not registered` when no
@@ -427,6 +517,7 @@ pub async fn run_resolved(
                     Some(res.output.len()),
                     None,
                 );
+                emit_member_grades(&logger, &res.output, &outcomes);
                 println!(
                     "{member_section}\n\n=== aggregator [{aggregator_id}] (transport={}) ===\n{}",
                     res.transport.as_str(),
@@ -544,5 +635,97 @@ mod tests {
         let text = build_aggregator_prompt("t", &outcomes);
         assert!(text.contains("[truncated:"));
         assert!(text.len() < MAX_MEMBER_PROMPT_BYTES * 2);
+    }
+
+    #[test]
+    fn aggregator_prompt_asks_for_grades_of_succeeding_members_only() {
+        let text = build_aggregator_prompt("t", &fixture());
+        // Gemini and Opencode produced output; Claude failed and must not be graded.
+        assert!(text.contains("\"grades\""), "got: {text}");
+        assert!(text.contains("gemini, opencode"), "got: {text}");
+        // No grading section at all when nobody produced output.
+        let failed = vec![MemberOutcome {
+            backend: BackendId::Claude,
+            transport: None,
+            output: None,
+            error: Some("down".into()),
+        }];
+        assert!(!build_aggregator_prompt("t", &failed).contains("# Grading"));
+    }
+
+    #[test]
+    fn parse_member_grades_reads_last_fenced_block_and_filters_junk() {
+        let graded = [BackendId::Gemini, BackendId::Opencode];
+        let reply = r#"Synthesis text with an early snippet:
+```json
+{"other": true}
+```
+More prose.
+```json
+{"grades": [
+  {"backend": "gemini", "grade": 85, "rank": 1},
+  {"backend": "opencode", "grade": 30, "rank": 2},
+  {"backend": "opencode", "grade": 99},
+  {"backend": "claude", "grade": 90},
+  {"backend": "ghost", "grade": 50},
+  {"backend": "gemini", "grade": 300}
+]}
+```"#;
+        // Duplicate keeps the first, non-members and unknown ids drop, >100 drops.
+        assert_eq!(
+            parse_member_grades(reply, &graded),
+            vec![
+                (BackendId::Gemini, 85, Some(1)),
+                (BackendId::Opencode, 30, Some(2)),
+            ]
+        );
+
+        // Bare-JSON reply (no fences) parses too; junk parses to nothing.
+        let bare = r#"{"grades": [{"backend": "gemini", "grade": 70}]}"#;
+        assert_eq!(
+            parse_member_grades(bare, &graded),
+            vec![(BackendId::Gemini, 70, None)]
+        );
+        assert!(parse_member_grades("no json here", &graded).is_empty());
+        assert!(parse_member_grades("```json\n{\"grades\": \"nope\"}\n```", &graded).is_empty());
+    }
+
+    #[test]
+    fn emit_member_grades_writes_events_and_tolerates_gradeless_replies() {
+        // Serialize XDG_STATE_HOME mutation with the other state-dir tests.
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+
+        let logger = RunLogger::adopt("r-agg".into());
+        // A reply with no grades block emits nothing and does not error.
+        emit_member_grades(&logger, "plain synthesis, no JSON", &fixture());
+        // A graded reply emits one MemberGraded per member that produced output.
+        emit_member_grades(
+            &logger,
+            "```json\n{\"grades\": [{\"backend\": \"gemini\", \"grade\": 88, \"rank\": 1}, {\"backend\": \"opencode\", \"grade\": 35, \"rank\": 2}, {\"backend\": \"claude\", \"grade\": 90}]}\n```",
+            &fixture(),
+        );
+
+        let log =
+            std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap_or_default();
+        let graded: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("member_graded"))
+            .collect();
+        assert_eq!(graded.len(), 2, "got: {log}");
+        assert!(graded[0].contains("\"backend\":\"gemini\"") && graded[0].contains("\"grade\":88"));
+        assert!(
+            graded[1].contains("\"backend\":\"opencode\"") && graded[1].contains("\"grade\":35")
+        );
+
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
     }
 }

@@ -1,10 +1,10 @@
 [package]
 name = "agentpit"
-version = "0.1.33"
+version = "0.2.0"
 edition = "2024"
 authors = ["yamato"]
 license = "Apache-2.0"
-description = "Multi-agent hub CLI: route work to Gemini / Antigravity (agy) / Claude / Codex / OpenCode backends."
+description = "Multi-agent hub CLI: route work to Antigravity (agy) / Claude / Codex / OpenCode backends."
 repository = "https://github.com/ymadd/agentpit"
 rust-version = "1.93.0"
 

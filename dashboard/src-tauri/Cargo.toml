@@ -1,6 +1,6 @@
 [package]
 name = "agentpit-dashboard"
-version = "0.1.33"
+version = "0.2.0"
 edition = "2021"
 description = "Desktop control plane for agentpit, with a bundled CLI"
 license = "Apache-2.0"

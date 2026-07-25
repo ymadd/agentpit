@@ -331,7 +331,11 @@ pub struct BackendOverride {
 pub struct HubConfig {
     #[serde(default)]
     pub default: DefaultSection,
-    #[serde(default = "default_routes")]
+    /// Hard pins per tool. An entry here wins over `auto_route` **entirely** — the
+    /// similarity / capability-profile / cost-tiebreak stages never run for that tool — so
+    /// this defaults to EMPTY (opt-in). It used to default to a pin for every `RouteKey`,
+    /// which made the whole auto-route chain unreachable no matter what the user configured.
+    #[serde(default)]
     pub routes: BTreeMap<RouteKey, BackendId>,
     #[serde(default)]
     pub auto_route: AutoRouteSection,
@@ -416,14 +420,6 @@ fn default_security_review_members() -> Vec<BackendId> {
 fn default_adversarial_review_members() -> Vec<BackendId> {
     // Codex for adversarial scrutiny; Antigravity's long context for whole-file tracing.
     vec![BackendId::Codex, BackendId::Antigravity]
-}
-fn default_routes() -> BTreeMap<RouteKey, BackendId> {
-    let mut m = BTreeMap::new();
-    m.insert(RouteKey::Rescue, BackendId::Antigravity);
-    m.insert(RouteKey::Review, BackendId::Claude);
-    m.insert(RouteKey::Explain, BackendId::Antigravity);
-    m.insert(RouteKey::Refactor, BackendId::Claude);
-    m
 }
 
 pub fn save_config(config: &HubConfig) -> Result<PathBuf> {
@@ -544,10 +540,7 @@ pub fn load_config(override_path: Option<&Path>) -> Result<LoadedConfig> {
             })
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(LoadedConfig {
-            config: HubConfig {
-                routes: default_routes(),
-                ..HubConfig::default()
-            },
+            config: HubConfig::default(),
             source: ConfigSource::Defaults,
             path,
         }),
@@ -562,11 +555,13 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# agentpit config
 backend = "antigravity"
 auto_route = true
 
-[routes]
-rescue   = "antigravity"
-review   = "claude"
-explain  = "antigravity"
-refactor = "claude"
+# [routes] — OPTIONAL hard pins, one per tool. An entry here wins over auto_route
+# entirely: the capability-profile / similarity / cost-tiebreak stages never run for that
+# tool, so `agentpit profile learn` can never influence it. Leave a tool out (or omit this
+# section) to let agentpit pick the backend from measured capability instead.
+# [routes]
+# rescue   = "antigravity"
+# review   = "claude"
 
 [auto_route]
 long_context_threshold = 100000
@@ -668,6 +663,41 @@ review_members = ["claude", "gemini"]
             loaded.config.ensemble.review_members,
             vec![BackendId::Claude, BackendId::Gemini]
         );
+    }
+
+    /// Regression: `routes` used to default to a pin for EVERY `RouteKey`, and the default
+    /// applied whenever the `[routes]` section was absent. Since the router evaluates the
+    /// route table before `auto_route`, that made the similarity / capability-profile /
+    /// cost-tiebreak stages unreachable — omitting `[routes]` re-created the pins instead of
+    /// clearing them. A config without the section must now leave the table empty.
+    #[test]
+    fn routes_default_to_empty_so_auto_route_is_reachable() {
+        let dir = tempdir().unwrap();
+
+        let path = dir.path().join("no-routes.toml");
+        fs::write(&path, "[default]\nbackend = \"claude\"\n").unwrap();
+        let loaded = load_config(Some(&path)).unwrap();
+        assert!(
+            loaded.config.routes.is_empty(),
+            "omitting [routes] must not synthesize pins: {:?}",
+            loaded.config.routes
+        );
+
+        // No config file at all: same rule.
+        let missing = dir.path().join("absent.toml");
+        let defaults = load_config(Some(&missing)).unwrap();
+        assert_eq!(defaults.source, ConfigSource::Defaults);
+        assert!(defaults.config.routes.is_empty());
+
+        // An explicit pin still works, and only for the tool it names.
+        let pinned_path = dir.path().join("pinned.toml");
+        fs::write(&pinned_path, "[routes]\nreview = \"codex\"\n").unwrap();
+        let pinned = load_config(Some(&pinned_path)).unwrap();
+        assert_eq!(
+            pinned.config.routes.get(&RouteKey::Review),
+            Some(&BackendId::Codex)
+        );
+        assert_eq!(pinned.config.routes.get(&RouteKey::Rescue), None);
     }
 
     #[test]

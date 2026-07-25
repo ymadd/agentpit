@@ -8,6 +8,16 @@ use crate::auth::{AuthStatus, check_auth};
 use crate::dispatch::resolve_transport;
 use crate::types::BackendId;
 
+/// The tools whose backend a `[routes]` entry pins, as `tool=backend` strings in table
+/// order. Pure: reads the config, allocates a fresh `Vec`.
+fn pinned_tools(config: &crate::config::HubConfig) -> Vec<String> {
+    config
+        .routes
+        .iter()
+        .map(|(tool, backend)| format!("{tool}={backend}"))
+        .collect()
+}
+
 pub async fn run(filter: Option<BackendId>) -> Result<()> {
     let ctx = load_context()?;
     let available = ctx.regs.available();
@@ -33,6 +43,20 @@ pub async fn run(filter: Option<BackendId>) -> Result<()> {
             "off"
         }
     );
+    // A `[routes]` pin short-circuits auto_route for that tool, so learned/benchmarked
+    // capability never influences it. Silent before: `auto_route: on` read as "capability
+    // routing is live" even when every tool was pinned and the profile stage never ran.
+    if ctx.loaded.config.default.auto_route {
+        let pinned = pinned_tools(&ctx.loaded.config);
+        if !pinned.is_empty() {
+            println!(
+                "  note: [routes] pins {} — auto_route (capability profile / similarity) \
+                 does not run for {}. Remove the pin to route by measured capability.",
+                pinned.join(", "),
+                if pinned.len() == 1 { "it" } else { "them" },
+            );
+        }
+    }
     println!();
     println!("backends:");
 

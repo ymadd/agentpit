@@ -210,16 +210,23 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
 fn fetch_verified_binary(tag: &str, asset_name: &str) -> Result<Vec<u8>> {
     let gz = download_bytes(&asset_url(tag, asset_name))?;
     let sha_bytes = download_bytes(&asset_url(tag, &format!("{asset_name}.sha256")))?;
-    let sha_line = String::from_utf8_lossy(&sha_bytes).into_owned();
-    let expected = parse_sha256_line(&sha_line)
+    verify_and_decompress(&gz, &String::from_utf8_lossy(&sha_bytes), asset_name)
+}
+
+/// The verification gate itself, split out from the network so it can be tested against
+/// tampered inputs offline: parse the digest line, compare it to the payload's actual
+/// SHA-256, and only then decompress. Every failure path returns `Err` — the caller writes
+/// nothing to disk unless this returns bytes.
+fn verify_and_decompress(gz: &[u8], sha_line: &str, asset_name: &str) -> Result<Vec<u8>> {
+    let expected = parse_sha256_line(sha_line)
         .ok_or_else(|| anyhow!("malformed .sha256 asset for {asset_name}: {sha_line:?}"))?;
-    let actual = sha256_hex(&gz);
+    let actual = sha256_hex(gz);
     if !actual.eq_ignore_ascii_case(&expected) {
         return Err(anyhow!(
             "checksum mismatch for {asset_name}: expected {expected}, got {actual} — refusing to install"
         ));
     }
-    gunzip(&gz).with_context(|| format!("failed to decompress {asset_name}"))
+    gunzip(gz).with_context(|| format!("failed to decompress {asset_name}"))
 }
 
 fn asset_url(tag: &str, asset_name: &str) -> String {
@@ -691,6 +698,47 @@ mod tests {
         );
         assert_eq!(parse_sha256_line("not a digest"), None);
         assert_eq!(parse_sha256_line(""), None);
+    }
+
+    /// The gate must *reject*, not merely compute: a payload whose digest does not match
+    /// its `.sha256` line never reaches the caller, so nothing is ever staged or installed.
+    #[test]
+    fn verify_and_decompress_rejects_tampered_payloads() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"the genuine release binary").unwrap();
+        let gz = enc.finish().unwrap();
+        let good_line = format!("{}  agentpit-x.gz\n", sha256_hex(&gz));
+
+        // Honest asset: verifies and decompresses.
+        assert_eq!(
+            verify_and_decompress(&gz, &good_line, "agentpit-x.gz").unwrap(),
+            b"the genuine release binary"
+        );
+
+        // One flipped byte in the payload: rejected, with the digests named.
+        let mut tampered = gz.clone();
+        *tampered.last_mut().unwrap() ^= 0xff;
+        let err = format!(
+            "{:#}",
+            verify_and_decompress(&tampered, &good_line, "agentpit-x.gz").unwrap_err()
+        );
+        assert!(err.contains("checksum mismatch"), "got: {err}");
+
+        // A digest line for a *different* payload (substituted .sha256): also rejected.
+        let other = format!("{}  agentpit-x.gz\n", sha256_hex(b"something else"));
+        assert!(verify_and_decompress(&gz, &other, "agentpit-x.gz").is_err());
+
+        // Missing / malformed digest line: rejected rather than skipped.
+        for line in ["", "not-a-digest  agentpit-x.gz", "404: Not Found"] {
+            let err = format!(
+                "{:#}",
+                verify_and_decompress(&gz, line, "agentpit-x.gz").unwrap_err()
+            );
+            assert!(err.contains("malformed"), "line {line:?} gave: {err}");
+        }
     }
 
     #[test]

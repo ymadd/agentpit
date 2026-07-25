@@ -161,11 +161,11 @@ desktop Settings screen, run `agentpit config` for the terminal editor, or edit 
 backend = "antigravity"
 auto_route = true
 
-[routes]
-rescue   = "antigravity"
-review   = "claude"
-explain  = "antigravity"
-refactor = "claude"
+# [routes] is optional and empty by default. An entry here is a HARD PIN that wins over
+# auto-routing entirely, so the capability-profile and similarity stages never run for that
+# tool and `agentpit profile learn` can never influence it. Pin only what you want frozen.
+# [routes]
+# review = "claude"
 
 [auto_route]
 long_context_threshold = 100000
@@ -225,13 +225,26 @@ Notes:
 
 ## How auto-routing works
 
-When `default.auto_route = true` (the default), `agentpit`:
+When `default.auto_route = true` (the default), `agentpit` resolves a backend in this order
+and stops at the first hit:
 
-1. Honors an explicit `--backend` flag
-2. Else uses the per-tool `[routes]` entry
-3. Else, if the prompt is huge (`> long_context_threshold` chars), sends it to `long_context_backend`
-4. Else, if the prompt contains a review keyword, sends it to `review_backend`
-5. Else, falls back to `default.backend`
+1. An explicit `--backend` flag
+2. A per-tool `[routes]` pin — **empty by default**, and a pin here skips every stage below,
+   so a tool you pin never benefits from measured capability
+3. Similarity: a backend that won sufficiently similar past tasks (kNN over `routes.jsonl`;
+   only in `--features similarity` builds with the embedding model installed)
+4. Capability profile: the task is diagnosed into a `TaskCategory`, and when the diagnosis is
+   confident enough the highest-scoring available backend for that category wins. Candidates
+   within `auto_route.quality_margin` of the best are treated as equal on quality, and the
+   cheapest (`[backends.<id>].cost`) takes it
+5. Long context: the prompt's estimated token count exceeds `long_context_threshold` →
+   `long_context_backend` (the estimate is roughly `chars / 4`, not a character count)
+6. Review keyword: the prompt contains one of `review_keywords` → `review_backend`
+7. `default.backend`
+
+Steps 3–6 run only when `auto_route` is on and a task text is present. `agentpit diagnose
+"<task>"` prints exactly what this chain would pick, and `agentpit status` warns when a
+`[routes]` pin is suppressing steps 3–6 for a tool.
 
 ## Workspace
 

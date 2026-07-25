@@ -68,7 +68,7 @@ pub enum Action {
     /// Replay past telemetry against a routing policy and report its would-have-been
     /// accuracy: for each recorded routing decision (one per distinct task+category),
     /// where would the policy have routed, and does the folded verdict for that
-    /// (task, backend) say it went well?
+    /// (task, category, backend) say it went well?
     Replay {
         /// `seeded` (the profile stage over the hand-seeded priors), `learned` (the
         /// similarity stage when available, then the profile stage with cost tiebreak
@@ -124,6 +124,10 @@ pub async fn run(action: Option<Action>) -> Result<()> {
 /// A replay policy's routing choice for one labelled run.
 type PolicyPicker = Box<dyn Fn(&crate::profile::learn::Label) -> Option<BackendId>>;
 
+/// One folded verdict's identity: the task, the category it was routed as, and the backend
+/// that ran it. Scoring is per `(task, category)`, so the category has to be part of this.
+type VerdictKey = (String, crate::profile::TaskCategory, BackendId);
+
 /// What `replay_core` measured: routing decisions replayed, how many were evaluable, and
 /// how many of those the policy would have gotten right.
 struct ReplayReport {
@@ -133,30 +137,36 @@ struct ReplayReport {
     correct: usize,
 }
 
-/// Collapse all labels for one `(task, backend)` into a single verdict by weighted
-/// majority (label weights already rank the sources: human verdict > grade > rerun >
-/// exit). A tie goes to the most recent label. This replaces the old OR fold, where one
-/// stray exit-ok label outvoted any number of bad verdicts.
+/// Collapse all labels for one `(task, category, backend)` into a single verdict by
+/// weighted majority (label weights already rank the sources: human verdict > grade >
+/// rerun > exit). A tie goes to the most recent label. This replaces the old OR fold,
+/// where one stray exit-ok label outvoted any number of bad verdicts.
+///
+/// The category belongs in the key: scoring happens per `(task, category)` decision, so a
+/// verdict folded across categories would let a backend's outcome on one category decide a
+/// different category's decision for the same task.
 fn fold_verdicts(
     labels: &[crate::profile::learn::Label],
-) -> std::collections::HashMap<(String, BackendId), bool> {
+) -> std::collections::HashMap<VerdictKey, bool> {
     struct Acc {
         good: f32,
         bad: f32,
         latest_ts: u64,
         latest_success: bool,
     }
-    let mut acc: std::collections::HashMap<(String, BackendId), Acc> = Default::default();
+    let mut acc: std::collections::HashMap<VerdictKey, Acc> = Default::default();
     for label in labels {
         let Some(hash) = &label.task_hash else {
             continue;
         };
-        let entry = acc.entry((hash.clone(), label.backend)).or_insert(Acc {
-            good: 0.0,
-            bad: 0.0,
-            latest_ts: 0,
-            latest_success: label.success,
-        });
+        let entry = acc
+            .entry((hash.clone(), label.category, label.backend))
+            .or_insert(Acc {
+                good: 0.0,
+                bad: 0.0,
+                latest_ts: 0,
+                latest_success: label.success,
+            });
         if label.success {
             entry.good += label.weight;
         } else {
@@ -204,8 +214,8 @@ fn replay_core(labels: &[crate::profile::learn::Label], pick_for: &PolicyPicker)
         let Some(pick) = pick_for(label) else {
             continue;
         };
-        let Some(went_well) = verdicts.get(&(hash.clone(), pick)) else {
-            continue; // the policy picked a backend nobody ever ran on this task
+        let Some(went_well) = verdicts.get(&(hash.clone(), label.category, pick)) else {
+            continue; // nobody ran this backend on this task *in this category*
         };
         report.evaluable += 1;
         if *went_well {
@@ -1203,8 +1213,30 @@ mod tests {
             lbl(BackendId::Codex, "h1", false, 1.0, 4), // tie by weight → latest wins
         ];
         let verdicts = fold_verdicts(&labels);
-        assert!(!verdicts[&("h1".to_string(), BackendId::Gemini)]);
-        assert!(!verdicts[&("h1".to_string(), BackendId::Codex)]);
+        let coding = crate::profile::TaskCategory::Coding;
+        assert!(!verdicts[&("h1".to_string(), coding, BackendId::Gemini)]);
+        assert!(!verdicts[&("h1".to_string(), coding, BackendId::Codex)]);
+
+        // Review finding: a verdict must not leak across categories. The same task+backend
+        // graded good as Docs must leave the Coding verdict (bad, above) untouched.
+        let mut cross = labels.clone();
+        cross.push(crate::profile::learn::Label {
+            backend: BackendId::Gemini,
+            category: crate::profile::TaskCategory::Docs,
+            success: true,
+            weight: 3.0,
+            task_hash: Some("h1".into()),
+            ts: 9,
+        });
+        let split = fold_verdicts(&cross);
+        assert!(!split[&("h1".to_string(), coding, BackendId::Gemini)]);
+        assert!(
+            split[&(
+                "h1".to_string(),
+                crate::profile::TaskCategory::Docs,
+                BackendId::Gemini
+            )]
+        );
     }
 
     /// Review finding M6: evaluation is per routing decision, not per label — five reruns

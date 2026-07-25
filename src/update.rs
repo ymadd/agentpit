@@ -173,6 +173,11 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
         });
     }
 
+    if !is_supported_release_tag(&latest) {
+        return Err(anyhow!(
+            "latest release tag {latest:?} is not a plain vMAJOR.MINOR.PATCH — refusing to update"
+        ));
+    }
     let tag = format!("v{}", normalized_version(&latest));
     let target = self_update::get_target();
     let asset_name = format!("{}.gz", asset_identifier(BIN_NAME, target));
@@ -187,7 +192,7 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
     // non-executable file.
     let current_exe = std::env::current_exe().context("cannot locate the running executable")?;
     let staged = current_exe.with_extension(format!("update.{}", std::process::id()));
-    std::fs::write(&staged, &binary)
+    write_new_file(&staged, &binary)
         .with_context(|| format!("failed to stage update at {}", staged.display()))?;
     let staged_ok = ensure_executable(&staged)
         .and_then(|()| assert_staged_version(&staged, normalized_version(&latest)));
@@ -208,6 +213,42 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
         dashboard,
         resign_error,
     })
+}
+
+/// Write `bytes` to `path`, failing if anything is already there.
+///
+/// The staging path is derived from the executable's own path plus our pid, so it is
+/// predictable. A plain `fs::write` opens with `O_CREAT|O_TRUNC` and **follows symlinks**,
+/// so anyone able to create files in that directory could pre-place a symlink and have the
+/// update's bytes land on an arbitrary file. `create_new` (`O_EXCL`) refuses to follow a
+/// symlink or reuse an existing entry, so a collision fails closed instead.
+/// Nothing is removed first: clearing the path would defeat the guard, since a symlink
+/// planted there would simply be deleted and recreated as a regular file. An occupied path
+/// (a leftover from a crashed update that happened to share our pid) fails the update
+/// rather than silently reusing it.
+fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// A release tag we are willing to turn into a download URL and a bundle version string.
+/// `fetch_latest_tag` returns whatever the release is named, and that value flows into URL
+/// paths and `PlistBuddy` arguments, so anything that is not a plain `vMAJOR.MINOR.PATCH`
+/// (no slashes, no whitespace) is rejected rather than sanitized.
+fn is_supported_release_tag(tag: &str) -> bool {
+    let core = tag.trim().trim_start_matches('v');
+    let mut parts = core.split('.');
+    let ok = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    });
+    ok && parts.next().is_none()
 }
 
 /// Run the staged binary's `--version` and require it to report `expected`.
@@ -586,7 +627,7 @@ fn sync_installed_dashboard(version: &str) -> DashboardUpdateOutcome {
         // where the installed dashboard was present but not runnable if anything failed
         // in between.
         let staged = path.with_extension(format!("update.{}", std::process::id()));
-        std::fs::write(&staged, &binary)
+        write_new_file(&staged, &binary)
             .with_context(|| format!("failed to stage {}", staged.display()))?;
         if let Err(error) = ensure_executable(&staged) {
             let _ = std::fs::remove_file(&staged);
@@ -824,6 +865,49 @@ mod tests {
         let broken = fake("broken", "exit 3");
         assert!(assert_staged_version(&broken, "0.1.34").is_err());
         assert!(assert_staged_version(&temp.path().join("absent"), "0.1.34").is_err());
+    }
+
+    /// Security-review finding (2026-07-25): the tag flows into download URLs and into
+    /// PlistBuddy arguments, and `normalized_version` only trims whitespace and a leading
+    /// `v` — a tag containing a slash would reshape the URL path. Only plain semver tags
+    /// are accepted.
+    #[test]
+    fn only_plain_semver_release_tags_are_accepted() {
+        for ok in ["v0.1.34", "0.1.34", " v1.20.300 \n"] {
+            assert!(is_supported_release_tag(ok), "should accept {ok:?}");
+        }
+        for bad in [
+            "v0.1.34/../../evil",
+            "v0.1",
+            "v0.1.34-rc1",
+            "v0.1.34 extra",
+            "latest",
+            "",
+            "v1.2.3.4",
+        ] {
+            assert!(!is_supported_release_tag(bad), "should reject {bad:?}");
+        }
+    }
+
+    /// Security-review finding (2026-07-25): staging used `fs::write`, which follows a
+    /// symlink, so a pre-placed symlink at the predictable staging path could redirect the
+    /// update's bytes onto another file. `create_new` fails closed instead.
+    #[cfg(unix)]
+    #[test]
+    fn staging_refuses_to_follow_a_pre_placed_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"important").unwrap();
+        let staged = temp.path().join("agentpit.update.1");
+        std::os::unix::fs::symlink(&victim, &staged).unwrap();
+
+        assert!(write_new_file(&staged, b"payload").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"important");
+
+        // A clean path still stages normally.
+        let fresh = temp.path().join("agentpit.update.2");
+        write_new_file(&fresh, b"payload").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"payload");
     }
 
     #[test]

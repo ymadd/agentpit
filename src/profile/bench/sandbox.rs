@@ -282,18 +282,10 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Option<Pr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut out = child.stdout.take().expect("piped stdout");
-    let mut err = child.stderr.take().expect("piped stderr");
-    let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = out.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = err.read_to_end(&mut buf);
-        buf
-    });
+    let out = child.stdout.take().expect("piped stdout");
+    let err = child.stderr.take().expect("piped stderr");
+    let out_rx = spawn_capture(out);
+    let err_rx = spawn_capture(err);
 
     let start = Instant::now();
     let mut timed_out = false;
@@ -309,27 +301,58 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Option<Pr
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    // Kill the group even when the direct child exited on its own. A background descendant
-    // (`sh -c 'cmd &'`) keeps the inherited pipe write ends open, so the reader joins below
-    // would block long past the deadline — the timeout branch alone did not cover this,
-    // because the loop breaks on try_wait before it ever looks at the clock. By the time we
-    // get here the child is gone, so nothing legitimate is still writing.
+    // Kill the group even when the direct child exited on its own: a background descendant
+    // (`sh -c 'cmd &'`) keeps the inherited pipe write ends open, and the loop above breaks
+    // on try_wait before it ever consults the clock, so the deadline would not apply.
     if !timed_out {
         kill_process_group(&mut child);
     }
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
+
+    // Collect with a deadline instead of joining. The group kill is best-effort by nature —
+    // the candidate code is untrusted model output, the seatbelt profile permits fork/exec,
+    // and anything that calls setpgid(0,0) leaves the group we signal while still holding
+    // the pipe. Joining a reader in that state hangs the whole bench harness, so a reader
+    // that has not finished draining is abandoned (its thread ends when the pipe finally
+    // closes, or with the process) and its stream is reported as empty.
+    let stdout = out_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
     if timed_out {
         return Ok(None);
     }
     Ok(Some((status, stdout, stderr)))
 }
 
+/// How long to wait for a reader thread to finish draining after the child is gone. The
+/// pipes hit EOF immediately once every writer is dead; this only bounds the pathological
+/// case where one survived the group kill.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Cap on captured bytes per stream. The candidate is untrusted output that can print
+/// without bound; grading only ever reads a test summary, so a noisy run must not be able
+/// to exhaust memory before the deadline fires.
+const MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Drain `reader` on its own thread and deliver the bytes over a channel, so the caller can
+/// wait with a deadline rather than an unbounded `join`.
+fn spawn_capture<R: Read + Send + 'static>(reader: R) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = reader.take(MAX_CAPTURE_BYTES).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
 /// Kill the child's whole process group (`kill -KILL -<pgid>`; the child was spawned with
 /// `process_group(0)` so its pgid is its own pid), then the child itself as a fallback.
+///
+/// Best-effort by design: `kill` is resolved through PATH (it is not at a fixed path on
+/// every distribution), and a descendant that left the group with `setpgid` is out of
+/// reach. The caller must not assume this makes the pipes drain — see [`DRAIN_GRACE`].
 #[cfg(unix)]
 fn kill_process_group(child: &mut std::process::Child) {
-    let _ = Command::new("/bin/kill")
+    let _ = Command::new("kill")
         .args(["-KILL", &format!("-{}", child.id())])
         .status();
     let _ = child.kill();
@@ -485,6 +508,29 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "the backgrounded descendant blocked the reader join for {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Security-review finding (2026-07-25): the group kill is best-effort against the
+    /// untrusted candidate code the bench runs — the seatbelt profile allows fork/exec, so
+    /// a descendant that calls `setpgid(0,0)` leaves the group we signal while still holding
+    /// the inherited pipe. Joining its reader hung the whole harness. Collection is now
+    /// deadline-bounded, so even a deliberately escaping descendant cannot stall the run.
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_that_escapes_the_process_group_cannot_stall_the_run() {
+        let mut cmd = Command::new("sh");
+        // setsid detaches into its own session+group, so `kill -<pgid>` never reaches it;
+        // it holds stdout for 30s. The direct child exits immediately.
+        cmd.arg("-c")
+            .arg("(setsid sleep 30 || setsid sleep 30 &) >/dev/null 2>&1; sleep 30 & exit 0");
+        let start = Instant::now();
+        let result = run_with_timeout(cmd, Duration::from_secs(20)).unwrap();
+        assert!(result.is_some(), "the direct child exited normally");
+        assert!(
+            start.elapsed() < DRAIN_GRACE + Duration::from_secs(3),
+            "an escaped descendant stalled collection for {:?}",
             start.elapsed()
         );
     }

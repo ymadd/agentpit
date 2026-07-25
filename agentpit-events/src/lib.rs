@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -523,6 +523,14 @@ fn run_id_of(line: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// True when `path` is still exactly `snapshot_len` bytes — i.e. nothing was appended
+/// since the snapshot compaction is about to publish was taken. Compaction is unlocked by
+/// design (every emit is a bare append), so this is what stands between a slow compaction
+/// and silently deleting another process's events at rename time.
+fn log_unchanged(path: &Path, snapshot_len: u64) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.len() == snapshot_len)
+}
+
 /// Rewrite `events.jsonl` keeping only the newest `keep_runs` runs' lines once the file
 /// crosses `max_bytes`. Bounds the log a long-lived setup would otherwise grow forever.
 /// Writes via a temp file + atomic rename so a concurrent reader never sees a half file;
@@ -572,11 +580,21 @@ fn compact_events_log(max_bytes: u64, keep_runs: usize) {
     }
 
     // Pid in the temp name: two agentpit processes can start (and compact) concurrently, and
-    // a shared temp path would let them clobber each other's half-written snapshot before the
-    // rename. The rename itself stays atomic per process; last writer wins, which is fine —
-    // both snapshots are valid compactions of the same log.
+    // a shared temp path would let them clobber each other's half-written snapshot before
+    // the rename.
     let tmp = path.with_extension(format!("jsonl.compact.{}", process::id()));
-    if fs::write(&tmp, out).is_ok() {
+    if fs::write(&tmp, out).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+
+    // Renaming a snapshot of a log that has grown since we read it would delete whatever
+    // was appended in between — another process's events, silently. A unique temp name does
+    // not help with that: the loss happens at the rename, not in the temp file. There is no
+    // lock here (every emit is a bare append by design), so instead we only publish while
+    // the log is byte-for-byte the length we snapshotted; if anything appended, we drop this
+    // compaction and let a later run redo it against the newer file.
+    if log_unchanged(&path, meta.len()) {
         let _ = fs::rename(&tmp, &path);
     } else {
         let _ = fs::remove_file(&tmp);
@@ -1199,6 +1217,35 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
         }
+    }
+
+    /// Review finding (2026-07-25): compaction reads a snapshot and then renames over the
+    /// log, so anything another process appended in between was deleted by that rename — a
+    /// unique temp name does not help, because the loss happens at the rename, not in the
+    /// temp file. [`log_unchanged`] is the gate that stops it: the rename only proceeds
+    /// while the log is still the snapshot's length.
+    ///
+    /// (The race itself cannot be staged from a single-threaded test — `compact_events_log`
+    /// reads, writes and renames in one call — so the gate is tested directly.)
+    #[test]
+    fn compaction_publishes_only_while_the_log_is_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("events.jsonl");
+        fs::write(&log, "line one\n").unwrap();
+        let snapshot_len = fs::metadata(&log).unwrap().len();
+
+        assert!(log_unchanged(&log, snapshot_len), "nothing appended yet");
+
+        // A concurrent emit lands after the snapshot was taken.
+        fs::write(&log, "line one\nline two\n").unwrap();
+        assert!(
+            !log_unchanged(&log, snapshot_len),
+            "a grown log must block the rename that would delete the new line"
+        );
+
+        // A vanished log is not 'unchanged' either — nothing to publish over.
+        fs::remove_file(&log).unwrap();
+        assert!(!log_unchanged(&log, snapshot_len));
     }
 
     #[test]

@@ -349,8 +349,11 @@ pub struct HubConfig {
     pub cascade: CascadeSection,
 }
 
+/// Used for both `default.backend` and `auto_route.long_context_backend`. Claude since
+/// 2026-07-26: antigravity's individual tier hits week-long quota blocks, which makes it a
+/// poor default for exactly the dispatches that have nowhere else to go.
 fn default_backend() -> BackendId {
-    BackendId::Antigravity
+    BackendId::Claude
 }
 fn default_review_backend() -> BackendId {
     BackendId::Claude
@@ -549,10 +552,10 @@ pub fn load_config(override_path: Option<&Path>) -> Result<LoadedConfig> {
 }
 
 pub const DEFAULT_CONFIG_TOML: &str = r#"# agentpit config
-# Backends currently available: antigravity (agy), gemini, claude, codex (paid plan), opencode
+# Backends currently available: antigravity (agy), claude, codex (paid plan), opencode
 
 [default]
-backend = "antigravity"
+backend = "claude"
 auto_route = true
 
 # [routes] — OPTIONAL hard pins, one per tool. An entry here wins over auto_route
@@ -565,7 +568,7 @@ auto_route = true
 
 [auto_route]
 long_context_threshold = 100000
-long_context_backend   = "antigravity"
+long_context_backend   = "claude"
 review_keywords        = ["review", "audit", "critique", "security"]
 review_backend         = "claude"
 
@@ -581,7 +584,7 @@ review_members = ["antigravity", "opencode"]
 # [workflow]
 # Model-driven workflow: a manager backend (claude|codex) orchestrates sub-agents.
 # manager_backend       = "claude"   # unset: first authenticated manager; supported [default], then claude/codex
-# default_agents        = ["gemini", "opencode", "codex"]  # defaults to all available minus the manager
+# default_agents        = ["antigravity", "opencode", "codex"]  # defaults to all available minus the manager
 # max_depth             = 3          # hard recursion ceiling, enforced in Rust; clamped to 1..=32
 # max_calls_per_manager = 8          # advisory sub-dispatch budget surfaced in the prompt
 # use_mcp               = false      # orchestrate via the MCP channel (claude manager only); --use-mcp overrides
@@ -632,7 +635,7 @@ mod tests {
         let path = dir.path().join("absent.toml");
         let loaded = load_config(Some(&path)).unwrap();
         assert_eq!(loaded.source, ConfigSource::Defaults);
-        assert_eq!(loaded.config.default.backend, BackendId::Antigravity);
+        assert_eq!(loaded.config.default.backend, BackendId::Claude);
         assert_eq!(
             loaded.config.ensemble.review_members,
             vec![BackendId::Antigravity, BackendId::Opencode]

@@ -228,7 +228,7 @@ impl Router {
                 .iter()
                 .next()
                 .copied()
-                .unwrap_or(BackendId::Antigravity)
+                .unwrap_or(BackendId::Claude)
         };
         RouteDecision {
             backend: final_backend,

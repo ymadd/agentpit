@@ -156,7 +156,7 @@ desktop Settings screen, run `agentpit config` for the terminal editor, or edit 
 
 ```toml
 [default]
-backend = "antigravity"
+backend = "claude"
 auto_route = true
 
 # [routes] is optional and empty by default. An entry here is a HARD PIN that wins over
@@ -167,7 +167,7 @@ auto_route = true
 
 [auto_route]
 long_context_threshold = 100000
-long_context_backend   = "antigravity"
+long_context_backend   = "claude"
 review_keywords        = ["review", "audit", "critique", "security"]
 review_backend         = "claude"
 

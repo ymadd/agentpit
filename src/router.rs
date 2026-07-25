@@ -285,20 +285,20 @@ mod tests {
 
     fn base_config() -> HubConfig {
         let mut routes = BTreeMap::new();
-        routes.insert(RouteKey::Rescue, BackendId::Gemini);
+        routes.insert(RouteKey::Rescue, BackendId::Opencode);
         routes.insert(RouteKey::Review, BackendId::Claude);
-        routes.insert(RouteKey::Explain, BackendId::Gemini);
+        routes.insert(RouteKey::Explain, BackendId::Opencode);
         routes.insert(RouteKey::Refactor, BackendId::Claude);
         HubConfig {
             default: DefaultSection {
-                backend: BackendId::Gemini,
+                backend: BackendId::Opencode,
                 auto_route: true,
                 cascade: false,
             },
             routes,
             auto_route: AutoRouteSection {
                 long_context_threshold: 100,
-                long_context_backend: BackendId::Gemini,
+                long_context_backend: BackendId::Opencode,
                 review_keywords: vec!["audit".into(), "review".into()],
                 review_backend: BackendId::Claude,
                 quality_margin: 5,
@@ -313,7 +313,7 @@ mod tests {
 
     fn available() -> HashSet<BackendId> {
         let mut s = HashSet::new();
-        s.insert(BackendId::Gemini);
+        s.insert(BackendId::Opencode);
         s.insert(BackendId::Claude);
         s.insert(BackendId::Opencode);
         s
@@ -334,14 +334,14 @@ mod tests {
     #[test]
     fn ignores_explicit_when_unavailable() {
         let mut only_gemini = HashSet::new();
-        only_gemini.insert(BackendId::Gemini);
+        only_gemini.insert(BackendId::Opencode);
         let r = Router::new(base_config(), only_gemini, ProfileSet::default());
         let d = r.resolve(&RouteRequest {
             tool: RouteKey::Rescue,
             explicit_backend: Some(BackendId::Claude),
             task: Some("x"),
         });
-        assert_eq!(d.backend, BackendId::Gemini);
+        assert_eq!(d.backend, BackendId::Opencode);
         assert_eq!(d.reason, RouteReason::RouteTable);
     }
 
@@ -368,7 +368,7 @@ mod tests {
             explicit_backend: None,
             task: Some(&long),
         });
-        assert_eq!(d.backend, BackendId::Gemini);
+        assert_eq!(d.backend, BackendId::Opencode);
         assert_eq!(d.reason, RouteReason::AutoLongContext);
     }
 
@@ -428,7 +428,7 @@ mod tests {
 
     fn available_with_codex() -> HashSet<BackendId> {
         let mut s = HashSet::new();
-        s.insert(BackendId::Gemini);
+        s.insert(BackendId::Opencode);
         s.insert(BackendId::Claude);
         s.insert(BackendId::Codex);
         s
@@ -443,7 +443,7 @@ mod tests {
         let profiles = ProfileSet::from_profiles([
             profile_with(BackendId::Claude, TaskCategory::Coding, 70),
             profile_with(BackendId::Codex, TaskCategory::Coding, 90),
-            profile_with(BackendId::Gemini, TaskCategory::Coding, 80),
+            profile_with(BackendId::Opencode, TaskCategory::Coding, 80),
         ]);
         let r = Router::new(cfg, available_with_codex(), profiles);
 
@@ -474,7 +474,7 @@ mod tests {
         let profiles = ProfileSet::from_profiles([
             profile_with(BackendId::Claude, TaskCategory::Coding, 70),
             profile_with(BackendId::Codex, TaskCategory::Coding, 90),
-            profile_with(BackendId::Gemini, TaskCategory::Coding, 80),
+            profile_with(BackendId::Opencode, TaskCategory::Coding, 80),
         ]);
         let r = Router::new(cfg, available(), profiles); // available() has no Codex
 
@@ -484,7 +484,7 @@ mod tests {
             task: Some("implement a function to parse the duration feature"),
         });
 
-        assert_eq!(d.backend, BackendId::Gemini);
+        assert_eq!(d.backend, BackendId::Opencode);
         assert_eq!(
             d.reason,
             RouteReason::Profile {
@@ -506,7 +506,7 @@ mod tests {
         // nearly free; Claude is also cheap but out of margin (70).
         for (backend, cost) in [
             (BackendId::Codex, 80u8),
-            (BackendId::Gemini, 5),
+            (BackendId::Opencode, 5),
             (BackendId::Claude, 5),
         ] {
             cfg.backends.insert(
@@ -520,7 +520,7 @@ mod tests {
         let profiles = ProfileSet::from_profiles([
             profile_with(BackendId::Claude, TaskCategory::Coding, 70),
             profile_with(BackendId::Codex, TaskCategory::Coding, 90),
-            profile_with(BackendId::Gemini, TaskCategory::Coding, 88),
+            profile_with(BackendId::Opencode, TaskCategory::Coding, 88),
         ]);
         let r = Router::new(cfg.clone(), available_with_codex(), profiles.clone());
 
@@ -529,7 +529,7 @@ mod tests {
             explicit_backend: None,
             task: Some("implement a function to parse the duration feature"),
         });
-        assert_eq!(d.backend, BackendId::Gemini);
+        assert_eq!(d.backend, BackendId::Opencode);
         assert_eq!(
             d.reason,
             RouteReason::Profile {
@@ -560,7 +560,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.routes.clear();
         cfg.backends.insert(
-            BackendId::Gemini,
+            BackendId::Opencode,
             BackendOverride {
                 cost: Some(0),
                 ..BackendOverride::default()
@@ -569,7 +569,7 @@ mod tests {
         // Codex has no configured cost → mid-range 50; equal score → free Gemini wins.
         let profiles = ProfileSet::from_profiles([
             profile_with(BackendId::Codex, TaskCategory::Coding, 90),
-            profile_with(BackendId::Gemini, TaskCategory::Coding, 90),
+            profile_with(BackendId::Opencode, TaskCategory::Coding, 90),
         ]);
         let r = Router::new(cfg, available_with_codex(), profiles);
         let d = r.resolve(&RouteRequest {
@@ -577,7 +577,7 @@ mod tests {
             explicit_backend: None,
             task: Some("implement a function to parse the duration feature"),
         });
-        assert_eq!(d.backend, BackendId::Gemini);
+        assert_eq!(d.backend, BackendId::Opencode);
     }
 
     #[test]

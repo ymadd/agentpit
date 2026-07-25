@@ -376,14 +376,14 @@ mod tests {
     fn render_includes_both_legs_and_the_adjudication_instruction() {
         let bundle = RefuteBundle {
             critic: BackendId::Codex,
-            defender: BackendId::Gemini,
+            defender: BackendId::Codex,
             critique: Ok("the flaw is X".into()),
             defense: Some(Ok("X is wrong because Y; revised: Z".into())),
         };
         let text = render_refute(&bundle);
         assert!(text.contains("CRITIQUE [codex]"));
         assert!(text.contains("the flaw is X"));
-        assert!(text.contains("DEFENSE [gemini]"));
+        assert!(text.contains("DEFENSE [codex]"));
         assert!(text.contains("revised: Z"));
         assert!(text.contains("ADJUDICATION"));
         assert!(text.contains("ADOPT"));
@@ -394,7 +394,7 @@ mod tests {
     fn render_explains_a_skipped_defense_when_the_critique_failed() {
         let bundle = RefuteBundle {
             critic: BackendId::Codex,
-            defender: BackendId::Gemini,
+            defender: BackendId::Codex,
             critique: Err("codex: not authenticated".into()),
             defense: None,
         };
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn pick_prefers_the_preferred_order_and_respects_skip() {
-        let available = set(&[BackendId::Codex, BackendId::Antigravity, BackendId::Gemini]);
+        let available = set(&[BackendId::Codex, BackendId::Antigravity, BackendId::Codex]);
         let preferred = [BackendId::Codex, BackendId::Antigravity];
         assert_eq!(pick(&available, &preferred, None), Some(BackendId::Codex));
         assert_eq!(
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn pick_falls_back_deterministically_when_preferred_is_exhausted() {
-        let available = set(&[BackendId::Gemini, BackendId::Opencode]);
+        let available = set(&[BackendId::Codex, BackendId::Opencode]);
         let preferred = [BackendId::Codex, BackendId::Antigravity];
         // Neither preferred is available → the sorted-available fallback is deterministic.
         let first = pick(&available, &preferred, None);
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn resolve_pair_defaults_to_distinct_preferred_backends() {
-        let available = set(&[BackendId::Codex, BackendId::Antigravity, BackendId::Gemini]);
+        let available = set(&[BackendId::Codex, BackendId::Antigravity, BackendId::Codex]);
         let preferred = [BackendId::Codex, BackendId::Antigravity];
         let (critic, defender) = resolve_pair(None, None, &available, &preferred).unwrap();
         assert_eq!(critic, BackendId::Codex);
@@ -458,16 +458,16 @@ mod tests {
 
     #[test]
     fn resolve_pair_honors_explicit_choices() {
-        let available = set(&[BackendId::Codex, BackendId::Gemini]);
+        let available = set(&[BackendId::Codex, BackendId::Codex]);
         let preferred = [BackendId::Codex];
         let (critic, defender) = resolve_pair(
-            Some(BackendId::Gemini),
+            Some(BackendId::Codex),
             Some(BackendId::Codex),
             &available,
             &preferred,
         )
         .unwrap();
-        assert_eq!(critic, BackendId::Gemini);
+        assert_eq!(critic, BackendId::Codex);
         assert_eq!(defender, BackendId::Codex);
     }
 
@@ -475,8 +475,8 @@ mod tests {
     fn resolve_pair_rejects_an_unavailable_explicit_backend() {
         let available = set(&[BackendId::Codex]);
         let preferred = [BackendId::Codex];
-        assert!(resolve_pair(Some(BackendId::Gemini), None, &available, &preferred).is_err());
-        assert!(resolve_pair(None, Some(BackendId::Gemini), &available, &preferred).is_err());
+        assert!(resolve_pair(Some(BackendId::Antigravity), None, &available, &preferred).is_err());
+        assert!(resolve_pair(None, Some(BackendId::Antigravity), &available, &preferred).is_err());
     }
 
     #[test]

@@ -4,7 +4,6 @@
 export const MODEL = {
   claude: { mono: "C", color: "#d98a6b" },
   codex: { mono: "co", color: "#56b89a" },
-  gemini: { mono: "G", color: "#6f8fd9" },
   antigravity: { mono: "ag", color: "#c9a227" },
   opencode: { mono: "oc", color: "#7c5cff" },
   goose: { mono: "go", color: "#a7adba" },
@@ -15,7 +14,6 @@ export const CLI_NAME = {
   claude: "Claude Code",
   codex: "Codex",
   antigravity: "Antigravity",
-  gemini: "Gemini CLI",
   opencode: "OpenCode",
 };
 

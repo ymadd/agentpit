@@ -176,7 +176,7 @@ function RoutingPanel({ draft, change }) {
 }
 
 function BackendsPanel({ draft, change }) {
-  const defaults = { antigravity: "exec", gemini: "exec", claude: "exec", codex: "exec", opencode: "acp" };
+  const defaults = { antigravity: "exec", claude: "exec", codex: "exec", opencode: "acp" };
   return (
     <div className="set-page">
       <SectionIntro eyebrow="AGENT CLIs" title="バックエンド" copy="CLIごとの接続方式と既定モデルを設定します。ロールやコマンドの --model はここより優先されます。" command="[backends.*]" />

@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { draftFromSettings, validate, roleNameError, typeNameError, buildPayload, newRole, newType, DEFAULT_MAX_DEPTH } from "./settings.js";
 
 const raw = {
-  known_backends: ["claude", "codex", "gemini"],
-  backend_models: { claude: "claude-fable-5", codex: null, gemini: "gemini-3-pro" },
+  known_backends: ["claude", "codex", "antigravity"],
+  backend_models: { claude: "claude-fable-5", codex: null, antigravity: "gemini-3-pro" },
   workflow: { manager_backend: "claude", max_depth: 4, max_calls_per_manager: 10, use_mcp: true, enable_ask_human: false },
   roles: [{ name: "coder", backends: ["codex"], prompt: "be precise", model: "gpt-5-codex" }],
   types: [{ name: "review", title: "Review", roles: ["coder"], max_depth: 2 }],

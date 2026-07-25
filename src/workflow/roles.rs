@@ -227,8 +227,12 @@ mod tests {
             Some("strict"),
         )]);
         // Codex unavailable → antigravity wins.
-        let resolved =
-            resolve_role("reviewer", &r, &[BackendId::Antigravity, BackendId::Gemini]).unwrap();
+        let resolved = resolve_role(
+            "reviewer",
+            &r,
+            &[BackendId::Antigravity, BackendId::Opencode],
+        )
+        .unwrap();
         assert_eq!(resolved.backend, BackendId::Antigravity);
         assert_eq!(resolved.prompt.as_deref(), Some("strict"));
         // Both available → preference order wins over availability order.
@@ -240,8 +244,18 @@ mod tests {
     #[test]
     fn empty_backend_list_falls_back_to_sorted_available() {
         let r = roles(&[("researcher", &[], None)]);
-        let a = resolve_role("researcher", &r, &[BackendId::Opencode, BackendId::Gemini]).unwrap();
-        let b = resolve_role("researcher", &r, &[BackendId::Gemini, BackendId::Opencode]).unwrap();
+        let a = resolve_role(
+            "researcher",
+            &r,
+            &[BackendId::Opencode, BackendId::Opencode],
+        )
+        .unwrap();
+        let b = resolve_role(
+            "researcher",
+            &r,
+            &[BackendId::Opencode, BackendId::Opencode],
+        )
+        .unwrap();
         // Deterministic regardless of the available set's order.
         assert_eq!(a.backend, b.backend);
     }
@@ -291,7 +305,7 @@ mod tests {
     #[test]
     fn no_available_backend_for_a_role_is_a_hard_error() {
         let r = roles(&[("reviewer", &[BackendId::Codex], None)]);
-        let err = resolve_role("reviewer", &r, &[BackendId::Gemini])
+        let err = resolve_role("reviewer", &r, &[BackendId::Opencode])
             .unwrap_err()
             .to_string();
         assert!(err.contains("codex"));
@@ -310,7 +324,7 @@ mod tests {
     fn manager_role_picks_first_supported_backend() {
         let r = roles(&[(
             MANAGER_ROLE,
-            &[BackendId::Gemini, BackendId::Codex],
+            &[BackendId::Opencode, BackendId::Codex],
             Some("plan tightly"),
         )]);
         // Gemini cannot manage → codex wins.
@@ -323,9 +337,9 @@ mod tests {
 
     #[test]
     fn manager_role_with_no_supported_backend_errors() {
-        let r = roles(&[(MANAGER_ROLE, &[BackendId::Gemini], None)]);
+        let r = roles(&[(MANAGER_ROLE, &[BackendId::Opencode], None)]);
         let err = resolve_manager(&r, |_| false).unwrap_err().to_string();
-        assert!(err.contains("gemini"));
+        assert!(err.contains("opencode"));
         assert!(err.contains("supported: claude, codex"));
     }
 

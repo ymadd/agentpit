@@ -6,7 +6,7 @@
 
 ## 0. ビジョンと4本柱
 
-異なるバックエンド（claude/codex/gemini/antigravity(agy)/opencode）は得意分野が違う。
+異なるバックエンド（claude/codex/antigravity(agy)/opencode）は得意分野が違う。
 agentpit を「能力プロファイルに基づき、タスクに適任のエージェント（群れ）を動的に割り当て、
 群れ同士が引き継ぎ・反証しながら協働するハブ」にする。
 
@@ -99,7 +99,7 @@ src/diagnose/{mod,features,heuristic,llm}.rs     src/cli/{profile,diagnose}.rs
 
 ## 2. gold ベンチ課題集
 
-アンサンブル（claude/codex/antigravity/gemini ＋ claude統合）で確定。
+アンサンブル（claude/codex/antigravity ＋ claude統合）で確定。
 LLM-as-judge の主観を、可能な所は**機械判定**で置換する。
 
 ### 2.1 共通機械判定インフラ
@@ -278,7 +278,7 @@ MCP:  mcp__agentpit__dispatch_task {"role":"<name>","task":"<sub-task>"}
 
 ### 4.2 決定的制約
 
-exec backend（claude/codex/gemini/agy）は結果を返すと**プロセス終了**（`dispatch.rs:78`
+exec backend（claude/codex/agy）は結果を返すと**プロセス終了**（`dispatch.rs:78`
 「ACP transport is wired only for opencode」）。生きた双方向チャットは両端の生存が必要で、
 常駐セッションは現状 opencode の ACP のみ。→ 生きた peer-to-peer は構造的に不可。
 

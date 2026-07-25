@@ -212,7 +212,7 @@ mod tests {
             BackendId::Claude,
             BackendId::Codex,
             BackendId::Antigravity,
-            BackendId::Gemini,
+            BackendId::Opencode,
             BackendId::Opencode,
         ]
         .into_iter()
@@ -270,7 +270,7 @@ mod tests {
     fn low_confidence_task_falls_back_to_default() {
         let report = build_report(
             "alpha beta gamma",
-            &auto_route_config(BackendId::Gemini),
+            &auto_route_config(BackendId::Opencode),
             &all_seeded_available(),
             seeded_profiles(),
         );
@@ -278,7 +278,7 @@ mod tests {
         assert!(report.diagnosis.confidence < LLM_ASSIST_CONFIDENCE_THRESHOLD);
         assert_eq!(report.routing.reason, "default");
         assert!(!report.routing.from_profile);
-        assert_eq!(report.routing.backend, BackendId::Gemini);
+        assert_eq!(report.routing.backend, BackendId::Opencode);
         assert_eq!(report.routing.score, None);
     }
 

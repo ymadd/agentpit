@@ -288,7 +288,7 @@ mod tests {
         let task = refute_task("```python\ndef f():\n    return 1\n```\n");
         let bundle = RefuteBundle {
             critic: BackendId::Codex,
-            defender: BackendId::Gemini,
+            defender: BackendId::Opencode,
             critique: Ok("returns 1, should return 2".to_string()),
             defense: Some(Ok(
                 "I concede the critique.\n\n```python\ndef f():\n    return 2\n```\n".to_string(),
@@ -307,7 +307,7 @@ mod tests {
         let task = refute_task("```python\ndef f():\n    return 1\n```\n");
         let bundle = RefuteBundle {
             critic: BackendId::Codex,
-            defender: BackendId::Gemini,
+            defender: BackendId::Opencode,
             critique: Err("codex: not authenticated".to_string()),
             defense: None,
         };
@@ -336,7 +336,7 @@ mod tests {
             // refute_tasks.rs). This test only proves the plumbing doesn't panic on real data.
             let bundle = RefuteBundle {
                 critic: BackendId::Codex,
-                defender: BackendId::Gemini,
+                defender: BackendId::Opencode,
                 critique: Ok("a critique".to_string()),
                 defense: Some(Ok(format!("```python\n{fixed}\n```\n"))),
             };

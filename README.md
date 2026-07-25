@@ -1,6 +1,6 @@
 # agentpit
 
-Single-binary CLI that routes coding tasks across **Gemini**, **Antigravity (agy)**, **Claude Code**, **Codex**, and **OpenCode** — pick the best agent per task, fan out to several in parallel, or let `agentpit` choose for you.
+Single-binary CLI that routes coding tasks across **Antigravity (agy)**, **Claude Code**, **Codex**, and **OpenCode** — pick the best agent per task, fan out to several in parallel, or let `agentpit` choose for you.
 
 ![agentpit Workflow Studio — cast each agent into a role and orchestrate a model-driven workflow](assets/dashboard-studio.png)
 
@@ -8,11 +8,11 @@ Single-binary CLI that routes coding tasks across **Gemini**, **Antigravity (agy
 
 ## Why
 
-Different coding agents are good at different things: long-context reads on Gemini, refactors on Claude, adversarial review on Codex, free local models on OpenCode. `agentpit` is the dispatcher in front of them so you never have to remember which CLI to open.
+Different coding agents are good at different things: long-context reads on Antigravity, refactors on Claude, adversarial review on Codex, free local models on OpenCode. `agentpit` is the dispatcher in front of them so you never have to remember which CLI to open.
 
 - **One binary, many backends** — Rust, no runtime
 - **One-shot dispatch** — `agentpit rescue "task"` picks a backend by your routing rules
-- **Ensembles** — `agentpit review <target>` runs Gemini + OpenCode in parallel (configurable) and optionally synthesizes
+- **Ensembles** — `agentpit review <target>` runs Codex + OpenCode in parallel (configurable) and optionally synthesizes
 - **Model-driven workflows** — a manager backend decomposes a goal and dispatches sub-tasks to configured **roles** (the cast), then synthesizes
 - **Named workflows** — `agentpit workflow <type> "goal"` runs a saved preset; `workflow list` shows what's configured; `workflow new "<description>"` generates one for you
 - **Per-agent models** — pin a model per role or backend (`--model`, `[workflow.roles.<name>].model`, `[backends.<id>].model`), flowing through both one-shot and workflows
@@ -67,7 +67,6 @@ agentpit init --scope user
 
 | Backend | CLI on PATH | Default transport | Auth check |
 |---|---|---|---|
-| `gemini` | `gemini` | exec | `~/.gemini/oauth_creds.json` |
 | `antigravity` (alias `agy`) | `agy` | exec | `~/.gemini/oauth_creds.json` (shared with Gemini CLI) |
 | `claude` | `claude` | exec | `~/.claude.json` |
 | `codex` | `codex` | exec | `codex login status` |
@@ -76,7 +75,7 @@ agentpit init --scope user
 Each backend's transport (`exec` per-request or `acp` persistent session) can be overridden in `config.toml`.
 
 Backend output is streamed to the terminal and dashboard without exposing provider-specific
-framing. Claude Code (`stream-json` partial messages), Gemini CLI (`stream-json` message events),
+framing. Claude Code (`stream-json` partial messages),
 and Codex (`exec --json`) are decoded into clean text plus live tool progress; OpenCode already
 streams text through ACP. Antigravity currently has no documented structured stream, so its
 `--print` stdout remains a best-effort byte stream. Aggregators receive only the decoded answer —
@@ -84,7 +83,6 @@ never JSONL or progress lines.
 
 ### Installing the backends
 
-- **Gemini CLI** — `npm i -g @google/gemini-cli` (deprecated June 18 2026)
 - **Antigravity CLI** — `curl -fsSL https://antigravity.google/cli/install.sh | bash` (Gemini CLI's successor; Go binary)
 - **Claude Code** — install per [Anthropic docs](https://docs.claude.com/claude-code)
 - **Codex** — `npm i -g @openai/codex`
@@ -181,7 +179,7 @@ review_members  = ["antigravity", "opencode"]
 # review_aggregator = "claude"
 
 # Per-tool ensembles (split prompts across multiple backends)
-# rescue_members   = ["antigravity", "gemini"]
+# rescue_members   = ["antigravity", "codex"]
 # refactor_members = ["claude", "antigravity"]
 
 # Per-backend transport override
@@ -203,22 +201,20 @@ agentpit config ensemble review              # edit members + aggregator
 
 ## Antigravity (agy) — Gemini CLI's successor
 
-Google announced Antigravity 2.0 at I/O 2026; **Gemini CLI free / Pro / Ultra tiers stop serving requests on 2026-06-18** and migrate to `agy`. `agentpit` ships first-class support for `agy` as a backend so you can roll forward without changing your slash commands.
-
-Pass either name on the CLI: `--backend antigravity` or `--backend agy` (both resolve to `BackendId::Antigravity`).
+Google announced Antigravity 2.0 at I/O 2026; **Gemini CLI free / Pro / Ultra tiers stopped serving requests on 2026-06-18** and migrated to `agy`. The `gemini` backend was removed in v0.1.34 — its client now returns `IneligibleTierError` for individual plans. Use `agy` instead; both `--backend antigravity` and `--backend agy` resolve to it.
 
 ```bash
-# Migrate Gemini CLI plugins into Antigravity
+# Migrate Gemini CLI plugins into Antigravity (if you used it before)
 agy plugin import gemini
 
-# Route Gemini-shaped tasks to agy globally
+# Route long-context work to agy globally
 agentpit config route rescue --backend antigravity
 agentpit config route explain --backend antigravity
 ```
 
 Notes:
 
-- Exec spec defaults to `agy --dangerously-skip-permissions --print <task>`. **`--dangerously-skip-permissions` skips per-action approval prompts**, so `agy` can edit / delete files without confirmation. Same stance as the Gemini exec spec — drop the flag in `src/exec/antigravity.rs` if you want explicit confirmation.
+- Exec spec defaults to `agy --dangerously-skip-permissions --print <task>`. **`--dangerously-skip-permissions` skips per-action approval prompts**, so `agy` can edit / delete files without confirmation. Drop the flag in `src/exec/antigravity.rs` if you want explicit confirmation.
 - If `agy`'s non-interactive flag changes, edit the same file.
 - ACP transport is **not yet wired** for `agy` — once Google publishes an `--acp` mode equivalent we'll add it.
 - Auth is OAuth on first run of `agy`. For headless boxes use `agy auth login`.

@@ -160,9 +160,10 @@ mod tests {
 
     #[test]
     fn formats_message_with_launch_hint() {
-        let msg = format_auth_failure_message(BackendId::Gemini, "gemini", Some("Opened Terminal"));
-        assert!(msg.contains("[gemini]"));
-        assert!(msg.contains("gemini"));
+        let msg =
+            format_auth_failure_message(BackendId::Opencode, "opencode", Some("Opened Terminal"));
+        assert!(msg.contains("[opencode]"));
+        assert!(msg.contains("opencode"));
         assert!(msg.contains("Opened Terminal"));
     }
 }

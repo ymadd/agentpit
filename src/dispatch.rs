@@ -11,13 +11,11 @@ use crate::acp::{AcpAdapter, opencode::OpencodeAdapter};
 use crate::auth::is_auth_failure_outcome;
 use crate::config::HubConfig;
 use crate::exec::{
-    ExecAdapter, ExecRunOptions, antigravity::AntigravityExec, claude::ClaudeExec,
-    codex::CodexExec, gemini::GeminiExec,
+    ExecAdapter, ExecRunOptions, antigravity::AntigravityExec, claude::ClaudeExec, codex::CodexExec,
 };
 use crate::types::{BackendId, Transport};
 
 const DEFAULT_TRANSPORTS: &[(BackendId, Transport)] = &[
-    (BackendId::Gemini, Transport::Exec),
     (BackendId::Antigravity, Transport::Exec),
     (BackendId::Claude, Transport::Exec),
     (BackendId::Codex, Transport::Exec),
@@ -60,9 +58,6 @@ pub fn build_registries(config: &HubConfig) -> Registries {
             .unwrap_or(*default_transport);
 
         match (backend, transport) {
-            (BackendId::Gemini, Transport::Exec) => {
-                execs.insert(BackendId::Gemini, Box::new(GeminiExec));
-            }
             (BackendId::Antigravity, Transport::Exec) => {
                 execs.insert(BackendId::Antigravity, Box::new(AntigravityExec));
             }
@@ -198,7 +193,7 @@ mod tests {
     struct DummyExec;
     impl ExecAdapter for DummyExec {
         fn id(&self) -> BackendId {
-            BackendId::Gemini
+            BackendId::Opencode
         }
         fn build_spec(&self, _task: &str, _model: Option<&str>) -> ExecSpec {
             ExecSpec {
@@ -227,7 +222,7 @@ mod tests {
             execs: HashMap::new(),
             acps: HashMap::new(),
         };
-        r.execs.insert(BackendId::Gemini, Box::new(DummyExec));
+        r.execs.insert(BackendId::Opencode, Box::new(DummyExec));
         r
     }
 
@@ -245,12 +240,12 @@ mod tests {
             execs: HashMap::new(),
             acps: HashMap::new(),
         };
-        r.execs.insert(BackendId::Gemini, Box::new(DummyExec));
+        r.execs.insert(BackendId::Opencode, Box::new(DummyExec));
         // Inject an acp for gemini to test preference.
         struct GeminiAcp;
         impl AcpAdapter for GeminiAcp {
             fn id(&self) -> BackendId {
-                BackendId::Gemini
+                BackendId::Opencode
             }
             fn spawn_spec(&self, _model: Option<&str>) -> crate::acp::SpawnSpec {
                 crate::acp::SpawnSpec {
@@ -258,7 +253,7 @@ mod tests {
                 }
             }
         }
-        r.acps.insert(BackendId::Gemini, Box::new(GeminiAcp));
+        r.acps.insert(BackendId::Opencode, Box::new(GeminiAcp));
         r
     }
 
@@ -266,7 +261,7 @@ mod tests {
     fn returns_exec_when_only_exec_registered() {
         let r = regs_exec_only();
         assert_eq!(
-            resolve_transport(BackendId::Gemini, &r),
+            resolve_transport(BackendId::Opencode, &r),
             Some(Transport::Exec)
         );
     }
@@ -284,7 +279,7 @@ mod tests {
     fn prefers_exec_when_both_registered() {
         let r = regs_both_for_gemini();
         assert_eq!(
-            resolve_transport(BackendId::Gemini, &r),
+            resolve_transport(BackendId::Opencode, &r),
             Some(Transport::Exec)
         );
     }

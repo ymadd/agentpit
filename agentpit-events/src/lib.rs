@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize};
 pub enum BackendId {
     Claude,
     Codex,
-    Gemini,
     Antigravity,
     Opencode,
     Goose,
@@ -43,7 +42,6 @@ impl BackendId {
     pub const ALL: &'static [BackendId] = &[
         BackendId::Claude,
         BackendId::Codex,
-        BackendId::Gemini,
         BackendId::Antigravity,
         BackendId::Opencode,
         BackendId::Goose,
@@ -54,7 +52,6 @@ impl BackendId {
         match self {
             BackendId::Claude => "claude",
             BackendId::Codex => "codex",
-            BackendId::Gemini => "gemini",
             BackendId::Antigravity => "antigravity",
             BackendId::Opencode => "opencode",
             BackendId::Goose => "goose",
@@ -76,7 +73,6 @@ impl FromStr for BackendId {
         match s.to_ascii_lowercase().as_str() {
             "claude" => Ok(BackendId::Claude),
             "codex" => Ok(BackendId::Codex),
-            "gemini" => Ok(BackendId::Gemini),
             "antigravity" | "agy" => Ok(BackendId::Antigravity),
             "opencode" => Ok(BackendId::Opencode),
             "goose" => Ok(BackendId::Goose),
@@ -888,7 +884,10 @@ mod tests {
 
     #[test]
     fn parses_known_backends() {
-        assert_eq!("gemini".parse::<BackendId>().unwrap(), BackendId::Gemini);
+        assert_eq!(
+            "opencode".parse::<BackendId>().unwrap(),
+            BackendId::Opencode
+        );
         assert_eq!("AGY".parse::<BackendId>().unwrap(), BackendId::Antigravity);
     }
 
@@ -914,7 +913,7 @@ mod tests {
         let ev = Event::MemberFinished {
             ts: 123,
             run_id: "1-0".into(),
-            backend: BackendId::Gemini,
+            backend: BackendId::Opencode,
             aggregator: false,
             status: LegStatus::Ok,
             elapsed_ms: 3200,
@@ -923,7 +922,7 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"event\":\"member_finished\""));
-        assert!(json.contains("\"backend\":\"gemini\""));
+        assert!(json.contains("\"backend\":\"opencode\""));
         assert!(json.contains("\"status\":\"ok\""));
         let back: Event = serde_json::from_str(&json).unwrap();
         match back {
@@ -1070,9 +1069,9 @@ mod tests {
         unsafe {
             std::env::set_var("XDG_STATE_HOME", tmp.path());
         }
-        let logger = RunLogger::start(RunKind::Rescue, &[BackendId::Gemini], tmp.path());
-        logger.member_started(BackendId::Gemini, false);
-        logger.member_finished(BackendId::Gemini, false, LegStatus::Ok, 10, Some(5), None);
+        let logger = RunLogger::start(RunKind::Rescue, &[BackendId::Opencode], tmp.path());
+        logger.member_started(BackendId::Opencode, false);
+        logger.member_finished(BackendId::Opencode, false, LegStatus::Ok, 10, Some(5), None);
         logger.finished(LegStatus::Ok);
 
         let contents = std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap();
@@ -1131,7 +1130,7 @@ mod tests {
         let graded = Event::MemberGraded {
             ts: 3,
             run_id: "1-2".into(),
-            backend: BackendId::Gemini,
+            backend: BackendId::Opencode,
             grade: 85,
             rank: Some(1),
         };

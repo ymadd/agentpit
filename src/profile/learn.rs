@@ -383,13 +383,13 @@ mod tests {
             finished("r-1", "ok"),
             r#"{"event":"outcome_noted","ts":10,"run_id":"r-1","outcome":"bad"}"#.into(),
             // r-2: graded ensemble — decisive grades label members; the middling one is silent.
-            started("r-2", "review", &["claude", "codex", "gemini"]),
+            started("r-2", "review", &["claude", "codex", "opencode"]),
             route("r-2", "claude", Some("review"), "bb", 6),
             r#"{"event":"member_graded","ts":11,"run_id":"r-2","backend":"claude","grade":90}"#
                 .into(),
             r#"{"event":"member_graded","ts":11,"run_id":"r-2","backend":"codex","grade":30}"#
                 .into(),
-            r#"{"event":"member_graded","ts":11,"run_id":"r-2","backend":"gemini","grade":55}"#
+            r#"{"event":"member_graded","ts":11,"run_id":"r-2","backend":"opencode","grade":55}"#
                 .into(),
             finished("r-2", "ok"),
         ]

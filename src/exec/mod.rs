@@ -7,7 +7,6 @@ pub mod autonomy;
 mod base;
 pub mod claude;
 pub mod codex;
-pub mod gemini;
 mod stream;
 pub mod workflow_manager;
 

@@ -48,7 +48,6 @@ fn seeded_profile(backend: BackendId, rows: &[(TaskCategory, u8)]) -> Capability
 /// - **claude** — coding / refactor.
 /// - **codex** — review / adversarial review.
 /// - **antigravity** — long context / docs.
-/// - **gemini** — long context.
 /// - **opencode** — middling all-rounder (no standout column).
 ///
 /// Backends without a row here (goose, copilot) simply have no seeded scores and are picked
@@ -104,22 +103,6 @@ pub fn seeded_profiles() -> ProfileSet {
         ],
     );
 
-    let gemini = seeded_profile(
-        BackendId::Gemini,
-        &[
-            (Coding, 72),
-            (Refactor, 70),
-            (Review, 72),
-            (AdversarialReview, 68),
-            (SecurityReview, 70),
-            (Debug, 70),
-            (Explain, 76),
-            (Docs, 78),
-            (Planning, 74),
-            (LongContext, 86),
-        ],
-    );
-
     let opencode = seeded_profile(
         BackendId::Opencode,
         &[
@@ -136,7 +119,7 @@ pub fn seeded_profiles() -> ProfileSet {
         ],
     );
 
-    ProfileSet::from_profiles([claude, codex, antigravity, gemini, opencode])
+    ProfileSet::from_profiles([claude, codex, antigravity, opencode])
 }
 
 #[cfg(test)]
@@ -149,14 +132,13 @@ mod tests {
     }
 
     #[test]
-    fn seeds_the_five_known_backends() {
+    fn seeds_the_four_known_backends() {
         let set = seeded_profiles();
-        assert_eq!(set.len(), 5);
+        assert_eq!(set.len(), 4);
         for b in [
             BackendId::Claude,
             BackendId::Codex,
             BackendId::Antigravity,
-            BackendId::Gemini,
             BackendId::Opencode,
         ] {
             assert!(set.get(b).is_some(), "missing seed for {b:?}");

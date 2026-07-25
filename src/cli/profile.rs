@@ -1207,21 +1207,21 @@ mod tests {
     #[test]
     fn fold_verdicts_uses_weighted_majority_with_latest_tie_break() {
         let labels = vec![
-            lbl(BackendId::Gemini, "h1", true, 0.5, 1),  // exit ok
-            lbl(BackendId::Gemini, "h1", false, 3.0, 2), // human verdict: bad
+            lbl(BackendId::Opencode, "h1", true, 0.5, 1),  // exit ok
+            lbl(BackendId::Opencode, "h1", false, 3.0, 2), // human verdict: bad
             lbl(BackendId::Codex, "h1", true, 1.0, 3),
             lbl(BackendId::Codex, "h1", false, 1.0, 4), // tie by weight → latest wins
         ];
         let verdicts = fold_verdicts(&labels);
         let coding = crate::profile::TaskCategory::Coding;
-        assert!(!verdicts[&("h1".to_string(), coding, BackendId::Gemini)]);
+        assert!(!verdicts[&("h1".to_string(), coding, BackendId::Opencode)]);
         assert!(!verdicts[&("h1".to_string(), coding, BackendId::Codex)]);
 
         // Review finding: a verdict must not leak across categories. The same task+backend
         // graded good as Docs must leave the Coding verdict (bad, above) untouched.
         let mut cross = labels.clone();
         cross.push(crate::profile::learn::Label {
-            backend: BackendId::Gemini,
+            backend: BackendId::Opencode,
             category: crate::profile::TaskCategory::Docs,
             success: true,
             weight: 3.0,
@@ -1229,12 +1229,12 @@ mod tests {
             ts: 9,
         });
         let split = fold_verdicts(&cross);
-        assert!(!split[&("h1".to_string(), coding, BackendId::Gemini)]);
+        assert!(!split[&("h1".to_string(), coding, BackendId::Opencode)]);
         assert!(
             split[&(
                 "h1".to_string(),
                 crate::profile::TaskCategory::Docs,
-                BackendId::Gemini
+                BackendId::Opencode
             )]
         );
     }
@@ -1244,9 +1244,9 @@ mod tests {
     #[test]
     fn replay_core_scores_each_task_category_decision_once() {
         let labels: Vec<_> = (0..5)
-            .map(|i| lbl(BackendId::Gemini, "h1", true, 3.0, i))
+            .map(|i| lbl(BackendId::Opencode, "h1", true, 3.0, i))
             .collect();
-        let picker: PolicyPicker = Box::new(|_| Some(BackendId::Gemini));
+        let picker: PolicyPicker = Box::new(|_| Some(BackendId::Opencode));
         let report = replay_core(&labels, &picker);
         assert_eq!(report.labels, 5);
         assert_eq!(report.decisions, 1);
@@ -1269,17 +1269,17 @@ mod tests {
         };
         let mut claude = CapabilityProfile::seeded(BackendId::Claude);
         claude.scores.insert(TaskCategory::Coding, cell(90));
-        let mut gemini = CapabilityProfile::seeded(BackendId::Gemini);
-        gemini.scores.insert(TaskCategory::Coding, cell(87));
-        let set = ProfileSet::from_profiles([claude, gemini]);
-        let available: HashSet<BackendId> = [BackendId::Claude, BackendId::Gemini].into();
+        let mut opencode = CapabilityProfile::seeded(BackendId::Opencode);
+        opencode.scores.insert(TaskCategory::Coding, cell(87));
+        let set = ProfileSet::from_profiles([claude, opencode]);
+        let available: HashSet<BackendId> = [BackendId::Claude, BackendId::Opencode].into();
         let costs: HashMap<BackendId, u8> =
-            [(BackendId::Claude, 80), (BackendId::Gemini, 20)].into();
+            [(BackendId::Claude, 80), (BackendId::Opencode, 20)].into();
 
-        let label = lbl(BackendId::Gemini, "h1", true, 1.0, 0);
-        // Margin 5: Gemini (87, cost 20) is within reach of Claude (90, cost 80) → cheaper wins.
+        let label = lbl(BackendId::Opencode, "h1", true, 1.0, 0);
+        // Margin 5: Opencode (87, cost 20) is within reach of Claude (90, cost 80) → cheaper wins.
         let picker = profile_stage_picker(set.clone(), available.clone(), 5, costs.clone());
-        assert_eq!(picker(&label), Some(BackendId::Gemini));
+        assert_eq!(picker(&label), Some(BackendId::Opencode));
         // Margin 0: quality decides alone.
         let strict = profile_stage_picker(set, available, 0, costs);
         assert_eq!(strict(&label), Some(BackendId::Claude));
@@ -1300,12 +1300,12 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", dir.path());
         }
 
-        // Synthesize 10 human-verdict-good Gemini coding runs (seeded: Claude 88 > Gemini 72).
+        // Synthesize 10 human-verdict-good Opencode coding runs (seeded: Claude 88 > Opencode 66).
         let mut log = String::new();
         for i in 0..10 {
             log.push_str(&format!(
-                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r-{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/x\"}}\n\
-                 {{\"event\":\"route_decided\",\"ts\":{i},\"run_id\":\"r-{i}\",\"backend\":\"gemini\",\"reason\":\"profile\",\"category\":\"coding\",\"task_hash\":\"h{i}\"}}\n\
+                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r-{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"opencode\"],\"cwd\":\"/x\"}}\n\
+                 {{\"event\":\"route_decided\",\"ts\":{i},\"run_id\":\"r-{i}\",\"backend\":\"opencode\",\"reason\":\"profile\",\"category\":\"coding\",\"task_hash\":\"h{i}\"}}\n\
                  {{\"event\":\"run_finished\",\"ts\":{i},\"run_id\":\"r-{i}\",\"status\":\"ok\"}}\n\
                  {{\"event\":\"outcome_noted\",\"ts\":{i},\"run_id\":\"r-{i}\",\"outcome\":\"good\"}}\n",
             ));
@@ -1331,12 +1331,12 @@ mod tests {
 
         learn(false, 5, &profiles).unwrap();
         let merged = load_profiles(Some(&profiles)).unwrap();
-        let gemini = merged.get(BackendId::Gemini).unwrap();
-        assert_eq!(gemini.source, ProfileSource::Learned);
+        let learned = merged.get(BackendId::Opencode).unwrap();
+        assert_eq!(learned.source, ProfileSource::Learned);
         let (best, score) = merged
             .best_for(TaskCategory::Coding, &available)
             .expect("coding is scored");
-        assert_eq!(best, BackendId::Gemini, "10 good labels flip the argmax");
+        assert_eq!(best, BackendId::Opencode, "10 good labels flip the argmax");
         assert!(score.value > 88, "beta posterior beats Claude's seed");
         assert_eq!(score.samples, 10);
         assert!(score.confidence <= 0.85);

@@ -55,21 +55,6 @@ async fn check_codex() -> AuthStatus {
     }
 }
 
-async fn check_gemini() -> AuthStatus {
-    let creds = home_join(&[".gemini", "oauth_creds.json"]);
-    let ok = file_exists(&creds).await;
-    AuthStatus {
-        backend: BackendId::Gemini,
-        ok,
-        hint: if ok {
-            "Gemini OAuth credentials are present.".into()
-        } else {
-            "Gemini CLI has no OAuth credentials. Launch it once to log in.".into()
-        },
-        login_command: "gemini".into(),
-    }
-}
-
 async fn check_antigravity() -> AuthStatus {
     // agy is the Gemini CLI successor and reuses Gemini OAuth credentials.
     // antigravity_state.pbtxt is created once the user has actually launched agy.
@@ -132,7 +117,6 @@ async fn check_opencode() -> AuthStatus {
 pub async fn check_auth(backend: BackendId) -> AuthStatus {
     match backend {
         BackendId::Codex => check_codex().await,
-        BackendId::Gemini => check_gemini().await,
         BackendId::Antigravity => check_antigravity().await,
         BackendId::Claude => check_claude().await,
         BackendId::Opencode => check_opencode().await,

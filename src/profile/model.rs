@@ -276,7 +276,7 @@ mod tests {
         let learned: BTreeMap<TaskCategory, Score> = [(TaskCategory::Coding, learned_cell)].into();
 
         // Seeded cells: the learned cell wins, untouched cells survive, summary flips.
-        let mut seeded = CapabilityProfile::seeded(BackendId::Gemini);
+        let mut seeded = CapabilityProfile::seeded(BackendId::Opencode);
         seeded
             .scores
             .insert(TaskCategory::Coding, Score::seeded(60));
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(updated.score(TaskCategory::Docs).unwrap().value, 70);
 
         // Benchmarked cell: it alone stays frozen.
-        let mut benched = CapabilityProfile::seeded(BackendId::Gemini);
+        let mut benched = CapabilityProfile::seeded(BackendId::Opencode);
         benched.source = ProfileSource::Benchmarked;
         benched.scores.insert(
             TaskCategory::Coding,

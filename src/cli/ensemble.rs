@@ -561,7 +561,7 @@ mod tests {
     fn fixture() -> Vec<MemberOutcome> {
         vec![
             MemberOutcome {
-                backend: BackendId::Gemini,
+                backend: BackendId::Codex,
                 transport: Some(Transport::Exec),
                 output: Some("Looks fine.".into()),
                 error: None,
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn emits_section_per_outcome() {
         let text = render_concatenated(&fixture());
-        assert!(text.contains("=== gemini (transport=exec) ==="));
+        assert!(text.contains("=== codex (transport=exec) ==="));
         assert!(text.contains("Looks fine."));
         assert!(text.contains("=== opencode (transport=acp) ==="));
         assert!(text.contains("Found 2 issues."));
@@ -597,7 +597,7 @@ mod tests {
         let text = build_aggregator_prompt("review src/", &fixture());
         assert!(text.contains("# Original task"));
         assert!(text.contains("review src/"));
-        assert!(text.contains("## [gemini]"));
+        assert!(text.contains("## [codex]"));
         assert!(text.contains("Looks fine."));
         assert!(text.contains("## [opencode]"));
         assert!(text.contains("Found 2 issues."));
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn aggregator_prompt_bounds_each_member() {
         let outcomes = vec![MemberOutcome {
-            backend: BackendId::Gemini,
+            backend: BackendId::Codex,
             transport: Some(Transport::Exec),
             output: Some("x".repeat(MAX_MEMBER_PROMPT_BYTES * 2)),
             error: None,
@@ -643,7 +643,7 @@ mod tests {
         let text = build_aggregator_prompt("t", &fixture());
         // Gemini and Opencode produced output; Claude failed and must not be graded.
         assert!(text.contains("\"grades\""), "got: {text}");
-        assert!(text.contains("gemini, opencode"), "got: {text}");
+        assert!(text.contains("codex, opencode"), "got: {text}");
         // No grading section at all when nobody produced output.
         let failed = vec![MemberOutcome {
             backend: BackendId::Claude,
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn parse_member_grades_reads_last_fenced_block_and_filters_junk() {
-        let graded = [BackendId::Gemini, BackendId::Opencode];
+        let graded = [BackendId::Codex, BackendId::Opencode];
         let reply = r#"Synthesis text with an early snippet:
 ```json
 {"other": true}
@@ -664,28 +664,28 @@ mod tests {
 More prose.
 ```json
 {"grades": [
-  {"backend": "gemini", "grade": 85, "rank": 1},
+  {"backend": "codex", "grade": 85, "rank": 1},
   {"backend": "opencode", "grade": 30, "rank": 2},
   {"backend": "opencode", "grade": 99},
   {"backend": "claude", "grade": 90},
   {"backend": "ghost", "grade": 50},
-  {"backend": "gemini", "grade": 300}
+  {"backend": "codex", "grade": 300}
 ]}
 ```"#;
         // Duplicate keeps the first, non-members and unknown ids drop, >100 drops.
         assert_eq!(
             parse_member_grades(reply, &graded),
             vec![
-                (BackendId::Gemini, 85, Some(1)),
+                (BackendId::Codex, 85, Some(1)),
                 (BackendId::Opencode, 30, Some(2)),
             ]
         );
 
         // Bare-JSON reply (no fences) parses too; junk parses to nothing.
-        let bare = r#"{"grades": [{"backend": "gemini", "grade": 70}]}"#;
+        let bare = r#"{"grades": [{"backend": "codex", "grade": 70}]}"#;
         assert_eq!(
             parse_member_grades(bare, &graded),
-            vec![(BackendId::Gemini, 70, None)]
+            vec![(BackendId::Codex, 70, None)]
         );
         assert!(parse_member_grades("no json here", &graded).is_empty());
         assert!(parse_member_grades("```json\n{\"grades\": \"nope\"}\n```", &graded).is_empty());
@@ -709,7 +709,7 @@ More prose.
         // A graded reply emits one MemberGraded per member that produced output.
         emit_member_grades(
             &logger,
-            "```json\n{\"grades\": [{\"backend\": \"gemini\", \"grade\": 88, \"rank\": 1}, {\"backend\": \"opencode\", \"grade\": 35, \"rank\": 2}, {\"backend\": \"claude\", \"grade\": 90}]}\n```",
+            "```json\n{\"grades\": [{\"backend\": \"codex\", \"grade\": 88, \"rank\": 1}, {\"backend\": \"opencode\", \"grade\": 35, \"rank\": 2}, {\"backend\": \"claude\", \"grade\": 90}]}\n```",
             &fixture(),
         );
 
@@ -720,7 +720,7 @@ More prose.
             .filter(|l| l.contains("member_graded"))
             .collect();
         assert_eq!(graded.len(), 2, "got: {log}");
-        assert!(graded[0].contains("\"backend\":\"gemini\"") && graded[0].contains("\"grade\":88"));
+        assert!(graded[0].contains("\"backend\":\"codex\"") && graded[0].contains("\"grade\":88"));
         assert!(
             graded[1].contains("\"backend\":\"opencode\"") && graded[1].contains("\"grade\":35")
         );

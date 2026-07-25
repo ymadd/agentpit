@@ -324,7 +324,7 @@ mod tests {
     fn only_claude_and_codex_are_supported_managers() {
         assert!(is_supported_manager(BackendId::Claude));
         assert!(is_supported_manager(BackendId::Codex));
-        assert!(!is_supported_manager(BackendId::Gemini));
+        assert!(!is_supported_manager(BackendId::Opencode));
         assert!(!is_supported_manager(BackendId::Antigravity));
         assert!(!is_supported_manager(BackendId::Opencode));
     }

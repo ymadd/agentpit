@@ -7,8 +7,6 @@ pub enum StreamFormat {
     Text,
     /// Claude Code `--output-format stream-json --include-partial-messages`.
     ClaudeJsonl,
-    /// Gemini CLI `--output-format stream-json`.
-    GeminiJsonl,
     /// Codex `exec --json` events.
     CodexJsonl,
 }
@@ -58,7 +56,6 @@ impl StreamDecoder {
         match self.format {
             StreamFormat::Text => unreachable!("handled above"),
             StreamFormat::ClaudeJsonl => self.decode_claude(&value),
-            StreamFormat::GeminiJsonl => self.decode_gemini(&value),
             StreamFormat::CodexJsonl => self.decode_codex(&value),
         }
     }
@@ -133,32 +130,6 @@ impl StreamDecoder {
             Some("result") => {
                 if let Some(text) = value.get("result").and_then(Value::as_str) {
                     self.fallback_answer = Some(text.to_string());
-                }
-                DecodedChunk::default()
-            }
-            _ => DecodedChunk::default(),
-        }
-    }
-
-    fn decode_gemini(&mut self, value: &Value) -> DecodedChunk {
-        match value.get("type").and_then(Value::as_str) {
-            Some("message") if value.get("role").and_then(Value::as_str) == Some("assistant") => {
-                value
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(|text| self.answer(text.to_string()))
-                    .unwrap_or_default()
-            }
-            Some("tool_use") => {
-                let name = value
-                    .get("tool_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool");
-                self.progress("tool", name)
-            }
-            Some("error") => {
-                if let Some(message) = json_error_message(value) {
-                    self.fallback_answer = Some(message);
                 }
                 DecodedChunk::default()
             }
@@ -324,22 +295,6 @@ mod tests {
         let final_chunk = decoder.finish();
         assert_eq!(final_chunk.display.as_deref(), Some("fallback\n"));
         assert_eq!(final_chunk.answer.as_deref(), Some("fallback\n"));
-    }
-
-    #[test]
-    fn gemini_extracts_assistant_deltas_and_keeps_tool_progress_display_only() {
-        let mut decoder = StreamDecoder::new(StreamFormat::GeminiJsonl);
-        let user = decoder.decode_line(r#"{"type":"message","role":"user","content":"hello"}"#);
-        let delta = decoder
-            .decode_line(r#"{"type":"message","role":"assistant","content":"Hi","delta":true}"#);
-        let tool =
-            decoder.decode_line(r#"{"type":"tool_use","tool_name":"read_file","tool_id":"1"}"#);
-
-        assert_eq!(user, DecodedChunk::default());
-        assert_eq!(delta.answer.as_deref(), Some("Hi"));
-        assert_eq!(tool.display.as_deref(), Some("\n[tool] read_file\n"));
-        assert_eq!(tool.answer, None);
-        assert_eq!(decoder.finish().answer.as_deref(), Some("\n"));
     }
 
     #[test]

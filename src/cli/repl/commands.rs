@@ -306,8 +306,8 @@ mod tests {
 
     #[test]
     fn parses_backend_set_trims_whitespace() {
-        match parse_slash("/backend   gemini  ") {
-            Some(SlashCommand::BackendSet(id)) => assert_eq!(id, "gemini"),
+        match parse_slash("/backend   opencode  ") {
+            Some(SlashCommand::BackendSet(id)) => assert_eq!(id, "opencode"),
             other => panic!("expected BackendSet, got {other:?}"),
         }
     }
@@ -428,7 +428,7 @@ mod tests {
         let list = valid_backends_list();
         assert!(list.contains("claude"));
         assert!(list.contains("codex"));
-        assert!(list.contains("gemini"));
+        assert!(list.contains("opencode"));
         assert!(list.contains("antigravity"));
         assert!(list.contains("opencode"));
         assert!(list.contains("goose"));

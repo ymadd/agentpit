@@ -322,7 +322,7 @@ mod tests {
 
     async fn run_echo(spec: ExecSpec) -> String {
         run_spec(
-            BackendId::Gemini,
+            BackendId::Opencode,
             spec,
             ExecRunOptions {
                 cwd: std::env::current_dir().unwrap(),

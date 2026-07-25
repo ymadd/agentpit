@@ -43,7 +43,7 @@ use crate::types::BackendId;
 /// Parameters for the `dispatch_task` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DispatchTaskRequest {
-    /// Backend id to run (claude | codex | gemini | antigravity | opencode). Exactly one of
+    /// Backend id to run (claude | codex | codex | antigravity | opencode). Exactly one of
     /// `backend` or `role` must be provided.
     #[serde(default)]
     pub backend: Option<String>,
@@ -781,7 +781,7 @@ mod tests {
     struct DummyExec;
     impl ExecAdapter for DummyExec {
         fn id(&self) -> BackendId {
-            BackendId::Gemini
+            BackendId::Codex
         }
         fn build_spec(&self, _task: &str, _model: Option<&str>) -> ExecSpec {
             ExecSpec {
@@ -795,7 +795,7 @@ mod tests {
 
     fn tools() -> AgentpitTools {
         let mut regs = Registries::empty();
-        regs.execs.insert(BackendId::Gemini, Box::new(DummyExec));
+        regs.execs.insert(BackendId::Codex, Box::new(DummyExec));
         AgentpitTools::new(Arc::new(regs), std::env::temp_dir())
     }
 
@@ -844,7 +844,7 @@ mod tests {
             .filter_map(|c| c.as_text().map(|t| t.text.clone()))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("gemini"), "got: {text}");
+        assert!(text.contains("codex"), "got: {text}");
         assert!(text.contains("transport=exec"), "got: {text}");
     }
 
@@ -856,7 +856,7 @@ mod tests {
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
-                backend: Some("gemini".into()),
+                backend: Some("codex".into()),
                 role: None,
                 task: "noop".into(),
             }))
@@ -891,7 +891,7 @@ mod tests {
         roles.insert(
             "reviewer".to_string(),
             crate::config::RoleConfig {
-                backends: vec![BackendId::Gemini],
+                backends: vec![BackendId::Codex],
                 prompt: Some("You review.".into()),
                 model: None,
             },
@@ -953,7 +953,7 @@ mod tests {
         let res = tools_with_reviewer_role()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
-                backend: Some("gemini".into()),
+                backend: Some("codex".into()),
                 role: Some("reviewer".into()),
                 task: "noop".into(),
             }))
@@ -1013,7 +1013,7 @@ mod tests {
         let res = tools()
             .run_ensemble(Parameters(RunEnsembleRequest {
                 model: None,
-                members: vec!["gemini".into(), "gemini".into(), "gemini".into()],
+                members: vec!["codex".into(), "codex".into(), "codex".into()],
                 prompt: "noop".into(),
                 aggregator: None,
             }))
@@ -1027,9 +1027,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(
-            text.matches("=== gemini").count(),
+            text.matches("=== codex").count(),
             1,
-            "deduped ensemble must render exactly one gemini section; got: {text}"
+            "deduped ensemble must render exactly one codex section; got: {text}"
         );
     }
 
@@ -1065,7 +1065,7 @@ mod tests {
                 goal: "do something".into(),
                 workflow_type: None,
                 manager: None,
-                agents: Some(vec!["gemini".into(), "imaginary".into()]),
+                agents: Some(vec!["codex".into(), "imaginary".into()]),
                 max_depth: None,
                 use_mcp: None,
             }))
@@ -1184,7 +1184,7 @@ mod tests {
             .post_note(Parameters(PostNoteRequest {
                 body: "pass this on".into(),
                 kind: Some("board".into()),
-                from: Some("gemini".into()),
+                from: Some("codex".into()),
             }))
             .await
             .unwrap();

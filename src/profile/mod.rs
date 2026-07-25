@@ -120,13 +120,13 @@ mod tests {
         let set = ProfileSet::from_profiles([
             profile_with(BackendId::Claude, TaskCategory::Coding, 70),
             profile_with(BackendId::Codex, TaskCategory::Coding, 90),
-            profile_with(BackendId::Gemini, TaskCategory::Coding, 80),
+            profile_with(BackendId::Opencode, TaskCategory::Coding, 80),
         ]);
 
         let (backend, score) = set
             .best_for(
                 TaskCategory::Coding,
-                &available(&[BackendId::Claude, BackendId::Codex, BackendId::Gemini]),
+                &available(&[BackendId::Claude, BackendId::Codex, BackendId::Opencode]),
             )
             .unwrap();
         assert_eq!(backend, BackendId::Codex);

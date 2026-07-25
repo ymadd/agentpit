@@ -1767,7 +1767,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_agents_goal_grammar_and_synthesis() {
-        let agents = [BackendId::Gemini, BackendId::Opencode, BackendId::Codex];
+        let agents = [BackendId::Codex, BackendId::Opencode, BackendId::Codex];
         let text = build_manager_prompt(
             "ship the feature",
             &agents,
@@ -1780,7 +1780,7 @@ mod tests {
             &PromptRoles::default(),
         );
         // Each agent id appears.
-        assert!(text.contains("gemini"));
+        assert!(text.contains("codex"));
         assert!(text.contains("opencode"));
         assert!(text.contains("codex"));
         // The goal text.
@@ -1799,7 +1799,7 @@ mod tests {
 
     #[test]
     fn self_path_is_shell_quoted_for_paths_with_spaces() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let text = build_manager_prompt(
             "goal",
             &agents,
@@ -1818,7 +1818,7 @@ mod tests {
 
     #[test]
     fn mcp_prompt_uses_mcp_tools_and_omits_bash_grammar() {
-        let agents = [BackendId::Gemini, BackendId::Codex];
+        let agents = [BackendId::Codex, BackendId::Codex];
         let text = build_manager_prompt_mcp(
             "ship the feature",
             &agents,
@@ -1834,7 +1834,7 @@ mod tests {
         assert!(text.contains("mcp__agentpit__dispatch_task"));
         assert!(text.contains("mcp__agentpit__run_ensemble"));
         // The agents, goal, budget and synthesis instruction carry over.
-        assert!(text.contains("gemini"));
+        assert!(text.contains("codex"));
         assert!(text.contains("codex"));
         assert!(text.contains("ship the feature"));
         assert!(text.contains("depth 1/3"));
@@ -1849,7 +1849,7 @@ mod tests {
     #[test]
     fn cli_prompt_has_no_mcp_tool_names() {
         // The CLI variant must stay free of the MCP tool surface.
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let text = build_manager_prompt(
             "goal",
             &agents,
@@ -1866,7 +1866,7 @@ mod tests {
 
     #[test]
     fn discipline_block_absent_when_ask_disabled() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let cli = build_manager_prompt(
             "goal",
             &agents,
@@ -1909,7 +1909,7 @@ mod tests {
 
     #[test]
     fn conversation_block_teaches_handoff_and_refute_when_enabled() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let cli = build_manager_prompt(
             "goal",
             &agents,
@@ -1935,7 +1935,7 @@ mod tests {
 
     #[test]
     fn mcp_conversation_block_points_at_post_note_and_refute_tools() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let mcp = build_manager_prompt_mcp(
             "goal",
             &agents,
@@ -1955,7 +1955,7 @@ mod tests {
 
     #[test]
     fn high_tier_discipline_asks_only_on_destructive_not_ab_forks() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let text = build_manager_prompt(
             "goal",
             &agents,
@@ -1984,7 +1984,7 @@ mod tests {
 
     #[test]
     fn low_tier_discipline_invites_ab_fork_asks() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let text = build_manager_prompt(
             "goal",
             &agents,
@@ -2002,7 +2002,7 @@ mod tests {
 
     #[test]
     fn mcp_discipline_points_at_ask_human_tool() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let text = build_manager_prompt_mcp(
             "goal",
             &agents,
@@ -2026,7 +2026,7 @@ mod tests {
     /// drifted — treat as a bug, not a test to update casually.
     #[test]
     fn legacy_prompt_is_byte_identical_without_roles() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let text = build_manager_prompt(
             "goal",
             &agents,
@@ -2043,7 +2043,7 @@ You are the MANAGER agent for a multi-step coding workflow. Decompose the goal i
 sub-tasks, dispatch each to the best worker backend, read results, and write a final\n\
 synthesis. Your LAST message MUST be the synthesis — do not stop after the last dispatch.\n\
 \n\
-AVAILABLE WORKER BACKENDS: gemini\n\
+AVAILABLE WORKER BACKENDS: codex\n\
 Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch to yourself.\n\
 \n\
 DISPATCH GRAMMAR (use your Bash tool):\n\
@@ -2070,7 +2070,7 @@ goal\n";
     /// GOLDEN: the MCP-mode twin of the byte-identical pin above.
     #[test]
     fn legacy_mcp_prompt_is_byte_identical_without_roles() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let text = build_manager_prompt_mcp(
             "goal",
             &agents,
@@ -2086,7 +2086,7 @@ You are the MANAGER agent for a multi-step coding workflow. Decompose the goal i
 sub-tasks, dispatch each to the best worker backend, read results, and write a final\n\
 synthesis. Your LAST message MUST be the synthesis — do not stop after the last dispatch.\n\
 \n\
-AVAILABLE WORKER BACKENDS: gemini\n\
+AVAILABLE WORKER BACKENDS: codex\n\
 Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch to yourself.\n\
 \n\
 ORCHESTRATION TOOLS (use these MCP tools; do NOT shell out to agentpit):\n\
@@ -2167,7 +2167,7 @@ goal\n";
 
     #[test]
     fn manager_persona_block_is_injected_in_both_modes() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let roles = PromptRoles {
             roster: None,
             persona: Some("Prefer small, verifiable steps.\n"),
@@ -2190,13 +2190,13 @@ goal\n";
             assert!(text.contains("MANAGER PERSONA (from [workflow.roles.manager]):"));
             assert!(text.contains("Prefer small, verifiable steps."));
             // Persona composes with the legacy roster (persona-only manager role).
-            assert!(text.contains("AVAILABLE WORKER BACKENDS: gemini"));
+            assert!(text.contains("AVAILABLE WORKER BACKENDS: codex"));
         }
     }
 
     #[test]
     fn flow_hint_block_is_injected_only_when_set() {
-        let agents = [BackendId::Gemini];
+        let agents = [BackendId::Codex];
         let with_flow = PromptRoles {
             flow: Some("diagnose → plan → implement"),
             ..Default::default()
@@ -2383,8 +2383,8 @@ goal\n";
 
     #[test]
     fn manager_role_with_unsupported_backends_propagates_the_error() {
-        // Gemini cannot manage (is_supported_manager: claude|codex only).
-        let roles = role_map(&[("manager", &[BackendId::Gemini], None)]);
+        // Opencode cannot manage (is_supported_manager: claude|codex only).
+        let roles = role_map(&[("manager", &[BackendId::Opencode], None)]);
         assert!(resolve_manager_backend(None, None, &roles, None, BackendId::Antigravity).is_err());
     }
 
@@ -2556,7 +2556,7 @@ goal\n";
         // Gemini-only manager role is a hard error at run time; the listing degrades instead.
         let mut s = section_with_types();
         s.roles = role_map(&[
-            ("manager", &[BackendId::Gemini], None),
+            ("manager", &[BackendId::Opencode], None),
             ("reviewer", &[BackendId::Codex], Some("review")),
         ]);
         let listing = build_types_listing(

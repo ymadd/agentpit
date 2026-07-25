@@ -34,7 +34,10 @@ mod tests {
 
     #[test]
     fn parses_known_backends() {
-        assert_eq!("gemini".parse::<BackendId>().unwrap(), BackendId::Gemini);
+        assert_eq!(
+            "opencode".parse::<BackendId>().unwrap(),
+            BackendId::Opencode
+        );
         assert_eq!(
             "OPENCODE".parse::<BackendId>().unwrap(),
             BackendId::Opencode

@@ -651,7 +651,7 @@ backend = "claude"
 auto_route = false
 
 [ensemble]
-review_members = ["claude", "gemini"]
+review_members = ["claude", "opencode"]
 "#,
         )
         .unwrap();
@@ -661,7 +661,7 @@ review_members = ["claude", "gemini"]
         assert!(!loaded.config.default.auto_route);
         assert_eq!(
             loaded.config.ensemble.review_members,
-            vec![BackendId::Claude, BackendId::Gemini]
+            vec![BackendId::Claude, BackendId::Opencode]
         );
     }
 
@@ -792,7 +792,7 @@ backend = "${AGENTPIT_TEST_BACKEND}"
             r#"
 [workflow]
 manager_backend = "codex"
-default_agents = ["gemini", "opencode"]
+default_agents = ["opencode", "opencode"]
 max_depth = 5
 max_calls_per_manager = 12
 "#,
@@ -805,7 +805,7 @@ max_calls_per_manager = 12
         );
         assert_eq!(
             loaded.config.workflow.default_agents,
-            vec![BackendId::Gemini, BackendId::Opencode]
+            vec![BackendId::Opencode, BackendId::Opencode]
         );
         assert_eq!(loaded.config.workflow.max_depth, 5);
         assert_eq!(loaded.config.workflow.max_calls_per_manager, 12);

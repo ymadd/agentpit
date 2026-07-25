@@ -104,10 +104,15 @@ impl WireScore {
 }
 
 /// Whole-file wire shape: a table of per-backend entries keyed by backend name.
+///
+/// The key is a plain `String`, not a `BackendId`, so that a profile for a backend this
+/// build no longer knows is skipped instead of failing the whole load. `profiles.toml` is
+/// machine-generated and outlives the backend list — a file written when `gemini` existed
+/// must still load after that backend is removed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProfilesFile {
     #[serde(default)]
-    profile: BTreeMap<BackendId, ProfileEntry>,
+    profile: BTreeMap<String, ProfileEntry>,
 }
 
 /// True when telemetry carries no observations — lets `save` omit an empty `[telemetry]`
@@ -123,7 +128,7 @@ impl ProfilesFile {
             .iter()
             .map(|(backend, p)| {
                 (
-                    *backend,
+                    backend.to_string(),
                     ProfileEntry {
                         source: p.source,
                         measured_at: p.measured_at.clone(),
@@ -141,10 +146,12 @@ impl ProfilesFile {
     }
 
     /// Reconstruct a `ProfileSet`, stitching each entry's backend key back into its profile.
+    /// Entries naming a backend this build does not support are dropped (see the struct doc).
     fn into_set(self) -> ProfileSet {
         let profiles = self
             .profile
             .into_iter()
+            .filter_map(|(name, entry)| Some((name.parse::<BackendId>().ok()?, entry)))
             .map(|(backend, entry)| CapabilityProfile {
                 backend,
                 scores: entry
@@ -238,7 +245,7 @@ mod tests {
         let set = load_profiles(Some(&path)).unwrap();
 
         // Same shape as the seed: five known backends, all Seeded.
-        assert_eq!(set.len(), 5);
+        assert_eq!(set.len(), 4);
         let profile = set.get(BackendId::Claude).expect("claude seeded");
         assert_eq!(profile.source, ProfileSource::Seeded);
         assert_eq!(
@@ -339,13 +346,22 @@ value = 60
 samples = 0
 confidence = 0.4
 
-[profile.gemini]
+[profile.claude]
 source = "learned"
 
-[profile.gemini.scores.docs]
+[profile.claude.scores.docs]
 value = 77
 samples = 8
 confidence = 0.6
+
+# A backend this build no longer supports: the entry is skipped, not a load error.
+[profile.gemini]
+source = "seeded"
+
+[profile.gemini.scores.coding]
+value = 72
+samples = 0
+confidence = 0.4
 "#,
         )
         .unwrap();
@@ -365,13 +381,15 @@ confidence = 0.6
         );
         // Unambiguous profile-level source is taken as-is.
         assert_eq!(
-            set.get(BackendId::Gemini)
+            set.get(BackendId::Claude)
                 .unwrap()
                 .score(TaskCategory::Docs)
                 .unwrap()
                 .source,
             ProfileSource::Learned
         );
+        // The retired backend's entry was dropped rather than failing the whole load.
+        assert_eq!(set.len(), 2, "only supported backends survive the load");
 
         // A learned fold can still update the migrated cell — the freeze is gone.
         let merged = crate::profile::apply_learned(

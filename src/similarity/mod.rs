@@ -222,7 +222,7 @@ mod tests {
         let mut samples: Vec<RouteSample> = (0..3)
             .map(|_| sample(BackendId::Codex, "good", vec![1.0, 0.0]))
             .collect();
-        samples.extend((0..3).map(|_| sample(BackendId::Gemini, "good", vec![1.0, 0.0])));
+        samples.extend((0..3).map(|_| sample(BackendId::Opencode, "good", vec![1.0, 0.0])));
         assert!(pick_backend(&[1.0, 0.0], &samples, &cfg(), |_| true).is_none());
 
         // Dissimilar samples never count.
@@ -238,12 +238,14 @@ mod tests {
         let mut samples: Vec<RouteSample> = (0..3)
             .map(|_| sample(BackendId::Codex, "bad", vec![1.0, 0.0]))
             .collect();
-        samples.extend((0..3).map(|_| sample(BackendId::Gemini, "good", vec![1.0, 0.0])));
+        samples.extend((0..3).map(|_| sample(BackendId::Opencode, "good", vec![1.0, 0.0])));
         let pick = pick_backend(&[1.0, 0.0], &samples, &cfg(), |_| true).unwrap();
-        assert_eq!(pick.backend, BackendId::Gemini);
+        assert_eq!(pick.backend, BackendId::Opencode);
 
         // An offline winner is never picked.
-        assert!(pick_backend(&[1.0, 0.0], &samples, &cfg(), |b| b != BackendId::Gemini).is_none());
+        assert!(
+            pick_backend(&[1.0, 0.0], &samples, &cfg(), |b| b != BackendId::Opencode).is_none()
+        );
     }
 
     #[test]

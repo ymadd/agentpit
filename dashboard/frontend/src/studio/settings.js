@@ -5,7 +5,7 @@
 export const ROLE_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 export const DEFAULT_MAX_DEPTH = 3;
 export const DEFAULT_MAX_CALLS = 8;
-export const DEFAULT_BACKENDS = ["claude", "codex", "gemini", "antigravity", "opencode"];
+export const DEFAULT_BACKENDS = ["claude", "codex", "antigravity", "opencode"];
 export const DEFAULT_RESERVED_TYPE_NAMES = ["new", "list", "describe"];
 
 let roleKeySeq = 0;

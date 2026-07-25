@@ -454,7 +454,6 @@ fn pick_backend(label: &str) -> anyhow::Result<Option<BackendId>> {
                 "antigravity",
                 "agy — Gemini CLI successor",
             )
-            .item(BackendId::Gemini, "gemini", "")
             .item(BackendId::Claude, "claude", "")
             .item(BackendId::Codex, "codex", "")
             .item(BackendId::Opencode, "opencode", "")

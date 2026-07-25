@@ -227,14 +227,17 @@ and stops at the first hit:
 1. An explicit `--backend` flag
 2. A per-tool `[routes]` pin — **empty by default**, and a pin here skips every stage below,
    so a tool you pin never benefits from measured capability
-3. Similarity: a backend that won sufficiently similar past tasks (kNN over `routes.jsonl`;
+3. Capacity: the prompt's estimated token count exceeds `long_context_threshold` →
+   `long_context_backend` (the estimate is roughly `chars / 4`, not a character count).
+   Runs before the capability stages because fitting the context is a constraint, not a
+   preference — a huge task with a clear category signal must not be captured by a
+   confident diagnosis and sent to a backend it doesn't fit
+4. Similarity: a backend that won sufficiently similar past tasks (kNN over `routes.jsonl`;
    only in `--features similarity` builds with the embedding model installed)
-4. Capability profile: the task is diagnosed into a `TaskCategory`, and when the diagnosis is
+5. Capability profile: the task is diagnosed into a `TaskCategory`, and when the diagnosis is
    confident enough the highest-scoring available backend for that category wins. Candidates
    within `auto_route.quality_margin` of the best are treated as equal on quality, and the
    cheapest (`[backends.<id>].cost`) takes it
-5. Long context: the prompt's estimated token count exceeds `long_context_threshold` →
-   `long_context_backend` (the estimate is roughly `chars / 4`, not a character count)
 6. Review keyword: the prompt contains one of `review_keywords` → `review_backend`
 7. `default.backend`
 

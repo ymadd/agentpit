@@ -248,8 +248,9 @@ fn profile_stage_picker(
 /// Scope: this replays the *policy* stages of [`Router::resolve`](crate::router::Router)
 /// — the similarity stage and the capability-profile stage with its cost tiebreak, using
 /// the live config's `quality_margin` and per-backend costs. It deliberately does NOT
-/// replay the stages that bypass the policy: a `[routes]` pin, the diagnose confidence
-/// gate, the long-context / keyword fallbacks, or the default backend. So the number
+/// replay the stages that bypass the policy: a `[routes]` pin, the capacity gate (a task
+/// over `long_context_threshold` goes to `long_context_backend` before any policy runs),
+/// the diagnose confidence gate, the keyword fallback, or the default backend. So the number
 /// answers "how good are this policy's picks?", not "what would dispatch have done?" —
 /// on a machine whose `[routes]` pins a tool, dispatch would not have consulted the
 /// policy at all.

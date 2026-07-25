@@ -137,6 +137,23 @@ impl Router {
         if self.config.default.auto_route
             && let Some(task) = request.task
         {
+            // Capacity gate, before every capability stage. Capability (what a backend is good
+            // at) and capacity (does the task fit its context) are independent axes: a huge
+            // task with a clear category signal used to be captured by the confident diagnosis
+            // in the profile stage below and sent to the category argmax whether or not it fits
+            // there. A task that exceeds the threshold goes to the designated big-window
+            // backend; `diagnose_confidence` stays `None` because routing never classified it.
+            let auto = &self.config.auto_route;
+            if self.available.contains(&auto.long_context_backend)
+                && estimate_tokens(task) > auto.long_context_threshold
+            {
+                return RouteDecision {
+                    backend: auto.long_context_backend,
+                    reason: RouteReason::AutoLongContext,
+                    diagnose_confidence: None,
+                };
+            }
+
             // Similarity stage (before any category diagnosis): a backend that won enough
             // sufficiently-similar past tasks takes the dispatch directly. Compiled out of
             // non-`similarity` builds; inside them every miss (no model, no samples, slow
@@ -192,16 +209,6 @@ impl Router {
                 }
             }
 
-            let auto = &self.config.auto_route;
-            if self.available.contains(&auto.long_context_backend)
-                && estimate_tokens(task) > auto.long_context_threshold
-            {
-                return RouteDecision {
-                    backend: auto.long_context_backend,
-                    reason: RouteReason::AutoLongContext,
-                    diagnose_confidence,
-                };
-            }
             if self.available.contains(&auto.review_backend)
                 && contains_any_lowercased(task, &self.review_keywords_lower)
             {
@@ -370,6 +377,43 @@ mod tests {
         });
         assert_eq!(d.backend, BackendId::Opencode);
         assert_eq!(d.reason, RouteReason::AutoLongContext);
+    }
+
+    #[test]
+    fn capacity_beats_capability_for_huge_tasks() {
+        // 2026-07 eval finding: a huge task WITH a strong category signal used to be captured
+        // by the profile stage (the diagnosis is confident, so the long-context check below it
+        // never ran) and got sent to the category argmax regardless of whether it fits there.
+        // Capability (what a backend is good at) and capacity (does the task fit) are
+        // independent axes — the capacity gate must come first.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        // Claude is the clear Refactor argmax; Opencode is the long-context backend.
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Claude, TaskCategory::Refactor, 90),
+            profile_with(BackendId::Opencode, TaskCategory::Refactor, 40),
+        ]);
+        let r = Router::new(cfg, available(), profiles);
+
+        let huge = format!("refactor this module: {}", "alpha beta gamma ".repeat(100));
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some(&huge),
+        });
+
+        assert_eq!(d.reason, RouteReason::AutoLongContext);
+        assert_eq!(d.backend, BackendId::Opencode);
+
+        // The same task under the threshold routes by capability, as before.
+        let small = "refactor this module: alpha beta gamma";
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some(small),
+        });
+        assert_eq!(d.backend, BackendId::Claude);
+        assert!(matches!(d.reason, RouteReason::Profile { .. }));
     }
 
     #[test]

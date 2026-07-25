@@ -232,7 +232,8 @@ mod tests {
 
     #[test]
     fn reason_falls_back_to_the_first_line_and_tolerates_a_missing_error() {
-        let timeout = "codex dispatch timed out after 1800s (set AGENTPIT_DISPATCH_TIMEOUT_SECS to adjust)";
+        let timeout =
+            "codex dispatch timed out after 1800s (set AGENTPIT_DISPATCH_TIMEOUT_SECS to adjust)";
         assert_eq!(failure_reason(Some(timeout)), timeout);
         assert_eq!(failure_reason(None), "no reason was recorded");
         assert_eq!(failure_reason(Some("  \n\n ")), "no reason was recorded");

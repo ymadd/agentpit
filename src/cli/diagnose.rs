@@ -5,11 +5,17 @@
 //! machine-readable verdict for downstream automation (the Phase B issue→routing GitHub
 //! Action).
 //!
-//! The backend selection is the real thing: it calls `router::Router::resolve` with the
-//! same inputs a bare `agentpit rescue` dispatch uses, so every stage — the `[routes]`
-//! table, the similarity stage (in `--features similarity` builds), the profile pick with
-//! its cost tiebreak, long-context and keyword heuristics, and the default fallback — is
-//! reproduced instead of mirrored. What this prints is what dispatch would do.
+//! The backend selection is the real thing: it calls `router::Router::resolve` for the
+//! `rescue` route key, so every routing stage — the `[routes]` table, the similarity stage
+//! (in `--features similarity` builds), the profile pick with its cost tiebreak,
+//! long-context and keyword heuristics, and the default fallback — is reproduced instead
+//! of mirrored.
+//!
+//! Scope: this is the *router's* answer, which is not always the whole dispatch. A bare
+//! `agentpit rescue` with `[ensemble] rescue_members` configured fans out to those members
+//! without consulting the router at all, and `--role` / `--cascade` likewise pick their
+//! backend before routing. Those selections are dispatch-plan decisions layered above the
+//! router; `diagnose` reports the routing stage only.
 
 use std::collections::HashSet;
 
@@ -76,8 +82,9 @@ fn build_report(
 ) -> DiagnoseReport {
     let diagnosis = diagnose::diagnose(task);
 
-    // Exactly what a bare `agentpit rescue "<task>"` resolves — same route key, no
-    // explicit backend, same config/profile inputs.
+    // The router's own answer for the `rescue` route key, with no explicit backend — the
+    // same call `rescue` makes once it has decided to route (see the module docs for the
+    // dispatch-plan layers that can pre-empt routing entirely).
     let router = Router::new(config.clone(), available.clone(), profiles);
     let decision = router.resolve(&RouteRequest {
         tool: RouteKey::Rescue,

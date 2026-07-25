@@ -46,6 +46,23 @@ jobs:
           esac
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
+      # actions/checkout builds the workflow's ref, not the requested tag, so dispatching
+      # with a tag the tree does not carry would publish some other build under that name
+      # — with a perfectly valid checksum. The updater trusts the tag to mean the version,
+      # so the two have to agree before anything is built.
+      - uses: actions/checkout@v6
+
+      - name: Assert the tag matches the crate version
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "${TAG#v}" != "$crate_version" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $crate_version — refusing to build a mislabelled release"
+            exit 1
+          fi
+          echo "tag $TAG matches crate version $crate_version"
+
       - name: Flip release to draft (if it already exists)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

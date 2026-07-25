@@ -73,21 +73,26 @@ impl WireScore {
         }
     }
 
-    /// Migration for pre-per-cell files: a cell with samples inherits the profile-level
-    /// source, and a zero-sample cell is an untouched seeded prior regardless of it — the
-    /// same distinction the old `profile show` src column drew.
+    /// Migration for pre-per-cell files, which recorded provenance only per profile.
     ///
-    /// Known imprecision, accepted: under the old profile-level gate a `learn` fold could
-    /// write cells and a later partial benchmark could then promote the profile to
-    /// `Benchmarked`, so a legacy benchmarked profile may hold learned-origin cells that
-    /// this migration relabels as benchmarked (and therefore freezes). The file carries no
-    /// evidence to tell them apart; re-running `profile run` re-measures the cells that
-    /// matter, and every save from here on records the real per-cell source.
+    /// - A zero-sample cell is an untouched seeded prior regardless of the profile's source.
+    /// - A measured cell in a `Seeded`/`Learned` profile takes that source directly.
+    /// - A measured cell in a `Benchmarked` profile is **ambiguous** and is migrated as
+    ///   `Learned`, not `Benchmarked`. Under the old profile-level gate a `learn` fold could
+    ///   write cells and a later *partial* benchmark then promoted the whole profile, so such
+    ///   a file genuinely mixes learned and benchmarked cells with nothing to tell them
+    ///   apart. The two ways to be wrong are not symmetric: labelling a learned cell
+    ///   `Benchmarked` freezes it against every future fold (the exact defect per-cell
+    ///   provenance exists to remove, and unrecoverable without a hand edit), while labelling
+    ///   a benchmarked cell `Learned` merely lets telemetry update it, and `profile run`
+    ///   restores the measurement. So the ambiguous case resolves to the recoverable side.
+    ///
+    /// Every save from here on records the real per-cell source, so this runs once per file.
     fn resolve(self, entry_source: ProfileSource) -> Score {
-        let source = self.source.unwrap_or(if self.samples > 0 {
-            entry_source
-        } else {
-            ProfileSource::Seeded
+        let source = self.source.unwrap_or(match (self.samples, entry_source) {
+            (0, _) => ProfileSource::Seeded,
+            (_, ProfileSource::Benchmarked) => ProfileSource::Learned,
+            (_, source) => source,
         });
         Score {
             value: self.value,
@@ -307,9 +312,15 @@ mod tests {
     }
 
     /// Files written before per-cell provenance carry only the profile-level `source`.
-    /// On load, measured cells (samples > 0) inherit it; zero-sample cells stay seeded.
+    ///
+    /// Review finding (2026-07-25): migrating a measured cell in a *benchmarked* profile
+    /// straight to `Benchmarked` re-created the very freeze per-cell provenance removes —
+    /// a legacy `learn`-then-partial-benchmark file mixes learned and benchmarked cells
+    /// indistinguishably, and the learned ones would never accept a fold again. The
+    /// ambiguous case now resolves to `Learned`, which telemetry (and `profile run`) can
+    /// still move.
     #[test]
-    fn legacy_file_without_cell_source_migrates_on_load() {
+    fn legacy_file_without_cell_source_migrates_to_the_recoverable_side() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("legacy.toml");
         fs::write(
@@ -327,20 +338,56 @@ confidence = 0.82
 value = 60
 samples = 0
 confidence = 0.4
+
+[profile.gemini]
+source = "learned"
+
+[profile.gemini.scores.docs]
+value = 77
+samples = 8
+confidence = 0.6
 "#,
         )
         .unwrap();
 
         let set = load_profiles(Some(&path)).unwrap();
         let codex = set.get(BackendId::Codex).unwrap();
+        // Ambiguous (measured cell under a benchmarked profile) → Learned, so a later fold
+        // is not locked out.
         assert_eq!(
             codex.score(TaskCategory::Review).unwrap().source,
-            ProfileSource::Benchmarked
+            ProfileSource::Learned
         );
+        // Never measured → still a seeded prior.
         assert_eq!(
             codex.score(TaskCategory::Coding).unwrap().source,
             ProfileSource::Seeded
         );
+        // Unambiguous profile-level source is taken as-is.
+        assert_eq!(
+            set.get(BackendId::Gemini)
+                .unwrap()
+                .score(TaskCategory::Docs)
+                .unwrap()
+                .source,
+            ProfileSource::Learned
+        );
+
+        // A learned fold can still update the migrated cell — the freeze is gone.
+        let merged = crate::profile::apply_learned(
+            codex,
+            &[(
+                TaskCategory::Review,
+                Score {
+                    value: 40,
+                    samples: 12,
+                    confidence: 0.7,
+                    source: ProfileSource::Learned,
+                },
+            )]
+            .into(),
+        );
+        assert_eq!(merged.score(TaskCategory::Review).unwrap().value, 40);
 
         // Saving re-writes with explicit per-cell sources that round-trip unchanged.
         save_profiles(&set, &path).unwrap();

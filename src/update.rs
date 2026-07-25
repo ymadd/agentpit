@@ -182,12 +182,19 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
     let binary = fetch_verified_binary(&tag, &asset_name)?;
 
     // Stage next to the current exe (same filesystem) and swap in via self-replace — the
-    // same mechanism self_update used, minus its unverified download.
+    // same mechanism self_update used, minus its unverified download. Make it executable
+    // BEFORE it is ever swapped in, so no window exists where the installed path is a
+    // non-executable file.
     let current_exe = std::env::current_exe().context("cannot locate the running executable")?;
     let staged = current_exe.with_extension(format!("update.{}", std::process::id()));
     std::fs::write(&staged, &binary)
         .with_context(|| format!("failed to stage update at {}", staged.display()))?;
-    let _ = ensure_executable(&staged);
+    let staged_ok = ensure_executable(&staged)
+        .and_then(|()| assert_staged_version(&staged, normalized_version(&latest)));
+    if let Err(error) = staged_ok {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
     let replaced = self_replace::self_replace(&staged);
     let _ = std::fs::remove_file(&staged);
     replaced.context("failed to replace the running executable")?;
@@ -203,17 +210,52 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
     })
 }
 
-/// Download a release asset plus its `.sha256` sibling, verify the digest, and gunzip.
-/// Any mismatch aborts before a single byte is installed — a tampered or truncated asset
-/// (2026-07 eval, finding 7: the old flow installed unverified downloads) never replaces
-/// a working binary.
+/// Run the staged binary's `--version` and require it to report `expected`.
+///
+/// The checksum only proves the bytes match the digest the release published; it says
+/// nothing about *which* build those bytes are. A release cut from the wrong ref (the
+/// workflow builds the current branch, not the requested tag) yields a perfectly
+/// checksummed binary of some other version. This catches that before the swap.
+fn assert_staged_version(staged: &Path, expected: &str) -> Result<()> {
+    let output = std::process::Command::new(staged)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("staged binary at {} would not run", staged.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "staged binary exited {} on --version — refusing to install",
+            output.status
+        ));
+    }
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let matches = reported
+        .split_whitespace()
+        .any(|token| normalized_version(token) == expected);
+    if !matches {
+        return Err(anyhow!(
+            "staged binary reports {:?} but the release claims {expected} — refusing to install",
+            reported.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Download a release asset plus its `.sha256` sibling, check the digest, and gunzip.
+///
+/// **What this does and does not prove.** The digest is fetched from the same release, over
+/// the same channel, under the same write authority as the payload, so it establishes
+/// *integrity* (the bytes are the ones the release published — a truncated or corrupted
+/// download is caught) and NOT *authenticity* (anyone who can replace the asset can replace
+/// its `.sha256` too). Publisher authenticity needs a signature verified against a key that
+/// does not travel with the release; that is tracked separately. The staged binary's
+/// self-reported version is checked as a second, independent gate.
 fn fetch_verified_binary(tag: &str, asset_name: &str) -> Result<Vec<u8>> {
     let gz = download_bytes(&asset_url(tag, asset_name))?;
     let sha_bytes = download_bytes(&asset_url(tag, &format!("{asset_name}.sha256")))?;
     verify_and_decompress(&gz, &String::from_utf8_lossy(&sha_bytes), asset_name)
 }
 
-/// The verification gate itself, split out from the network so it can be tested against
+/// The integrity gate itself, split out from the network so it can be tested against
 /// tampered inputs offline: parse the digest line, compare it to the payload's actual
 /// SHA-256, and only then decompress. Every failure path returns `Err` — the caller writes
 /// nothing to disk unless this returns bytes.
@@ -254,10 +296,21 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Ceiling on a decompressed release binary. Well above any real build (the CLI and the
+/// dashboard are tens of MiB), and low enough that a gzip bomb — which passes the digest
+/// check when the digest is what was published — cannot exhaust memory during decompression.
+const MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+
 fn gunzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut out = Vec::new();
-    flate2::read::GzDecoder::new(bytes).read_to_end(&mut out)?;
+    let mut limited = flate2::read::GzDecoder::new(bytes).take(MAX_DECOMPRESSED_BYTES + 1);
+    limited.read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::other(format!(
+            "decompressed payload exceeds {MAX_DECOMPRESSED_BYTES} bytes — refusing to install"
+        )));
+    }
     Ok(out)
 }
 
@@ -528,10 +581,17 @@ fn sync_installed_dashboard(version: &str) -> DashboardUpdateOutcome {
     let tag = format!("v{}", normalized_version(version));
     let result = fetch_verified_binary(&tag, &asset_name).and_then(|binary| {
         // Stage as a sibling (same filesystem) and rename into place so a crash mid-write
-        // never leaves a half-written dashboard binary.
+        // never leaves a half-written dashboard binary. The executable bit goes on the
+        // STAGED file: a gz asset extracts as 0644, and chmod-after-rename left a window
+        // where the installed dashboard was present but not runnable if anything failed
+        // in between.
         let staged = path.with_extension(format!("update.{}", std::process::id()));
         std::fs::write(&staged, &binary)
             .with_context(|| format!("failed to stage {}", staged.display()))?;
+        if let Err(error) = ensure_executable(&staged) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
         std::fs::rename(&staged, &path).map_err(|error| {
             let _ = std::fs::remove_file(&staged);
             anyhow!("failed to install {}: {error}", path.display())
@@ -542,12 +602,6 @@ fn sync_installed_dashboard(version: &str) -> DashboardUpdateOutcome {
     match result {
         Ok(()) => {
             let installed_version = normalized_version(version).to_string();
-            if let Err(error) = ensure_executable(&path) {
-                return DashboardUpdateOutcome::Failed {
-                    path,
-                    error: format!("{error:#}"),
-                };
-            }
             save_dashboard_marker(&installed_version, &path);
             DashboardUpdateOutcome::Updated {
                 path,
@@ -739,6 +793,58 @@ mod tests {
             );
             assert!(err.contains("malformed"), "line {line:?} gave: {err}");
         }
+    }
+
+    /// Review finding (2026-07-25): a checksum proves the bytes are the ones the release
+    /// published, not that they are the version the tag claims — a release cut from the
+    /// wrong ref yields a valid checksum over the wrong build. The staged binary has to
+    /// say who it is before it replaces a working one.
+    #[cfg(unix)]
+    #[test]
+    fn staged_binary_must_report_the_expected_version() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = |name: &str, body: &str| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+
+        let right = fake("right", "echo 'agentpit 0.1.34'");
+        assert!(assert_staged_version(&right, "0.1.34").is_ok());
+
+        // A build of some other version, correctly checksummed, must not install.
+        let wrong = fake("wrong", "echo 'agentpit 0.1.33'");
+        let err = format!("{:#}", assert_staged_version(&wrong, "0.1.34").unwrap_err());
+        assert!(err.contains("refusing to install"), "got: {err}");
+
+        // A binary that cannot even report a version is not installable either.
+        let broken = fake("broken", "exit 3");
+        assert!(assert_staged_version(&broken, "0.1.34").is_err());
+        assert!(assert_staged_version(&temp.path().join("absent"), "0.1.34").is_err());
+    }
+
+    #[test]
+    fn gunzip_rejects_a_payload_that_expands_past_the_ceiling() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+
+        // A highly compressible payload just over the ceiling: valid gzip, small on the
+        // wire, refused on expansion.
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        let chunk = vec![0_u8; 1024 * 1024];
+        for _ in 0..=(MAX_DECOMPRESSED_BYTES / chunk.len() as u64) {
+            enc.write_all(&chunk).unwrap();
+        }
+        let bomb = enc.finish().unwrap();
+        assert!(
+            (bomb.len() as u64) < MAX_DECOMPRESSED_BYTES,
+            "the compressed form should be small"
+        );
+        let err = gunzip(&bomb).unwrap_err();
+        assert!(format!("{err}").contains("refusing to install"), "{err}");
     }
 
     #[test]

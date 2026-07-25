@@ -178,7 +178,12 @@ pub async fn dispatch(
         return Ok(DispatchResult {
             backend,
             transport: Transport::Acp,
-            auth_failed: is_auth_failure_outcome(&outcome.output, None),
+            // An `Ok` here means the ACP `PromptRequest` itself completed — the transport
+            // reported success, exactly like an exit-0 exec run. Passing `None` here (as
+            // "no exit signal") threw that signal away and left the answer's *text* to
+            // decide, so an agent that was merely asked to say "401 Unauthorized" had its
+            // answer discarded. Protocol status classifies the run; answer text never does.
+            auth_failed: is_auth_failure_outcome(&outcome.output, Some(true)),
             output: outcome.output,
         });
     }

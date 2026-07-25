@@ -296,22 +296,32 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Option<Pr
     });
 
     let start = Instant::now();
+    let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if start.elapsed() >= timeout {
+            timed_out = true;
             kill_process_group(&mut child);
-            let _ = child.wait();
-            // Safe to join now: every writer in the group is dead, so the pipes hit EOF.
-            let _ = out_reader.join();
-            let _ = err_reader.join();
-            return Ok(None);
+            break child.wait()?;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+
+    // Kill the group even when the direct child exited on its own. A background descendant
+    // (`sh -c 'cmd &'`) keeps the inherited pipe write ends open, so the reader joins below
+    // would block long past the deadline — the timeout branch alone did not cover this,
+    // because the loop breaks on try_wait before it ever looks at the clock. By the time we
+    // get here the child is gone, so nothing legitimate is still writing.
+    if !timed_out {
+        kill_process_group(&mut child);
+    }
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
+    if timed_out {
+        return Ok(None);
+    }
     Ok(Some((status, stdout, stderr)))
 }
 
@@ -450,6 +460,32 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "reader joins must not block on surviving grandchildren"
+        );
+    }
+
+    /// Review finding (2026-07-25): the test above only exercised the timeout branch,
+    /// because its shell stays alive until the deadline. When the direct child exits
+    /// FIRST and leaves a background descendant holding the pipes (`sh -c 'sleep 30 &'`),
+    /// the loop breaks on `try_wait` before ever consulting the clock, so the old code
+    /// skipped the kill entirely and blocked in `join` for as long as the descendant
+    /// lived — the deadline was simply not enforced on that path.
+    #[cfg(unix)]
+    #[test]
+    fn backgrounded_descendant_cannot_outlive_the_parent_and_block_the_join() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 &");
+        let start = Instant::now();
+        // A generous timeout that this run must NOT need: the child exits in milliseconds,
+        // and the only thing that could stall us is the surviving `sleep`.
+        let result = run_with_timeout(cmd, Duration::from_secs(20)).unwrap();
+        assert!(
+            result.is_some(),
+            "the child exited normally, so this is a completed run, not a timeout"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the backgrounded descendant blocked the reader join for {:?}",
+            start.elapsed()
         );
     }
 

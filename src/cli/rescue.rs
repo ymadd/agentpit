@@ -5,7 +5,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer};
 use crate::auth::{
-    check_auth, format_auth_failure_message, is_auth_failure, launch_login, launch_terminal_login,
+    check_auth, format_auth_failure_message, is_auth_failure_outcome, launch_login,
+    launch_terminal_login,
 };
 use crate::config::RouteKey;
 use crate::dispatch::{dispatch, resolve_transport};
@@ -301,7 +302,11 @@ async fn run_with_route_inner(
                 Some(msg.clone()),
             );
             logger.finished(LegStatus::Error);
-            if is_auth_failure(&msg) {
+            // A failed dispatch: the formatted error embeds the backend's stdout/stderr, so
+            // scan it the same way the success path does (tail only). Scanning the whole
+            // blob with the raw regex bypassed that gate and re-created the false positive
+            // for any long output that merely mentions an auth phrase.
+            if is_auth_failure_outcome(&msg, Some(false)) {
                 let mut launch_message = None;
                 if auto_login {
                     let (_, launch) = launch_login(backend_id).await;

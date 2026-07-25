@@ -41,6 +41,33 @@ pub fn render_concatenated(outcomes: &[MemberOutcome]) -> String {
     sections.join("\n\n")
 }
 
+/// Tell the user where a failed member's raw output is, when there is any.
+///
+/// A member reported as failed can still have produced a full, useful answer: a dispatch
+/// that ends in an error — or one misclassified as an auth failure — leaves everything it
+/// streamed in `runs/<run_id>/<backend>.log`. Without this line the run reads as a total
+/// loss and the transcript is only findable by someone who knows the state directory
+/// layout (dogfooding, 2026-07-25: a 20-minute review was recovered from there by hand).
+/// `None` when nothing failed, or when no captured file exists for the failures (event
+/// capture off, or the member never wrote anything).
+fn captured_output_hint(run_id: &str, outcomes: &[MemberOutcome]) -> Option<String> {
+    let dir = crate::events::runs_dir().join(run_id);
+    let with_capture: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| o.output.is_none())
+        .filter(|o| dir.join(format!("{}.log", o.backend)).is_file())
+        .map(|o| o.backend.as_str())
+        .collect();
+    if with_capture.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "raw output from {} is kept in {}",
+        with_capture.join(", "),
+        dir.display()
+    ))
+}
+
 /// Per-member cap on how much of each response is embedded in the aggregator prompt. A
 /// verbose member could otherwise blow the aggregator's context window (or cost) on its
 /// own; the tail is dropped with a marker so the synthesis still sees the bulk of it.
@@ -437,6 +464,9 @@ pub async fn run_resolved(
 
     let member_section = render_concatenated(&outcomes);
     let any_success = outcomes.iter().any(|o| o.output.is_some());
+    if let Some(hint) = captured_output_hint(logger.run_id(), &outcomes) {
+        eprintln!("{} {hint}", style("note:").yellow());
+    }
 
     if let Some(aggregator_id) = aggregator {
         if !any_success {
@@ -689,6 +719,55 @@ More prose.
         );
         assert!(parse_member_grades("no json here", &graded).is_empty());
         assert!(parse_member_grades("```json\n{\"grades\": \"nope\"}\n```", &graded).is_empty());
+    }
+
+    /// Dogfooding finding (2026-07-25): a member reported as failed can still have written
+    /// a complete transcript — a 20-minute review was recovered from `runs/` by hand after
+    /// the CLI showed only "auth failure during execution". The run must say where it is.
+    #[test]
+    fn failed_members_with_captured_output_are_pointed_at_their_log() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+
+        let run_dir = crate::events::runs_dir().join("r-hint");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("codex.log"), "19KB of review, discarded").unwrap();
+
+        let failed = |backend| MemberOutcome {
+            backend,
+            transport: Some(Transport::Exec),
+            output: None,
+            error: Some("auth failure during execution".into()),
+        };
+        let ok = MemberOutcome {
+            backend: BackendId::Claude,
+            transport: Some(Transport::Exec),
+            output: Some("fine".into()),
+            error: None,
+        };
+
+        // Failed member whose transcript exists: named, with the directory.
+        let hint = captured_output_hint("r-hint", &[failed(BackendId::Codex), ok])
+            .expect("a captured failure must be surfaced");
+        assert!(hint.contains("codex"), "got: {hint}");
+        assert!(hint.contains("r-hint"), "got: {hint}");
+        // A failure with nothing captured is not advertised.
+        assert_eq!(
+            captured_output_hint("r-hint", &[failed(BackendId::Opencode)]),
+            None
+        );
+        // Nothing failed: nothing to say.
+        assert_eq!(captured_output_hint("r-hint", &[]), None);
+
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
     }
 
     #[test]

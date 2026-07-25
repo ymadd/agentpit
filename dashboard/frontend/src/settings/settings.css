@@ -421,3 +421,20 @@
 @media (prefers-reduced-motion: reduce) {
   .set-root *, .set-root *::before, .set-root *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* Skills & commands refresh (Updates panel) */
+.set-skills-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.set-skills-note {
+  font-size: 12px;
+  opacity: 0.75;
+}
+.set-skills-note.error {
+  color: #e06c6c;
+  opacity: 1;
+}

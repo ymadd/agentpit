@@ -92,6 +92,14 @@ export async function checkForUpdates({ installIfAvailable = false } = {}) {
   return snapshot;
 }
 
+/// Re-install this build's Claude Code commands and skills into every detected `.claude/`.
+/// Returns the CLI's own summary so the caller can show it verbatim.
+export async function refreshSkills() {
+  const call = invoke();
+  if (!call) throw new Error("デスクトップアプリの外では実行できません。");
+  return call("skills_refresh");
+}
+
 export async function restartDesktopApp() {
   const call = invoke();
   if (call) await call("app_restart");

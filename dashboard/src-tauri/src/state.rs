@@ -317,8 +317,8 @@ mod tests {
     use std::io::Write;
 
     const LOG: &str = r#"
-{"event":"run_started","ts":100,"run_id":"1-0","pid":4242,"kind":"ensemble","members":["gemini","claude"],"cwd":"/tmp"}
-{"event":"member_started","ts":101,"run_id":"1-0","backend":"gemini","aggregator":false}
+{"event":"run_started","ts":100,"run_id":"1-0","pid":4242,"kind":"ensemble","members":["codex","claude"],"cwd":"/tmp"}
+{"event":"member_started","ts":101,"run_id":"1-0","backend":"codex","aggregator":false}
 {"event":"member_started","ts":101,"run_id":"1-0","backend":"claude","aggregator":false}
 {"event":"member_finished","ts":300,"run_id":"1-0","backend":"claude","aggregator":false,"status":"ok","elapsed_ms":199,"chars":42}
 "#;
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(
             run.members
                 .iter()
-                .find(|m| m.backend == "gemini")
+                .find(|m| m.backend == "codex")
                 .unwrap()
                 .status,
             "running"
@@ -365,7 +365,7 @@ mod tests {
             snap.recent[0]
                 .members
                 .iter()
-                .find(|m| m.backend == "gemini")
+                .find(|m| m.backend == "codex")
                 .unwrap()
                 .status,
             "interrupted"
@@ -396,14 +396,14 @@ mod tests {
     #[test]
     fn incremental_ingest_appends_without_reparsing() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(b"{\"event\":\"run_started\",\"ts\":1,\"run_id\":\"r\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/\"}\n").unwrap();
+        f.write_all(b"{\"event\":\"run_started\",\"ts\":1,\"run_id\":\"r\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"codex\"],\"cwd\":\"/\"}\n").unwrap();
         f.flush().unwrap();
         let mut t = Tracker::new();
         t.ingest(f.path());
         let off1 = t.offset;
         assert!(off1 > 0);
         // Append one more line; ingest should advance from the prior offset.
-        f.write_all(b"{\"event\":\"member_finished\",\"run_id\":\"r\",\"backend\":\"gemini\",\"status\":\"ok\",\"elapsed_ms\":5,\"ts\":2}\n").unwrap();
+        f.write_all(b"{\"event\":\"member_finished\",\"run_id\":\"r\",\"backend\":\"codex\",\"status\":\"ok\",\"elapsed_ms\":5,\"ts\":2}\n").unwrap();
         f.flush().unwrap();
         t.ingest(f.path());
         assert!(t.offset > off1);
@@ -416,13 +416,13 @@ mod tests {
     fn partial_trailing_line_is_not_consumed_until_complete() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         // Write a complete line plus a partial (no trailing newline).
-        f.write_all(b"{\"event\":\"run_started\",\"ts\":1,\"run_id\":\"r\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/\"}\n{\"event\":\"member_st").unwrap();
+        f.write_all(b"{\"event\":\"run_started\",\"ts\":1,\"run_id\":\"r\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"codex\"],\"cwd\":\"/\"}\n{\"event\":\"member_st").unwrap();
         f.flush().unwrap();
         let mut t = Tracker::new();
         t.ingest(f.path());
         assert_eq!(t.snapshot(|_| true, 20).live.len(), 1);
         // Complete the partial line.
-        f.write_all(b"arted\",\"ts\":2,\"run_id\":\"r\",\"backend\":\"gemini\"}\n")
+        f.write_all(b"arted\",\"ts\":2,\"run_id\":\"r\",\"backend\":\"codex\"}\n")
             .unwrap();
         f.flush().unwrap();
         t.ingest(f.path());
@@ -436,7 +436,7 @@ mod tests {
         let mut log = String::new();
         for i in 0..n {
             log.push_str(&format!(
-                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/\"}}\n"
+                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"codex\"],\"cwd\":\"/\"}}\n"
             ));
             log.push_str(&format!(
                 "{{\"event\":\"run_finished\",\"ts\":{i},\"run_id\":\"r{i}\",\"status\":\"ok\"}}\n"
@@ -457,11 +457,11 @@ mod tests {
     fn live_runs_are_not_evicted() {
         // One live run, then enough finished runs to exceed the cap. The live one survives.
         let mut log = String::from(
-            "{\"event\":\"run_started\",\"ts\":0,\"run_id\":\"live\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/\"}\n",
+            "{\"event\":\"run_started\",\"ts\":0,\"run_id\":\"live\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"codex\"],\"cwd\":\"/\"}\n",
         );
         for i in 1..(MAX_TRACKED_RUNS + 50) {
             log.push_str(&format!(
-                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"gemini\"],\"cwd\":\"/\"}}\n"
+                "{{\"event\":\"run_started\",\"ts\":{i},\"run_id\":\"r{i}\",\"pid\":1,\"kind\":\"rescue\",\"members\":[\"codex\"],\"cwd\":\"/\"}}\n"
             ));
             log.push_str(&format!(
                 "{{\"event\":\"run_finished\",\"ts\":{i},\"run_id\":\"r{i}\",\"status\":\"ok\"}}\n"

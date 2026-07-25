@@ -234,6 +234,9 @@ pub enum Command {
         /// Refresh existing installs in every detected scope (no prompt). Used internally by `agentpit update`.
         #[arg(long)]
         refresh: bool,
+        /// With --refresh, report what changed as JSON (consumed by the desktop app).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Check for or install a newer agentpit release from GitHub.
@@ -487,7 +490,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             scope,
             force,
             refresh,
-        } => init::run(scope, force, refresh).await,
+            json,
+        } => init::run(scope, force, refresh, json).await,
 
         Command::Update { check, json } => update::run(check, json).await,
 

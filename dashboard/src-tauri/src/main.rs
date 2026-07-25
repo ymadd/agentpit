@@ -273,6 +273,7 @@ fn main() {
             settings::config_get,
             settings::config_save,
             app_update::app_update_check,
+            app_update::skills_refresh,
             app_update::app_update_install,
             app_update::app_restart,
             workflow_gen::workflow_generate,

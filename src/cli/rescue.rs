@@ -621,21 +621,25 @@ mod tests {
             source: crate::profile::ProfileSource::Learned,
         };
         let candidates = vec![
-            (BackendId::Claude, score(88)),   // cost 80
-            (BackendId::Opencode, score(65)), // cost 0
-            (BackendId::Opencode, score(75)), // cost 20
-            (BackendId::Codex, score(55)),    // below min_score, out
+            (BackendId::Claude, score(88)),      // cost 80
+            (BackendId::Opencode, score(65)),    // cost 0
+            (BackendId::Antigravity, score(75)), // cost 20
+            (BackendId::Codex, score(55)),       // below min_score, out
         ];
         let cost = |b: BackendId| match b {
             BackendId::Opencode => 0,
-            BackendId::Opencode => 20,
+            BackendId::Antigravity => 20,
             BackendId::Claude => 80,
             _ => 50,
         };
         // Cheapest-first ladder, capped at max_hops+1 entries.
         assert_eq!(
             cascade_ladder(&candidates, 60, 2, cost),
-            vec![BackendId::Opencode, BackendId::Opencode, BackendId::Claude]
+            vec![
+                BackendId::Opencode,
+                BackendId::Antigravity,
+                BackendId::Claude
+            ]
         );
         assert_eq!(
             cascade_ladder(&candidates, 60, 0, cost),

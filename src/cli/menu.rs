@@ -118,7 +118,7 @@ async fn dispatch_main(action: MainAction) -> anyhow::Result<()> {
         MainAction::Status => super::status::run(None).await,
         MainAction::Login => login_flow().await,
         MainAction::Update => update_flow().await,
-        MainAction::Init => super::init::run(None, false, false).await,
+        MainAction::Init => super::init::run(None, false, false, false).await,
         MainAction::Quit => Ok(()),
     }
 }

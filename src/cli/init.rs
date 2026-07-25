@@ -145,9 +145,9 @@ fn prompt_scope() -> Result<Scope> {
     Ok(scope)
 }
 
-pub async fn run(scope: Option<Scope>, force: bool, refresh: bool) -> Result<()> {
+pub async fn run(scope: Option<Scope>, force: bool, refresh: bool, json: bool) -> Result<()> {
     if refresh {
-        return refresh_existing_installs().await;
+        return run_refresh(json).await;
     }
 
     let scope = match scope {
@@ -182,8 +182,37 @@ pub async fn run(scope: Option<Scope>, force: bool, refresh: bool) -> Result<()>
     Ok(())
 }
 
-pub async fn refresh_existing_installs() -> Result<()> {
-    let mut touched = 0usize;
+/// What a refresh did to one `.claude/` install. Serialized as-is by `--json`, which the
+/// desktop app reads to report skill/command updates instead of guessing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct RefreshedScope {
+    /// "project" or "user".
+    pub scope: String,
+    /// The `.claude/` root this scope resolved to.
+    pub path: String,
+    /// Files rewritten because their content differed (or was missing).
+    pub refreshed: usize,
+    /// Files the install is expected to carry in total.
+    pub total: usize,
+}
+
+/// The whole refresh: one entry per detected install. An empty list means no `.claude/`
+/// directory exists yet, which is not an error — nothing was installed to refresh.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct RefreshReport {
+    pub scopes: Vec<RefreshedScope>,
+}
+
+impl RefreshReport {
+    pub fn total_refreshed(&self) -> usize {
+        self.scopes.iter().map(|s| s.refreshed).sum()
+    }
+}
+
+/// Rewrite the managed command/skill files in every detected `.claude/` install so they
+/// match this binary's embedded copies. Returns what changed; printing is the caller's job.
+pub async fn refresh_existing_installs() -> Result<RefreshReport> {
+    let mut report = RefreshReport::default();
     for scope in [Scope::Project, Scope::User] {
         let (commands_dir, skills_dir) = resolve_dirs(scope)?;
         let exists =
@@ -191,23 +220,45 @@ pub async fn refresh_existing_installs() -> Result<()> {
         if !exists {
             continue;
         }
-        let updated = refresh_dir(&commands_dir, COMMAND_FILES).await?
+        let refreshed = refresh_dir(&commands_dir, COMMAND_FILES).await?
             + refresh_dir(&skills_dir, SKILL_FILES).await?;
-        if updated > 0 {
+        report.scopes.push(RefreshedScope {
+            scope: scope_label(scope).to_string(),
+            path: commands_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            refreshed,
+            total: COMMAND_FILES.len() + SKILL_FILES.len(),
+        });
+    }
+    Ok(report)
+}
+
+/// `agentpit init --refresh [--json]`: refresh, then report for humans or machines.
+pub async fn run_refresh(json: bool) -> Result<()> {
+    let report = refresh_existing_installs().await?;
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
+    if report.scopes.is_empty() {
+        println!("no .claude/ install detected — run `agentpit init` first");
+        return Ok(());
+    }
+    for scope in &report.scopes {
+        if scope.refreshed > 0 {
             println!(
-                "refreshed {} files in {} scope ({})",
-                updated,
-                scope_label(scope),
-                commands_dir
-                    .parent()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
+                "refreshed {} of {} files in {} scope ({})",
+                scope.refreshed, scope.total, scope.scope, scope.path
+            );
+        } else {
+            println!(
+                "{} scope already up to date ({} files, {})",
+                scope.scope, scope.total, scope.path
             );
         }
-        touched += 1;
-    }
-    if touched == 0 {
-        println!("no .claude/ install detected — run `agentpit init` first");
     }
     Ok(())
 }
@@ -291,5 +342,60 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         assert_eq!(commands, home.join(".claude/commands/agentpit"));
         assert_eq!(skills, home.join(".claude/skills"));
+    }
+
+    /// `refresh_dir` is what makes an install converge on this binary's copies: it rewrites
+    /// only what differs, adds files a newer build introduced, and leaves a matching install
+    /// untouched (so the desktop can report "already up to date" honestly).
+    #[tokio::test]
+    async fn refresh_dir_writes_only_what_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files: &[(&str, &str)] = &[("a.md", "alpha"), ("b.md", "beta")];
+
+        // A directory that does not exist yet is not an install — nothing is created.
+        let absent = root.join("absent");
+        assert_eq!(refresh_dir(&absent, files).await.unwrap(), 0);
+        assert!(!absent.exists());
+
+        // Stale content and a missing file both get written.
+        let install = root.join("install");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("a.md"), "OLD").unwrap();
+        assert_eq!(refresh_dir(&install, files).await.unwrap(), 2);
+        assert_eq!(
+            std::fs::read_to_string(install.join("a.md")).unwrap(),
+            "alpha"
+        );
+        assert_eq!(
+            std::fs::read_to_string(install.join("b.md")).unwrap(),
+            "beta"
+        );
+
+        // Second pass has nothing to do.
+        assert_eq!(refresh_dir(&install, files).await.unwrap(), 0);
+    }
+
+    /// The JSON contract the desktop app parses. Field names are load-bearing.
+    #[test]
+    fn refresh_report_serializes_the_shape_the_desktop_reads() {
+        let report = RefreshReport {
+            scopes: vec![RefreshedScope {
+                scope: "user".into(),
+                path: "/home/x/.claude".into(),
+                refreshed: 3,
+                total: 22,
+            }],
+        };
+        assert_eq!(report.total_refreshed(), 3);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"scope\":\"user\""), "got: {json}");
+        assert!(json.contains("\"refreshed\":3"), "got: {json}");
+        assert!(json.contains("\"total\":22"), "got: {json}");
+        // Round-trips, so the desktop parsing the same struct cannot drift.
+        assert_eq!(
+            serde_json::from_str::<RefreshReport>(&json).unwrap(),
+            report
+        );
     }
 }

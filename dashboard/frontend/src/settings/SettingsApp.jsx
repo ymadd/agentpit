@@ -7,6 +7,7 @@ import {
   checkForUpdates,
   getUpdateSnapshot,
   installAvailableUpdate,
+  refreshSkills,
   restartDesktopApp,
   setAutoUpdateEnabled,
   subscribeToUpdates,
@@ -254,6 +255,32 @@ function EnsemblesPanel({ draft, change }) {
   );
 }
 
+function SkillsCard() {
+  const [state, setState] = useState({ status: "idle", message: "" });
+  const run = async () => {
+    setState({ status: "running", message: "更新しています…" });
+    try {
+      const result = await refreshSkills();
+      setState({ status: "done", message: result.message });
+    } catch (error) {
+      setState({ status: "error", message: String(error) });
+    }
+  };
+  return (
+    <Card>
+      <span className="set-card-kicker">CLAUDE CODE</span>
+      <h2>コマンドとスキル</h2>
+      <p>このバージョンに同梱された <code>/agentpit:*</code> コマンドとスキルを、検出した <code>.claude/</code> すべてに再インストールします。アプリ更新時にも自動で実行されます。</p>
+      <div className="set-skills-actions">
+        <button className="set-secondary" disabled={state.status === "running"} onClick={run}>
+          {state.status === "running" ? "更新中…" : "今すぐ更新"}
+        </button>
+        {state.message ? <span className={state.status === "error" ? "set-skills-note error" : "set-skills-note"}>{state.message}</span> : null}
+      </div>
+    </Card>
+  );
+}
+
 function useUpdateState() {
   const [state, setState] = useState(getUpdateSnapshot);
   useEffect(() => subscribeToUpdates(setState), []);
@@ -302,6 +329,7 @@ function UpdatesPanel() {
           <div className="set-cli-contract"><code>agentpit</code><span>sidecar</span><i>→</i><code>config.toml</code></div>
         </Card>
       </div>
+      <SkillsCard />
     </div>
   );
 }

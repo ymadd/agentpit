@@ -70,10 +70,10 @@ pub enum Action {
     /// where would the policy have routed, and does the folded verdict for that
     /// (task, backend) say it went well?
     Replay {
-        /// `seeded` (deployed profile stage over the hand-seeded priors), `learned`
-        /// (the deployed auto-route chain: similarity stage when available, then the
-        /// profile stage with cost tiebreak over the current profiles.toml), or
-        /// `similarity` (kNN stage alone; needs a `--features similarity` build).
+        /// `seeded` (the profile stage over the hand-seeded priors), `learned` (the
+        /// similarity stage when available, then the profile stage with cost tiebreak
+        /// over the current profiles.toml), or `similarity` (kNN stage alone; needs a
+        /// `--features similarity` build).
         #[arg(long, default_value = "learned")]
         policy: String,
     },
@@ -234,6 +234,15 @@ fn profile_stage_picker(
 }
 
 /// `agentpit profile replay`: score a routing policy against the recorded labels.
+///
+/// Scope: this replays the *policy* stages of [`Router::resolve`](crate::router::Router)
+/// — the similarity stage and the capability-profile stage with its cost tiebreak, using
+/// the live config's `quality_margin` and per-backend costs. It deliberately does NOT
+/// replay the stages that bypass the policy: a `[routes]` pin, the diagnose confidence
+/// gate, the long-context / keyword fallbacks, or the default backend. So the number
+/// answers "how good are this policy's picks?", not "what would dispatch have done?" —
+/// on a machine whose `[routes]` pins a tool, dispatch would not have consulted the
+/// policy at all.
 ///
 /// Honest scoring caveat: we only know how backends that actually ran performed, so a pick
 /// is *evaluable* only when some label exists for the same task on the picked backend.

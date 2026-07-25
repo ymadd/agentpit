@@ -74,9 +74,15 @@ impl WireScore {
     }
 
     /// Migration for pre-per-cell files: a cell with samples inherits the profile-level
-    /// source (that measurement is what set the profile's source in the first place); a
-    /// zero-sample cell is an untouched seeded prior regardless of the profile's source —
-    /// the same distinction the old `profile show` src column drew.
+    /// source, and a zero-sample cell is an untouched seeded prior regardless of it — the
+    /// same distinction the old `profile show` src column drew.
+    ///
+    /// Known imprecision, accepted: under the old profile-level gate a `learn` fold could
+    /// write cells and a later partial benchmark could then promote the profile to
+    /// `Benchmarked`, so a legacy benchmarked profile may hold learned-origin cells that
+    /// this migration relabels as benchmarked (and therefore freezes). The file carries no
+    /// evidence to tell them apart; re-running `profile run` re-measures the cells that
+    /// matter, and every save from here on records the real per-cell source.
     fn resolve(self, entry_source: ProfileSource) -> Score {
         let source = self.source.unwrap_or(if self.samples > 0 {
             entry_source

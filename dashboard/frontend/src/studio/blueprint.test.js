@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { seedBlueprint, deriveEdges, edgesFor, workflowName, deriveFlow } from "./blueprint.js";
+import { seedBlueprint, deriveEdges, edgesFor, workflowName, deriveFlow, deriveSteps } from "./blueprint.js";
 import { stepNodeData, metaFor } from "./backends.js";
 
 test("deriveEdges mirrors the vanilla default flow (goal→steps→ghost + spawn sub-flow)", () => {
@@ -64,4 +64,58 @@ test("stepNodeData marks an unknown role worker as a faint example", () => {
   const d = stepNodeData({ manager: "claude", workers: [{ type: "role", id: "ghost-role" }] }, []);
   assert.equal(d.workers[0].known, false);
   assert.equal(d.workers[0].label, "ghost-role");
+});
+
+test("deriveSteps projects the cards to config shape in the drawn order", () => {
+  const plan = deriveSteps(seedBlueprint());
+  assert.deepEqual(plan.map((s) => s.name), ["Diagnose", "Plan", "Implement", "Review", "Integrate"]);
+
+  const review = plan.find((s) => s.name === "Review");
+  assert.equal(review.manager_backend, "claude");
+  assert.deepEqual(review.roles, ["reviewer", "security"]);
+  assert.deepEqual(review.backends, []);
+  assert.equal(review.fanout, 3);
+  assert.equal(review.dynamic, true);
+  assert.equal(review.ask, true);
+  assert.ok(review.persona.startsWith("Check spec violations"));
+
+  // geometry, ids, the display index, and the canvas-only `spawns` flag stay out of config
+  for (const key of ["id", "index", "x", "y", "w", "spawns", "workers"]) {
+    assert.ok(!(key in review), `${key} must not reach config`);
+  }
+});
+
+test("deriveSteps splits workers into cast roles and raw CLI backends", () => {
+  const bp = seedBlueprint();
+  bp.steps = [{ id: "s1", name: "Build", manager: "codex", workers: [{ type: "role", id: "coder" }, { type: "cli", id: "opencode" }] }];
+  bp.edges = [{ id: "e", source: "goal", target: "s1" }];
+  const [s] = deriveSteps(bp);
+  assert.deepEqual(s.roles, ["coder"]);
+  assert.deepEqual(s.backends, ["opencode"]);
+});
+
+test("deriveSteps drops unnamed cards and normalizes blanks to null", () => {
+  const bp = seedBlueprint();
+  bp.steps = [
+    { id: "s1", name: "  ", manager: "claude", workers: [] },
+    { id: "s2", name: " Ship ", manager: "", persona: "  ", behavior: "", fanout: 0, workers: [] },
+  ];
+  bp.edges = [{ id: "e", source: "goal", target: "s2" }];
+  const plan = deriveSteps(bp);
+  assert.equal(plan.length, 1, "the unnamed card is not a config entry");
+  assert.equal(plan[0].name, "Ship");
+  assert.equal(plan[0].persona, null);
+  assert.equal(plan[0].behavior, null);
+  assert.equal(plan[0].manager_backend, null);
+  assert.equal(plan[0].fanout, null, "fanout 0 is not a real width");
+});
+
+// flow and steps come from one traversal, so they can never disagree about the order.
+test("deriveSteps and deriveFlow always agree on the order", () => {
+  const bp = seedBlueprint();
+  bp.edges = [
+    { id: "e1", source: "goal", target: "s2" },
+    { id: "e2", source: "s2", target: "s1" },
+  ];
+  assert.equal(deriveSteps(bp).map((s) => s.name).join(" → "), deriveFlow(bp));
 });

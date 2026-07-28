@@ -220,6 +220,47 @@ pub struct RoleConfig {
     pub model: Option<String>,
 }
 
+/// One step of a sketched workflow PLAN (`[[workflow.steps]]`, `[[workflow.types.<name>.steps]]`).
+/// The dashboard's Studio canvas writes these from its step cards.
+///
+/// A step is a SOFT plan entry handed to the manager in its prompt — it is deliberately NOT an
+/// executable node. Nothing in Rust dispatches, orders, or gates on a step: agentpit stays
+/// model-driven, so the manager may merge, reorder, skip, or invent steps as the goal demands.
+/// (A hard DAG would contradict the whole design; see `flow` for the one-line degenerate form.)
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    /// Step label, e.g. "Review" — how the step reads in the plan. The only field that matters
+    /// on its own; a step with a blank name is dropped when the plan is rendered.
+    pub name: String,
+    /// Who the step's worker should BE (the Studio card's persona).
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// What the step should DO (the Studio card's behavior / directive).
+    #[serde(default)]
+    pub behavior: Option<String>,
+    /// Suggested lead backend for this step — the same idea as `[workflow].manager_backend`, one
+    /// level down. A suggestion in the prompt, not a binding the runtime enforces.
+    #[serde(default)]
+    pub manager_backend: Option<BackendId>,
+    /// Worker roles from the shared `[workflow.roles.*]` cast to dispatch this step to. Names
+    /// missing from the cast are surfaced by `workflow list` and otherwise ignored.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Raw backends for step workers that are not named roles (the Studio's CLI chips).
+    #[serde(default)]
+    pub backends: Vec<BackendId>,
+    /// Advisory parallel width for this step. `None` = let the manager decide.
+    #[serde(default)]
+    pub fanout: Option<u32>,
+    /// The step may improvise its own sub-dispatches rather than run as a single shot.
+    #[serde(default)]
+    pub dynamic: bool,
+    /// The step may use the human back-channel. Only meaningful when `enable_ask_human` is on —
+    /// with it off the manager is never told the channel exists.
+    #[serde(default)]
+    pub ask: bool,
+}
+
 /// A named workflow "type" (`[workflow.types.<name>]`) — a PRESET over the base `[workflow]`
 /// and the shared `[workflow.roles.*]` cast, selected by `agentpit workflow <type> "<goal>"`.
 /// Every field is an optional override: unset fields inherit from `[workflow]`, and an empty
@@ -260,6 +301,11 @@ pub struct WorkflowType {
     /// no flow hint (the default). Never a hard DAG — this stays model-driven.
     #[serde(default)]
     pub flow: Option<String>,
+    /// The sketched PLAN (`[[workflow.types.<name>.steps]]`) — the richer form of `flow`, carrying
+    /// each step's persona/behavior/roles. Empty = inherit the base `[workflow]` plan. When a plan
+    /// is present it supersedes `flow` in the manager prompt.
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +334,15 @@ pub struct WorkflowSection {
     /// it off the manager is never told to call a back-channel that would otherwise 404.
     #[serde(default)]
     pub enable_ask_human: bool,
+    /// A soft "suggested flow" for the BASE workflow — the ordered step names sketched on the
+    /// dashboard canvas, injected as a non-binding hint (same treatment as a type's `flow`).
+    /// A type without its own `flow` inherits this one. `None`/empty = no hint (the default).
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// The BASE workflow's sketched PLAN (`[[workflow.steps]]`). Supersedes `flow` when non-empty;
+    /// a type without its own `steps` inherits it. Empty = no plan (the default).
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
 }
 
 impl Default for WorkflowSection {
@@ -301,6 +356,8 @@ impl Default for WorkflowSection {
             max_calls_per_manager: 8,
             use_mcp: false,
             enable_ask_human: false,
+            flow: None,
+            steps: Vec::new(),
         }
     }
 }
@@ -588,6 +645,22 @@ review_members = ["antigravity", "opencode"]
 # max_depth             = 3          # hard recursion ceiling, enforced in Rust; clamped to 1..=32
 # max_calls_per_manager = 8          # advisory sub-dispatch budget surfaced in the prompt
 # use_mcp               = false      # orchestrate via the MCP channel (claude manager only); --use-mcp overrides
+# flow = "Diagnose → Plan → Implement → Review"  # soft step-order hint (the dashboard canvas writes this);
+#                                    # never a hard DAG. A type without its own `flow` inherits it.
+
+# The sketched PLAN — the richer form of `flow`, one entry per Studio step card. Injected into
+# the manager prompt as a SUGGESTION: the manager may merge, reorder, skip, or add steps. Nothing
+# here is enforced in Rust. A type without its own `steps` inherits this plan.
+# [[workflow.steps]]
+# name     = "Review"
+# persona  = "Check spec violations, boundaries, and security."   # who the worker should BE
+# behavior = "If unsure, summon a refutation swarm."              # what it should DO
+# manager_backend = "claude"         # suggested lead for this step
+# roles    = ["reviewer", "security"]  # cast members to dispatch this step to
+# backends = ["codex"]               # raw CLIs for workers that are not named roles
+# fanout   = 3                       # advisory parallel width
+# dynamic  = true                    # may improvise its own sub-dispatches
+# ask      = true                    # may use the human back-channel (needs enable_ask_human)
 
 # Named workflow roles: the manager dispatches to ROLES instead of raw backends when any
 # worker role is defined. The reserved role "manager" configures the orchestrator itself.

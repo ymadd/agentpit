@@ -76,3 +76,34 @@ test("buildPayload matches the settings_save contract (nulls, round-tripped type
   assert.equal(p.types[0].max_depth, 2);
   assert.equal(p.types[0].title, "Review");
 });
+
+// The BASE canvas's sketch reaches config through `[workflow].flow`. Blank must send null
+// so the Rust side removes the key ("unset = no hint") instead of writing an empty string.
+test("buildPayload carries the base workflow flow hint, blank as null", () => {
+  const d = draftFromSettings({ ...raw, workflow: { ...raw.workflow, flow: "Diagnose → Plan" } });
+  assert.equal(d.workflow.flow, "Diagnose → Plan");
+  assert.equal(buildPayload(d).workflow.flow, "Diagnose → Plan");
+
+  d.workflow.flow = "   ";
+  assert.equal(buildPayload(d).workflow.flow, null);
+  assert.equal(buildPayload(draftFromSettings(raw)).workflow.flow, null);
+});
+
+test("buildPayload carries the plan steps for the base workflow and each type", () => {
+  const step = { name: "Review", persona: null, behavior: null, manager_backend: "claude", roles: ["reviewer"], backends: [], fanout: 2, dynamic: true, ask: false };
+  const d = draftFromSettings({
+    ...raw,
+    workflow: { ...raw.workflow, steps: [step] },
+    types: [{ name: "review", steps: [{ ...step, name: "Audit" }] }],
+  });
+  assert.deepEqual(d.workflow.steps, [step]);
+  assert.equal(d.types[0].steps[0].name, "Audit");
+
+  const payload = buildPayload(d);
+  assert.deepEqual(payload.workflow.steps, [step]);
+  assert.equal(payload.types[0].steps[0].name, "Audit");
+
+  // no plan sketched → an empty array, which the Rust side turns into "remove the key"
+  assert.deepEqual(buildPayload(draftFromSettings(raw)).workflow.steps, []);
+  assert.deepEqual(buildPayload(draftFromSettings(raw)).types[0].steps, []);
+});

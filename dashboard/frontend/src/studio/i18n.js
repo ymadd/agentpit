@@ -96,6 +96,10 @@ export const JA = {
   "Backend transport and default models are managed in Settings → Backends. Role models here still override those defaults.":
     "バックエンドの接続方式と既定モデルは「設定 → バックエンド」で管理します。ここで指定したロールモデルが引き続き優先されます。",
   "Saved to config.toml `[workflow]` on Save.": "保存時に config.toml の `[workflow]` に書き込まれます。",
+  // plan / flow preview
+  "Plan written to config (from your cards and arrows)": "設定に書き込まれる計画（カードと矢印から生成）",
+  "No named steps on the canvas yet — nothing will be written.": "名前付きのステップがまだありません — 何も書き込まれません。",
+  "Injected into the manager brief as a non-binding suggestion.": "拘束力のない提案として、マネージャーのブリーフに注入されます。",
   // type form
   "WORKFLOW TYPE ·": "ワークフロータイプ ·",
   "Workflow name": "ワークフロー名",
@@ -150,6 +154,29 @@ export const JA = {
   dynamic: "動的",
   WORKFLOW: "ワークフロー",
   "Saved to config.toml `[workflow.types.*]` on Save.": "保存時に config.toml の `[workflow.types.*]` に書き込まれます。",
+  // live workflow-run view
+  "Workflow run": "ワークフロー実行",
+  "{n} stages": "{n} ステージ",
+  "{running} running / {total} stages": "{running} 実行中 / {total} ステージ",
+  "finished · {n} stages": "完了 · {n} ステージ",
+  "{n} failed": "{n} 件失敗",
+  "Follow the latest run": "最新の実行を追う",
+  "No workflow has run yet — start one with `agentpit workflow …`": "まだワークフローの実行がありません — `agentpit workflow …` で開始してください。",
+  live: "実行中",
+  finished: "完了",
+  running: "実行中",
+  done: "完了",
+  failed: "失敗",
+  Status: "状態",
+  Kind: "種別",
+  Role: "ロール",
+  Elapsed: "経過",
+  Directory: "ディレクトリ",
+  "Run ID": "ラン ID",
+  Agents: "エージェント",
+  "No agent has started yet.": "まだエージェントが開始していません。",
+  aggregator: "集約",
+  "{n} chars": "{n} 文字",
 };
 
 export function makeT(lang) {

@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use super::{install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer};
 use crate::auth::check_auth;
-use crate::config::{HubConfig, RoleConfig, WorkflowSection};
+use crate::config::{HubConfig, RoleConfig, WorkflowSection, WorkflowStep};
 use crate::dispatch::{Registries, dispatch};
 use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::exec::{AskTier, McpConfigGuard, WorkflowManagerExec, is_supported_manager};
@@ -204,6 +204,7 @@ pub(crate) async fn run_capture(
         persona: manager_persona.as_deref(),
         brief: eff.brief.as_deref(),
         flow: eff.flow.as_deref(),
+        steps: &eff.steps,
     };
     let prompt = if mcp_mode {
         build_manager_prompt_mcp(
@@ -408,6 +409,9 @@ struct EffectiveWorkflow {
     /// The type's soft FLOW hint (`[workflow.types.<name>].flow`) — the sketched step order,
     /// injected as a non-binding suggestion. `None` = no hint (base + unsketched types).
     flow: Option<String>,
+    /// The sketched PLAN (`[[...steps]]`) — the richer form of `flow`. Supersedes `flow` in the
+    /// manager prompt when non-empty. Empty = no plan.
+    steps: Vec<WorkflowStep>,
     /// The resolved type name, for the leader line. `None` = base workflow.
     type_name: Option<String>,
 }
@@ -429,7 +433,8 @@ fn resolve_workflow_type(
         enable_ask_human: section.enable_ask_human,
         role_filter: None,
         brief: None,
-        flow: None,
+        flow: section.flow.clone(),
+        steps: section.steps.clone(),
         type_name: None,
     };
     let Some(name) = type_name else {
@@ -454,7 +459,14 @@ fn resolve_workflow_type(
         enable_ask_human: t.enable_ask_human.unwrap_or(base.enable_ask_human),
         role_filter: (!t.roles.is_empty()).then(|| t.roles.clone()),
         brief: t.prompt.clone(),
-        flow: t.flow.clone(),
+        // A type that was never sketched inherits the base canvas's flow hint, mirroring how
+        // every other unset per-type field falls back to `[workflow]`.
+        flow: t.flow.clone().or_else(|| section.flow.clone()),
+        steps: if t.steps.is_empty() {
+            section.steps.clone()
+        } else {
+            t.steps.clone()
+        },
         type_name: Some(name.to_string()),
     })
 }
@@ -505,6 +517,16 @@ struct TypeListingEntry {
     roles_missing_from_cast: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     brief: Option<String>,
+    /// The effective soft flow hint (own `flow`, else inherited from `[workflow]`). Listed so
+    /// the sketch drawn in the dashboard is inspectable from the CLI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flow: Option<String>,
+    /// The effective sketched PLAN (own `steps`, else inherited). Supersedes `flow` in the prompt.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    steps: Vec<WorkflowStep>,
+    /// Step roles named by the plan but missing from the shared cast (ignored at run time).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    step_roles_missing_from_cast: Vec<String>,
     /// When-to-use description (`[workflow.types.<name>].description`). Base workflow has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
@@ -580,6 +602,22 @@ fn build_types_listing(
             roles,
             roles_missing_from_cast: missing,
             brief: eff.brief,
+            flow: eff.flow,
+            // A plan role that is not in the cast is silently ignored at run time, so name it
+            // here — the same courtesy the type's own `roles` already gets.
+            step_roles_missing_from_cast: {
+                let mut m: Vec<String> = eff
+                    .steps
+                    .iter()
+                    .flat_map(|s| s.roles.iter())
+                    .filter(|r| !all_workers.contains(r))
+                    .cloned()
+                    .collect();
+                m.sort();
+                m.dedup();
+                m
+            },
+            steps: eff.steps,
             description,
         }
     };
@@ -629,6 +667,35 @@ fn render_types_listing(listing: &TypesListing) -> String {
         }
         if let Some(brief) = &e.brief {
             out.push_str(&format!("    brief: {}\n", truncate_line(brief, 100)));
+        }
+        // The plan supersedes `flow` in the prompt, so print whichever one actually applies
+        // rather than both — the listing exists to show what a run would really see.
+        if e.steps.is_empty() {
+            if let Some(flow) = &e.flow {
+                out.push_str(&format!("    flow: {}\n", truncate_line(flow, 100)));
+            }
+        } else {
+            out.push_str(&format!("    plan ({} steps):\n", e.steps.len()));
+            for (i, s) in e.steps.iter().enumerate() {
+                let lead = match s.manager_backend {
+                    Some(b) => format!(" · {b}"),
+                    None => String::new(),
+                };
+                let workers = step_workers(s);
+                let w = if workers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" → {}", workers.join(", "))
+                };
+                out.push_str(&format!(
+                    "      {}. {}{lead}{w}\n",
+                    i + 1,
+                    truncate_line(&s.name, 60)
+                ));
+            }
+            for missing in &e.step_roles_missing_from_cast {
+                out.push_str(&format!("      {missing}? (not in cast)\n"));
+            }
         }
     };
 
@@ -809,6 +876,9 @@ pub struct PromptRoles<'a> {
     /// The soft FLOW hint from `[workflow.types.<name>].flow` — the sketched step order, injected
     /// as a NON-BINDING suggestion (the manager still improvises). `None` = no hint.
     pub flow: Option<&'a str>,
+    /// The sketched PLAN (`[[...steps]]`). Richer than `flow` and supersedes it when non-empty.
+    /// Empty (the `Default`) keeps the legacy prompt byte-identical.
+    pub steps: &'a [WorkflowStep],
 }
 
 /// The manager-persona block injected right below the orchestrator header, or empty.
@@ -842,6 +912,97 @@ fn flow_hint_block(flow: Option<&str>) -> String {
             "SUGGESTED FLOW (the user sketched this on the canvas — treat it as a hint, not a script; adapt freely to the goal):\n{f}\n\n",
             f = f.trim()
         ),
+    }
+}
+
+/// A step's workers as one flat display list: cast roles first, then raw backends. Shared by the
+/// manager prompt and `workflow list` so the two can't drift apart.
+fn step_workers(s: &WorkflowStep) -> Vec<String> {
+    s.roles
+        .iter()
+        .cloned()
+        .chain(s.backends.iter().map(|b| b.to_string()))
+        .collect()
+}
+
+/// One plan step rendered as a numbered entry: a meta line (lead / roles / fanout / flags) plus
+/// the optional persona and behavior. Every field is optional except the name, so a bare
+/// `name = "Review"` renders as a single clean line rather than a skeleton of empty labels.
+fn plan_step_lines(i: usize, s: &WorkflowStep) -> String {
+    let mut meta: Vec<String> = Vec::new();
+    if let Some(b) = s.manager_backend {
+        meta.push(format!("lead: {b}"));
+    }
+    let workers = step_workers(s);
+    if !workers.is_empty() {
+        meta.push(format!("workers: {}", workers.join(", ")));
+    }
+    if let Some(f) = s.fanout {
+        meta.push(format!("fan out ~{f}"));
+    }
+    if s.dynamic {
+        meta.push("may improvise sub-steps".to_string());
+    }
+    if s.ask {
+        meta.push("may ask the human".to_string());
+    }
+
+    let mut out = format!("  {n}. {name}", n = i + 1, name = s.name.trim());
+    if !meta.is_empty() {
+        out.push_str(&format!("  ({})", meta.join(" · ")));
+    }
+    out.push('\n');
+    if let Some(p) = s
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        out.push_str(&format!("     who: {p}\n"));
+    }
+    if let Some(b) = s
+        .behavior
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        out.push_str(&format!("     do:  {b}\n"));
+    }
+    out
+}
+
+/// The sketched-PLAN block (from `[[workflow.steps]]` / `[[workflow.types.<name>.steps]]`), or
+/// empty. Same contract as [`flow_hint_block`] — a NON-BINDING suggestion the manager adapts —
+/// but carrying each step's persona, directive, workers, and flags instead of just an order.
+///
+/// Unnamed steps are skipped: the name is what makes a step legible in the plan, and rendering a
+/// blank entry would just spend prompt budget on noise.
+fn plan_block(steps: &[WorkflowStep]) -> String {
+    let named: Vec<&WorkflowStep> = steps.iter().filter(|s| !s.name.trim().is_empty()).collect();
+    if named.is_empty() {
+        return String::new();
+    }
+    let body: String = named
+        .iter()
+        .enumerate()
+        .map(|(i, s)| plan_step_lines(i, s))
+        .collect();
+    format!(
+        "SUGGESTED PLAN (the user sketched these steps on the canvas — treat them as a hint, not a\n\
+         script; merge, reorder, skip, or add steps as the goal demands):\n\
+         {body}\n"
+    )
+}
+
+/// The plan slot of the manager prompt: the richer PLAN when steps were sketched, else the
+/// one-line FLOW hint. Never both — `flow` is the degenerate form of the same sketch, so
+/// emitting both would restate the step order twice.
+fn plan_or_flow_block(steps: &[WorkflowStep], flow: Option<&str>) -> String {
+    let plan = plan_block(steps);
+    if plan.is_empty() {
+        flow_hint_block(flow)
+    } else {
+        plan
     }
 }
 
@@ -1013,7 +1174,7 @@ pub fn build_manager_prompt(
     };
     let persona = persona_block(roles.persona);
     let brief = brief_block(roles.brief);
-    let flow = flow_hint_block(roles.flow);
+    let flow = plan_or_flow_block(roles.steps, roles.flow);
     format!(
         "=== AGENTPIT WORKFLOW ORCHESTRATOR ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
@@ -1115,7 +1276,7 @@ pub fn build_manager_prompt_mcp(
     };
     let persona = persona_block(roles.persona);
     let brief = brief_block(roles.brief);
-    let flow = flow_hint_block(roles.flow);
+    let flow = plan_or_flow_block(roles.steps, roles.flow);
     format!(
         "=== AGENTPIT WORKFLOW ORCHESTRATOR (MCP MODE) ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
@@ -2118,6 +2279,7 @@ goal\n";
             persona: None,
             brief: None,
             flow: None,
+            steps: &[],
         }
     }
 
@@ -2173,6 +2335,7 @@ goal\n";
             persona: Some("Prefer small, verifiable steps.\n"),
             brief: None,
             flow: None,
+            steps: &[],
         };
         let shell = build_manager_prompt(
             "goal",
@@ -2191,6 +2354,56 @@ goal\n";
             assert!(text.contains("Prefer small, verifiable steps."));
             // Persona composes with the legacy roster (persona-only manager role).
             assert!(text.contains("AVAILABLE WORKER BACKENDS: codex"));
+        }
+    }
+
+    // End-to-end through the real prompt assembly (both modes), not just the block renderer.
+    #[test]
+    fn plan_block_reaches_the_assembled_manager_prompt_in_both_modes() {
+        let agents = [BackendId::Codex];
+        let steps = vec![WorkflowStep {
+            name: "Review".into(),
+            persona: Some("Be a strict reviewer.".into()),
+            behavior: Some("Critique only.".into()),
+            manager_backend: Some(BackendId::Claude),
+            roles: vec!["reviewer".into()],
+            fanout: Some(3),
+            ..WorkflowStep::default()
+        }];
+        let with_plan = PromptRoles {
+            // a `flow` is also set: the plan must win, and the prompt must not carry both
+            flow: Some("diagnose → plan"),
+            steps: &steps,
+            ..Default::default()
+        };
+        let shell = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            1,
+            3,
+            8,
+            "run-1",
+            None,
+            &with_plan,
+        );
+        let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &with_plan);
+        for text in [&shell, &mcp] {
+            assert!(text.contains("SUGGESTED PLAN"), "got: {text}");
+            assert!(text.contains("1. Review"), "got: {text}");
+            assert!(text.contains("who: Be a strict reviewer."), "got: {text}");
+            assert!(text.contains("workers: reviewer"), "got: {text}");
+            assert!(
+                !text.contains("SUGGESTED FLOW"),
+                "plan must supersede flow: {text}"
+            );
+            assert!(!text.contains("diagnose → plan"), "got: {text}");
+            // still a hint, and the improvise-your-own-plan procedure is intact
+            assert!(
+                text.contains("merge, reorder, skip, or add steps"),
+                "got: {text}"
+            );
+            assert!(text.contains("Briefly state your plan"), "got: {text}");
         }
     }
 
@@ -2413,6 +2626,7 @@ goal\n";
                 use_mcp: None,
                 enable_ask_human: Some(true),
                 flow: Some("diagnose → plan → implement".into()),
+                steps: Vec::new(),
             },
         );
         s
@@ -2445,6 +2659,144 @@ goal\n";
         );
         assert_eq!(eff.brief.as_deref(), Some("Run a strict review."));
         assert_eq!(eff.type_name.as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn base_flow_hint_resolves_and_types_inherit_it() {
+        let mut s = section_with_types();
+        s.flow = Some("Diagnose → Plan → Ship".into());
+        // The base workflow (`agentpit workflow "<goal>"`) now carries the sketch, so the
+        // dashboard's default canvas is not inert.
+        assert_eq!(
+            resolve_workflow_type(&s, None).unwrap().flow.as_deref(),
+            Some("Diagnose → Plan → Ship")
+        );
+        // A type with its own flow keeps it...
+        assert_eq!(
+            resolve_workflow_type(&s, Some("review"))
+                .unwrap()
+                .flow
+                .as_deref(),
+            Some("diagnose → plan → implement")
+        );
+        // ...and one that was never sketched inherits the base, like every other unset field.
+        s.types.get_mut("review").unwrap().flow = None;
+        assert_eq!(
+            resolve_workflow_type(&s, Some("review"))
+                .unwrap()
+                .flow
+                .as_deref(),
+            Some("Diagnose → Plan → Ship")
+        );
+    }
+
+    fn step(name: &str) -> WorkflowStep {
+        WorkflowStep {
+            name: name.into(),
+            ..WorkflowStep::default()
+        }
+    }
+
+    #[test]
+    fn base_plan_resolves_and_types_inherit_it() {
+        let mut s = section_with_types();
+        s.steps = vec![step("Diagnose"), step("Ship")];
+        assert_eq!(
+            resolve_workflow_type(&s, None)
+                .unwrap()
+                .steps
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Diagnose", "Ship"]
+        );
+        // A type with no plan of its own inherits the base plan...
+        assert_eq!(
+            resolve_workflow_type(&s, Some("review"))
+                .unwrap()
+                .steps
+                .len(),
+            2
+        );
+        // ...and a type that HAS one replaces it wholesale (not a merge).
+        s.types.get_mut("review").unwrap().steps = vec![step("Audit")];
+        let eff = resolve_workflow_type(&s, Some("review")).unwrap();
+        assert_eq!(
+            eff.steps
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Audit"]
+        );
+    }
+
+    #[test]
+    fn plan_block_renders_meta_persona_and_directive() {
+        let steps = vec![
+            WorkflowStep {
+                name: "Review".into(),
+                persona: Some("Be a strict reviewer.".into()),
+                behavior: Some("Critique only.".into()),
+                manager_backend: Some(BackendId::Claude),
+                roles: vec!["reviewer".into()],
+                backends: vec![BackendId::Codex],
+                fanout: Some(3),
+                dynamic: true,
+                ask: true,
+            },
+            // a bare step must stay a single clean line, not a skeleton of empty labels
+            step("Ship"),
+        ];
+        let out = plan_block(&steps);
+        assert!(out.contains("SUGGESTED PLAN"), "got: {out}");
+        assert!(out.contains("hint, not a"), "must stay non-binding: {out}");
+        assert!(out.contains("1. Review"), "got: {out}");
+        assert!(out.contains("lead: claude"), "got: {out}");
+        assert!(out.contains("workers: reviewer, codex"), "got: {out}");
+        assert!(out.contains("fan out ~3"), "got: {out}");
+        assert!(out.contains("may improvise sub-steps"), "got: {out}");
+        assert!(out.contains("may ask the human"), "got: {out}");
+        assert!(out.contains("who: Be a strict reviewer."), "got: {out}");
+        assert!(out.contains("do:  Critique only."), "got: {out}");
+        assert!(out.contains("2. Ship\n"), "got: {out}");
+        assert!(
+            !out.contains("who: \n") && !out.contains("do:  \n"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn plan_block_is_empty_without_named_steps() {
+        assert!(plan_block(&[]).is_empty());
+        assert!(
+            plan_block(&[step("  ")]).is_empty(),
+            "blank names are dropped"
+        );
+        // ...and a blank-named step among real ones does not consume a number
+        let out = plan_block(&[step("A"), step(""), step("B")]);
+        assert!(out.contains("1. A") && out.contains("2. B"), "got: {out}");
+    }
+
+    // The plan is the richer form of `flow`, so exactly one of them reaches the prompt.
+    #[test]
+    fn plan_supersedes_the_flow_hint() {
+        let out = plan_or_flow_block(&[step("Review")], Some("a → b"));
+        assert!(out.contains("SUGGESTED PLAN"), "got: {out}");
+        assert!(!out.contains("SUGGESTED FLOW"), "must not emit both: {out}");
+        // with no plan the one-line hint still applies
+        let out = plan_or_flow_block(&[], Some("a → b"));
+        assert!(
+            out.contains("SUGGESTED FLOW") && out.contains("a → b"),
+            "got: {out}"
+        );
+        assert!(plan_or_flow_block(&[], None).is_empty());
+    }
+
+    #[test]
+    fn no_base_flow_means_no_hint() {
+        let s = section_with_types();
+        assert!(resolve_workflow_type(&s, None).unwrap().flow.is_none());
+        assert!(flow_hint_block(None).is_empty());
     }
 
     #[test]

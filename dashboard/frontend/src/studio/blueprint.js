@@ -107,13 +107,13 @@ export function edgesFor(bp) {
   return Array.isArray(bp.edges) ? bp.edges : deriveEdges(bp);
 }
 
-// Phase 4: distil the drawn edges into a prose "flow" — the STEP names in the
-// order they're reached from the goal. This is the soft ordering hint written to
-// [workflow.types.*].flow and injected into the manager brief ("you sketched
-// this; adapt freely"). Returns "" when there are no steps.
-export function deriveFlow(bp) {
-  const steps = new Map((bp.steps || []).map((s) => [s.id, s]));
-  if (steps.size === 0) return "";
+// The step CARDS in the order the drawn arrows reach them from the goal. Both the prose
+// `flow` hint and the structured `steps` plan are derived from this one traversal, so the
+// two can never disagree about the order. Steps not reachable from the goal (orphans) trail
+// in array order rather than being dropped — an unwired card is still part of the sketch.
+export function orderedSteps(bp) {
+  const byId = new Map((bp.steps || []).map((s) => [s.id, s]));
+  if (byId.size === 0) return [];
   const next = new Map();
   for (const e of edgesFor(bp)) {
     if (!next.has(e.source)) next.set(e.source, []);
@@ -124,11 +124,46 @@ export function deriveFlow(bp) {
   const visit = (id) => {
     if (seen.has(id)) return;
     seen.add(id);
-    if (steps.has(id)) order.push(steps.get(id).name || "step");
+    if (byId.has(id)) order.push(byId.get(id));
     for (const nx of next.get(id) || []) visit(nx);
   };
   visit("goal");
-  // any steps not reachable from the goal (orphans) trail in array order
-  for (const s of bp.steps || []) if (!seen.has(s.id)) order.push(s.name || "step");
-  return order.join(" → ");
+  for (const s of bp.steps || []) if (!seen.has(s.id)) order.push(s);
+  return order;
+}
+
+// Phase 4: distil the drawn edges into a prose "flow" — the STEP names in the
+// order they're reached from the goal. This is the soft ordering hint written to
+// [workflow.types.*].flow and injected into the manager brief ("you sketched
+// this; adapt freely"). Returns "" when there are no steps.
+export function deriveFlow(bp) {
+  return orderedSteps(bp)
+    .map((s) => s.name || "step")
+    .join(" → ");
+}
+
+// The structured PLAN written to `[[workflow.steps]]` / `[[workflow.types.*.steps]]` — the
+// richer form of `flow`, carrying each card's persona, directive, workers, and flags.
+//
+// Only the SEMANTIC fields cross into config: geometry (x/y/w), ids, the display index, and
+// the canvas-only `spawns` decoration stay in the localStorage sketch. Unnamed cards are
+// skipped — the name is what makes a step legible in the manager's plan, so a blank one is
+// a half-drafted card, not a config entry.
+export function deriveSteps(bp) {
+  return orderedSteps(bp)
+    .filter((s) => (s.name || "").trim())
+    .map((s) => {
+      const workers = s.workers || [];
+      return {
+        name: s.name.trim(),
+        persona: (s.persona || "").trim() || null,
+        behavior: (s.behavior || "").trim() || null,
+        manager_backend: s.manager || null,
+        roles: workers.filter((w) => w.type === "role").map((w) => w.id).filter(Boolean),
+        backends: workers.filter((w) => w.type !== "role").map((w) => w.id).filter(Boolean),
+        fanout: Number.isFinite(s.fanout) && s.fanout > 0 ? s.fanout : null,
+        dynamic: !!s.dynamic,
+        ask: !!s.ask,
+      };
+    });
 }

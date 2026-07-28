@@ -57,24 +57,7 @@
 }
 .sd-body { flex: 1 1 auto; min-height: 0; display: flex; }
 .sd-canvas { flex: 1 1 auto; min-width: 0; }
-.sd-canvas .react-flow__minimap {
-  overflow: hidden;
-  border: 1px solid var(--line-3);
-  border-radius: 9px;
-  background: #0a0e14 !important;
-}
-.sd-canvas .react-flow__minimap-mask { fill: rgba(105, 197, 176, 0.12); }
-.sd-canvas .react-flow__minimap-node { fill: #4d596a; stroke: none; }
-.sd-canvas .react-flow__controls { overflow: hidden; border: 1px solid var(--line-3); border-radius: 8px; box-shadow: none; }
-.sd-canvas .react-flow__controls-button {
-  border-bottom-color: var(--line-3);
-  background: #0d121a;
-  color: var(--muted);
-}
-.sd-canvas .react-flow__controls-button:hover { background: #151c26; }
-.sd-canvas .react-flow__controls-button svg { fill: currentColor; }
-.sd-canvas .react-flow__attribution { background: rgba(8, 11, 16, 0.72); }
-.sd-canvas .react-flow__attribution a { color: var(--faint); }
+/* React Flow's own chrome is themed in ../reactflow-dark.css, shared with the live run view. */
 
 /* StudioStepNode reuses legacy .ws-* class names for its self-contained styles.
    The globally-loaded legacy style.css sets `.ws-node { position:absolute; left:0;
@@ -355,6 +338,24 @@
   font-size: 12px;
 }
 .sd-note { margin-top: 10px; font-size: 10px; line-height: 1.5; color: var(--faint); }
+/* The derived plan — one entry per step card, in the order the arrows reach them. */
+.sd-plan { margin: 0 0 8px; padding: 0 0 0 20px; display: flex; flex-direction: column; gap: 5px; }
+.sd-plan li { font-size: 11px; color: var(--text-2); }
+.sd-plan-name { font-weight: 600; color: var(--text); }
+.sd-plan-meta { margin-left: 7px; font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }
+
+/* The derived flow hint — what Save writes to `flow`, echoed back while you sketch. */
+.sd-flow {
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ac-tx);
+  word-break: break-word;
+}
 .sd-fielderr { margin: -6px 0 10px; font-size: 11px; color: #f08a98; }
 .sd-section-title {
   margin: 18px 0 0;

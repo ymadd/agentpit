@@ -28,6 +28,8 @@ function typeFromConfig(t) {
     enable_ask_human: t.enable_ask_human == null ? null : !!t.enable_ask_human,
     // Phase 4: soft flow hint (derived from the drawn edges; recomputed on Save).
     flow: t.flow || "",
+    // The structured plan (`[[workflow.types.*.steps]]`), likewise recomputed on Save.
+    steps: [...(t.steps || [])],
     isNew: false,
   };
 }
@@ -47,6 +49,9 @@ export function draftFromSettings(data) {
       max_calls_per_manager: wf.max_calls_per_manager ?? DEFAULT_MAX_CALLS,
       use_mcp: !!wf.use_mcp,
       enable_ask_human: !!wf.enable_ask_human,
+      // Soft flow hint for the BASE canvas, recomputed from the sketch on Save.
+      flow: wf.flow || "",
+      steps: [...(wf.steps || [])],
     },
     roles: ((data && data.roles) || []).map((r) => ({
       _key: ++roleKeySeq,
@@ -119,6 +124,8 @@ export function buildPayload(draft) {
       max_calls_per_manager: draft.workflow.max_calls_per_manager ?? DEFAULT_MAX_CALLS,
       use_mcp: !!draft.workflow.use_mcp,
       enable_ask_human: !!draft.workflow.enable_ask_human,
+      flow: draft.workflow.flow && draft.workflow.flow.trim() ? draft.workflow.flow : null,
+      steps: draft.workflow.steps || [],
     },
     roles: draft.roles.map((r) => ({
       name: r.name,
@@ -138,6 +145,7 @@ export function buildPayload(draft) {
       use_mcp: t.use_mcp ?? null,
       enable_ask_human: t.enable_ask_human ?? null,
       flow: t.flow && t.flow.trim() ? t.flow : null,
+      steps: t.steps || [],
     })),
   };
 }

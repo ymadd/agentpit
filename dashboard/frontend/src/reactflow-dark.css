@@ -1,0 +1,49 @@
+/* React Flow ships its chrome (minimap, controls, attribution) light-themed. Both canvases —
+   the Studio blueprint (.sd-canvas) and the live workflow run (.wr-canvas) — sit on the dark
+   dashboard, so the overrides live here once instead of being kept in lockstep in two files. */
+
+.sd-canvas .react-flow__minimap,
+.wr-canvas .react-flow__minimap {
+  overflow: hidden;
+  border: 1px solid var(--line-3);
+  border-radius: 9px;
+  background: #0a0e14 !important;
+}
+.sd-canvas .react-flow__minimap-mask,
+.wr-canvas .react-flow__minimap-mask {
+  fill: rgba(105, 197, 176, 0.12);
+}
+.sd-canvas .react-flow__minimap-node,
+.wr-canvas .react-flow__minimap-node {
+  fill: #4d596a;
+  stroke: none;
+}
+.sd-canvas .react-flow__controls,
+.wr-canvas .react-flow__controls {
+  overflow: hidden;
+  border: 1px solid var(--line-3);
+  border-radius: 8px;
+  box-shadow: none;
+}
+.sd-canvas .react-flow__controls-button,
+.wr-canvas .react-flow__controls-button {
+  border-bottom-color: var(--line-3);
+  background: #0d121a;
+  color: var(--muted);
+}
+.sd-canvas .react-flow__controls-button:hover,
+.wr-canvas .react-flow__controls-button:hover {
+  background: #151c26;
+}
+.sd-canvas .react-flow__controls-button svg,
+.wr-canvas .react-flow__controls-button svg {
+  fill: currentColor;
+}
+.sd-canvas .react-flow__attribution,
+.wr-canvas .react-flow__attribution {
+  background: rgba(8, 11, 16, 0.72);
+}
+.sd-canvas .react-flow__attribution a,
+.wr-canvas .react-flow__attribution a {
+  color: var(--faint);
+}

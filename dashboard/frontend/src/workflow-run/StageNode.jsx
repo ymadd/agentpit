@@ -4,7 +4,7 @@ function fmt(secs) {
   return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, "0")}s`;
 }
 
-function elapsed(data) {
+export function elapsed(data) {
   if (data.finished) {
     return data.durationMs ? fmt(Math.round(data.durationMs / 1000)) : "";
   }
@@ -18,7 +18,7 @@ const STATUS = {
   failed: { color: "#e5687a", text: "#f08a98", label: "failed" },
 };
 
-export default function StageNode({ data }) {
+export default function StageNode({ data, selected }) {
   const s = STATUS[data.status] || STATUS.running;
   const handleStyle = {
     width: 8,
@@ -27,7 +27,10 @@ export default function StageNode({ data }) {
     border: "1.5px solid var(--line-3)",
   };
   return (
-    <div className={`wr-stage ${data.isRoot ? "root" : ""} st-${data.status}`} style={{ "--st": s.color, "--st-tx": s.text }}>
+    <div
+      className={`wr-stage ${data.isRoot ? "root" : ""} st-${data.status} ${selected ? "sel" : ""}`}
+      style={{ "--st": s.color, "--st-tx": s.text }}
+    >
       <Handle type="target" position={Position.Left} style={handleStyle} />
       <div className="wr-stage-hd">
         <span className={`wr-dot ${data.status === "running" ? "pulse" : ""}`} />

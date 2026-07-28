@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -13,12 +13,13 @@ import "@xyflow/react/dist/style.css";
 import StudioStepNode from "../StudioStepNode.jsx";
 import { WorkflowNode, GenStepNode, GhostNode } from "./nodes.jsx";
 import { stepNodeData, metaFor, resolveWorker } from "./backends.js";
-import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName, seedBlueprint, deriveFlow, hasBlueprint } from "./blueprint.js";
+import { loadBlueprint, saveBlueprint, edgesFor, blueprintKey, workflowName, seedBlueprint, deriveFlow, deriveSteps, hasBlueprint } from "./blueprint.js";
 import { draftFromSettings, validate, buildPayload, newRole, newType, typeNameError } from "./settings.js";
 import { indexModelCatalogs, primaryRoleCatalog } from "./model-catalogs.js";
 import { loadSavedSteps, saveSavedSteps, stepTemplate, stepFromTemplate, maxStepSeq } from "./savedsteps.js";
 import { Field, Text, Area, Num, Toggle, Select, TriState, BackendChips } from "./forms.jsx";
 import { t as tr, setStudioLang, detectLang, persistLang } from "./i18n.js";
+import "../reactflow-dark.css";
 import "./studio.css";
 
 const nodeTypes = {
@@ -373,18 +374,23 @@ export default function StudioApp({ embedded = false }) {
     setSaveError(null);
     try {
       const invoke = window.__TAURI__?.core?.invoke;
-      // Phase 4: recompute the soft flow hint ONLY for types the user actually
+      // Phase 4: recompute the soft flow hint ONLY for workflows the user actually
       // sketched (a real localStorage blueprint). A config-authored type never
-      // opened in the canvas keeps its existing flow — we must NOT stamp the
-      // generic seed flow onto it (that would clobber a hand-authored flow and
-      // break "unset = no hint").
+      // opened in the canvas keeps its existing flow/plan — we must NOT stamp the
+      // generic seed onto it (that would clobber a hand-authored one and break
+      // "unset = inherit / no hint"). `flow` and `steps` come from the SAME sketch,
+      // so they can never disagree about the step order.
+      const derive = (name, existing) => {
+        if (!hasBlueprint(name)) return { flow: existing.flow || "", steps: existing.steps || [] };
+        const bp = name === bpNameRef.current ? bpRef.current : loadBlueprint(name);
+        return { flow: deriveFlow(bp), steps: deriveSteps(bp) };
+      };
+
       const withFlows = {
         ...draft,
-        types: draft.types.map((t) => {
-          const name = workflowName(t);
-          if (!hasBlueprint(name)) return { ...t, flow: t.flow || "" }; // never sketched → preserve
-          return { ...t, flow: deriveFlow(t._key === currentType ? bpRef.current : loadBlueprint(name)) };
-        }),
+        // The BASE canvas gets the same treatment as a named type.
+        workflow: { ...draft.workflow, ...derive("base", draft.workflow) },
+        types: draft.types.map((t) => ({ ...t, ...derive(workflowName(t), t) })),
       };
       if (invoke) await invoke("settings_save", { payload: buildPayload(withFlows) });
       setDirty(false);
@@ -587,6 +593,15 @@ export default function StudioApp({ embedded = false }) {
     });
   }, [setNodes, updateBlueprint]);
 
+  // Exactly what Save will write for this workflow: the one-line `flow` hint and the
+  // structured `steps` plan. Keyed on bpVersion (bumped by every sketch edit and workflow
+  // switch), so editing a card or drawing an arrow shows its effect on config immediately —
+  // without this the canvas→config link is invisible and the sketch reads as decoration.
+  // Memoized because the whole editor re-renders on unrelated state (typing in the
+  // inspector, a model-catalog fetch) and the derivation walks the full edge graph.
+  const flowPreview = useMemo(() => deriveFlow(bpRef.current), [bpVersion]);
+  const planPreview = useMemo(() => deriveSteps(bpRef.current), [bpVersion]);
+
   if (!draft) return <div className={"sd-root" + (embedded ? " sd-embedded" : "")} />;
 
   const backends = draft.known_backends;
@@ -733,6 +748,8 @@ export default function StudioApp({ embedded = false }) {
               onToggleRole={toggleTypeRole}
               onDescribe={runDescribe}
               onDelete={deleteType}
+              flowPreview={flowPreview}
+              planPreview={planPreview}
             />
           ) : (
             <WorkflowForm
@@ -740,6 +757,8 @@ export default function StudioApp({ embedded = false }) {
               backends={backends}
               beOpts={beOpts}
               onField={setWorkflowField}
+              flowPreview={flowPreview}
+              planPreview={planPreview}
             />
           )}
         </div>
@@ -832,7 +851,37 @@ function StepForm({ step, beOpts, roles, onField, onDelete, onRemoveWorker, onSa
   );
 }
 
-function WorkflowForm({ wf, backends, beOpts, onField }) {
+// What the canvas will actually write to config: the ordered plan (one entry per step card)
+// and the one-line flow it distils to. Shown in the inspector so the canvas→config link is
+// visible while sketching — it is a HINT the manager adapts, never a DAG it must follow.
+function FlowPreview({ flow, plan }) {
+  return (
+    <Field label={tr("Plan written to config (from your cards and arrows)")}>
+      {plan && plan.length ? (
+        <>
+          <ol className="sd-plan">
+            {plan.map((s, i) => {
+              const workers = [...s.roles, ...s.backends];
+              return (
+                <li key={`${s.name}-${i}`}>
+                  <span className="sd-plan-name">{s.name}</span>
+                  {s.manager_backend ? <span className="sd-plan-meta">{metaFor(s.manager_backend).label}</span> : null}
+                  {workers.length ? <span className="sd-plan-meta">→ {workers.join(", ")}</span> : null}
+                </li>
+              );
+            })}
+          </ol>
+          <div className="sd-flow">{flow}</div>
+        </>
+      ) : (
+        <div className="sd-note">{tr("No named steps on the canvas yet — nothing will be written.")}</div>
+      )}
+      <div className="sd-note">{tr("Injected into the manager brief as a non-binding suggestion.")}</div>
+    </Field>
+  );
+}
+
+function WorkflowForm({ wf, backends, beOpts, onField, flowPreview, planPreview }) {
   return (
     <>
       <h3>{tr("WORKFLOW · base [workflow]")}</h3>
@@ -863,13 +912,14 @@ function WorkflowForm({ wf, backends, beOpts, onField }) {
         <Toggle checked={!!wf.use_mcp} onChange={(v) => onField("use_mcp", v)} label={tr("use MCP")} />
         <Toggle checked={!!wf.enable_ask_human} onChange={(v) => onField("enable_ask_human", v)} label={tr("ask-human")} />
       </div>
+      <FlowPreview flow={flowPreview} plan={planPreview} />
       <div className="sd-note">{tr("Backend transport and default models are managed in Settings → Backends. Role models here still override those defaults.")}</div>
       <div className="sd-note">{tr("Saved to config.toml `[workflow]` on Save.")}</div>
     </>
   );
 }
 
-function TypeForm({ type, beOpts, roleNames, error, describing, onField, onToggleRole, onDescribe, onDelete }) {
+function TypeForm({ type, beOpts, roleNames, error, describing, onField, onToggleRole, onDescribe, onDelete, flowPreview, planPreview }) {
   const t = type;
   return (
     <>
@@ -906,6 +956,7 @@ function TypeForm({ type, beOpts, roleNames, error, describing, onField, onToggl
           </div>
         )}
       </Field>
+      <FlowPreview flow={flowPreview} plan={planPreview} />
       <div className="sd-note">{tr("Overrides below — empty = inherit base [workflow].")}</div>
       <Field label={tr("Manager backend (override)")}>
         <Select value={t.manager_backend} onChange={(v) => onField(t._key, "manager_backend", v || "")} options={beOpts} placeholder={tr("inherit")} />

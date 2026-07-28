@@ -29,8 +29,9 @@
   z-index: 60;
   display: flex;
   flex-direction: column;
-  background: rgba(6, 8, 13, 0.86);
-  backdrop-filter: blur(3px);
+  /* Opaque: at 0.86 the dashboard's headline bled through the canvas and competed
+     with the stage cards for legibility. */
+  background: #06080d;
 }
 .wr-head {
   flex: none;
@@ -55,13 +56,104 @@
   font-family: inherit;
   font-size: 12px;
 }
-.wr-canvas { flex: 1 1 auto; min-height: 0; }
+.wr-head .wr-pick {
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--line-3);
+  background: #10141d;
+  color: var(--text-2);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  max-width: 340px;
+}
+.wr-head .wr-failed { font-size: 11px; color: #f08a98; }
+
+.wr-body { flex: 1 1 auto; min-height: 0; display: flex; }
+.wr-canvas { flex: 1 1 auto; min-width: 0; }
 .wr-empty {
   flex: 1;
   display: grid;
   place-items: center;
   color: var(--faint);
   font-size: 13px;
+}
+
+/* React Flow's own chrome (minimap/controls/attribution) is themed in ../reactflow-dark.css,
+   shared with the Studio canvas — without it the minimap renders as a white slab. */
+
+/* stage detail panel */
+.wr-detail {
+  flex: none;
+  width: 288px;
+  overflow-y: auto;
+  padding: 14px 16px 24px;
+  border-left: 1px solid var(--line-2);
+  background: #0b0f16;
+  font-family: "IBM Plex Sans JP", system-ui, sans-serif;
+}
+.wr-detail-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.wr-detail-title { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; color: var(--text); }
+.wr-detail-close {
+  flex: none;
+  border: 1px solid var(--line-3);
+  border-radius: 6px;
+  background: #10141d;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 7px;
+}
+.wr-kv { display: grid; grid-template-columns: auto 1fr; gap: 5px 10px; margin: 0 0 16px; }
+.wr-kv dt { font-size: 10px; color: var(--faint); }
+.wr-kv dd { margin: 0; font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--text-2); }
+.wr-kv dd.wr-kv-wrap { word-break: break-all; }
+.wr-kv dd.st-running { color: var(--ac-tx); }
+.wr-kv dd.st-done { color: #7fce9e; }
+.wr-kv dd.st-failed { color: #f08a98; }
+.wr-detail-sub {
+  padding-top: 12px;
+  border-top: 1px solid var(--line-2);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--ac-tx);
+}
+.wr-detail-empty { margin-top: 10px; font-size: 11px; color: var(--faint); }
+.wr-members { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.wr-members li {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  border-left: 2px solid var(--line-3);
+  background: #10141d;
+}
+.wr-members li.st-running { border-left-color: var(--ac); }
+.wr-members li.st-done { border-left-color: #5fb884; }
+.wr-members li.st-failed { border-left-color: #e5687a; }
+.wr-member-hd { display: flex; align-items: baseline; gap: 7px; }
+.wr-member-be { flex: 1; min-width: 0; font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--text); }
+.wr-member-tag {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  border: 1px solid var(--line-3);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.wr-member-st { font-family: "IBM Plex Mono", monospace; font-size: 9px; text-transform: uppercase; color: var(--faint); }
+.wr-member-bd { display: flex; gap: 10px; margin-top: 3px; font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }
+.wr-member-err {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(229, 104, 122, 0.09);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #f08a98;
+  word-break: break-word;
+  white-space: pre-wrap;
 }
 
 /* stage node */
@@ -74,6 +166,10 @@
 }
 .wr-stage.root { border-color: var(--ac-bd); }
 .wr-stage.st-running { border-color: var(--st); box-shadow: 0 0 0 1px var(--st), 0 0 22px -8px var(--st); }
+/* after .root so a failed manager reads red, not accent */
+.wr-stage.st-failed { border-color: var(--st); }
+.wr-stage.sel { border-color: var(--st); box-shadow: 0 0 0 2px var(--st); }
+.wr-stage { cursor: pointer; }
 .wr-stage-hd {
   display: flex;
   align-items: center;

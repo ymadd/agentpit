@@ -52,6 +52,13 @@ pub struct WorkflowPayload {
     pub max_calls_per_manager: u32,
     pub use_mcp: bool,
     pub enable_ask_human: bool,
+    /// Soft flow hint for the BASE workflow (sketched step order) — `[workflow].flow`.
+    /// `#[serde(default)]` so a payload from an older frontend still deserializes.
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// The BASE workflow's sketched plan — `[[workflow.steps]]`.
+    #[serde(default)]
+    pub steps: Vec<WorkflowStepEntry>,
 }
 
 impl Default for WorkflowPayload {
@@ -63,8 +70,34 @@ impl Default for WorkflowPayload {
             max_calls_per_manager: DEFAULT_MAX_CALLS_PER_MANAGER,
             use_mcp: false,
             enable_ask_human: false,
+            flow: None,
+            steps: Vec::new(),
         }
     }
+}
+
+/// One sketched plan step (`[[workflow.steps]]` / `[[workflow.types.<name>.steps]]`). Mirrors
+/// `config::WorkflowStep`. Geometry (x/y/w) never crosses this boundary — the canvas layout stays
+/// in the Studio's localStorage sketch; only the semantic fields become config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct WorkflowStepEntry {
+    pub name: String,
+    #[serde(default)]
+    pub persona: Option<String>,
+    #[serde(default)]
+    pub behavior: Option<String>,
+    #[serde(default)]
+    pub manager_backend: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub backends: Vec<String>,
+    #[serde(default)]
+    pub fanout: Option<u32>,
+    #[serde(default)]
+    pub dynamic: bool,
+    #[serde(default)]
+    pub ask: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -105,6 +138,9 @@ pub struct WorkflowTypeEntry {
     /// Soft flow hint (sketched step order) — written to `[workflow.types.<name>].flow`.
     #[serde(default)]
     pub flow: Option<String>,
+    /// This type's sketched plan — `[[workflow.types.<name>.steps]]`. Empty = inherit the base.
+    #[serde(default)]
+    pub steps: Vec<WorkflowStepEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -360,6 +396,10 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
         if let Some(b) = wf.get("enable_ask_human").and_then(Item::as_bool) {
             workflow.enable_ask_human = b;
         }
+        if let Some(s) = wf.get("flow").and_then(Item::as_str) {
+            workflow.flow = Some(s.to_string());
+        }
+        workflow.steps = read_steps(Some(wf));
         if let Some(roles_table) = wf.get("roles").and_then(Item::as_table_like) {
             for (name, item) in roles_table.iter() {
                 let backends = item
@@ -422,6 +462,7 @@ fn settings_get_at(path: &Path) -> SettingsPayload {
                     use_mcp: item.get("use_mcp").and_then(Item::as_bool),
                     enable_ask_human: item.get("enable_ask_human").and_then(Item::as_bool),
                     flow: item.get("flow").and_then(Item::as_str).map(str::to_string),
+                    steps: read_steps(item.as_table_like()),
                 });
             }
         }
@@ -858,6 +899,22 @@ fn validate(payload: &SettingsSave) -> Result<(), String> {
         check_backend(backend)?;
     }
 
+    // A plan step names backends the same way everything else does, so it gets the same check.
+    // Step ROLES are deliberately not validated against the cast: `workflow list` reports the
+    // ones that are missing, and a half-built plan must stay saveable.
+    let check_steps = |steps: &[WorkflowStepEntry], owner: &str| -> Result<(), String> {
+        for s in steps {
+            if let Some(b) = s.manager_backend.as_deref().filter(|b| !b.is_empty()) {
+                check_backend(b).map_err(|e| format!("{owner} step {:?}: {e}", s.name))?;
+            }
+            for b in &s.backends {
+                check_backend(b).map_err(|e| format!("{owner} step {:?}: {e}", s.name))?;
+            }
+        }
+        Ok(())
+    };
+    check_steps(&payload.workflow.steps, "[workflow]")?;
+
     let mut seen = std::collections::HashSet::new();
     for role in &payload.roles {
         if !valid_role_name(&role.name) {
@@ -896,6 +953,7 @@ fn validate(payload: &SettingsSave) -> Result<(), String> {
         if let Some(mb) = &t.manager_backend {
             check_backend(mb)?;
         }
+        check_steps(&t.steps, &format!("workflow type '{}'", t.name))?;
     }
 
     Ok(())
@@ -907,6 +965,94 @@ fn string_array(items: &[String]) -> Array {
         arr.push(item.as_str());
     }
     arr
+}
+
+/// Read a `steps` key as plan entries. Accepts BOTH the `[[...steps]]` array-of-tables this
+/// writer emits and the inline `steps = [{ name = "..." }]` form a hand-edited config may use —
+/// reading only one shape would silently drop the other on the next save.
+fn read_steps(parent: Option<&dyn toml_edit::TableLike>) -> Vec<WorkflowStepEntry> {
+    let Some(item) = parent.and_then(|t| t.get("steps")) else {
+        return Vec::new();
+    };
+    let tables: Vec<&dyn toml_edit::TableLike> = match item {
+        Item::ArrayOfTables(arr) => arr.iter().map(|t| t as &dyn toml_edit::TableLike).collect(),
+        Item::Value(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_inline_table().map(|t| t as &dyn toml_edit::TableLike))
+            .collect(),
+        _ => return Vec::new(),
+    };
+    tables
+        .into_iter()
+        .map(|t| WorkflowStepEntry {
+            name: t
+                .get("name")
+                .and_then(Item::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            persona: table_optional_string(Some(t), "persona"),
+            behavior: table_optional_string(Some(t), "behavior"),
+            manager_backend: table_optional_string(Some(t), "manager_backend"),
+            roles: table_strings(Some(t), "roles", &[]),
+            backends: table_strings(Some(t), "backends", &[]),
+            fanout: t
+                .get("fanout")
+                .and_then(Item::as_integer)
+                .map(|n| n.max(0) as u32),
+            dynamic: t.get("dynamic").and_then(Item::as_bool).unwrap_or(false),
+            ask: t.get("ask").and_then(Item::as_bool).unwrap_or(false),
+        })
+        .collect()
+}
+
+/// Render plan entries as a `[[...steps]]` array of tables. Only non-empty optional fields are
+/// written, so a bare step stays `name = "..."` instead of a wall of empty keys.
+fn steps_array(steps: &[WorkflowStepEntry]) -> toml_edit::ArrayOfTables {
+    let mut out = toml_edit::ArrayOfTables::new();
+    for s in steps {
+        let mut t = Table::new();
+        t["name"] = value(s.name.clone());
+        for (key, val) in [("persona", &s.persona), ("behavior", &s.behavior)] {
+            if let Some(v) = val.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                t[key] = value(v.to_string());
+            }
+        }
+        if let Some(v) = s
+            .manager_backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            t["manager_backend"] = value(v.to_string());
+        }
+        if !s.roles.is_empty() {
+            t["roles"] = Item::Value(Value::Array(string_array(&s.roles)));
+        }
+        if !s.backends.is_empty() {
+            t["backends"] = Item::Value(Value::Array(string_array(&s.backends)));
+        }
+        if let Some(v) = s.fanout {
+            t["fanout"] = value(v as i64);
+        }
+        if s.dynamic {
+            t["dynamic"] = value(true);
+        }
+        if s.ask {
+            t["ask"] = value(true);
+        }
+        out.push(t);
+    }
+    out
+}
+
+/// Replace a table's `steps` key: the array of tables when there is a plan, otherwise remove the
+/// key entirely so "no plan = inherit / no hint" survives a save from an empty canvas.
+fn set_steps(table: &mut dyn toml_edit::TableLike, steps: &[WorkflowStepEntry]) {
+    if steps.is_empty() {
+        table.remove("steps");
+    } else {
+        table.insert("steps", Item::ArrayOfTables(steps_array(steps)));
+    }
 }
 
 /// Apply `payload` onto `doc`'s `[workflow]` table in place: set the scalar keys (removing
@@ -955,6 +1101,21 @@ fn apply_workflow(doc: &mut DocumentMut, payload: &SettingsSave) {
         "enable_ask_human",
         value(payload.workflow.enable_ask_human),
     );
+    // Blank flow = "no hint": remove the key rather than writing `flow = ""`, so an unsketched
+    // base workflow keeps the documented "unset = no hint" semantics in config.toml.
+    match payload
+        .workflow
+        .flow
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(flow) => set_preserving_decor(workflow, "flow", value(flow.to_string())),
+        None => {
+            workflow.remove("flow");
+        }
+    }
+    set_steps(workflow, &payload.workflow.steps);
 
     // Replace [workflow.roles] wholesale, in the order given.
     let mut roles_table = Table::new();
@@ -1028,6 +1189,7 @@ fn apply_workflow(doc: &mut DocumentMut, payload: &SettingsSave) {
                 tt["flow"] = value(v.clone());
             }
         }
+        set_steps(&mut tt, &t.steps);
         types_table[&t.name] = Item::Table(tt);
     }
     set_preserving_decor(workflow, "types", Item::Table(types_table));
@@ -1353,6 +1515,7 @@ future_backend_key = 42
             "max_calls_per_manager",
             "use_mcp",
             "enable_ask_human",
+            "flow",
         ] {
             assert!(wf.get(key).is_some(), "missing workflow key {key}: {wf}");
         }
@@ -1584,6 +1747,232 @@ max_depth = 5
         );
     }
 
+    // The Studio's BASE canvas writes `[workflow].flow`. Blank must remove the key rather
+    // than write `flow = ""`, so "unset = no hint" survives a save from an unsketched canvas.
+    #[test]
+    fn base_workflow_flow_round_trips_and_blank_removes_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let save = |flow: Option<&str>| SettingsSave {
+            backend_models: BTreeMap::new(),
+            types: vec![],
+            roles: vec![],
+            workflow: WorkflowPayload {
+                flow: flow.map(str::to_string),
+                ..WorkflowPayload::default()
+            },
+        };
+
+        settings_save_at(&save(Some("Diagnose → Plan → Ship")), &path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("flow = \"Diagnose → Plan → Ship\""),
+            "got: {raw}"
+        );
+        assert_eq!(
+            settings_get_at(&path).workflow.flow.as_deref(),
+            Some("Diagnose → Plan → Ship")
+        );
+
+        settings_save_at(&save(Some("   ")), &path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("flow ="), "blank flow must be removed: {raw}");
+        assert_eq!(settings_get_at(&path).workflow.flow, None);
+    }
+
+    fn plan_step(name: &str) -> WorkflowStepEntry {
+        WorkflowStepEntry {
+            name: name.into(),
+            ..WorkflowStepEntry::default()
+        }
+    }
+
+    // The real JSON the Studio's Save path emits (captured from `buildPayload` in the browser
+    // against the seeded canvas). Hand-written Rust structs can drift from what the frontend
+    // actually sends — this pins the wire contract, including explicit `null`s for the optional
+    // fields and the derived step order.
+    #[test]
+    fn studio_payload_json_deserializes_and_writes_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let save: SettingsSave = serde_json::from_str(
+            r#"{
+              "workflow": {
+                "manager_backend": "claude", "default_agents": [], "max_depth": 3,
+                "max_calls_per_manager": 8, "use_mcp": false, "enable_ask_human": false,
+                "flow": "Diagnose → Plan",
+                "steps": [
+                  {"name":"Diagnose","persona":"Classify the task.","behavior":"features→category.",
+                   "manager_backend":"antigravity","roles":["longctx"],"backends":[],
+                   "fanout":1,"dynamic":false,"ask":false},
+                  {"name":"Plan","persona":null,"behavior":null,"manager_backend":"claude",
+                   "roles":["coder"],"backends":[],"fanout":null,"dynamic":true,"ask":true}
+                ]
+              },
+              "roles": [],
+              "types": []
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(save.workflow.steps.len(), 2);
+        assert_eq!(save.workflow.steps[1].persona, None, "explicit null → None");
+        assert_eq!(save.workflow.steps[1].fanout, None);
+
+        settings_save_at(&save, &path).unwrap();
+        let back = settings_get_at(&path);
+        assert_eq!(
+            back.workflow.steps, save.workflow.steps,
+            "round trip is lossless"
+        );
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[[workflow.steps]]"), "got: {raw}");
+        assert!(
+            raw.contains("manager_backend = \"antigravity\""),
+            "got: {raw}"
+        );
+        // nulls and falses must not be materialized as keys
+        assert!(
+            !raw.contains("fanout = 0") && !raw.contains("dynamic = false"),
+            "got: {raw}"
+        );
+    }
+
+    #[test]
+    fn plan_steps_round_trip_as_an_array_of_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let full = WorkflowStepEntry {
+            name: "Review".into(),
+            persona: Some("Be strict.".into()),
+            behavior: Some("Critique only.".into()),
+            manager_backend: Some("claude".into()),
+            roles: vec!["reviewer".into()],
+            backends: vec!["codex".into()],
+            fanout: Some(3),
+            dynamic: true,
+            ask: true,
+        };
+        let save = SettingsSave {
+            backend_models: BTreeMap::new(),
+            roles: vec![],
+            types: vec![WorkflowTypeEntry {
+                name: "review".into(),
+                title: None,
+                description: None,
+                prompt: None,
+                roles: vec![],
+                manager_backend: None,
+                max_depth: None,
+                max_calls_per_manager: None,
+                use_mcp: None,
+                enable_ask_human: None,
+                flow: None,
+                steps: vec![plan_step("Audit")],
+            }],
+            workflow: WorkflowPayload {
+                steps: vec![full.clone(), plan_step("Ship")],
+                ..WorkflowPayload::default()
+            },
+        };
+        settings_save_at(&save, &path).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[[workflow.steps]]"), "got: {raw}");
+        assert!(
+            raw.contains("[[workflow.types.review.steps]]"),
+            "got: {raw}"
+        );
+        // a bare step must not be padded with empty keys
+        assert!(!raw.contains("persona = \"\""), "got: {raw}");
+
+        let back = settings_get_at(&path);
+        assert_eq!(back.workflow.steps.len(), 2);
+        assert_eq!(back.workflow.steps[0], full);
+        assert_eq!(back.workflow.steps[1], plan_step("Ship"));
+        assert_eq!(back.types[0].steps, vec![plan_step("Audit")]);
+
+        // Saving an empty plan REMOVES the key, so "no plan = inherit" survives a round trip.
+        let cleared = SettingsSave {
+            workflow: WorkflowPayload::default(),
+            ..save
+        };
+        settings_save_at(&cleared, &path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("[[workflow.steps]]"), "got: {raw}");
+        assert!(settings_get_at(&path).workflow.steps.is_empty());
+    }
+
+    // A hand-edited config may use the inline form; reading only the array-of-tables shape would
+    // silently drop the user's plan on the next save.
+    #[test]
+    fn inline_steps_array_is_read_and_normalized_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[workflow]\nsteps = [{ name = \"Diagnose\", roles = [\"longctx\"] }, { name = \"Ship\", fanout = 2 }]\n",
+        )
+        .unwrap();
+
+        let read = settings_get_at(&path);
+        assert_eq!(read.workflow.steps.len(), 2);
+        assert_eq!(read.workflow.steps[0].name, "Diagnose");
+        assert_eq!(read.workflow.steps[0].roles, vec!["longctx".to_string()]);
+        assert_eq!(read.workflow.steps[1].fanout, Some(2));
+
+        // Round-tripping it back normalizes to [[workflow.steps]] without losing anything.
+        let save = SettingsSave {
+            backend_models: BTreeMap::new(),
+            roles: vec![],
+            types: vec![],
+            workflow: WorkflowPayload {
+                steps: read.workflow.steps.clone(),
+                ..WorkflowPayload::default()
+            },
+        };
+        settings_save_at(&save, &path).unwrap();
+        assert_eq!(settings_get_at(&path).workflow.steps, read.workflow.steps);
+    }
+
+    #[test]
+    fn step_backends_are_validated_but_step_roles_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let with_steps = |steps: Vec<WorkflowStepEntry>| SettingsSave {
+            backend_models: BTreeMap::new(),
+            roles: vec![],
+            types: vec![],
+            workflow: WorkflowPayload {
+                steps,
+                ..WorkflowPayload::default()
+            },
+        };
+
+        let bad_lead = WorkflowStepEntry {
+            manager_backend: Some("nope".into()),
+            ..plan_step("Review")
+        };
+        let err = settings_save_at(&with_steps(vec![bad_lead]), &path).unwrap_err();
+        assert!(err.contains("unknown backend: nope"), "got: {err}");
+        assert!(err.contains("Review"), "should name the step: {err}");
+
+        let bad_worker = WorkflowStepEntry {
+            backends: vec!["nope".into()],
+            ..plan_step("Review")
+        };
+        assert!(settings_save_at(&with_steps(vec![bad_worker]), &path).is_err());
+
+        // A role that is not in the cast is fine — `workflow list` reports it instead, so a
+        // half-built plan stays saveable.
+        let unknown_role = WorkflowStepEntry {
+            roles: vec!["not-in-cast".into()],
+            ..plan_step("Review")
+        };
+        settings_save_at(&with_steps(vec![unknown_role]), &path).unwrap();
+    }
+
     #[test]
     fn types_round_trip_and_only_nonempty_overrides_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -1603,6 +1992,7 @@ max_depth = 5
                     use_mcp: None,
                     enable_ask_human: Some(true),
                     flow: Some("audit → refute".into()),
+                    steps: vec![],
                 },
                 // A minimal type: just a brief, no roles/knobs — must not emit empty keys.
                 WorkflowTypeEntry {
@@ -1617,6 +2007,7 @@ max_depth = 5
                     use_mcp: None,
                     enable_ask_human: None,
                     flow: None,
+                    steps: vec![],
                 },
             ],
             workflow: WorkflowPayload::default(),
@@ -1688,6 +2079,7 @@ max_depth = 5
                 use_mcp: None,
                 enable_ask_human: None,
                 flow: None,
+                steps: vec![],
             }],
             workflow: WorkflowPayload::default(),
             roles: vec![],

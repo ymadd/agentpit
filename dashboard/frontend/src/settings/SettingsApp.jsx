@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import StudioApp from "../studio/StudioApp.jsx";
 import { metaFor } from "../studio/backends.js";
+import { indexModelCatalogs } from "../studio/model-catalogs.js";
 import {
   autoUpdateEnabled,
   checkForUpdates,
@@ -176,7 +177,7 @@ function RoutingPanel({ draft, change }) {
   );
 }
 
-function BackendsPanel({ draft, change }) {
+function BackendsPanel({ draft, change, modelCatalogs }) {
   const defaults = { antigravity: "exec", claude: "exec", codex: "exec", opencode: "acp" };
   return (
     <div className="set-page">
@@ -184,6 +185,9 @@ function BackendsPanel({ draft, change }) {
       <div className="set-backend-grid">
         {draft.backends.map((entry) => {
           const meta = metaFor(entry.id);
+          const catalog = modelCatalogs[entry.id];
+          const models = catalog?.models || [];
+          const listId = models.length ? `set-models-${entry.id}` : undefined;
           return (
             <Card key={entry.id} className="set-backend-card">
               <div className="set-backend-title">
@@ -202,8 +206,15 @@ function BackendsPanel({ draft, change }) {
               </label>
               <label className="set-field">
                 <span>既定モデル</span>
-                <input className="set-input mono" value={entry.model} onChange={(event) => change((next) => { next.backends.find((item) => item.id === entry.id).model = event.target.value; })} placeholder="CLI default" />
-                <small>空欄なら各CLIの既定モデルを使用します。</small>
+                <input className="set-input mono" value={entry.model} list={listId} onChange={(event) => change((next) => { next.backends.find((item) => item.id === entry.id).model = event.target.value; })} placeholder="CLI default" />
+                {listId ? (
+                  <datalist id={listId}>
+                    {models.map((model) => (
+                      <option key={model.value} value={model.value} label={model.label !== model.value ? model.label : undefined} />
+                    ))}
+                  </datalist>
+                ) : null}
+                <small>空欄なら各CLIの既定モデルを使用します。{listId ? `候補は ${catalog.source} から取得しています。` : null}</small>
               </label>
             </Card>
           );
@@ -341,6 +352,7 @@ export default function SettingsApp() {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+  const [modelCatalogs, setModelCatalogs] = useState({});
   const active = useMemo(() => NAV.find((item) => item.id === section) || NAV[0], [section]);
 
   const load = async () => {
@@ -355,6 +367,15 @@ export default function SettingsApp() {
     }
   };
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    // Model discovery shells out to each CLI, so it stays off the config load path: the form is
+    // usable immediately and the suggestions fill in when the probes return.
+    const call = window.__TAURI__?.core?.invoke;
+    const catalogs = call ? call("get_model_catalogs", { refresh: false }) : Promise.resolve(window.__AGENTPIT_MOCK_MODEL_CATALOGS__ || []);
+    let alive = true;
+    catalogs.then((data) => { if (alive) setModelCatalogs(indexModelCatalogs(data)); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   const change = (mutator) => {
     setDraft((current) => {
@@ -416,7 +437,7 @@ export default function SettingsApp() {
         <div className={`set-workflow-stage ${section === "workflow" ? "active" : ""}`}>{visitedWorkflow ? <StudioApp embedded /> : null}</div>
         {section !== "workflow" ? (
           <main className="set-scroll">
-            {!draft ? <div className="set-loading"><span /><p>設定ファイルを読み込んでいます…</p></div> : section === "general" ? <GeneralPanel draft={draft} change={change} /> : section === "routing" ? <RoutingPanel draft={draft} change={change} /> : section === "backends" ? <BackendsPanel draft={draft} change={change} /> : section === "ensembles" ? <EnsemblesPanel draft={draft} change={change} /> : <UpdatesPanel />}
+            {!draft ? <div className="set-loading"><span /><p>設定ファイルを読み込んでいます…</p></div> : section === "general" ? <GeneralPanel draft={draft} change={change} /> : section === "routing" ? <RoutingPanel draft={draft} change={change} /> : section === "backends" ? <BackendsPanel draft={draft} change={change} modelCatalogs={modelCatalogs} /> : section === "ensembles" ? <EnsemblesPanel draft={draft} change={change} /> : <UpdatesPanel />}
           </main>
         ) : null}
       </section>

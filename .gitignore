@@ -3,3 +3,5 @@
 /dashboard/src-tauri/binaries/agentpit-*
 Cargo.lock.bak
 .DS_Store
+/.playwright-mcp/
+/*.png

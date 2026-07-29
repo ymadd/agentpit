@@ -1,21 +1,22 @@
 ---
 description: Run a model-driven workflow (optionally a named type), list the types, or generate one
-argument-hint: [type|new|list] <goal> [--manager=claude|codex] [--model=<m>] [--agents=gemini,opencode] [--max-depth=3] [--use-mcp]
+argument-hint: [type|new|list|describe] <goal> [--manager=claude|codex] [--model=<m>] [--agents=antigravity,opencode] [--max-depth=3] [--use-mcp]
 ---
 
 Parse `$ARGUMENTS`:
 - The FIRST non-flag positional is a workflow TYPE when a SECOND positional (the goal) follows;
   with a single positional it IS the goal. So `agentpit workflow "<goal>"` runs the base
   `[workflow]`, and `agentpit workflow <type> "<goal>"` runs the `[workflow.types.<type>]` preset.
-- The literal first positionals `new` (the generator) and `list` (the catalog) are reserved,
-  never types.
+- The literal first positionals `new` (the generator), `list` (the catalog), and `describe`
+  (when-to-use blurb generator; reads a workflow spec on stdin) are reserved, never types.
 - `--manager=<claude|codex>` overrides the orchestrating manager backend.
 - `--agents=<comma-separated>` overrides the worker roster the manager may dispatch to.
 - `--max-depth=<N>` sets the recursion-depth ceiling.
 - `--use-mcp` routes the manager through agentpit's MCP server (claude manager only) instead of
   shelling out: claude is launched with `--mcp-config` pointing at `agentpit mcp serve` and scoped
-  to the `mcp__agentpit__*` tools (`dispatch_task` / `list_backends` / `run_ensemble`). With a codex
-  manager the flag warns and falls back to CLI shell-out.
+  to the `mcp__agentpit__*` tools (no Bash): `dispatch_task` / `list_backends` / `run_ensemble`,
+  plus `post_note` and `refute`, and `ask_human` when the human back-channel is enabled. With a
+  codex manager the flag warns and falls back to CLI shell-out.
 
 Run:
 

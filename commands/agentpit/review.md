@@ -13,5 +13,5 @@ Run:
 agentpit review "<target>" [--focus <focus>]
 ```
 
-The CLI emits per-backend sections with `=== gemini (transport=exec) ===` style headers.
+The CLI emits per-backend sections with `=== antigravity (transport=exec) ===` style headers.
 Relay verbatim, and group CRITICAL / HIGH findings at the top if helpful.

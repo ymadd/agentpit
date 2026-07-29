@@ -9,7 +9,7 @@ description: Fan a prompt out to multiple backend agents in parallel, optionally
 
 - "Ask three agents and merge the answers."
 - "What does each model say about this approach?"
-- "Cross-check with Gemini and OpenCode before I commit to a direction."
+- "Cross-check with Antigravity and OpenCode before I commit to a direction."
 
 ## How to invoke
 

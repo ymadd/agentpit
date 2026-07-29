@@ -1,13 +1,13 @@
 ---
 name: agentpit-explain
-description: Explain code or a topic via another backend agent. Useful when Gemini's long context is needed, or when the user explicitly asks for an outside explanation.
+description: Explain code or a topic via another backend agent. Useful when the target is too large for the current context, or when the user explicitly asks for an outside explanation.
 ---
 
 # agentpit:explain
 
 ## When to invoke
 
-- "Explain how this module works using gemini"
+- "Explain how this module works using codex"
 - The target is too large to comfortably hold in the current context.
 
 ## How to invoke

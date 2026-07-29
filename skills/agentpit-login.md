@@ -8,7 +8,7 @@ description: Check or launch a backend's login flow. On macOS, agentpit opens a 
 ## How to invoke
 
 ```bash
-agentpit login <gemini|claude|codex|opencode> [--check]
+agentpit login <claude|codex|antigravity|opencode> [--check]
 ```
 
 - `--check` only reports status; it does not open Terminal.

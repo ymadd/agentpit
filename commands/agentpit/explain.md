@@ -1,5 +1,5 @@
 ---
-description: Explain code via a backend agent (Gemini-first for long context)
+description: Explain code via a backend agent (auto-routed; useful for targets too large for the current context)
 argument-hint: <target> [--deep]
 ---
 

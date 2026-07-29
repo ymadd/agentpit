@@ -1,6 +1,6 @@
 ---
 name: agentpit-review
-description: Run a multi-agent code review (Gemini + OpenCode in parallel by default). Invoke when the user asks for a code review, audit, or second/third-opinion review of files, diffs, or designs.
+description: Run a multi-agent code review (Antigravity + OpenCode in parallel by default). Invoke when the user asks for a code review, audit, or second/third-opinion review of files, diffs, or designs.
 ---
 
 # agentpit:review

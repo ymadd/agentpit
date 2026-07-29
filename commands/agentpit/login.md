@@ -1,6 +1,6 @@
 ---
 description: Check or trigger the login flow for a backend agent
-argument-hint: <gemini|claude|codex|opencode> [--check]
+argument-hint: <claude|codex|antigravity|opencode> [--check]
 ---
 
 Parse `$ARGUMENTS`:

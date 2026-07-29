@@ -18,8 +18,9 @@ agentpit workflow [type] "<goal>" [--manager claude|codex] [--agents a,b,c] [--m
 ```
 
 - An optional leading `type` selects a named `[workflow.types.<type>]` preset (see below); with a
-  single positional that positional is the goal and the base `[workflow]` runs. `new` and `list`
-  are reserved (the generator and the catalog).
+  single positional that positional is the goal and the base `[workflow]` runs. `new`, `list`,
+  and `describe` are reserved (the generator, the catalog, and the when-to-use blurb generator —
+  `describe` reads a workflow spec on stdin; the desktop dashboard uses it).
 - `--manager` selects the orchestrating backend (claude or codex). Without an explicit or
   configured manager, agentpit selects the first authenticated manager: a supported
   `[default].backend`, otherwise Claude then Codex.
@@ -28,7 +29,9 @@ agentpit workflow [type] "<goal>" [--manager claude|codex] [--agents a,b,c] [--m
 - `--max-depth` caps workflow recursion (default 3); the ceiling is enforced in Rust.
 - `--use-mcp` (claude manager only) drives the manager through agentpit's MCP server instead of
   shelling out to the CLI: claude is launched with `--mcp-config` pointing at `agentpit mcp serve`
-  and scoped to the `mcp__agentpit__*` tools (`dispatch_task` / `list_backends` / `run_ensemble`).
+  and scoped to the `mcp__agentpit__*` tools (no Bash): `dispatch_task` / `list_backends` /
+  `run_ensemble`, plus the conversation-layer tools `post_note` and `refute`, and `ask_human`
+  when the human back-channel is enabled.
   A codex manager warns and falls back to CLI shell-out. Also settable via `[workflow].use_mcp`.
 
 ## Roles (optional casting)
@@ -77,9 +80,10 @@ Any agent can be pinned to a model. Precedence (highest first): an explicit `--m
 command → the role's `[workflow.roles.<name>].model` → the backend's `[backends.<id>].model`
 default → the CLI's own default (no flag emitted, byte-identical to before). So `agentpit rescue
 --role reviewer "…"` runs on the reviewer role's model, `agentpit workflow --model opus "…"` pins
-the manager, and a workflow's cast can mix a different model per role. Each backend maps `--model`
-to its own CLI flag (claude/codex `--model`, gemini `-m`, agy `--model`, opencode `--model` on the
-ACP spawn). The MCP tools (`dispatch_task` / `run_ensemble` / `run_workflow`) each take a `model`.
+the manager, and a workflow's cast can mix a different model per role. Each backend maps the model
+to its own mechanism (claude/codex/agy get a `--model` flag; opencode receives it via the
+`OPENCODE_CONFIG_CONTENT` env var on the ACP spawn — opencode ≥ 1.18 rejects a `--model` flag).
+The MCP tools (`dispatch_task` / `run_ensemble` / `run_workflow`) each take a `model`.
 
 ## Named workflows (types) + generation
 
@@ -103,7 +107,9 @@ sanitized (names → kebab, backends filtered to known ids), and re-serialized �
 ## MCP channel
 
 `agentpit mcp serve` is a standalone stdio MCP server exposing `dispatch_task`, `list_backends`,
-`run_ensemble`, and `run_workflow`. `--use-mcp` wires it into the manager automatically — you do
+`run_ensemble`, `run_workflow`, plus the manager-side tools `ask_human` (block on a human answer),
+`post_note` (durable handoff / board note), and `refute` (critique→defense pass on a stuck
+candidate). `--use-mcp` wires it into the manager automatically — you do
 not run it by hand. A whole workflow CAN also be launched over MCP via the
 `mcp__agentpit__run_workflow` tool (in addition to the CLI): the per-sub-task dispatch/ensemble
 primitives remain available too, so an MCP client can either drive the steps itself or hand off

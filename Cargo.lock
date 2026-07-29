@@ -73,6 +73,7 @@ dependencies = [
  "fastembed",
  "flate2",
  "regex",
+ "reqwest 0.13.3",
  "rmcp",
  "rustyline",
  "self-replace",

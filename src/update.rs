@@ -13,7 +13,11 @@ const DASHBOARD_BIN_NAME: &str = "agentpit-dashboard";
 #[cfg(windows)]
 const DASHBOARD_BIN_NAME: &str = "agentpit-dashboard.exe";
 const DASHBOARD_VERSION_MARKER: &str = "dashboard-version";
-const CACHE_TTL: Duration = Duration::from_secs(60);
+/// How long the banner's version cache stays fresh. 6h: a release banner may lag by that
+/// much, but the check no longer re-hits github.com on every CLI start over a minute apart
+/// (the old 60s TTL meant one network round-trip per command for any regular user, and an
+/// offline poison-retry every minute).
+const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -74,18 +78,48 @@ fn parse_version(s: &str) -> (u64, u64, u64) {
     (major, minor, patch)
 }
 
+/// Resolve the latest release tag WITHOUT the GitHub REST API.
+///
+/// The previous implementation listed releases via `api.github.com`, whose unauthenticated
+/// budget is 60 requests/hour per IP — shared by every process on the machine. Combined
+/// with the short cache TTL, ordinary CLI usage exhausted it and the desktop's update
+/// check surfaced `403` (observed 2026-07-30). The web-side
+/// `github.com/<owner>/<repo>/releases/latest` endpoint has no such budget: it answers
+/// `302` with the tag in the `Location` header, so we GET it with redirects disabled and
+/// read the tag off the header. The download path was never on the API (asset URLs are
+/// built from the tag), so this removes the rate-limited dependency entirely.
 pub fn fetch_latest_tag() -> Result<String> {
-    let releases = self_update::backends::github::ReleaseList::configure()
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
+    let url = format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest");
+    let response = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| anyhow!("self_update config error: {e}"))?
-        .fetch()
-        .map_err(|e| anyhow!("failed to fetch releases from {REPO_OWNER}/{REPO_NAME}: {e}"))?;
-    let latest = releases
-        .first()
-        .ok_or_else(|| anyhow!("no releases published for {REPO_OWNER}/{REPO_NAME}"))?;
-    Ok(latest.version.clone())
+        .map_err(|e| anyhow!("http client error: {e}"))?
+        .get(&url)
+        .send()
+        .map_err(|e| anyhow!("failed to reach {url}: {e}"))?;
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    latest_tag_from_location(location).ok_or_else(|| {
+        anyhow!(
+            "no releases published for {REPO_OWNER}/{REPO_NAME} \
+             (status {}, redirect {location:?})",
+            response.status()
+        )
+    })
+}
+
+/// The tag out of a `releases/latest` redirect target: `…/releases/tag/<tag>` → `<tag>`.
+/// Anything else — no redirect (repo or releases missing), a redirect elsewhere — is `None`.
+fn latest_tag_from_location(location: &str) -> Option<String> {
+    let (_, tag) = location.split_once("/releases/tag/")?;
+    if tag.is_empty() || tag.contains('/') {
+        return None;
+    }
+    Some(tag.to_string())
 }
 
 pub fn refresh_cache() -> Result<VersionCache> {
@@ -929,6 +963,29 @@ mod tests {
         );
         let err = gunzip(&bomb).unwrap_err();
         assert!(format!("{err}").contains("refusing to install"), "{err}");
+    }
+
+    #[test]
+    fn latest_tag_from_location_extracts_only_a_plain_tag_redirect() {
+        assert_eq!(
+            latest_tag_from_location("https://github.com/ymadd/agentpit/releases/tag/v0.2.6")
+                .as_deref(),
+            Some("v0.2.6")
+        );
+        // No redirect header / a redirect that is not a tag page → None, never a panic.
+        assert_eq!(latest_tag_from_location(""), None);
+        assert_eq!(
+            latest_tag_from_location("https://github.com/ymadd/agentpit/releases"),
+            None
+        );
+        assert_eq!(
+            latest_tag_from_location("https://github.com/ymadd/agentpit/releases/tag/"),
+            None
+        );
+        assert_eq!(
+            latest_tag_from_location("https://github.com/x/y/releases/tag/v1.0.0/assets"),
+            None
+        );
     }
 
     #[test]

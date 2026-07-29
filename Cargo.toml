@@ -33,6 +33,10 @@ fastembed = { version = "5", optional = true }
 regex = "1"
 rmcp = { version = "=1.7.0", features = ["server", "macros", "transport-io"] }
 rustyline = "18"
+# Direct dep on the reqwest self_update already brings in (blocking client): the latest-tag
+# probe needs redirects DISABLED to read the Location header, which self_update's own
+# Download API cannot do. No new TLS stack — features unify with self_update's.
+reqwest = { version = "0.13", default-features = false, features = ["blocking"] }
 self_update = { version = "0.44", features = ["archive-tar", "compression-flate2"] }
 # Checksum-verified self-update: the release's .sha256 assets are checked before any binary
 # is installed. All three are already in the tree transitively via self_update.

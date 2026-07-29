@@ -100,10 +100,22 @@ pub async fn dispatch_free_text(
         .dim()
     );
 
+    // Effective model: the REPL has no --model or role, so the backend's configured default
+    // is the whole chain. It used to be skipped here entirely — a `[backends.claude]
+    // model = "opus"` applied to `rescue` but silently not to the same task typed in the
+    // REPL (HILLTE-269).
+    let effective_model = crate::workflow::roles::resolve_model(
+        None,
+        None,
+        state
+            .config
+            .backends
+            .get(&backend_id)
+            .and_then(|o| o.model.as_deref()),
+    );
+
     let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &state.cwd);
-    // The REPL dispatch passes no model (see the dispatch call below) — record that
-    // truthfully rather than guessing at a backend default the dispatch never applies.
-    decision.log(&logger, &task, None);
+    decision.log(&logger, &task, effective_model.as_deref());
     logger.member_started(backend_id, false);
     let started = Instant::now();
 
@@ -159,7 +171,7 @@ pub async fn dispatch_free_text(
     let cwd = state.cwd.clone();
 
     let result = tokio::select! {
-        res = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &regs_ref, None) => {
+        res = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &regs_ref, effective_model.as_deref()) => {
             indicator_cancel.cancel();
             // Erase indicator if no streaming output has arrived.
             if !first_chunk_seen.load(std::sync::atomic::Ordering::Relaxed) {

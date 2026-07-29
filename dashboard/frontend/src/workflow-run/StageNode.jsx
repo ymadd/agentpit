@@ -1,4 +1,6 @@
+import { useEffect, useRef, useState } from "react";
 import { Handle, Position } from "@xyflow/react";
+import Bot from "./Bot.jsx";
 
 function fmt(secs) {
   return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, "0")}s`;
@@ -20,6 +22,17 @@ const STATUS = {
 
 export default function StageNode({ data, selected }) {
   const s = STATUS[data.status] || STATUS.running;
+  // One-shot mascot effects. The component stays mounted across polls (React Flow keys
+  // nodes by run_id), so mount = the stage appearing on screen → birth pop; a later
+  // transition into done → celebration hop. animationend clears, so re-renders from
+  // polling never replay them.
+  const prev = useRef(null);
+  const [fx, setFx] = useState("wrb-born");
+  useEffect(() => {
+    if (prev.current && prev.current !== data.status && data.status === "done") setFx("wrb-celebrate");
+    prev.current = data.status;
+  }, [data.status]);
+
   const handleStyle = {
     width: 8,
     height: 8,
@@ -28,18 +41,33 @@ export default function StageNode({ data, selected }) {
   };
   return (
     <div
-      className={`wr-stage ${data.isRoot ? "root" : ""} st-${data.status} ${selected ? "sel" : ""}`}
-      style={{ "--st": s.color, "--st-tx": s.text }}
+      className={`wr-agent ${fx}`}
+      onAnimationEnd={(e) => {
+        if (e.animationName === "wrb-pop" || e.animationName === "wrb-hop") setFx("");
+      }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
-      <div className="wr-stage-hd">
-        <span className={`wr-dot ${data.status === "running" ? "pulse" : ""}`} />
-        <span className="wr-stage-title">{data.title}</span>
-        <span className="wr-stage-status">{s.label}</span>
+      <div className="wr-bot">
+        <Bot status={data.status} isRoot={data.isRoot} />
       </div>
-      <div className="wr-stage-bd">
-        {data.subtitle ? <span className="wr-stage-sub">{data.subtitle}</span> : null}
-        <span className="wr-stage-elapsed">{elapsed(data)}</span>
+      <div
+        className={`wr-stage ${data.isRoot ? "root" : ""} st-${data.status} ${selected ? "sel" : ""}`}
+        style={{ "--st": s.color, "--st-tx": s.text }}
+      >
+        <div className="wr-stage-hd">
+          <span className={`wr-dot ${data.status === "running" ? "pulse" : ""}`} />
+          <span className="wr-stage-title">{data.title}</span>
+          <span className="wr-stage-status">{s.label}</span>
+        </div>
+        <div className="wr-stage-bd">
+          {data.subtitle ? <span className="wr-stage-sub">{data.subtitle}</span> : null}
+          <span className="wr-stage-elapsed">{elapsed(data)}</span>
+        </div>
+        {data.status === "running" ? (
+          <div className="wr-stage-prog">
+            <div className="wr-stage-prog-fill" />
+          </div>
+        ) : null}
       </div>
       <Handle type="source" position={Position.Right} style={handleStyle} />
     </div>

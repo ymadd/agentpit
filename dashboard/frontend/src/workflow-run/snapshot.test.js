@@ -159,3 +159,53 @@ test("routeLabel joins the present route parts and keeps a zero score", () => {
   assert.equal(routeLabel({ reason: "explicit", category: null, score: null }), "explicit");
   assert.equal(routeLabel({ reason: "profile", category: "coding", score: 0 }), "profile coding 0");
 });
+
+// ── diffFeed: the live-feed narration diff ──────────────────────────────────
+
+const run = (id, status, extra = {}) => {
+  if (status === "running") return { run_id: id, finished: false, members: [], ...extra };
+  if (status === "failed") return { run_id: id, finished: true, status: "error", members: [], ...extra };
+  return { run_id: id, finished: true, status: "ok", members: [], ...extra };
+};
+
+test("diffFeed reports a newly appeared run as deployed", async () => {
+  const { diffFeed } = await import("./snapshot.js");
+  const evs = diffFeed([run("a", "running")], [run("a", "running"), run("b", "running", { role: "reviewer" })]);
+  assert.deepEqual(evs, [{ id: "b", name: "reviewer", type: "deployed" }]);
+});
+
+test("diffFeed reports running→done as returned and running→failed as failed", async () => {
+  const { diffFeed } = await import("./snapshot.js");
+  const prev = [run("a", "running"), run("b", "running")];
+  const curr = [run("a", "done"), run("b", "failed")];
+  assert.deepEqual(evs_types(diffFeed(prev, curr)), [
+    ["a", "returned"],
+    ["b", "failed"],
+  ]);
+});
+
+test("diffFeed reports a run that appears already finished as deployed AND returned", async () => {
+  const { diffFeed } = await import("./snapshot.js");
+  const evs = diffFeed([], [run("fast", "done")]);
+  assert.deepEqual(evs_types(evs), [
+    ["fast", "deployed"],
+    ["fast", "returned"],
+  ]);
+});
+
+test("diffFeed is silent when nothing changed", async () => {
+  const { diffFeed } = await import("./snapshot.js");
+  const snap = [run("a", "running"), run("b", "done")];
+  assert.deepEqual(diffFeed(snap, snap), []);
+});
+
+test("feedName prefers role, then backends, then kind", async () => {
+  const { feedName } = await import("./snapshot.js");
+  assert.equal(feedName({ role: "reviewer", members: [{ backend: "codex" }] }), "reviewer");
+  assert.equal(feedName({ role: null, members: [{ backend: "codex" }] }), "codex");
+  assert.equal(feedName({ role: null, members: [], kind: "rescue" }), "rescue");
+});
+
+function evs_types(evs) {
+  return evs.map((e) => [e.id, e.type]);
+}

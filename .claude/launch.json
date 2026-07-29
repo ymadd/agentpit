@@ -4,8 +4,8 @@
     {
       "name": "dashboard",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--prefix", "dashboard/frontend"],
-      "port": 5173
+      "runtimeArgs": ["run", "dev", "--prefix", "dashboard/frontend", "--", "--port", "5183"],
+      "port": 5183
     },
     {
       "name": "mission-control",

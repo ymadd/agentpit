@@ -168,8 +168,9 @@ export function buildStageGraph(snapshot, root) {
   const { byId } = indexRuns(snapshot);
   const { placed, links } = walkTree(root, childrenByParent(byId));
 
-  const COL = 260;
-  const ROW = 132;
+  // Wide enough for the mascot (58px) sitting beside the 210px card, plus breathing room.
+  const COL = 340;
+  const ROW = 148;
 
   const nodes = placed.map(({ run, depth, row }) => {
     const isRoot = run.run_id === root.run_id;
@@ -207,6 +208,35 @@ export function buildStageGraph(snapshot, root) {
   });
 
   return { nodes, edges };
+}
+
+// What to call a run in the live feed: its cast role when dispatched by role,
+// otherwise the backend(s) that ran it, otherwise its kind.
+export function feedName(run) {
+  return run.role || backendLabel(run) || run.kind || run.run_id;
+}
+
+// Diff two polls of the same workflow subtree into feed entries — the "SCOUT-A 誕生"
+// narration layer. `prev`/`curr` are run arrays (root + descendants). Pure so it can
+// be tested without React: appearance → deployed, running→done → returned,
+// running→failed → failed. Order follows `curr` (dispatch order from the layout walk).
+export function diffFeed(prev, curr) {
+  const before = new Map(prev.map((r) => [r.run_id, runStatus(r)]));
+  const out = [];
+  for (const r of curr) {
+    const now = runStatus(r);
+    const was = before.get(r.run_id);
+    if (was === undefined) {
+      out.push({ id: r.run_id, name: feedName(r), type: "deployed" });
+      // A run can appear already-finished (first poll after a fast stage): report both.
+      if (now !== "running") out.push({ id: r.run_id, name: feedName(r), type: now === "done" ? "returned" : "failed" });
+    } else if (was === "running" && now === "done") {
+      out.push({ id: r.run_id, name: feedName(r), type: "returned" });
+    } else if (was === "running" && now === "failed") {
+      out.push({ id: r.run_id, name: feedName(r), type: "failed" });
+    }
+  }
+  return out;
 }
 
 // Small summary for the panel header. `total` counts every stage DRAWN (the whole

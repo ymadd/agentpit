@@ -69,7 +69,7 @@
 .wr-head .wr-failed { font-size: 11px; color: #f08a98; }
 
 .wr-body { flex: 1 1 auto; min-height: 0; display: flex; }
-.wr-canvas { flex: 1 1 auto; min-width: 0; }
+.wr-canvas { flex: 1 1 auto; min-width: 0; position: relative; }
 .wr-empty {
   flex: 1;
   display: grid;
@@ -238,3 +238,109 @@
   white-space: nowrap;
 }
 .wr-stage-elapsed { flex: none; font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }
+
+/* ── mascot layer (bot beside each stage card) ─────────────────────────────
+   Colors echo the app icon: charcoal pod, mint core/nodes, terracotta blush. */
+.wr-agent { position: relative; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.wr-agent.wrb-born { animation: wrb-pop 0.55s cubic-bezier(0.2, 2.2, 0.4, 1); }
+@keyframes wrb-pop {
+  0% { transform: scale(0); opacity: 0; }
+  70% { transform: scale(1.12); }
+  100% { transform: scale(1); opacity: 1; }
+}
+.wr-bot { flex: none; width: 58px; }
+.wrb { display: block; width: 100%; overflow: visible; }
+
+.wrb-body { fill: #2a323f; stroke: #4a566e; stroke-width: 2.5; }
+.wrb-arm rect, .wrb-leg { fill: #3a4453; }
+.wrb-ant, .wrb-spoke { stroke: #4a566e; stroke-width: 2.5; stroke-linecap: round; }
+.wrb-node, .wrb-core { fill: #3d5a55; }
+.wrb-core-dot { fill: var(--ac); opacity: 0.9; }
+.wrb-blush { fill: #e0926e; opacity: 0; }
+.wrb-face path, .wrb-face line { stroke: #63dfba; stroke-width: 3; fill: none; stroke-linecap: round; }
+.wrb-face .wrb-eye-o { fill: #63dfba; stroke: none; }
+.wrb-face .wrb-glint { fill: #eafff7; stroke: none; opacity: 0.9; }
+.wrb-face .wrb-mouth-open { fill: #63dfba; stroke: none; }
+.wrb-arm { transform-box: fill-box; transform-origin: 50% 4px; transition: transform 0.45s cubic-bezier(0.3, 1.8, 0.5, 1); }
+
+/* running: 集中ゆらゆら — core and spoke nodes pulse mint */
+.wrb-running { animation: wrb-sway 1.7s ease-in-out infinite; }
+@keyframes wrb-sway {
+  0%, 100% { transform: rotate(-2.4deg); }
+  50% { transform: rotate(2.4deg); }
+}
+.wrb-running .wrb-node { fill: #63dfba; animation: wrb-blink 1s infinite; }
+.wrb-running .wrb-core { fill: #63dfba; animation: wrb-corepulse 1.6s ease-in-out infinite; }
+.wrb-running .wrb-blush { opacity: 0.55; }
+@keyframes wrb-blink { 50% { opacity: 0.3; } }
+@keyframes wrb-corepulse { 50% { opacity: 0.45; } }
+
+/* done: バンザイ */
+.wrb-done .wrb-arm-l { transform: rotate(150deg); }
+.wrb-done .wrb-arm-r { transform: rotate(-150deg); }
+.wrb-done .wrb-node, .wrb-done .wrb-core { fill: var(--ok); }
+.wrb-done .wrb-blush { opacity: 0.55; }
+.wr-agent.wrb-celebrate .wrb { animation: wrb-hop 0.9s ease-in-out 2; }
+@keyframes wrb-hop {
+  0%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-10px); }
+  60% { transform: translateY(0); }
+  80% { transform: translateY(-4px); }
+}
+
+/* failed: しょんぼり — arms droop, everything glows error-red */
+.wrb-failed .wrb-arm-l { transform: rotate(-18deg); }
+.wrb-failed .wrb-arm-r { transform: rotate(18deg); }
+.wrb-failed .wrb-node, .wrb-failed .wrb-core { fill: var(--err); }
+.wrb-failed .wrb-face path, .wrb-failed .wrb-face line { stroke: var(--err); }
+.wrb-failed { filter: saturate(0.8); }
+
+/* indeterminate activity bar on running cards (no real progress % exists) */
+.wr-stage-prog { height: 3px; background: var(--line); overflow: hidden; }
+.wr-stage-prog-fill {
+  height: 100%;
+  width: 34%;
+  background: var(--ac);
+  border-radius: 2px;
+  animation: wr-indet 1.3s ease-in-out infinite alternate;
+}
+@keyframes wr-indet {
+  0% { margin-left: 0; }
+  100% { margin-left: 66%; }
+}
+
+/* ── live feed (誕生・帰還の実況) ───────────────────────────────────────── */
+.wr-feed {
+  position: absolute;
+  /* clear of React Flow's zoom controls in the bottom-left corner */
+  left: 60px;
+  bottom: 16px;
+  z-index: 8;
+  width: 300px;
+  padding: 8px 12px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line-2);
+  background: rgba(10, 13, 20, 0.82);
+  backdrop-filter: blur(4px);
+  pointer-events: none; /* display-only: never steal canvas pans */
+}
+.wr-feed-hd {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9px;
+  letter-spacing: 0.3em;
+  color: var(--faint);
+  margin-bottom: 4px;
+}
+.wr-feed-ev {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.7;
+}
+.wr-feed-ev .wr-feed-ts { font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); flex: none; padding-top: 1px; }
+.wr-feed-ev .wr-feed-tx { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wr-feed-ev.wr-feed-failed .wr-feed-tx { color: #f08a98; }
+.wr-feed-ev.fresh { animation: wr-feed-in 0.5s; }
+@keyframes wr-feed-in {
+  0% { opacity: 0; transform: translateX(10px); }
+}

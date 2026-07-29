@@ -9,7 +9,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import StageNode, { elapsed } from "./StageNode.jsx";
-import { getSnapshot, listWorkflows, buildStageGraph, summarize, runStatus, routeLabel } from "./snapshot.js";
+import { getSnapshot, listWorkflows, buildStageGraph, summarize, runStatus, routeLabel, descendants, diffFeed } from "./snapshot.js";
 import { makeT, detectLang } from "../studio/i18n.js";
 import "../reactflow-dark.css";
 import "./styles.css";
@@ -146,6 +146,30 @@ function Overlay({ t, snapshot, workflows, root, info, pinnedId, onPin, onClose 
     setSelId(null);
   }, [root]);
 
+  // Live feed: narrate subtree changes between polls (誕生 / 帰還 / 失敗). The first
+  // poll of a run seeds silently so opening the overlay mid-run doesn't replay history.
+  const [feed, setFeed] = useState([]);
+  const feedPrev = useRef(null);
+  const feedSeq = useRef(0);
+  const rootId = root ? root.run_id : null;
+  useEffect(() => {
+    feedPrev.current = null;
+    setFeed([]);
+  }, [rootId]);
+  useEffect(() => {
+    if (!root) return;
+    const curr = [root, ...descendants(snapshot, root)];
+    const prev = feedPrev.current;
+    feedPrev.current = curr;
+    if (!prev) return;
+    const evs = diffFeed(prev, curr);
+    if (evs.length === 0) return;
+    const ts = new Date().toLocaleTimeString();
+    setFeed((f) =>
+      [...f, ...evs.map((e) => ({ ...e, ts, key: feedSeq.current++ }))].slice(-30)
+    );
+  }, [snapshot, root]);
+
   const selected = nodes.find((n) => n.id === selId) || null;
   const liveIds = new Set((snapshot.live || []).map((r) => r.run_id));
 
@@ -204,6 +228,20 @@ function Overlay({ t, snapshot, workflows, root, info, pinnedId, onPin, onClose 
               <MiniMap pannable zoomable />
               <Controls showInteractive={false} />
             </ReactFlow>
+            {feed.length > 0 ? (
+              <div className="wr-feed">
+                <div className="wr-feed-hd">{t("LIVE FEED")}</div>
+                {feed.slice(-6).map((e, i, shownFeed) => (
+                  <div
+                    key={e.key}
+                    className={`wr-feed-ev wr-feed-${e.type}${i === shownFeed.length - 1 ? " fresh" : ""}`}
+                  >
+                    <span className="wr-feed-ts">{e.ts}</span>
+                    <span className="wr-feed-tx">{t(FEED_LABEL[e.type], { name: e.name })}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </div>
           {selected ? <StageDetail t={t} data={selected.data} onClose={() => setSelId(null)} /> : null}
         </div>
@@ -215,6 +253,12 @@ function Overlay({ t, snapshot, workflows, root, info, pinnedId, onPin, onClose 
 }
 
 const MEMBER_STATE = { ok: "done", error: "failed", running: "running" };
+
+const FEED_LABEL = {
+  deployed: "{name} deployed",
+  returned: "{name} returned",
+  failed: "{name} failed",
+};
 
 // Why a stage is red, what each backend did, and where it ran. Without this the
 // per-member `error` the event log already carries is never visible anywhere.

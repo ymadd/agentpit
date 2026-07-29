@@ -241,9 +241,13 @@ and stops at the first hit:
 6. Review keyword: the prompt contains one of `review_keywords` → `review_backend`
 7. `default.backend`
 
-Steps 3–6 run only when `auto_route` is on and a task text is present. `agentpit diagnose
-"<task>"` prints exactly what this chain would pick, and `agentpit status` warns when a
-`[routes]` pin is suppressing steps 3–6 for a tool.
+Steps 3–6 run only when `auto_route` is on and a task text is present, and they all skip a
+backend whose last dispatch failed with a quota / tier / auth-shaped error in the past 30
+minutes (read from the event log — credentials being present doesn't mean the backend
+works, and capability scores deliberately don't encode plan-dependent availability). Steps
+1, 2 and 7 are user decisions and always route as written. `agentpit diagnose "<task>"`
+prints exactly what this chain would pick — including any currently suspended backends —
+and `agentpit status` warns when a `[routes]` pin is suppressing steps 3–6 for a tool.
 
 ## Workspace
 

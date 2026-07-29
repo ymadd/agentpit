@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod ask;
 pub mod auth;
+pub mod availability;
 pub mod cli;
 pub mod config;
 pub mod diagnose;

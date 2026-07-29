@@ -53,7 +53,8 @@ pub async fn dispatch_free_text(
     // Capability matrix for diagnostic routing; falls back to seeded priors (missing file)
     // or the legacy heuristics (corrupt file) without breaking the turn.
     let profiles = crate::profile::load_profiles(None).unwrap_or_default();
-    let router = Router::new(state.config.clone(), available.clone(), profiles);
+    let router = Router::new(state.config.clone(), available.clone(), profiles)
+        .with_suspended(crate::availability::recently_suspended());
 
     // Honour both the session's active_backend AND any per-turn @modifier.
     let effective_explicit = explicit_backend.or(state.active_backend);

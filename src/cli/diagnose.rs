@@ -54,6 +54,9 @@ struct DiagnoseReport {
     diagnosis: Diagnosis,
     routing: Routing,
     available: Vec<BackendId>,
+    /// Backends the auto-route stages are currently skipping (recent durable dispatch
+    /// failure — quota / tier / auth). Explicit picks and `[routes]` pins still reach them.
+    suspended: Vec<BackendId>,
     threshold: f32,
 }
 
@@ -61,8 +64,9 @@ pub async fn run(task: String, json: bool) -> Result<()> {
     let ctx = load_context()?;
     let available = ctx.regs.available();
     let profiles = load_profiles(None)?;
+    let suspended = crate::availability::recently_suspended();
 
-    let report = build_report(&task, &ctx.loaded.config, &available, profiles);
+    let report = build_report(&task, &ctx.loaded.config, &available, &suspended, profiles);
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -78,6 +82,7 @@ fn build_report(
     task: &str,
     config: &HubConfig,
     available: &HashSet<BackendId>,
+    suspended: &HashSet<BackendId>,
     profiles: ProfileSet,
 ) -> DiagnoseReport {
     let diagnosis = diagnose::diagnose(task);
@@ -85,7 +90,8 @@ fn build_report(
     // The router's own answer for the `rescue` route key, with no explicit backend — the
     // same call `rescue` makes once it has decided to route (see the module docs for the
     // dispatch-plan layers that can pre-empt routing entirely).
-    let router = Router::new(config.clone(), available.clone(), profiles);
+    let router =
+        Router::new(config.clone(), available.clone(), profiles).with_suspended(suspended.clone());
     let decision = router.resolve(&RouteRequest {
         tool: RouteKey::Rescue,
         explicit_backend: None,
@@ -107,12 +113,15 @@ fn build_report(
 
     let mut available_sorted: Vec<BackendId> = available.iter().copied().collect();
     available_sorted.sort();
+    let mut suspended_sorted: Vec<BackendId> = suspended.iter().copied().collect();
+    suspended_sorted.sort();
 
     DiagnoseReport {
         task: task.to_string(),
         diagnosis,
         routing,
         available: available_sorted,
+        suspended: suspended_sorted,
         threshold: LLM_ASSIST_CONFIDENCE_THRESHOLD,
     }
 }
@@ -198,6 +207,19 @@ fn render_human(report: &DiagnoseReport) -> String {
             .join(", ")
     };
     let _ = writeln!(out, "  available  {avail}");
+    if !report.suspended.is_empty() {
+        let list = report
+            .suspended
+            .iter()
+            .map(|b| b.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "  suspended  {list}   (recent quota/auth failure — auto-route skips them; \
+             --backend and [routes] pins still work)"
+        );
+    }
 
     out
 }
@@ -232,6 +254,7 @@ mod tests {
             "implement a function to parse the duration feature",
             &auto_route_config(BackendId::Opencode),
             &all_seeded_available(),
+            &HashSet::new(),
             seeded_profiles(),
         );
 
@@ -258,6 +281,7 @@ mod tests {
             "implement a function to parse the duration feature",
             &config,
             &all_seeded_available(),
+            &HashSet::new(),
             seeded_profiles(),
         );
 
@@ -272,6 +296,7 @@ mod tests {
             "alpha beta gamma",
             &auto_route_config(BackendId::Opencode),
             &all_seeded_available(),
+            &HashSet::new(),
             seeded_profiles(),
         );
 
@@ -290,6 +315,7 @@ mod tests {
             "refactor the auth module to flatten the nesting",
             &auto_route_config(BackendId::Codex),
             &all_seeded_available(),
+            &HashSet::new(),
             ProfileSet::default(),
         );
 
@@ -305,6 +331,7 @@ mod tests {
             "implement a function to parse the duration feature",
             &auto_route_config(BackendId::Opencode),
             &all_seeded_available(),
+            &HashSet::new(),
             seeded_profiles(),
         );
         let json = serde_json::to_string(&report).unwrap();
@@ -322,6 +349,7 @@ mod tests {
             "implement a function to parse the duration feature",
             &auto_route_config(BackendId::Opencode),
             &all_seeded_available(),
+            &HashSet::new(),
             seeded_profiles(),
         );
         let out = render_human(&report);

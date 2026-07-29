@@ -92,6 +92,11 @@ impl RouteDecision {
 pub struct Router {
     config: HubConfig,
     available: HashSet<BackendId>,
+    /// Backends the AUTO stages skip because their last dispatch failed durably (quota /
+    /// tier / auth) within the cooldown — see [`crate::availability::suspended_backends`].
+    /// An explicit `--backend` or a `[routes]` pin is a user decision and is still honored;
+    /// so is the default fallback (there is nothing better left to pick by then).
+    suspended: HashSet<BackendId>,
     profiles: ProfileSet,
     review_keywords_lower: Vec<String>,
 }
@@ -107,9 +112,20 @@ impl Router {
         Self {
             config,
             available,
+            suspended: HashSet::new(),
             profiles,
             review_keywords_lower,
         }
+    }
+
+    pub fn with_suspended(mut self, suspended: HashSet<BackendId>) -> Self {
+        self.suspended = suspended;
+        self
+    }
+
+    /// Available AND not suspended — the bar every auto-route stage applies.
+    fn auto_usable(&self, backend: BackendId) -> bool {
+        self.available.contains(&backend) && !self.suspended.contains(&backend)
     }
 
     pub fn resolve(&self, request: &RouteRequest<'_>) -> RouteDecision {
@@ -144,7 +160,7 @@ impl Router {
             // there. A task that exceeds the threshold goes to the designated big-window
             // backend; `diagnose_confidence` stays `None` because routing never classified it.
             let auto = &self.config.auto_route;
-            if self.available.contains(&auto.long_context_backend)
+            if self.auto_usable(auto.long_context_backend)
                 && estimate_tokens(task) > auto.long_context_threshold
             {
                 return RouteDecision {
@@ -158,11 +174,17 @@ impl Router {
             // sufficiently-similar past tasks takes the dispatch directly. Compiled out of
             // non-`similarity` builds; inside them every miss (no model, no samples, slow
             // load, thin evidence) falls through to the profile stage below.
+            let auto_available: HashSet<BackendId> = self
+                .available
+                .difference(&self.suspended)
+                .copied()
+                .collect();
+
             #[cfg(feature = "similarity")]
             if let Some(pick) = crate::similarity::embed::route(
                 task,
                 &self.config.auto_route.similarity,
-                &self.available,
+                &auto_available,
             ) {
                 return RouteDecision {
                     backend: pick.backend,
@@ -185,7 +207,7 @@ impl Router {
             if diagnosis.confidence >= LLM_ASSIST_CONFIDENCE_THRESHOLD {
                 let candidates = self
                     .profiles
-                    .candidates_for(diagnosis.primary, &self.available);
+                    .candidates_for(diagnosis.primary, &auto_available);
                 let margin = self.config.auto_route.quality_margin;
                 let cost_of = |b: BackendId| {
                     self.config
@@ -209,7 +231,7 @@ impl Router {
                 }
             }
 
-            if self.available.contains(&auto.review_backend)
+            if self.auto_usable(auto.review_backend)
                 && contains_any_lowercased(task, &self.review_keywords_lower)
             {
                 return RouteDecision {
@@ -622,6 +644,73 @@ mod tests {
             task: Some("implement a function to parse the duration feature"),
         });
         assert_eq!(d.backend, BackendId::Opencode);
+    }
+
+    #[test]
+    fn suspension_skips_auto_stages_but_never_explicit_or_pins() {
+        // The profile argmax (Codex, 90) is suspended after a durable failure: the profile
+        // stage must pick the next best available backend instead.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Claude, TaskCategory::Coding, 70),
+            profile_with(BackendId::Codex, TaskCategory::Coding, 90),
+            profile_with(BackendId::Opencode, TaskCategory::Coding, 80),
+        ]);
+        let suspended: HashSet<BackendId> = [BackendId::Codex].into_iter().collect();
+        let r = Router::new(cfg, available_with_codex(), profiles.clone())
+            .with_suspended(suspended.clone());
+
+        let task = "implement a function to parse the duration feature";
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some(task),
+        });
+        assert_eq!(d.backend, BackendId::Opencode);
+        assert!(matches!(d.reason, RouteReason::Profile { score: 80, .. }));
+
+        // An explicit pick is a user decision — suspension never blocks it.
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: Some(BackendId::Codex),
+            task: Some(task),
+        });
+        assert_eq!(d.backend, BackendId::Codex);
+        assert_eq!(d.reason, RouteReason::Explicit);
+
+        // So is a [routes] pin.
+        let mut pinned = base_config();
+        pinned.routes.clear();
+        pinned.routes.insert(RouteKey::Review, BackendId::Codex);
+        let r = Router::new(pinned, available_with_codex(), profiles).with_suspended(suspended);
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Review,
+            explicit_backend: None,
+            task: Some(task),
+        });
+        assert_eq!(d.backend, BackendId::Codex);
+        assert_eq!(d.reason, RouteReason::RouteTable);
+    }
+
+    #[test]
+    fn suspended_long_context_backend_falls_through_the_capacity_gate() {
+        // The capacity gate's target is quota-dead: skip the gate rather than dispatch a
+        // huge task into a guaranteed failure. With no other signal the task lands on the
+        // default backend (which stays reachable — by then there is nothing better left).
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        let suspended: HashSet<BackendId> =
+            [cfg.auto_route.long_context_backend].into_iter().collect();
+        let r = Router::new(cfg, available(), ProfileSet::default()).with_suspended(suspended);
+        let long = "x".repeat(10_000);
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some(&long),
+        });
+        assert_ne!(d.reason, RouteReason::AutoLongContext);
+        assert_eq!(d.reason, RouteReason::Default);
     }
 
     #[test]

@@ -155,7 +155,8 @@ async fn run_with_route_inner(
     // seeded priors; a corrupt one degrades gracefully to the legacy heuristics rather than
     // breaking routing.
     let profiles = crate::profile::load_profiles(None).unwrap_or_default();
-    let router = Router::new(ctx.loaded.config.clone(), available.clone(), profiles);
+    let router = Router::new(ctx.loaded.config.clone(), available.clone(), profiles)
+        .with_suspended(crate::availability::recently_suspended());
 
     let decision = router.resolve(&RouteRequest {
         tool: route_key,

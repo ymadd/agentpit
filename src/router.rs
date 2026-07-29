@@ -70,8 +70,9 @@ pub struct RouteDecision {
 
 impl RouteDecision {
     /// Emit this decision as a `RouteDecided` event on `logger` (and save the task text under
-    /// `tasks/<hash>.txt`). One call per run, right after the run starts.
-    pub fn log(&self, logger: &crate::events::RunLogger, task: &str) {
+    /// `tasks/<hash>.txt`). One call per run, right after the run starts. `model` is the
+    /// dispatch's resolved model when the caller knows it — the router itself never does.
+    pub fn log(&self, logger: &crate::events::RunLogger, task: &str, model: Option<&str>) {
         let (category, score) = match self.reason {
             RouteReason::Profile {
                 category, score, ..
@@ -84,6 +85,7 @@ impl RouteDecision {
             category,
             score,
             self.diagnose_confidence,
+            model,
             task,
         );
     }

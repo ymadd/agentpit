@@ -260,6 +260,12 @@ pub enum Event {
         /// Diagnose confidence when a diagnosis ran for this resolve (auto-route paths).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnose_confidence: Option<f32>,
+        /// The model resolved for the dispatch (`--model` > role model > backend default),
+        /// where the emitting path knows it. Best-effort: fan-out paths that pin no single
+        /// model omit it. Recorded so per-model outcomes (one backend, many models —
+        /// opencode above all) can be analyzed before any model-level routing exists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
         task_hash: String,
     },
     /// A per-member grade extracted from an ensemble aggregator's structured verdict
@@ -743,6 +749,7 @@ impl RunLogger {
         category: Option<&str>,
         score: Option<u8>,
         diagnose_confidence: Option<f32>,
+        model: Option<&str>,
         task: &str,
     ) {
         let task_hash = record_task_text(task);
@@ -754,6 +761,7 @@ impl RunLogger {
             category: category.map(str::to_string),
             score,
             diagnose_confidence,
+            model: model.map(str::to_string),
             task_hash,
         });
     }
@@ -1096,17 +1104,23 @@ mod tests {
             category: Some("coding".into()),
             score: Some(90),
             diagnose_confidence: Some(0.7),
+            model: Some("gpt-5-codex".into()),
             task_hash: "deadbeefdeadbeef".into(),
         };
         let json = serde_json::to_string(&route).unwrap();
         assert!(json.contains("\"event\":\"route_decided\""), "got: {json}");
         assert!(json.contains("\"task_hash\":\"deadbeefdeadbeef\""));
+        assert!(json.contains("\"model\":\"gpt-5-codex\""));
         match serde_json::from_str::<Event>(&json).unwrap() {
             Event::RouteDecided {
-                backend, category, ..
+                backend,
+                category,
+                model,
+                ..
             } => {
                 assert_eq!(backend, BackendId::Codex);
                 assert_eq!(category.as_deref(), Some("coding"));
+                assert_eq!(model.as_deref(), Some("gpt-5-codex"));
             }
             _ => panic!("wrong variant"),
         }
@@ -1118,11 +1132,14 @@ mod tests {
                 category,
                 score,
                 diagnose_confidence,
+                model,
                 ..
             } => {
                 assert_eq!(category, None);
                 assert_eq!(score, None);
                 assert_eq!(diagnose_confidence, None);
+                // Pre-model log lines (every release up to v0.2.5) parse with model = None.
+                assert_eq!(model, None);
             }
             _ => panic!("wrong variant"),
         }

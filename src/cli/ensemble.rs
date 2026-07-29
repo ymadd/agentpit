@@ -396,7 +396,15 @@ pub async fn run_resolved(
     // Fan-out runs never consult the router; the RouteDecided line exists for its task_hash
     // (re-run detection, kNN) and names the aggregator — else the first member — as "the" backend.
     if let Some(primary) = aggregator.or_else(|| members.first().copied()) {
-        logger.route_decided(primary, "ensemble", None, None, None, &prompt);
+        logger.route_decided(
+            primary,
+            "ensemble",
+            None,
+            None,
+            None,
+            model.as_deref(),
+            &prompt,
+        );
     }
 
     let pre = preflight(&members, &regs).await;

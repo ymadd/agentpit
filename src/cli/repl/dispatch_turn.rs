@@ -101,7 +101,9 @@ pub async fn dispatch_free_text(
     );
 
     let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &state.cwd);
-    decision.log(&logger, &task);
+    // The REPL dispatch passes no model (see the dispatch call below) — record that
+    // truthfully rather than guessing at a backend default the dispatch never applies.
+    decision.log(&logger, &task, None);
     logger.member_started(backend_id, false);
     let started = Instant::now();
 

@@ -281,6 +281,7 @@ impl AgentpitTools {
             None,
             None,
             None,
+            model.as_deref(),
             &task,
         );
         let outcome = dispatch_member_logged(
@@ -352,7 +353,15 @@ impl AgentpitTools {
         // Same shape as the CLI ensemble: no router ran; the line carries the task_hash and
         // names the aggregator — else the first member — as "the" backend.
         if let Some(primary) = aggregator.or_else(|| members.first().copied()) {
-            logger.route_decided(primary, "ensemble", None, None, None, &req.prompt);
+            logger.route_decided(
+                primary,
+                "ensemble",
+                None,
+                None,
+                None,
+                req.model.as_deref(),
+                &req.prompt,
+            );
         }
         let mut set = tokio::task::JoinSet::new();
         for b in members {
@@ -641,7 +650,7 @@ impl AgentpitTools {
             &self.cwd,
         );
         // The critic leg carries the refutation; log it as the run's routed backend.
-        logger.route_decided(critic, "refute", None, None, None, &req.task);
+        logger.route_decided(critic, "refute", None, None, None, None, &req.task);
 
         let bundle = crate::workflow::converse::run_refute(
             &req.task,

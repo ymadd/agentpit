@@ -221,8 +221,20 @@ async fn run_with_route_inner(
         RouteKey::Explain => RunKind::Explain,
         RouteKey::Refactor => RunKind::Refactor,
     };
+    // Effective model: explicit --model > role.model > [backends.<id>].model default > None.
+    // Resolved before the RouteDecided emit so the telemetry records what actually runs.
+    let effective_model = crate::workflow::roles::resolve_model(
+        model.as_deref(),
+        role_model.as_deref(),
+        ctx.loaded
+            .config
+            .backends
+            .get(&backend_id)
+            .and_then(|o| o.model.as_deref()),
+    );
+
     let logger = RunLogger::start_with_role(kind, &[backend_id], &cwd, role_label);
-    decision.log(&logger, &task);
+    decision.log(&logger, &task, effective_model.as_deref());
     logger.member_started(backend_id, false);
     let started = Instant::now();
 
@@ -234,17 +246,6 @@ async fn run_with_route_inner(
             to_stdout(c);
             to_file(c);
         });
-
-    // Effective model: explicit --model > role.model > [backends.<id>].model default > None.
-    let effective_model = crate::workflow::roles::resolve_model(
-        model.as_deref(),
-        role_model.as_deref(),
-        ctx.loaded
-            .config
-            .backends
-            .get(&backend_id)
-            .and_then(|o| o.model.as_deref()),
-    );
     let result = dispatch(
         backend_id,
         &task,
@@ -487,6 +488,15 @@ pub async fn run_cascade(
             diagnosis.primary.as_str(),
             cost_of(backend_id),
         );
+        let effective_model = crate::workflow::roles::resolve_model(
+            model.as_deref(),
+            None,
+            ctx.loaded
+                .config
+                .backends
+                .get(&backend_id)
+                .and_then(|o| o.model.as_deref()),
+        );
         let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &resolved_cwd);
         logger.route_decided(
             backend_id,
@@ -494,6 +504,7 @@ pub async fn run_cascade(
             Some(diagnosis.primary.as_str()),
             None,
             Some(diagnosis.confidence),
+            effective_model.as_deref(),
             &task,
         );
         logger.member_started(backend_id, false);
@@ -506,15 +517,6 @@ pub async fn run_cascade(
                 to_stdout(c);
                 to_file(c);
             });
-        let effective_model = crate::workflow::roles::resolve_model(
-            model.as_deref(),
-            None,
-            ctx.loaded
-                .config
-                .backends
-                .get(&backend_id)
-                .and_then(|o| o.model.as_deref()),
-        );
 
         let outcome = dispatch(
             backend_id,

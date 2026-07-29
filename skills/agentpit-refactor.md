@@ -12,8 +12,13 @@ description: Have another backend agent plan a refactor (changes + unified diff)
 
 ## How to invoke
 
+Prefer the bare form — omitting `--backend` lets agentpit auto-route by learned capability
+(`[routes]` pin → capability profile → similarity → heuristics → default; recently
+quota/auth-dead backends are skipped). Pass `--backend <id>` only when the user names one —
+an explicit backend bypasses the learned routing entirely:
+
 ```bash
-agentpit refactor "<path>" "<goal>" [--backend <id>]
+agentpit refactor "<path>" "<goal>"
 ```
 
 ## Output

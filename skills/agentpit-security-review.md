@@ -28,6 +28,15 @@ Defaults:
 
 Useful `--focus` values: `auth`, `secrets`, `injection`, `crypto`, `supply-chain`, `deserialization`.
 
+## Routing note
+
+This is an **ensemble** (parallel fan-out), not a routed dispatch: the learned router
+(capability profile / similarity / suspension) is **not consulted** — members come from the
+config's `[ensemble]` lists unless `--members` overrides them. The trade runs the other way:
+when an aggregator is set, its per-member grades become training labels for
+`agentpit profile learn`, which improves the routed commands (`rescue` / `explain` /
+`refactor`).
+
 ## Output
 
 Each backend reports findings categorized as **CRITICAL / HIGH / MEDIUM / LOW** with file:line citations and one-line remediations. If `--aggregator` is set, a trailing synthesized section is added.

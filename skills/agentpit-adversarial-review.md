@@ -31,6 +31,15 @@ Defaults:
 
 Useful `--focus` values: `concurrency`, `error-paths`, `resource-limits`, `api-contracts`, `tests`, `performance`, `naming-lies`.
 
+## Routing note
+
+This is an **ensemble** (parallel fan-out), not a routed dispatch: the learned router
+(capability profile / similarity / suspension) is **not consulted** — members come from the
+config's `[ensemble]` lists unless `--members` overrides them. The trade runs the other way:
+when an aggregator is set, its per-member grades become training labels for
+`agentpit profile learn`, which improves the routed commands (`rescue` / `explain` /
+`refactor`).
+
 ## Output
 
 Each backend reports findings categorized as **CRITICAL / HIGH / MEDIUM / LOW** with file:line citations and a concrete reproducer or execution trace (not "could potentially…"). Negative results are reported explicitly with the evidence behind them.

@@ -23,6 +23,15 @@ Defaults:
 - members: `antigravity, opencode`
 - aggregator: none (members run in parallel and each section is shown separately)
 
+## Routing note
+
+This is an **ensemble** (parallel fan-out), not a routed dispatch: the learned router
+(capability profile / similarity / suspension) is **not consulted** — members come from the
+config's `[ensemble]` lists unless `--members` overrides them. The trade runs the other way:
+when an aggregator is set, its per-member grades become training labels for
+`agentpit profile learn`, which improves the routed commands (`rescue` / `explain` /
+`refactor`).
+
 ## Output
 
 Per-backend sections with `=== <backend> (transport=...) ===` headers. If `--aggregator` is set,

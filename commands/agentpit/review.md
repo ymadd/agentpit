@@ -15,3 +15,5 @@ agentpit review "<target>" [--focus <focus>]
 
 The CLI emits per-backend sections with `=== antigravity (transport=exec) ===` style headers.
 Relay verbatim, and group CRITICAL / HIGH findings at the top if helpful.
+
+Note: this is an ensemble fan-out — the learned router is not consulted; members come from `[ensemble]` config (or `--members`). Aggregator grades feed `agentpit profile learn`.

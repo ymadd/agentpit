@@ -18,3 +18,5 @@ agentpit ensemble "<prompt>" [--members <a,b,c>] [--aggregator <id>] [--model <m
 
 The CLI already prints per-source sections (and a trailing aggregator section if requested).
 Relay verbatim.
+
+Note: this is an ensemble fan-out — the learned router is not consulted; members come from `[ensemble]` config (or `--members`). Aggregator grades feed `agentpit profile learn`.

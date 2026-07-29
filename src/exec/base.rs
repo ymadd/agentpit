@@ -20,8 +20,10 @@ const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
 /// Per-`read_until` cap for the line-oriented readers. A backend that streams forever
 /// without a newline would otherwise grow the line buffer unboundedly *before*
 /// [`MAX_CAPTURED_BYTES`] ever applies (that cap guards the collected transcript, not the
-/// in-flight line). Hitting the cap simply yields the bytes read so far as one chunk; a
-/// genuine line that long has no decodable meaning anyway.
+/// in-flight line). A structured line that overflows the cap cannot be decoded from its
+/// halves, so the JSONL reader discards the rest of it and says so in the stream —
+/// silently passing the halves through used to inject megabytes of raw JSON into the
+/// collected answer.
 const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
 /// Callback invoked with each streamed stdout chunk (e.g. tee to terminal + capture file).
@@ -144,6 +146,32 @@ pub async fn run_spec(
                 if n == 0 {
                     break;
                 }
+                // A line that filled the cap without reaching its newline is a structured
+                // event too large to decode (e.g. a huge embedded tool result). Its halves
+                // would each fail to parse and be passed through as raw text, injecting the
+                // whole blob into the collected answer — drop the line instead, visibly.
+                if n as u64 == MAX_LINE_BYTES && !buf.ends_with(b"\n") {
+                    let dropped = discard_line_remainder(&mut reader).await?;
+                    // `dropped == 0` means EOF right here: the buffer was a complete
+                    // cap-sized final line after all, so decode it normally below.
+                    if dropped > 0 {
+                        let note = format!(
+                            "[agentpit] dropped a {}-byte output line: it exceeds the \
+                             {MAX_LINE_BYTES}-byte line cap and cannot be decoded\n",
+                            n as u64 + dropped,
+                        );
+                        consume_decoded(
+                            DecodedChunk {
+                                display: Some(note.clone()),
+                                answer: Some(note),
+                            },
+                            &on_stdout,
+                            &mut collected,
+                            &mut truncated,
+                        );
+                        continue;
+                    }
+                }
                 let chunk = String::from_utf8_lossy(&buf).into_owned();
                 consume_decoded(
                     decoder.decode_line(&chunk),
@@ -210,6 +238,30 @@ pub async fn run_spec(
         output: stdout_text,
         exit_code: code,
     })
+}
+
+/// Read and throw away the rest of an oversized line, returning how many bytes went.
+/// Stops after the newline (leaving the next line unread) or at EOF; each read is capped
+/// like the main loop's so the discard itself stays bounded in memory.
+async fn discard_line_remainder<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<u64> {
+    let mut skipped = 0u64;
+    let mut chunk = Vec::with_capacity(4096);
+    loop {
+        chunk.clear();
+        let n = (&mut *reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut chunk)
+            .await?;
+        if n == 0 {
+            return Ok(skipped);
+        }
+        skipped += n as u64;
+        if chunk.ends_with(b"\n") {
+            return Ok(skipped);
+        }
+    }
 }
 
 fn drain_valid_utf8(
@@ -337,6 +389,74 @@ mod tests {
         .output
         .trim()
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn discard_line_remainder_stops_at_the_newline_and_reports_the_bytes() {
+        let mut reader = BufReader::new(&b"rest-of-oversized-line\nnext line\n"[..]);
+        let dropped = discard_line_remainder(&mut reader).await.unwrap();
+        assert_eq!(dropped, "rest-of-oversized-line\n".len() as u64);
+
+        // The next line is untouched and still readable.
+        let mut next = Vec::new();
+        reader.read_until(b'\n', &mut next).await.unwrap();
+        assert_eq!(next, b"next line\n");
+
+        // EOF mid-line reports what was there.
+        let mut reader = BufReader::new(&b"tail without newline"[..]);
+        assert_eq!(
+            discard_line_remainder(&mut reader).await.unwrap(),
+            "tail without newline".len() as u64
+        );
+        let mut reader = BufReader::new(&b""[..]);
+        assert_eq!(discard_line_remainder(&mut reader).await.unwrap(), 0);
+    }
+
+    /// HILLTE-253 (1): a structured line larger than the per-line cap used to be split into
+    /// unparseable halves that the decoder passed through raw — megabytes of JSON injected
+    /// into the collected answer, with no sign anything went wrong. It is now dropped with
+    /// an explicit note, and the lines after it still decode.
+    #[tokio::test]
+    async fn oversized_jsonl_line_is_dropped_with_a_visible_note() {
+        let spec = ExecSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                // One ~2MiB JSON event line, then a normal agent message.
+                concat!(
+                    r#"printf '{"type":"item.started","item":{"type":"command_execution","pad":"'; "#,
+                    r#"head -c 2097152 /dev/zero | tr '\0' 'a'; printf '"}}\n'; "#,
+                    r#"printf '{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}\n'"#
+                )
+                .into(),
+            ],
+            env: vec![],
+            stdin_input: None,
+        };
+        let outcome = run_spec(
+            BackendId::Codex,
+            spec,
+            ExecRunOptions {
+                cwd: std::env::current_dir().unwrap(),
+                cancel: CancellationToken::new(),
+                on_stdout: None,
+                model: None,
+            },
+            StreamFormat::CodexJsonl,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            outcome.output.contains("[agentpit] dropped a "),
+            "expected the drop note, got: {}",
+            &outcome.output[..outcome.output.len().min(300)]
+        );
+        assert!(outcome.output.contains("Done"), "later lines must decode");
+        assert!(
+            !outcome.output.contains("aaaa"),
+            "the oversized blob must not leak into the answer"
+        );
     }
 
     #[test]

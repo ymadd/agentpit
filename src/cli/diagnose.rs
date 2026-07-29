@@ -130,6 +130,7 @@ fn method_str(method: DiagnoseMethod) -> &'static str {
     match method {
         DiagnoseMethod::Heuristic => "heuristic",
         DiagnoseMethod::LlmAssisted => "llm_assisted",
+        DiagnoseMethod::Declared => "declared",
     }
 }
 

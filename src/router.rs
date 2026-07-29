@@ -757,6 +757,38 @@ mod tests {
     }
 
     #[test]
+    fn declared_category_marker_reaches_the_profile_stage() {
+        // The workflow-manager fix (2026-07-30): a signal-free body under a first-line
+        // `CATEGORY:` declaration must clear the confidence gate and route by capability,
+        // where the same body without the marker falls through to default.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Codex, TaskCategory::Review, 90),
+            profile_with(BackendId::Claude, TaskCategory::Review, 70),
+        ]);
+        let r = Router::new(cfg, available_with_codex(), profiles);
+
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("CATEGORY: review\nalpha beta gamma"),
+        });
+        assert_eq!(d.backend, BackendId::Codex);
+        assert!(matches!(
+            d.reason,
+            RouteReason::Profile {
+                category: TaskCategory::Review,
+                ..
+            }
+        ));
+        assert_eq!(
+            d.diagnose_confidence,
+            Some(crate::diagnose::DECLARED_CONFIDENCE)
+        );
+    }
+
+    #[test]
     fn low_confidence_diagnosis_does_not_take_profile_path() {
         // A signal-free task diagnoses to a low-confidence category. Even though the profiles
         // do score that category, the confidence gate must keep us off the profile path so a

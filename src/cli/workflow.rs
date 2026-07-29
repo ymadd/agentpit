@@ -1151,13 +1151,17 @@ pub fn build_manager_prompt(
             format!(
                 "DISPATCH GRAMMAR (use your Bash tool):\n\
                  \x20 One role:      {self_path} rescue --role <name> \"<sub-task>\"\n\
+                 \x20 Auto-routed:   {self_path} rescue \"<sub-task>\"\n\
                  \x20 Parallel fan:  {self_path} ensemble <id> <id> ... \"<prompt>\" [--aggregator <id>]\n\
-                 \x20 --role is REQUIRED for rescue; the backends in parentheses are informational \
+                 \x20 Prefer a role when one fits the sub-task; omit --role when none does and the \
+                 learned router picks the backend — then start the sub-task's FIRST line with \
+                 `CATEGORY: <kind>` (coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning) \
+                 so the router knows the kind of work. The backends in parentheses are informational \
                  (ensemble still takes backend ids). Quote sub-tasks. For multi-line, use a bash heredoc.\n"
             ),
         ),
-        // NB: the legacy branch reproduces the PRE-ROLES prompt byte-for-byte, including the
-        // flush-left continuation lines (`\<newline>` strips leading whitespace) — pinned by
+        // NB: the legacy branch is the flat-backend prompt (flush-left continuation lines:
+        // `\<newline>` strips leading whitespace) — pinned byte-for-byte by
         // `legacy_prompt_is_byte_identical_without_roles`.
         None => (
             format!(
@@ -1167,8 +1171,13 @@ pub fn build_manager_prompt(
             format!(
                 "DISPATCH GRAMMAR (use your Bash tool):\n\
                  One backend:   {self_path} rescue --backend <id> \"<sub-task>\"\n\
+                 Auto-routed:   {self_path} rescue \"<sub-task>\"\n\
                  Parallel fan:  {self_path} ensemble <id> <id> ... \"<prompt>\" [--aggregator <id>]\n\
-                 --backend is REQUIRED for rescue. Quote sub-tasks. For multi-line, use a bash heredoc.\n"
+                 Omit --backend to let the learned router pick the worker per sub-task; name one only \
+                 when the sub-task clearly needs a specific backend. Start every auto-routed sub-task's \
+                 FIRST line with `CATEGORY: <kind>` (coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning) \
+                 — you know the kind of work, and the router picks the best worker for it. \
+                 Quote sub-tasks. For multi-line, use a bash heredoc.\n"
             ),
         ),
     };
@@ -1255,12 +1264,14 @@ pub fn build_manager_prompt_mcp(
             "ORCHESTRATION TOOLS (use these MCP tools; do NOT shell out to agentpit):\n\
              \x20 mcp__agentpit__list_backends  — list available backends + their auth/transport state.\n\
              \x20 mcp__agentpit__dispatch_task  — run ONE role. Args: {\"role\":\"<name>\",\"task\":\"<sub-task>\"} \
-             ({\"backend\":\"<id>\"} is the legacy alternative; never pass both).\n\
+             ({\"backend\":\"<id>\"} is the legacy alternative; never pass both; omit both when no \
+             role fits and the learned router picks the backend — then start the task's FIRST line with \
+             `CATEGORY: <kind>`, kind in coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning).\n\
              \x20 mcp__agentpit__run_ensemble   — fan out in parallel. Args: {\"members\":[\"<id>\",...],\"prompt\":\"<prompt>\",\"aggregator\":\"<id>\"} (aggregator optional).\n"
                 .to_string(),
         ),
-        // NB: the legacy branch reproduces the PRE-ROLES prompt byte-for-byte, including the
-        // flush-left continuation lines (`\<newline>` strips leading whitespace) — pinned by
+        // NB: the legacy branch is the flat-backend prompt (flush-left continuation lines:
+        // `\<newline>` strips leading whitespace) — pinned byte-for-byte by
         // `legacy_mcp_prompt_is_byte_identical_without_roles`.
         None => (
             format!(
@@ -1269,7 +1280,9 @@ pub fn build_manager_prompt_mcp(
             ),
             "ORCHESTRATION TOOLS (use these MCP tools; do NOT shell out to agentpit):\n\
              mcp__agentpit__list_backends  — list available backends + their auth/transport state.\n\
-             mcp__agentpit__dispatch_task  — run ONE backend. Args: {\"backend\":\"<id>\",\"task\":\"<sub-task>\"}.\n\
+             mcp__agentpit__dispatch_task  — run ONE backend. Args: {\"backend\":\"<id>\",\"task\":\"<sub-task>\"}; \
+             omit \"backend\" to let the learned router pick the worker per sub-task — then start the task's \
+             FIRST line with `CATEGORY: <kind>` (coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning).\n\
              mcp__agentpit__run_ensemble   — fan out in parallel. Args: {\"members\":[\"<id>\",...],\"prompt\":\"<prompt>\",\"aggregator\":\"<id>\"} (aggregator optional).\n"
                 .to_string(),
         ),
@@ -2209,8 +2222,13 @@ Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch
 \n\
 DISPATCH GRAMMAR (use your Bash tool):\n\
 One backend:   '/bin/agentpit' rescue --backend <id> \"<sub-task>\"\n\
+Auto-routed:   '/bin/agentpit' rescue \"<sub-task>\"\n\
 Parallel fan:  '/bin/agentpit' ensemble <id> <id> ... \"<prompt>\" [--aggregator <id>]\n\
---backend is REQUIRED for rescue. Quote sub-tasks. For multi-line, use a bash heredoc.\n\
+Omit --backend to let the learned router pick the worker per sub-task; name one only \
+when the sub-task clearly needs a specific backend. Start every auto-routed sub-task's \
+FIRST line with `CATEGORY: <kind>` (coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning) \
+— you know the kind of work, and the router picks the best worker for it. \
+Quote sub-tasks. For multi-line, use a bash heredoc.\n\
 \n\
 BUDGET: workflow depth 1/3; aim for <= 8 sub-dispatch calls.\n\
 The system REJECTS any nested workflow past the depth ceiling. Plan within budget.\n\
@@ -2252,7 +2270,9 @@ Pick the best fit per sub-task. Dispatch only to a worker above; do NOT dispatch
 \n\
 ORCHESTRATION TOOLS (use these MCP tools; do NOT shell out to agentpit):\n\
 mcp__agentpit__list_backends  — list available backends + their auth/transport state.\n\
-mcp__agentpit__dispatch_task  — run ONE backend. Args: {\"backend\":\"<id>\",\"task\":\"<sub-task>\"}.\n\
+mcp__agentpit__dispatch_task  — run ONE backend. Args: {\"backend\":\"<id>\",\"task\":\"<sub-task>\"}; \
+omit \"backend\" to let the learned router pick the worker per sub-task — then start the task's \
+FIRST line with `CATEGORY: <kind>` (coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning).\n\
 mcp__agentpit__run_ensemble   — fan out in parallel. Args: {\"members\":[\"<id>\",...],\"prompt\":\"<prompt>\",\"aggregator\":\"<id>\"} (aggregator optional).\n\
 \n\
 BUDGET: workflow depth 1/3; aim for <= 8 sub-dispatch calls.\n\
@@ -2301,6 +2321,8 @@ goal\n";
         assert!(text.contains("implementer (claude): You implement."));
         assert!(text.contains("reviewer (codex): You review."));
         assert!(text.contains("'/bin/agentpit' rescue --role <name> \"<sub-task>\""));
+        // Router escape hatch: a role-less rescue auto-routes.
+        assert!(text.contains("Auto-routed:   '/bin/agentpit' rescue \"<sub-task>\""));
         assert!(text.contains("do NOT invent role names"));
         // The flat-backend roster and grammar are gone.
         assert!(!text.contains("AVAILABLE WORKER BACKENDS"));
@@ -2320,6 +2342,8 @@ goal\n";
         assert!(text.contains("AVAILABLE ROLES"));
         assert!(text.contains("{\"role\":\"<name>\",\"task\":\"<sub-task>\"}"));
         assert!(text.contains("never pass both"));
+        // Router escape hatch: an address-less dispatch_task auto-routes.
+        assert!(text.contains("omit both when no role fits"));
         assert!(!text.contains("AVAILABLE WORKER BACKENDS"));
         assert!(!text.contains("run ONE backend"));
         // list_backends / run_ensemble remain.

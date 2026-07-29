@@ -89,7 +89,12 @@ pub async fn run_with_role(
             .await
         }
         DispatchPlan::Direct(backend) => {
-            if backend.is_none() {
+            // The rescue_members ensemble shortcut applies only to a top-level bare rescue.
+            // Inside a workflow (depth > 0) a bare `rescue "<task>"` is the manager asking the
+            // learned router to pick ONE worker for a sub-task; hijacking it into an N-member
+            // ensemble would multiply cost invisibly — the manager fans out explicitly via
+            // `ensemble` when it wants that.
+            if backend.is_none() && crate::workflow::guard::current_depth() == 0 {
                 let ctx = super::load_context()?;
                 let members = ctx.loaded.config.ensemble.rescue_members.clone();
                 if !members.is_empty() {

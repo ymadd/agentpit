@@ -24,7 +24,9 @@ Exposed tools:
 
 - `mcp__agentpit__list_backends` — list backends + their transport and auth state.
 - `mcp__agentpit__dispatch_task` — run ONE backend on a task and return its output; addressed by
-  backend id (`{"backend":"<id>"}`) or by a configured workflow role (`{"role":"<name>"}`).
+  backend id (`{"backend":"<id>"}`), by a configured workflow role (`{"role":"<name>"}`), or with
+  neither — the learned router then picks the backend for the task, exactly like a bare
+  `agentpit rescue`.
 - `mcp__agentpit__run_ensemble` — fan a prompt to several backends in parallel, optional aggregator.
 - `mcp__agentpit__run_workflow` — launch a whole model-driven workflow (manager decomposes the goal,
   dispatches sub-tasks to workers, returns a synthesis).

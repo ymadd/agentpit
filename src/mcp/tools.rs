@@ -43,12 +43,12 @@ use crate::types::BackendId;
 /// Parameters for the `dispatch_task` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DispatchTaskRequest {
-    /// Backend id to run (claude | codex | codex | antigravity | opencode). Exactly one of
-    /// `backend` or `role` must be provided.
+    /// Backend id to run (claude | codex | codex | antigravity | opencode). At most one of
+    /// `backend` or `role`; omit both to let the learned router pick per task.
     #[serde(default)]
     pub backend: Option<String>,
     /// Configured `[workflow.roles.<name>]` role to dispatch to; the role resolves which backend
-    /// plays it and prepends its persona to the task. Exactly one of `backend` or `role`.
+    /// plays it and prepends its persona to the task. At most one of `backend` or `role`.
     #[serde(default)]
     pub role: Option<String>,
     /// Optional model to pin (e.g. "opus"). Overrides the role's configured model.
@@ -153,6 +153,10 @@ pub struct AgentpitTools {
     regs: Arc<Registries>,
     cwd: PathBuf,
     roles: Arc<std::collections::BTreeMap<String, crate::config::RoleConfig>>,
+    /// The loaded hub config, backing the router when `dispatch_task` is called with neither
+    /// `backend` nor `role`. Defaults to `HubConfig::default()` (router still resolves, over
+    /// empty routes and default knobs).
+    config: Arc<crate::config::HubConfig>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -164,6 +168,7 @@ impl AgentpitTools {
             regs,
             cwd,
             roles: Arc::new(std::collections::BTreeMap::new()),
+            config: Arc::new(crate::config::HubConfig::default()),
             tool_router: Self::tool_router(),
         }
     }
@@ -174,6 +179,13 @@ impl AgentpitTools {
         roles: std::collections::BTreeMap<String, crate::config::RoleConfig>,
     ) -> Self {
         self.roles = Arc::new(roles);
+        self
+    }
+
+    /// Attach the loaded config so an address-less `dispatch_task` can route through the real
+    /// router ([routes] pins, auto-route stages, backend model defaults).
+    pub fn with_config(mut self, config: crate::config::HubConfig) -> Self {
+        self.config = Arc::new(config);
         self
     }
 }
@@ -222,27 +234,46 @@ impl AgentpitTools {
     /// Run ONE backend (or configured role) on a task and return its output.
     #[tool(
         name = "dispatch_task",
-        description = "Run ONE backend agent on a task and return its output. Address it either by backend id ({\"backend\":\"<id>\"}) or by a configured workflow role ({\"role\":\"<name>\"} — the role resolves its backend and prepends its persona); exactly one of the two, never both."
+        description = "Run ONE backend agent on a task and return its output. Address it by backend id ({\"backend\":\"<id>\"}), by a configured workflow role ({\"role\":\"<name>\"} — the role resolves its backend and prepends its persona), or omit both to let the learned router pick the best backend for the task. Never pass both. When auto-routing, the task's first line may declare `CATEGORY: <kind>` (coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning) to tell the router the kind of work outright."
     )]
     async fn dispatch_task(
         &self,
         Parameters(req): Parameters<DispatchTaskRequest>,
     ) -> Result<CallToolResult, McpError> {
-        // Exactly one of backend|role addresses the dispatch; both or neither is ambiguous and a
-        // structured error, mirroring the CLI's `--role`/`--backend` mutual exclusion.
-        let (backend, task, model, role) = match (&req.backend, &req.role) {
+        // At most one of backend|role addresses the dispatch (both is ambiguous — a structured
+        // error mirroring the CLI's `--role`/`--backend` mutual exclusion). Passing NEITHER
+        // routes the task through the learned router, exactly like a bare `agentpit rescue`.
+        let (backend, task, model, role, decision) = match (&req.backend, &req.role) {
             (Some(_), Some(_)) => {
                 return Ok(tool_error(
-                    "'backend' and 'role' are mutually exclusive; pass exactly one".to_string(),
+                    "'backend' and 'role' are mutually exclusive; pass at most one".to_string(),
                 ));
             }
             (None, None) => {
-                return Ok(tool_error(
-                    "dispatch_task requires either 'backend' or 'role'".to_string(),
-                ));
+                let available: HashSet<BackendId> = self.regs.available();
+                let profiles = crate::profile::load_profiles(None).unwrap_or_default();
+                let router =
+                    crate::router::Router::new((*self.config).clone(), available, profiles)
+                        .with_suspended(crate::availability::recently_suspended());
+                let decision = router.resolve(&crate::router::RouteRequest {
+                    tool: crate::config::RouteKey::Rescue,
+                    explicit_backend: None,
+                    task: Some(&req.task),
+                });
+                let backend = decision.backend;
+                // Same precedence as the CLI route: explicit model > backend's config default.
+                let model = crate::workflow::roles::resolve_model(
+                    req.model.as_deref(),
+                    None,
+                    self.config
+                        .backends
+                        .get(&backend)
+                        .and_then(|o| o.model.as_deref()),
+                );
+                (backend, req.task, model, None, Some(decision))
             }
             (Some(b), None) => match b.parse::<BackendId>() {
-                Ok(b) => (b, req.task, req.model.clone(), None),
+                Ok(b) => (b, req.task, req.model.clone(), None, None),
                 Err(e) => return Ok(tool_error(format!("unknown backend '{b}': {e}"))),
             },
             (None, Some(role_name)) => {
@@ -261,7 +292,7 @@ impl AgentpitTools {
                             resolved.model.as_deref(),
                             None,
                         );
-                        (resolved.backend, wrapped, model, Some(resolved.name))
+                        (resolved.backend, wrapped, model, Some(resolved.name), None)
                     }
                     Err(e) => return Ok(tool_error(format!("{e:#}"))),
                 }
@@ -274,16 +305,21 @@ impl AgentpitTools {
         // label it "reviewer · codex" rather than just the backend.
         let logger =
             RunLogger::start_with_role(RunKind::Rescue, &[backend], &self.cwd, role.as_deref());
-        // MCP dispatches pin their backend explicitly (by id or via a role) — no router involved.
-        logger.route_decided(
-            backend,
-            if role.is_some() { "role" } else { "explicit" },
-            None,
-            None,
-            None,
-            model.as_deref(),
-            &task,
-        );
+        // An address-less dispatch logs the router's real decision (reason/category/confidence),
+        // so workflow sub-dispatches both use and feed the learned routing loop; a pinned one
+        // logs "explicit"/"role" as before.
+        match &decision {
+            Some(d) => d.log(&logger, &task, model.as_deref()),
+            None => logger.route_decided(
+                backend,
+                if role.is_some() { "role" } else { "explicit" },
+                None,
+                None,
+                None,
+                model.as_deref(),
+                &task,
+            ),
+        }
         let outcome = dispatch_member_logged(
             backend,
             task,
@@ -979,7 +1015,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_task_neither_backend_nor_role_is_structured_error() {
+    #[allow(clippy::await_holding_lock)]
+    async fn dispatch_task_without_address_routes_via_router() {
+        // Neither backend nor role: the learned router resolves the dispatch (here the default
+        // config's fallback lands on the only registered backend) and the RouteDecided event
+        // carries the router's real reason, never the "explicit"/"role" pins.
+        let _g = isolated_state_dir();
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
@@ -989,14 +1030,16 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert_eq!(res.is_error, Some(true));
-        let text = res
-            .content
-            .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("either 'backend' or 'role'"), "got: {text}");
+        assert_eq!(res.is_error, Some(false), "expected success, got: {res:?}");
+        let log = std::fs::read_to_string(agentpit_events::events_path()).unwrap_or_default();
+        let routed = log
+            .lines()
+            .find(|l| l.contains("route_decided"))
+            .expect("a route_decided line was written");
+        assert!(
+            !routed.contains("\"reason\":\"explicit\"") && !routed.contains("\"reason\":\"role\""),
+            "auto dispatch must log a router reason: {routed}"
+        );
     }
 
     #[tokio::test]

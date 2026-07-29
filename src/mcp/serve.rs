@@ -10,5 +10,6 @@ pub async fn run() -> Result<()> {
     let ctx = load_context()?;
     let cwd = resolve_cwd(None)?;
     let roles = ctx.loaded.config.workflow.roles.clone();
-    super::server::run_stdio(ctx.regs, cwd, roles).await
+    let config = ctx.loaded.config.clone();
+    super::server::run_stdio(ctx.regs, cwd, roles, config).await
 }

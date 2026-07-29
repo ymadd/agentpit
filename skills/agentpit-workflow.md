@@ -74,6 +74,20 @@ available backend is a hard error rather than a silent substitution. The MCP equ
 `mcp__agentpit__dispatch_task {"role":"<name>","task":"<sub-task>"}` (`role` and `backend` are
 mutually exclusive there too), so a `--use-mcp` workflow targets roles by name the same way.
 
+A sub-dispatch with NO role and NO backend — `agentpit rescue "<sub-task>"` in shell mode,
+`dispatch_task {"task":"<sub-task>"}` over MCP — goes through the learned router (similarity /
+capability profiles / heuristics), so each workflow step can be routed per task instead of
+pinned; the RouteDecided event records the router's real reason, feeding the same learning loop
+as top-level rescues. Inside a workflow a bare `rescue` never triggers the
+`[ensemble].rescue_members` fan-out shortcut — it is always ONE routed worker.
+
+An auto-routed task's FIRST line may declare its kind outright: `CATEGORY: <kind>` with kind in
+coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning. The
+declaration is diagnosed at confidence 0.95, clearing the profile stage's gate — long
+multi-instruction manager prompts otherwise split the keyword heuristic across categories and
+fall back to default routing. The manager prompt teaches this marker for every auto-routed
+sub-dispatch; a typo'd kind is ignored (normal heuristics apply).
+
 ## Models per agent
 
 Any agent can be pinned to a model. Precedence (highest first): an explicit `--model <m>` on the

@@ -103,7 +103,15 @@ flag is emitted). `--model` on `workflow` pins the manager; a worker role dispat
 Dispatch grammar for a configured worker role: `agentpit rescue --role <name> "<sub-task>"`
 (`--role` and `--backend` are mutually exclusive), or over MCP
 `mcp__agentpit__dispatch_task {"role":"<name>","task":"<sub-task>"}` (`role`/`backend` exclusive
-there too). With at least one worker role configured, the workflow manager's roster becomes
+there too). A sub-dispatch with NO role and NO backend — `agentpit rescue "<sub-task>"` in shell
+mode, `dispatch_task {"task":"<sub-task>"}` over MCP — goes through the learned router
+(similarity / capability profiles / heuristics), so each workflow step can be routed per task
+instead of pinned; the RouteDecided event records the router's reason. Inside a workflow a bare
+`rescue` never triggers the `[ensemble].rescue_members` fan-out shortcut — it is always ONE
+routed worker. An auto-routed task's FIRST line may declare `CATEGORY: <kind>`
+(coding|refactor|review|security-review|adversarial-review|debug|explain|docs|planning), which
+the router trusts at confidence 0.95 so the capability-profile stage fires even on long
+manager-written prompts; an unknown kind is ignored. With at least one worker role configured, the workflow manager's roster becomes
 AVAILABLE ROLES and it dispatches by role name; `--agents` is ignored with a warning. The
 reserved `manager` role is never a dispatch target (`--role manager` is a hard error); manager
 resolution is `--manager` > the type's `manager_backend` > `[workflow.roles.manager]` (first

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildConfigPayload, draftFromConfig } from "./config.js";
+import { buildConfigPayload, draftFromConfig, validateConfigDraft } from "./config.js";
 
 test("full config draft retains every CLI settings section", () => {
   const draft = draftFromConfig({
@@ -21,6 +21,7 @@ test("full config draft retains every CLI settings section", () => {
   });
 
   assert.equal(draft.defaults.backend, "codex");
+  assert.equal(draft.routes.review, "codex");
   assert.equal(draft.auto_route.review_keywords_text, "review, security");
   assert.deepEqual(draft.ensemble.default.members, ["claude", "codex"]);
   assert.equal(draft.backends[1].model, "gpt-test");
@@ -37,4 +38,16 @@ test("save payload trims models and normalizes keywords", () => {
   assert.deepEqual(payload.auto_route.review_keywords, ["review", "security"]);
   assert.deepEqual(payload.backends[0], { id: "claude", transport: "acp", model: "opus" });
   assert.equal(payload.backends[1].model, null);
+});
+
+test("absent routes stay unpinned and survive the save payload", () => {
+  const draft = draftFromConfig({});
+  assert.deepEqual(draft.routes, { rescue: "", review: "", explain: "", refactor: "" });
+  assert.equal(draft.defaults.backend, "claude");
+  assert.equal(draft.auto_route.long_context_backend, "claude");
+  assert.equal(validateConfigDraft(draft), null);
+
+  draft.routes.review = "codex";
+  const payload = buildConfigPayload(draft);
+  assert.deepEqual(payload.routes, { rescue: "", review: "codex", explain: "", refactor: "" });
 });

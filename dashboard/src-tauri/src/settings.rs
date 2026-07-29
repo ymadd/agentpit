@@ -185,13 +185,16 @@ pub struct CoreConfigPayload {
 impl Default for CoreConfigPayload {
     fn default() -> Self {
         Self {
-            backend: "antigravity".into(),
+            backend: "claude".into(),
             auto_route: true,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A hard pin per route. An empty string means "no pin" — the route is left to
+/// auto-routing, and the key is absent from the `[routes]` table on disk. This mirrors
+/// `src/config.rs`, where `routes` is `#[serde(default)]` and starts out empty.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RoutesConfigPayload {
     pub rescue: String,
     pub review: String,
@@ -199,14 +202,14 @@ pub struct RoutesConfigPayload {
     pub refactor: String,
 }
 
-impl Default for RoutesConfigPayload {
-    fn default() -> Self {
-        Self {
-            rescue: "antigravity".into(),
-            review: "claude".into(),
-            explain: "antigravity".into(),
-            refactor: "claude".into(),
-        }
+impl RoutesConfigPayload {
+    fn entries(&self) -> [(&'static str, &str); 4] {
+        [
+            ("rescue", self.rescue.as_str()),
+            ("review", self.review.as_str()),
+            ("explain", self.explain.as_str()),
+            ("refactor", self.refactor.as_str()),
+        ]
     }
 }
 
@@ -223,7 +226,7 @@ impl Default for AutoRouteConfigPayload {
     fn default() -> Self {
         Self {
             long_context_threshold: 100_000,
-            long_context_backend: "antigravity".into(),
+            long_context_backend: "claude".into(),
             review_keywords: vec![
                 "review".into(),
                 "audit".into(),
@@ -542,13 +545,14 @@ fn config_get_at(path: &Path) -> ConfigPayload {
             .unwrap_or(default_values.auto_route),
     };
 
-    let route_defaults = RoutesConfigPayload::default();
+    // Only keys actually present in `[routes]` become pins; everything else stays empty
+    // (= unpinned) so the UI never invents a pin the file never had.
     let routes_table = doc.get("routes").and_then(Item::as_table_like);
     let routes = RoutesConfigPayload {
-        rescue: table_string(routes_table, "rescue", &route_defaults.rescue),
-        review: table_string(routes_table, "review", &route_defaults.review),
-        explain: table_string(routes_table, "explain", &route_defaults.explain),
-        refactor: table_string(routes_table, "refactor", &route_defaults.refactor),
+        rescue: table_string(routes_table, "rescue", ""),
+        review: table_string(routes_table, "review", ""),
+        explain: table_string(routes_table, "explain", ""),
+        refactor: table_string(routes_table, "refactor", ""),
     };
 
     let auto_defaults = AutoRouteConfigPayload::default();
@@ -652,11 +656,13 @@ fn validate_config(payload: &ConfigSave) -> Result<(), String> {
     };
 
     check_backend(&payload.defaults.backend)?;
+    // An empty route is the "unpinned" state, not a backend name.
+    for (_, backend) in payload.routes.entries() {
+        if !backend.trim().is_empty() {
+            check_backend(backend)?;
+        }
+    }
     for backend in [
-        &payload.routes.rescue,
-        &payload.routes.review,
-        &payload.routes.explain,
-        &payload.routes.refactor,
         &payload.auto_route.long_context_backend,
         &payload.auto_route.review_backend,
     ] {
@@ -739,6 +745,24 @@ fn set_ensemble_entry(
     set_optional_string(table, aggregator_key, entry.aggregator.as_deref());
 }
 
+/// Write the pinned routes and delete the unpinned ones. A `[routes]` table left with no
+/// keys is removed outright, so a pin-free config never grows an empty table; unrelated keys
+/// someone put under `[routes]` keep the table alive.
+fn apply_routes(doc: &mut DocumentMut, routes: &RoutesConfigPayload) {
+    let entries = routes.entries();
+    let all_unpinned = entries.iter().all(|(_, pin)| pin.trim().is_empty());
+    if all_unpinned && doc.get("routes").is_none() {
+        return;
+    }
+    let table = root_table_mut(doc, "routes");
+    for (key, pin) in entries {
+        set_optional_string(table, key, Some(pin));
+    }
+    if table.is_empty() {
+        doc.as_table_mut().remove("routes");
+    }
+}
+
 /// Apply only the CLI fields represented by `ConfigSave`; workflow tables and unknown
 /// future keys survive verbatim.
 fn apply_config(doc: &mut DocumentMut, payload: &ConfigSave) {
@@ -746,11 +770,7 @@ fn apply_config(doc: &mut DocumentMut, payload: &ConfigSave) {
     set_preserving_decor(defaults, "backend", value(payload.defaults.backend.clone()));
     set_preserving_decor(defaults, "auto_route", value(payload.defaults.auto_route));
 
-    let routes = root_table_mut(doc, "routes");
-    set_preserving_decor(routes, "rescue", value(payload.routes.rescue.clone()));
-    set_preserving_decor(routes, "review", value(payload.routes.review.clone()));
-    set_preserving_decor(routes, "explain", value(payload.routes.explain.clone()));
-    set_preserving_decor(routes, "refactor", value(payload.routes.refactor.clone()));
+    apply_routes(doc, &payload.routes);
 
     let auto_route = root_table_mut(doc, "auto_route");
     set_preserving_decor(
@@ -1354,7 +1374,14 @@ mod tests {
 
         assert!(!payload.exists);
         assert_eq!(payload.defaults, CoreConfigPayload::default());
+        // No file, no pins: every route reads back as unpinned (auto-routing).
         assert_eq!(payload.routes, RoutesConfigPayload::default());
+        assert_eq!(
+            payload.routes.entries().map(|(_, pin)| pin),
+            ["", "", "", ""]
+        );
+        assert_eq!(payload.defaults.backend, "claude");
+        assert_eq!(payload.auto_route.long_context_backend, "claude");
         assert_eq!(payload.auto_route, AutoRouteConfigPayload::default());
         assert_eq!(payload.ensemble, EnsembleConfigPayload::default());
         assert_eq!(payload.backends.len(), known_backends().len());
@@ -1362,6 +1389,84 @@ mod tests {
             .backends
             .iter()
             .all(|entry| entry.transport.is_none() && entry.model.is_none()));
+    }
+
+    #[test]
+    fn config_without_routes_table_loads_as_fully_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[default]\nbackend = \"codex\"\n\n[auto_route]\nreview_backend = \"claude\"\n",
+        )
+        .unwrap();
+
+        let payload = config_get_at(&path);
+        assert_eq!(payload.routes, RoutesConfigPayload::default());
+        assert_eq!(
+            payload.routes.entries().map(|(_, pin)| pin),
+            ["", "", "", ""]
+        );
+    }
+
+    #[test]
+    fn saving_all_routes_empty_removes_the_routes_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# header stays\n[default]\nbackend = \"codex\"\n\n[routes]\nrescue = \"codex\"\nreview = \"claude\"\n",
+        )
+        .unwrap();
+
+        config_save_at(&ConfigSave::default(), &path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("[routes]"), "got: {raw}");
+        assert!(raw.contains("# header stays"), "got: {raw}");
+        assert_eq!(config_get_at(&path).routes, RoutesConfigPayload::default());
+
+        // Idempotent: saving again on a table-free doc must not resurrect it.
+        config_save_at(&ConfigSave::default(), &path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("[routes]"), "got: {raw}");
+    }
+
+    #[test]
+    fn saving_one_pinned_route_writes_only_that_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut save = ConfigSave::default();
+        save.routes.review = "codex".into();
+        config_save_at(&save, &path).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("review = \"codex\""), "got: {raw}");
+        for absent in ["rescue =", "explain =", "refactor ="] {
+            assert!(!raw.contains(absent), "{absent} in: {raw}");
+        }
+
+        let loaded = config_get_at(&path);
+        assert_eq!(loaded.routes.review, "codex");
+        assert_eq!(loaded.routes.rescue, "");
+        assert_eq!(loaded.routes.explain, "");
+        assert_eq!(loaded.routes.refactor, "");
+    }
+
+    #[test]
+    fn unpinning_routes_keeps_unrelated_comments_and_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# top comment\n[routes]\n# route note\nreview = \"claude\"\nfuture_route = \"keep-me\"\n",
+        )
+        .unwrap();
+
+        config_save_at(&ConfigSave::default(), &path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# top comment"), "got: {raw}");
+        assert!(raw.contains("future_route = \"keep-me\""), "got: {raw}");
+        assert!(!raw.contains("review ="), "got: {raw}");
     }
 
     #[test]

@@ -29,6 +29,13 @@ export async function getSnapshot() {
 // (there was no finish event to record). Testing `!finished` alone would therefore
 // render a dead stage as perpetually running, with a ticking timer — check the
 // terminal statuses first.
+// "profile coding 82" (reason + category + score) or just "explicit" when the route
+// carries no diagnosis detail — the router's own decision, from `Event::RouteDecided`
+// via the snapshot's `run.route`. A score of 0 is real data and must survive.
+export function routeLabel(route) {
+  return [route.reason, route.category, route.score].filter((v) => v != null).join(" ");
+}
+
 export function runStatus(run) {
   const s = run.status;
   if (s === "error" || s === "interrupted") return "failed";

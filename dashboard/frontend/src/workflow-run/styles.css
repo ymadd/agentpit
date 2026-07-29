@@ -103,6 +103,21 @@
   font-size: 11px;
   padding: 2px 7px;
 }
+.wr-outcome {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 5px;
+  padding: 0 5px;
+}
+.wr-outcome-good { color: #7fce9e; background: rgba(95, 184, 132, 0.12); }
+.wr-outcome-bad { color: #f08a98; background: rgba(229, 104, 122, 0.12); }
+.wr-route {
+  margin: -6px 0 14px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--ac-tx);
+}
 .wr-kv { display: grid; grid-template-columns: auto 1fr; gap: 5px 10px; margin: 0 0 16px; }
 .wr-kv dt { font-size: 10px; color: var(--faint); }
 .wr-kv dd { margin: 0; font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--text-2); }
@@ -142,6 +157,14 @@
   padding: 0 4px;
 }
 .wr-member-st { font-family: "IBM Plex Mono", monospace; font-size: 9px; text-transform: uppercase; color: var(--faint); }
+.wr-member-grade {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9px;
+  color: var(--ac-tx);
+  border: 1px solid var(--line-3);
+  border-radius: 4px;
+  padding: 0 4px;
+}
 .wr-member-bd { display: flex; gap: 10px; margin-top: 3px; font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--faint); }
 .wr-member-err {
   margin-top: 6px;

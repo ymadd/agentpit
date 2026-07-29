@@ -27,18 +27,20 @@ export function draftFromConfig(data = {}) {
     exists: data.exists !== false,
     known_backends: [...known],
     defaults: {
-      backend: data.defaults?.backend || "antigravity",
+      backend: data.defaults?.backend || "claude",
       auto_route: data.defaults?.auto_route !== false,
     },
+    // "" means unpinned: the route falls through to auto-routing and the key stays out
+    // of the [routes] table on disk. Never invent a pin the config did not have.
     routes: {
-      rescue: data.routes?.rescue || "antigravity",
-      review: data.routes?.review || "claude",
-      explain: data.routes?.explain || "antigravity",
-      refactor: data.routes?.refactor || "claude",
+      rescue: data.routes?.rescue || "",
+      review: data.routes?.review || "",
+      explain: data.routes?.explain || "",
+      refactor: data.routes?.refactor || "",
     },
     auto_route: {
       long_context_threshold: data.auto_route?.long_context_threshold ?? 100000,
-      long_context_backend: data.auto_route?.long_context_backend || "antigravity",
+      long_context_backend: data.auto_route?.long_context_backend || "claude",
       review_keywords_text: (data.auto_route?.review_keywords || ["review", "audit", "critique", "security"]).join(", "),
       review_backend: data.auto_route?.review_backend || "claude",
     },
@@ -95,7 +97,8 @@ export function validateConfigDraft(draft) {
   const known = new Set(draft.known_backends);
   const backendValues = [
     draft.defaults.backend,
-    ...Object.values(draft.routes),
+    // An empty route is the unpinned state, not a backend id.
+    ...Object.values(draft.routes).filter(Boolean),
     draft.auto_route.long_context_backend,
     draft.auto_route.review_backend,
   ];

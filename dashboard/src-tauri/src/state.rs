@@ -24,6 +24,25 @@ pub struct MemberView {
     pub error: Option<String>,
 }
 
+/// The router's (or a fan-out path's) backend choice for a run, folded from
+/// [`Event::RouteDecided`]. One per run.
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteView {
+    pub backend: String,
+    pub reason: String,
+    pub category: Option<String>,
+    pub score: Option<u8>,
+    pub diagnose_confidence: Option<f32>,
+}
+
+/// A per-member grade folded from [`Event::MemberGraded`] (an ensemble aggregator's
+/// structured verdict on one member).
+#[derive(Debug, Clone, Serialize)]
+pub struct GradeView {
+    pub grade: u8,
+    pub rank: Option<u8>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunView {
     pub run_id: String,
@@ -44,6 +63,13 @@ pub struct RunView {
     pub depth: u32,
     /// The workflow role this run plays (e.g. "reviewer"), when dispatched by role.
     pub role: Option<String>,
+    /// This run's routing decision, from `Event::RouteDecided`. `None` if the route
+    /// hasn't been (or wasn't) recorded.
+    pub route: Option<RouteView>,
+    /// Per-member grades from `Event::MemberGraded`, keyed by backend name.
+    pub grades: BTreeMap<String, GradeView>,
+    /// The human's good/bad verdict on this run (`agentpit outcome`), if noted.
+    pub outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -142,6 +168,9 @@ impl Tracker {
                     parent_run_id: None,
                     depth: 0,
                     role: None,
+                    route: None,
+                    grades: BTreeMap::new(),
+                    outcome: None,
                 },
             );
             self.prune();
@@ -248,14 +277,53 @@ impl Tracker {
             // straight from the asks/ sidecar files (see `asks.rs`), and notes (① handoff /
             // ③ board, design §4.5) are a durable transcript the workflow manager consumes —
             // neither is reflected into the Tracker's per-run member views.
-            // The learned-routing telemetry (route decisions, aggregator grades, human
-            // verdicts) is fold-time input for `agentpit profile learn`, not run-view state.
-            Event::Ask { .. }
-            | Event::AskAnswered { .. }
-            | Event::Note { .. }
-            | Event::RouteDecided { .. }
-            | Event::MemberGraded { .. }
-            | Event::OutcomeNoted { .. } => {}
+            Event::Ask { .. } | Event::AskAnswered { .. } | Event::Note { .. } => {}
+            // Learned-routing telemetry, folded into the run view so the dashboard can
+            // surface it (design: learned routing layer). These arrive for a run_id that
+            // should already exist (RouteDecided right after run_started, MemberGraded
+            // after the aggregator finishes, OutcomeNoted from a later `agentpit outcome`
+            // call) — unlike the member/run arms above, we don't fabricate a stub run for
+            // one, since `agentpit outcome` in particular can reference a run long since
+            // pruned from the tracker (see `prune`), and a stub with none of the run's
+            // real fields would be worse than just not showing it.
+            Event::RouteDecided {
+                run_id,
+                backend,
+                reason,
+                category,
+                score,
+                diagnose_confidence,
+                ..
+            } => {
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.route = Some(RouteView {
+                        backend: backend.as_str().to_string(),
+                        reason,
+                        category,
+                        score,
+                        diagnose_confidence,
+                    });
+                }
+            }
+            Event::MemberGraded {
+                run_id,
+                backend,
+                grade,
+                rank,
+                ..
+            } => {
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.grades
+                        .insert(backend.as_str().to_string(), GradeView { grade, rank });
+                }
+            }
+            Event::OutcomeNoted {
+                run_id, outcome, ..
+            } => {
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.outcome = Some(outcome.as_str().to_string());
+                }
+            }
         }
     }
 
@@ -509,5 +577,52 @@ mod tests {
         assert_eq!(r1.parent_run_id.as_deref(), Some("r0"));
         assert_eq!(r1.depth, 1);
         assert_eq!(r1.role.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn route_grade_and_outcome_events_fold_into_the_run_view() {
+        let log = concat!(
+            "{\"event\":\"run_started\",\"ts\":1,\"run_id\":\"r0\",\"pid\":1,\"kind\":\"ensemble\",\"members\":[\"codex\",\"claude\"],\"cwd\":\"/x\"}\n",
+            "{\"event\":\"route_decided\",\"ts\":2,\"run_id\":\"r0\",\"backend\":\"codex\",\"reason\":\"profile\",\"category\":\"coding\",\"score\":82,\"task_hash\":\"h\"}\n",
+            "{\"event\":\"member_graded\",\"ts\":3,\"run_id\":\"r0\",\"backend\":\"codex\",\"grade\":87,\"rank\":1}\n",
+            "{\"event\":\"member_graded\",\"ts\":4,\"run_id\":\"r0\",\"backend\":\"claude\",\"grade\":60,\"rank\":2}\n",
+            "{\"event\":\"outcome_noted\",\"ts\":5,\"run_id\":\"r0\",\"outcome\":\"good\"}\n",
+        );
+        let (t, _f) = tracker_from(log);
+        let snap = t.snapshot(|_| true, 20);
+        let run = snap.live.iter().find(|r| r.run_id == "r0").unwrap();
+        let route = run.route.as_ref().unwrap();
+        assert_eq!(route.backend, "codex");
+        assert_eq!(route.reason, "profile");
+        assert_eq!(route.category.as_deref(), Some("coding"));
+        assert_eq!(route.score, Some(82));
+        assert_eq!(route.diagnose_confidence, None);
+        assert_eq!(run.grades.get("codex").unwrap().grade, 87);
+        assert_eq!(run.grades.get("codex").unwrap().rank, Some(1));
+        assert_eq!(run.grades.get("claude").unwrap().grade, 60);
+        assert_eq!(run.outcome.as_deref(), Some("good"));
+    }
+
+    #[test]
+    fn route_grade_and_outcome_events_for_an_unknown_run_are_ignored() {
+        let log = concat!(
+            "{\"event\":\"route_decided\",\"ts\":1,\"run_id\":\"ghost\",\"backend\":\"codex\",\"reason\":\"profile\",\"task_hash\":\"h\"}\n",
+            "{\"event\":\"member_graded\",\"ts\":2,\"run_id\":\"ghost\",\"backend\":\"codex\",\"grade\":50}\n",
+            "{\"event\":\"outcome_noted\",\"ts\":3,\"run_id\":\"ghost\",\"outcome\":\"bad\"}\n",
+        );
+        let (t, _f) = tracker_from(log);
+        let snap = t.snapshot(|_| true, 20);
+        assert_eq!(snap.live.len(), 0);
+        assert_eq!(snap.recent.len(), 0);
+    }
+
+    #[test]
+    fn old_logs_without_the_routing_events_still_parse() {
+        let (t, _f) = tracker_from(LOG);
+        let snap = t.snapshot(|_| true, 20);
+        let run = &snap.live[0];
+        assert!(run.route.is_none());
+        assert!(run.grades.is_empty());
+        assert_eq!(run.outcome, None);
     }
 }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pickWorkflow, listWorkflows, buildStageGraph, runStatus, summarize, descendants } from "./snapshot.js";
+import { pickWorkflow, listWorkflows, buildStageGraph, runStatus, summarize, descendants, routeLabel } from "./snapshot.js";
 
 // A manager (claude) that dispatched three stages: codex failed, codex ok, and
 // an antigravity reviewer still running — the shape a real `agentpit workflow`
@@ -150,4 +150,12 @@ test("buildStageGraph places each run once even on a cyclic parent chain", () =>
   const g = buildStageGraph(s, s.live[0]);
   assert.equal(g.nodes.length, 2);
   assert.equal(new Set(g.nodes.map((n) => n.id)).size, 2);
+});
+
+// Strata review 2026-07-29: routeLabel had no test — a regression turning
+// "profile coding 82" into anything else would have passed CI.
+test("routeLabel joins the present route parts and keeps a zero score", () => {
+  assert.equal(routeLabel({ reason: "profile", category: "coding", score: 82 }), "profile coding 82");
+  assert.equal(routeLabel({ reason: "explicit", category: null, score: null }), "explicit");
+  assert.equal(routeLabel({ reason: "profile", category: "coding", score: 0 }), "profile coding 0");
 });

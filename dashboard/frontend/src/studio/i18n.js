@@ -177,6 +177,8 @@ export const JA = {
   "No agent has started yet.": "まだエージェントが開始していません。",
   aggregator: "集約",
   "{n} chars": "{n} 文字",
+  "route: {label}": "ルート: {label}",
+  "{grade} / rank {rank}": "{grade}点 / {rank}位",
 };
 
 export function makeT(lang) {

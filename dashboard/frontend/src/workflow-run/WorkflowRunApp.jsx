@@ -9,7 +9,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import StageNode, { elapsed } from "./StageNode.jsx";
-import { getSnapshot, listWorkflows, buildStageGraph, summarize, runStatus } from "./snapshot.js";
+import { getSnapshot, listWorkflows, buildStageGraph, summarize, runStatus, routeLabel } from "./snapshot.js";
 import { makeT, detectLang } from "../studio/i18n.js";
 import "../reactflow-dark.css";
 import "./styles.css";
@@ -221,14 +221,19 @@ const MEMBER_STATE = { ok: "done", error: "failed", running: "running" };
 function StageDetail({ t, data, onClose }) {
   const run = data.run || {};
   const members = run.members || [];
+  const grades = run.grades || {};
   return (
     <aside className="wr-detail">
       <div className="wr-detail-hd">
         <span className="wr-detail-title">{data.title}</span>
+        {run.outcome ? (
+          <span className={`wr-outcome wr-outcome-${run.outcome}`}>{run.outcome === "good" ? "✓" : "✕"}</span>
+        ) : null}
         <button className="wr-detail-close" onClick={onClose} aria-label={t("Close ✕")}>
           ✕
         </button>
       </div>
+      {run.route ? <div className="wr-route">{t("route: {label}", { label: routeLabel(run.route) })}</div> : null}
       <dl className="wr-kv">
         <dt>{t("Status")}</dt>
         <dd className={`st-${data.status}`}>{t(data.status)}</dd>
@@ -248,11 +253,18 @@ function StageDetail({ t, data, onClose }) {
         <div className="wr-detail-empty">{t("No agent has started yet.")}</div>
       ) : (
         <ul className="wr-members">
-          {members.map((m, i) => (
+          {members.map((m, i) => {
+            const grade = grades[m.backend];
+            return (
             <li key={`${m.backend}-${m.aggregator ? "agg" : "m"}-${i}`} className={`st-${MEMBER_STATE[m.status] || "running"}`}>
               <div className="wr-member-hd">
                 <span className="wr-member-be">{m.backend}</span>
                 {m.aggregator ? <span className="wr-member-tag">{t("aggregator")}</span> : null}
+                {grade ? (
+                  <span className="wr-member-grade">
+                    {grade.rank != null ? t("{grade} / rank {rank}", { grade: grade.grade, rank: grade.rank }) : grade.grade}
+                  </span>
+                ) : null}
                 <span className="wr-member-st">{m.status}</span>
               </div>
               <div className="wr-member-bd">
@@ -261,7 +273,8 @@ function StageDetail({ t, data, onClose }) {
               </div>
               {m.error ? <div className="wr-member-err">{m.error}</div> : null}
             </li>
-          ))}
+            );
+          })}
         </ul>
       )}
     </aside>

@@ -42,7 +42,8 @@ const ENSEMBLE_META = {
 };
 
 function BackendMark({ id, size = "normal" }) {
-  const meta = metaFor(id);
+  // No id = the unpinned/auto state: a neutral dot instead of a backend monogram.
+  const meta = id ? metaFor(id) : { mono: "·", color: "#7d8595" };
   return (
     <span className={`set-backend-mark ${size}`} style={{ "--backend-color": meta.color }} aria-hidden="true">
       {meta.mono}
@@ -145,7 +146,7 @@ function RoutingPanel({ draft, change }) {
             <p>{route.copy}</p>
             <div className="set-inline-backend">
               <BackendMark id={draft.routes[route.key]} />
-              <BackendSelect value={draft.routes[route.key]} backends={draft.known_backends} onChange={(backend) => change((next) => { next.routes[route.key] = backend; })} />
+              <BackendSelect allowEmpty emptyLabel="自動（学習ルーティング）" value={draft.routes[route.key]} backends={draft.known_backends} onChange={(backend) => change((next) => { next.routes[route.key] = backend; })} />
             </div>
           </Card>
         ))}

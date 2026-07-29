@@ -101,6 +101,7 @@ pub async fn run_with_role(
                         members,
                         aggregator,
                         model,
+                        false,
                         cwd,
                     )
                     .await;

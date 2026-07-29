@@ -147,7 +147,8 @@ pub async fn handle_slash(
                 eprintln!("{}", style("usage: /review <target>").yellow());
             } else {
                 let cwd_str = state.cwd.display().to_string();
-                let _ = crate::cli::review::run(target, None, None, None, Some(cwd_str)).await;
+                let _ =
+                    crate::cli::review::run(target, None, None, None, None, Some(cwd_str)).await;
             }
             Ok((state, LoopControl::Continue))
         }

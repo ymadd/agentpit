@@ -82,6 +82,10 @@ pub enum Command {
         focus: Option<String>,
         #[arg(long, value_delimiter = ',')]
         members: Option<Vec<BackendId>>,
+        /// Pick members by learned capability profile (top-N for the review category)
+        /// instead of the [ensemble] config list. Optional N defaults to that list's size.
+        #[arg(long, value_name = "N", num_args = 0..=1, conflicts_with = "members")]
+        routed: Option<Option<usize>>,
         #[arg(long)]
         aggregator: Option<BackendId>,
         #[arg(long)]
@@ -96,6 +100,10 @@ pub enum Command {
         focus: Option<String>,
         #[arg(long, value_delimiter = ',')]
         members: Option<Vec<BackendId>>,
+        /// Pick members by learned capability profile (top-N for the securityreview
+        /// category) instead of the [ensemble] config list. Optional N defaults to that list's size.
+        #[arg(long, value_name = "N", num_args = 0..=1, conflicts_with = "members")]
+        routed: Option<Option<usize>>,
         #[arg(long)]
         aggregator: Option<BackendId>,
         #[arg(long)]
@@ -110,6 +118,10 @@ pub enum Command {
         focus: Option<String>,
         #[arg(long, value_delimiter = ',')]
         members: Option<Vec<BackendId>>,
+        /// Pick members by learned capability profile (top-N for the adversarialreview
+        /// category) instead of the [ensemble] config list. Optional N defaults to that list's size.
+        #[arg(long, value_name = "N", num_args = 0..=1, conflicts_with = "members")]
+        routed: Option<Option<usize>>,
         #[arg(long)]
         aggregator: Option<BackendId>,
         #[arg(long)]
@@ -379,25 +391,28 @@ pub async fn run(cli: Cli) -> Result<()> {
             target,
             focus,
             members,
+            routed,
             aggregator,
             cwd,
-        } => review::run(target, focus, members, aggregator, cwd).await,
+        } => review::run(target, focus, members, routed, aggregator, cwd).await,
 
         Command::SecurityReview {
             target,
             focus,
             members,
+            routed,
             aggregator,
             cwd,
-        } => security_review::run(target, focus, members, aggregator, cwd).await,
+        } => security_review::run(target, focus, members, routed, aggregator, cwd).await,
 
         Command::AdversarialReview {
             target,
             focus,
             members,
+            routed,
             aggregator,
             cwd,
-        } => adversarial_review::run(target, focus, members, aggregator, cwd).await,
+        } => adversarial_review::run(target, focus, members, routed, aggregator, cwd).await,
 
         Command::Explain {
             target,

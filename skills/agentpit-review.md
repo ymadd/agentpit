@@ -16,7 +16,7 @@ Use this skill when the user asks for a code review across multiple agents.
 ## How to invoke
 
 ```bash
-agentpit review "<target>" [--focus <topic>] [--members <a,b,c>] [--aggregator <id>]
+agentpit review "<target>" [--focus <topic>] [--members <a,b,c> | --routed [N]] [--aggregator <id>]
 ```
 
 Defaults:
@@ -25,12 +25,20 @@ Defaults:
 
 ## Routing note
 
-This is an **ensemble** (parallel fan-out), not a routed dispatch: the learned router
-(capability profile / similarity / suspension) is **not consulted** — members come from the
-config's `[ensemble]` lists unless `--members` overrides them. The trade runs the other way:
-when an aggregator is set, its per-member grades become training labels for
-`agentpit profile learn`, which improves the routed commands (`rescue` / `explain` /
-`refactor`).
+This is an **ensemble** (parallel fan-out): by default the learned router is **not
+consulted** — members come from the config's `[ensemble]` lists unless overridden.
+Member selection, strongest override first:
+
+- `--members <a,b,c>` — explicit list, always wins.
+- `--routed [N]` — pick the top-N members from the learned capability profiles
+  (review-category scores; suspended backends excluded). N defaults to the config
+  list's size. **Use this whenever the user asks for the router / learned routing /
+  profile-based member selection** (e.g. "router で選んで", `--backend router` intent).
+- neither — the config's `[ensemble]` list.
+
+The learning loop: when an aggregator is set, its per-member grades become training
+labels for `agentpit profile learn`, which improves both the routed commands
+(`rescue` / `explain` / `refactor`) and `--routed` member selection here.
 
 ## Output
 

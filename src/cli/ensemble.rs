@@ -12,7 +12,57 @@ use super::{install_ctrlc_cancel, load_context, resolve_cwd};
 use crate::auth::check_auth;
 use crate::dispatch::{Registries, dispatch, resolve_transport};
 use crate::events::{LegStatus, RunKind, RunLogger};
+use crate::profile::{ProfileSet, TaskCategory};
 use crate::types::{BackendId, Transport};
+
+/// `--routed`: pick the ensemble's members by learned capability instead of the `[ensemble]`
+/// config list — every available, non-suspended backend scored for `category`, ordered like
+/// the router's profile stage (value, then confidence, then samples), top `n`. `n` defaults
+/// to the config list's size. Falls back to `fallback` (the config list) when no backend has
+/// a score for the category (profiles.toml missing or never seeded), so `--routed` degrades
+/// to the default behaviour rather than failing the run.
+///
+/// The stderr line prints each pick's score AND sample count on purpose: `samples: 0` means
+/// the pick came from seeded priors, not learning — without that, a seed-ordered pick is
+/// indistinguishable from a learned one (the route-table lesson of 2026-07-25).
+pub(crate) fn routed_members(
+    profiles: &ProfileSet,
+    category: TaskCategory,
+    available: &HashSet<BackendId>,
+    suspended: &HashSet<BackendId>,
+    n: Option<usize>,
+    fallback: Vec<BackendId>,
+) -> Vec<BackendId> {
+    let usable: HashSet<BackendId> = available.difference(suspended).copied().collect();
+    let mut candidates = profiles.candidates_for(category, &usable);
+    if candidates.is_empty() {
+        eprintln!(
+            "{} --routed: no capability scores for {} among usable backends; using [ensemble] config members",
+            style("⚠").yellow(),
+            category.as_str(),
+        );
+        return fallback;
+    }
+    candidates.sort_by(|(_, a), (_, b)| {
+        b.value
+            .cmp(&a.value)
+            .then(b.confidence.total_cmp(&a.confidence))
+            .then(b.samples.cmp(&a.samples))
+    });
+    let n = n.unwrap_or_else(|| fallback.len().max(1));
+    let picked: Vec<(BackendId, crate::profile::Score)> = candidates.into_iter().take(n).collect();
+    let detail = picked
+        .iter()
+        .map(|(b, s)| format!("{b} (score {}, samples {})", s.value, s.samples))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "{} routed members [{}]: {detail}",
+        style("→").bold(),
+        category.as_str(),
+    );
+    picked.into_iter().map(|(b, _)| b).collect()
+}
 
 pub struct MemberOutcome {
     pub backend: BackendId,
@@ -360,6 +410,7 @@ pub async fn run(
         members,
         aggregator,
         model,
+        false,
         cwd,
     )
     .await
@@ -373,6 +424,7 @@ pub async fn run_resolved(
     members: Vec<BackendId>,
     aggregator: Option<BackendId>,
     model: Option<String>,
+    routed: bool,
     cwd: Option<String>,
 ) -> Result<()> {
     let cwd = resolve_cwd(cwd)?;
@@ -393,12 +445,18 @@ pub async fn run_resolved(
 
     let regs = Arc::new(ctx.regs);
     let logger = RunLogger::start(kind, &members, &cwd);
-    // Fan-out runs never consult the router; the RouteDecided line exists for its task_hash
-    // (re-run detection, kNN) and names the aggregator — else the first member — as "the" backend.
+    // Fan-out runs never consult the single-backend router; the RouteDecided line exists for
+    // its task_hash (re-run detection, kNN) and names the aggregator — else the first member —
+    // as "the" backend. "ensemble_routed" marks that `--routed` picked the members from the
+    // capability profiles, so profile-driven selection is verifiable in the event log.
     if let Some(primary) = aggregator.or_else(|| members.first().copied()) {
         logger.route_decided(
             primary,
-            "ensemble",
+            if routed {
+                "ensemble_routed"
+            } else {
+                "ensemble"
+            },
             None,
             None,
             None,
@@ -595,6 +653,88 @@ pub async fn run_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::{CapabilityProfile, Score};
+
+    fn profile_with(backend: BackendId, category: TaskCategory, value: u8) -> CapabilityProfile {
+        let mut p = CapabilityProfile::seeded(backend);
+        p.scores.insert(category, Score::seeded(value));
+        p
+    }
+
+    fn set(backends: &[BackendId]) -> HashSet<BackendId> {
+        backends.iter().copied().collect()
+    }
+
+    #[test]
+    fn routed_members_picks_top_n_by_score() {
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Claude, TaskCategory::Review, 70),
+            profile_with(BackendId::Codex, TaskCategory::Review, 90),
+            profile_with(BackendId::Opencode, TaskCategory::Review, 80),
+        ]);
+        let available = set(&[BackendId::Claude, BackendId::Codex, BackendId::Opencode]);
+        let fallback = vec![BackendId::Antigravity, BackendId::Opencode];
+
+        // n defaults to the fallback list's size (2): the two highest scores win.
+        let picked = routed_members(
+            &profiles,
+            TaskCategory::Review,
+            &available,
+            &HashSet::new(),
+            None,
+            fallback.clone(),
+        );
+        assert_eq!(picked, vec![BackendId::Codex, BackendId::Opencode]);
+
+        // Explicit n overrides the default count.
+        let picked = routed_members(
+            &profiles,
+            TaskCategory::Review,
+            &available,
+            &HashSet::new(),
+            Some(3),
+            fallback,
+        );
+        assert_eq!(
+            picked,
+            vec![BackendId::Codex, BackendId::Opencode, BackendId::Claude]
+        );
+    }
+
+    #[test]
+    fn routed_members_skips_suspended_and_unavailable() {
+        let profiles = ProfileSet::from_profiles([
+            profile_with(BackendId::Claude, TaskCategory::Review, 70),
+            profile_with(BackendId::Codex, TaskCategory::Review, 90),
+            profile_with(BackendId::Opencode, TaskCategory::Review, 80),
+        ]);
+        // Codex is suspended (durable failure cooldown), Claude is not even available:
+        // the top pick must be the best usable backend, not the raw argmax.
+        let picked = routed_members(
+            &profiles,
+            TaskCategory::Review,
+            &set(&[BackendId::Codex, BackendId::Opencode]),
+            &set(&[BackendId::Codex]),
+            Some(2),
+            vec![BackendId::Antigravity],
+        );
+        assert_eq!(picked, vec![BackendId::Opencode]);
+    }
+
+    #[test]
+    fn routed_members_falls_back_to_config_when_nothing_scored() {
+        // Empty profiles (profiles.toml missing) must degrade to the config list, not fail.
+        let fallback = vec![BackendId::Antigravity, BackendId::Opencode];
+        let picked = routed_members(
+            &ProfileSet::new(),
+            TaskCategory::Review,
+            &set(&[BackendId::Claude, BackendId::Codex]),
+            &HashSet::new(),
+            None,
+            fallback.clone(),
+        );
+        assert_eq!(picked, fallback);
+    }
 
     fn fixture() -> Vec<MemberOutcome> {
         vec![

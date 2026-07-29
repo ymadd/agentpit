@@ -302,7 +302,7 @@ async fn review_flow() -> anyhow::Result<()> {
         }
     };
 
-    super::review::run(target, focus, None, None, None).await
+    super::review::run(target, focus, None, None, None, None).await
 }
 
 async fn security_review_flow() -> anyhow::Result<()> {
@@ -330,7 +330,7 @@ async fn security_review_flow() -> anyhow::Result<()> {
         }
     };
 
-    super::security_review::run(target, focus, None, None, None).await
+    super::security_review::run(target, focus, None, None, None, None).await
 }
 
 async fn adversarial_review_flow() -> anyhow::Result<()> {
@@ -358,7 +358,7 @@ async fn adversarial_review_flow() -> anyhow::Result<()> {
         }
     };
 
-    super::adversarial_review::run(target, focus, None, None, None).await
+    super::adversarial_review::run(target, focus, None, None, None, None).await
 }
 
 async fn explain_flow() -> anyhow::Result<()> {

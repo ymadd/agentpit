@@ -6,6 +6,7 @@ pub async fn run(
     target: String,
     focus: Option<String>,
     members: Option<Vec<BackendId>>,
+    routed: Option<Option<usize>>,
     aggregator: Option<BackendId>,
     cwd: Option<String>,
 ) -> Result<()> {
@@ -43,8 +44,18 @@ pub async fn run(
         ));
     }
     let ctx = super::load_context()?;
-    let members =
-        members.unwrap_or_else(|| ctx.loaded.config.ensemble.security_review_members.clone());
+    let defaults = ctx.loaded.config.ensemble.security_review_members.clone();
+    let members = members.unwrap_or_else(|| match routed {
+        Some(n) => super::ensemble::routed_members(
+            &crate::profile::load_profiles(None).unwrap_or_default(),
+            crate::profile::TaskCategory::SecurityReview,
+            &ctx.regs.available(),
+            &crate::availability::recently_suspended(),
+            n,
+            defaults,
+        ),
+        None => defaults,
+    });
     let aggregator = aggregator.or(ctx.loaded.config.ensemble.security_review_aggregator);
     super::ensemble::run_resolved(
         ctx,
@@ -53,6 +64,7 @@ pub async fn run(
         members,
         aggregator,
         None, // model: no --model; each member uses its backend default
+        routed.is_some(),
         cwd,
     )
     .await

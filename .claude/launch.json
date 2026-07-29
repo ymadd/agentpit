@@ -6,6 +6,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--prefix", "dashboard/frontend"],
       "port": 5173
+    },
+    {
+      "name": "mission-control",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["mission-control/server.js"],
+      "port": 4649
     }
   ]
 }

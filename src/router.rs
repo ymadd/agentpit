@@ -694,6 +694,24 @@ mod tests {
     }
 
     #[test]
+    fn suspended_review_backend_falls_through_the_keyword_stage() {
+        // base_config routes review keywords to Claude; with Claude suspended the keyword
+        // stage must not fire, leaving the task to the default backend.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        let suspended: HashSet<BackendId> = [cfg.auto_route.review_backend].into_iter().collect();
+        let r = Router::new(cfg, available(), ProfileSet::default()).with_suspended(suspended);
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("please audit this function"),
+        });
+        assert_ne!(d.reason, RouteReason::AutoKeyword);
+        assert_eq!(d.reason, RouteReason::Default);
+        assert_eq!(d.backend, BackendId::Opencode);
+    }
+
+    #[test]
     fn suspended_long_context_backend_falls_through_the_capacity_gate() {
         // The capacity gate's target is quota-dead: skip the gate rather than dispatch a
         // huge task into a guaranteed failure. With no other signal the task lands on the

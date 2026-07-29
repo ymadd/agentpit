@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Mission Control — サブエージェント管制室</title>
+<style>
+  /* agentpit dashboard tokens (dashboard/frontend/public/style.css) */
+  :root {
+    --ac: #e0926e;
+    --ac-tx: #f0b59a;
+    --ac-soft: rgba(224, 146, 110, 0.16);
+    --ac-bd: rgba(224, 146, 110, 0.45);
+    --bg: #06080d;
+    --panel: #0a0d14;
+    --card: #10141d;
+    --line: #161b26;
+    --line-2: #1c2230;
+    --line-3: #232a3a;
+    --text: #e8ebf2;
+    --text-2: #c4cad6;
+    --muted: #7c8595;
+    --muted-2: #5b6473;
+    --faint: #4c5667;
+    --ok: #4ec9a0;
+    --err: #f0726b;
+    --live: #3fb950;
+    --sans: "IBM Plex Sans JP", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    /* bot — modeled on the agentpit app icon: charcoal pod + glowing mint core + spoke nodes */
+    --bot-body: #2a323f;
+    --bot-rim: #4a566e;
+    --bot-limb: #3a4453;
+    --bot-mint: #63dfba;
+    --bot-mint-dim: #3d5a55;
+    --bot-blush: #e0926e;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* ── header ─────────────────────────────── */
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 18px; border-bottom: 1px solid var(--line-2);
+    background: var(--panel);
+  }
+  header .logo { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: .28em; color: var(--ac-tx); }
+  header .title { font-size: 13px; color: var(--muted); }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 11px; padding: 4px 12px; border-radius: 999px;
+    border: 1px solid var(--line-3); color: var(--muted);
+  }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+  .badge.active { color: var(--ac-tx); border-color: var(--ac-bd); }
+  .badge.active .dot { background: var(--live); animation: pulse 1.6s infinite; }
+  .badge.complete { color: var(--ok); border-color: rgba(78, 201, 160, .4); }
+  .badge.complete .dot { background: var(--ok); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  header .clock { margin-left: auto; font-family: var(--mono); font-size: 13px; color: var(--ac-tx); letter-spacing: .04em; }
+  .sumchips { margin-left: auto; display: flex; gap: 8px; }
+  .sumchips span {
+    font-family: var(--mono); font-size: 11px; padding: 4px 12px; border-radius: 999px;
+    color: var(--ok); border: 1px solid rgba(78, 201, 160, .35); background: rgba(78, 201, 160, .07);
+  }
+
+  /* ── layout ─────────────────────────────── */
+  main { flex: 1; display: flex; min-height: 0; }
+  #tree { flex: 1; position: relative; overflow: auto; }
+  #wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #cols { position: relative; display: flex; gap: 46px; align-items: flex-start; padding: 24px; width: max-content; }
+  .col { display: flex; flex-direction: column; gap: 30px; }
+  .col-label {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .34em; color: var(--muted-2);
+    text-align: center; margin-bottom: -8px;
+  }
+
+  /* ── agent = bot + card ─────────────────── */
+  .agent { display: flex; align-items: center; gap: 8px; }
+  .agent.born { animation: pop .55s cubic-bezier(.2, 2.2, .4, 1); }
+  @keyframes pop { 0% { transform: scale(0); opacity: 0; } 70% { transform: scale(1.12); } 100% { transform: scale(1); opacity: 1; } }
+
+  .bot { position: relative; width: 72px; flex: none; }
+  .bot svg { width: 100%; display: block; overflow: visible; }
+  .bot .zzz {
+    display: none; position: absolute; top: -10px; right: 0;
+    font-family: var(--mono); font-size: 12px; color: var(--muted-2);
+    animation: floatz 2.6s ease-in-out infinite;
+  }
+  .agent[data-status="standby"] .zzz { display: block; }
+  @keyframes floatz { 0% { transform: translateY(4px); opacity: 0; } 40% { opacity: 1; } 100% { transform: translateY(-9px); opacity: 0; } }
+
+  /* bot parts — round charcoal pod, mint glow, spoke nodes (agentpit icon motif) */
+  .body { fill: var(--bot-body); stroke: var(--bot-rim); stroke-width: 2.5; }
+  .arm rect, .leg { fill: var(--bot-limb); }
+  .ant, .spoke { stroke: var(--bot-rim); stroke-width: 2.5; stroke-linecap: round; }
+  .node { fill: var(--bot-mint-dim); }
+  .core { fill: var(--bot-mint-dim); }
+  .core-dot { fill: var(--ac); opacity: .9; }
+  .blush { fill: var(--bot-blush); opacity: 0; }
+  .face path, .face line { stroke: var(--bot-mint); stroke-width: 3; fill: none; stroke-linecap: round; }
+  .face .eye-o { fill: var(--bot-mint); stroke: none; }
+  .face .glint { fill: #eafff7; stroke: none; opacity: .9; }
+  .face .mouth-open { fill: var(--bot-mint); stroke: none; }
+  .arm { transform-box: fill-box; transform-origin: 50% 4px; transition: transform .45s cubic-bezier(.3, 1.8, .5, 1); }
+
+  /* standby: 居眠り */
+  .agent[data-status="standby"] svg { animation: breathe 3.4s ease-in-out infinite; opacity: .55; filter: saturate(.45); }
+  @keyframes breathe { 50% { transform: translateY(2.5px); } }
+
+  /* running: 集中ゆらゆら — コアとノードがミントに脈動 */
+  .agent[data-status="running"] svg { animation: sway 1.7s ease-in-out infinite; }
+  @keyframes sway { 0%, 100% { transform: rotate(-2.4deg); } 50% { transform: rotate(2.4deg); } }
+  .agent[data-status="running"] .node { fill: var(--bot-mint); animation: blink 1s infinite; }
+  .agent[data-status="running"] .core { fill: var(--bot-mint); animation: corepulse 1.6s ease-in-out infinite; }
+  .agent[data-status="running"] .blush { opacity: .55; }
+  @keyframes blink { 50% { opacity: .3; } }
+  @keyframes corepulse { 50% { opacity: .45; } }
+
+  /* done: バンザイ */
+  .agent[data-status="done"] .arm-l { transform: rotate(150deg); }
+  .agent[data-status="done"] .arm-r { transform: rotate(-150deg); }
+  .agent[data-status="done"] .node, .agent[data-status="done"] .core { fill: var(--ok); }
+  .agent[data-status="done"] .blush { opacity: .55; }
+  .agent[data-status="done"] svg { filter: saturate(.75); }
+  .agent.celebrate svg { animation: hop .9s ease-in-out 2; }
+  @keyframes hop { 0%, 100% { transform: translateY(0); } 30% { transform: translateY(-12px); } 60% { transform: translateY(0); } 80% { transform: translateY(-5px); } }
+
+  /* card */
+  .card {
+    width: 196px; background: var(--card); border: 1px solid var(--line-2);
+    border-radius: 10px; padding: 9px 11px; transition: border-color .5s, box-shadow .5s, opacity .5s;
+  }
+  .agent[data-status="running"] .card { border-color: var(--ac-bd); box-shadow: 0 0 16px var(--ac-soft); }
+  .agent[data-status="done"] .card { opacity: .62; }
+  .card .row1 { display: flex; align-items: center; gap: 6px; }
+  .card .name { font-weight: 600; font-size: 12px; letter-spacing: .03em; color: var(--text); }
+  .card .model {
+    margin-left: auto; font-family: var(--mono); font-size: 10px;
+    color: var(--ac-tx); background: var(--ac-soft); border-radius: 4px; padding: 1px 6px;
+  }
+  .card .task { font-size: 11px; color: var(--text-2); margin-top: 4px; line-height: 1.5; }
+  .prog { display: flex; align-items: center; gap: 8px; margin-top: 7px; }
+  .bar { flex: 1; height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  .fill { height: 100%; background: var(--ac); border-radius: 2px; transition: width .8s; }
+  .fill.indet { width: 34% !important; animation: indet 1.3s ease-in-out infinite alternate; }
+  @keyframes indet { 0% { margin-left: 0; } 100% { margin-left: 66%; } }
+  .agent[data-status="done"] .fill { background: var(--ok); }
+  .pct { font-family: var(--mono); font-size: 10px; color: var(--muted); width: 30px; text-align: right; }
+  .meta { display: flex; gap: 9px; margin-top: 6px; font-family: var(--mono); font-size: 10px; color: var(--muted); }
+  .summary {
+    display: none; margin-top: 6px; font-size: 10.5px; color: var(--ok);
+    border-top: 1px dashed var(--line-2); padding-top: 5px; line-height: 1.5;
+  }
+  .agent[data-status="done"] .summary { display: block; }
+  .agent[data-status="standby"] .prog, .agent[data-status="standby"] .meta { visibility: hidden; }
+
+  /* wires */
+  .wire { fill: none; stroke: var(--line-3); stroke-width: 2; }
+  .wire.live { stroke: var(--ac-bd); stroke-dasharray: 7 7; animation: flow .8s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -14; } }
+
+  /* ── event log ──────────────────────────── */
+  #log {
+    width: 272px; flex: none; border-left: 1px solid var(--line-2);
+    background: var(--panel); display: flex; flex-direction: column; min-height: 0;
+  }
+  #log h2 {
+    font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: .34em; color: var(--muted-2);
+    padding: 12px 16px 9px; border-bottom: 1px solid var(--line-2);
+  }
+  #logbody { flex: 1; overflow-y: auto; padding: 10px 14px; }
+  .ev { display: flex; gap: 8px; font-size: 11px; line-height: 1.6; padding: 3px 0; }
+  .ev .ts { font-family: var(--mono); font-size: 10px; color: var(--faint); flex: none; padding-top: 1px; }
+  .ev .who { color: var(--ac-tx); flex: none; font-weight: 600; }
+  .ev .txt { color: var(--text-2); }
+  .ev.fresh { animation: evin .5s; }
+  @keyframes evin { 0% { opacity: 0; transform: translateX(10px); } }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">MISSION CONTROL</span>
+  <span class="badge standby" id="phase"><span class="dot"></span><span id="phase-tx">待機中</span></span>
+  <span class="title" id="mtitle"></span>
+  <span class="clock" id="clock"></span>
+  <span class="sumchips" id="sum" hidden></span>
+</header>
+<main>
+  <div id="tree">
+    <svg id="wires"></svg>
+    <div id="cols"></div>
+  </div>
+  <aside id="log">
+    <h2>EVENT LOG</h2>
+    <div id="logbody"></div>
+  </aside>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const els = new Map();       // agent id -> DOM element
+const shown = new Map();     // agent id -> last rendered status
+let state = null;
+let logLen = 0;
+
+/* ── robot svg — round Claude-ish blob ── */
+const FACES = {
+  standby: `<path d="M35 46 q4.5 4 9 0"/><path d="M56 46 q4.5 4 9 0"/><path d="M46.5 57 q3.5 2 7 0"/>`,
+  running: `<ellipse class="eye-o" cx="39.5" cy="46" rx="4.5" ry="6"/><ellipse class="eye-o" cx="60.5" cy="46" rx="4.5" ry="6"/>
+            <circle class="glint" cx="41" cy="44" r="1.6"/><circle class="glint" cx="62" cy="44" r="1.6"/>
+            <path d="M46.5 57 q3.5 2.5 7 0"/>`,
+  done:    `<path d="M35 47 q4.5 -6 9 0"/><path d="M56 47 q4.5 -6 9 0"/><path class="mouth-open" d="M44 54 q6 7 12 0 z"/>`,
+};
+function botSVG(status) {
+  return `<svg viewBox="0 0 100 108">
+    <line class="ant" x1="50" y1="20" x2="50" y2="10"/><circle class="node" cx="50" cy="8" r="4"/>
+    <line class="spoke" x1="21" y1="34" x2="13" y2="29"/><circle class="node" cx="11" cy="28" r="3.5"/>
+    <line class="spoke" x1="79" y1="34" x2="87" y2="29"/><circle class="node" cx="89" cy="28" r="3.5"/>
+    <g class="arm arm-l"><rect x="12" y="52" width="9" height="20" rx="4.5"/></g>
+    <g class="arm arm-r"><rect x="79" y="52" width="9" height="20" rx="4.5"/></g>
+    <rect class="leg" x="33" y="84" width="11" height="13" rx="5"/>
+    <rect class="leg" x="56" y="84" width="11" height="13" rx="5"/>
+    <rect class="body" x="19" y="19" width="62" height="68" rx="26"/>
+    <circle class="core" cx="50" cy="71" r="7.5"/>
+    <circle class="core-dot" cx="59" cy="76" r="2"/>
+    <circle class="blush" cx="29" cy="55" r="4.5"/><circle class="blush" cx="71" cy="55" r="4.5"/>
+    <g class="face">${FACES[status] || FACES.standby}</g>
+  </svg><span class="zzz">z Z</span>`;
+}
+
+/* ── helpers ── */
+const PHASES = { standby: "待機中", active: "稼働中", complete: "ミッション完了" };
+const fmtDur = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const fmtTok = (n) => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+const elapsedSec = (iso) => iso ? Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000) : 0;
+
+/* ── auto-fit: shrink the whole tree when it would overflow ── */
+function fit() {
+  const tree = $("#tree"), cols = $("#cols");
+  cols.style.transform = "none";
+  const w = cols.offsetWidth, h = cols.offsetHeight;
+  const s = Math.max(0.55, Math.min(1, tree.clientWidth / w, tree.clientHeight / h));
+  cols.style.transformOrigin = "0 0";
+  cols.style.transform = s < 1 ? `scale(${s})` : "none";
+  // scale() shrinks only the visual box — pull the layout box in too, so no stray scrollbars
+  cols.style.marginRight = s < 1 ? `${-w * (1 - s)}px` : "0";
+  cols.style.marginBottom = s < 1 ? `${-h * (1 - s)}px` : "0";
+}
+
+/* ── render ── */
+function render() {
+  if (!state) return;
+  const m = state.mission;
+  $("#phase").className = "badge " + m.phase;
+  $("#phase-tx").textContent = PHASES[m.phase] || m.phase;
+  $("#mtitle").textContent = m.title || "";
+  if (m.phase === "complete" && m.summary) {
+    $("#clock").hidden = true;
+    const s = $("#sum");
+    s.hidden = false;
+    s.innerHTML = `<span>機体 ${m.summary.agents}</span><span>計 ${fmtTok(m.summary.totalTokens)} tok</span><span>所要 ${fmtDur(m.summary.durationSec)}</span>`;
+  } else {
+    $("#clock").hidden = false;
+    $("#sum").hidden = true;
+  }
+
+  // generation columns (create on demand; never reorder existing nodes)
+  const maxGen = Math.max(0, ...state.agents.map((a) => a.gen));
+  const cols = $("#cols");
+  for (let g = cols.children.length; g <= maxGen; g++) {
+    const c = document.createElement("div");
+    c.className = "col";
+    c.innerHTML = `<div class="col-label">${g === 0 ? "COMMAND" : "GEN " + g}</div>`;
+    cols.appendChild(c);
+  }
+
+  for (const a of state.agents) {
+    let el = els.get(a.id);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "agent born";
+      el.dataset.id = a.id;
+      el.innerHTML = `<div class="bot"></div>
+        <div class="card"><div class="row1"><span class="name"></span><span class="model"></span></div>
+        <div class="task"></div>
+        <div class="prog"><div class="bar"><div class="fill"></div></div><span class="pct"></span></div>
+        <div class="meta"></div><div class="summary"></div></div>`;
+      el.addEventListener("animationend", () => el.classList.remove("born", "celebrate"));
+      cols.children[a.gen].appendChild(el);
+      els.set(a.id, el);
+    }
+    if (shown.get(a.id) !== a.status) {
+      el.dataset.status = a.status;
+      el.querySelector(".bot").innerHTML = botSVG(a.status);
+      if (shown.has(a.id) && a.status === "done") el.classList.add("celebrate");
+      shown.set(a.id, a.status);
+    }
+    el.querySelector(".name").textContent = a.name;
+    el.querySelector(".model").textContent = a.model;
+    el.querySelector(".task").textContent = a.task;
+    const fill = el.querySelector(".fill"), pct = el.querySelector(".pct");
+    if (a.status === "done") {
+      fill.classList.remove("indet"); fill.style.width = "100%"; pct.textContent = "100%";
+    } else if (typeof a.progress === "number") {
+      fill.classList.remove("indet"); fill.style.width = a.progress + "%"; pct.textContent = a.progress + "%";
+    } else {
+      fill.classList.add("indet"); pct.textContent = "--";
+    }
+    const meta = el.querySelector(".meta");
+    if (a.status === "done" && a.result) {
+      meta.innerHTML = `<span>⏱ ${fmtDur(a.result.durationSec)}</span><span>◈ ${fmtTok(a.result.tokens)} tok</span><span>⚒ ${a.result.toolUses}</span>`;
+      el.querySelector(".summary").textContent = a.result.summary || "";
+    } else {
+      meta.innerHTML = `<span class="live-elapsed" data-start="${a.startedAt || ""}">⏱ --:--</span>`;
+    }
+  }
+  // drop agents no longer present
+  for (const [id, el] of els) {
+    if (!state.agents.some((a) => a.id === id)) { el.remove(); els.delete(id); shown.delete(id); }
+  }
+
+  // event log
+  const body = $("#logbody");
+  if (state.log.length !== logLen) {
+    body.innerHTML = state.log.map((e, i) =>
+      `<div class="ev${i >= logLen ? " fresh" : ""}"><span class="ts">${e.ts}</span><span class="who">${e.who}</span><span class="txt">${e.text}</span></div>`
+    ).join("");
+    logLen = state.log.length;
+    body.scrollTop = body.scrollHeight;
+  }
+  fit();
+  requestAnimationFrame(drawWires);
+}
+
+/* ── wires ── */
+function drawWires() {
+  if (!state) return;
+  const tree = $("#tree"), svg = $("#wires");
+  const tb = tree.getBoundingClientRect();
+  svg.setAttribute("width", tree.scrollWidth);
+  svg.setAttribute("height", tree.scrollHeight);
+  let paths = "";
+  for (const a of state.agents) {
+    if (!a.parent || !els.has(a.parent) || !els.has(a.id)) continue;
+    const p = els.get(a.parent).querySelector(".card").getBoundingClientRect();
+    const c = els.get(a.id).querySelector(".bot").getBoundingClientRect();
+    const x1 = p.right - tb.left + tree.scrollLeft, y1 = p.top + p.height / 2 - tb.top + tree.scrollTop;
+    const x2 = c.left - tb.left + tree.scrollLeft, y2 = c.top + c.height / 2 - tb.top + tree.scrollTop;
+    const mx = (x1 + x2) / 2;
+    paths += `<path class="wire${a.status === "running" ? " live" : ""}" d="M${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}"/>`;
+  }
+  svg.innerHTML = paths;
+}
+addEventListener("resize", () => { fit(); drawWires(); });
+
+/* ── per-second clock/elapsed tick ── */
+setInterval(() => {
+  if (!state) return;
+  const m = state.mission;
+  if (m.phase === "active" && m.startedAt) $("#clock").textContent = fmtDur(elapsedSec(m.startedAt));
+  document.querySelectorAll(".live-elapsed").forEach((s) => {
+    if (s.dataset.start) s.textContent = "⏱ " + fmtDur(elapsedSec(s.dataset.start));
+  });
+}, 1000);
+
+/* ── live mode: poll state.json ── */
+let lastRaw = "";
+async function poll() {
+  try {
+    const r = await fetch("state.json", { cache: "no-store" });
+    const raw = await r.text();
+    if (raw !== lastRaw) { lastRaw = raw; state = JSON.parse(raw); render(); }
+  } catch (e) { /* server gone; keep last view */ }
+}
+
+/* ── demo mode: scripted timeline ── */
+function runDemo() {
+  const t0 = Date.now();
+  const iso = (offsetSec) => new Date(t0 + offsetSec * 1000).toISOString();
+  const now = () => new Date().toTimeString().slice(0, 8);
+  state = {
+    mission: { phase: "standby", startedAt: null, title: "デモミッション — リポジトリ横断調査", summary: null },
+    agents: [{ id: "root", name: "指令塔", parent: null, gen: 0, model: "fable-5", task: "ミッション統括・成果の統合", status: "standby", startedAt: null, progress: null, result: null }],
+    log: [{ ts: now(), who: "SYSTEM", text: "管制室オンライン" }],
+  };
+  const A = (id) => state.agents.find((a) => a.id === id);
+  const L = (who, text) => state.log.push({ ts: now(), who, text });
+  const steps = [
+    [1.5, () => { state.mission.phase = "active"; state.mission.startedAt = iso(1.5); A("root").status = "running"; A("root").startedAt = iso(1.5); L("指令塔", "ミッション開始"); }],
+    [3, () => { state.agents.push({ id: "scout-a", name: "SCOUT-A", parent: "root", gen: 1, model: "sonnet", task: "イベント層のスキーマ調査", status: "running", startedAt: iso(3), progress: null, result: null }); L("指令塔", "SCOUT-A 誕生 — スキーマ調査へ"); }],
+    [5, () => { state.agents.push({ id: "builder-b", name: "BUILDER-B", parent: "root", gen: 1, model: "opus", task: "ダッシュボードUIの試作", status: "running", startedAt: iso(5), progress: 4, result: null }); L("指令塔", "BUILDER-B 誕生 — UI試作を開始"); }],
+    [6.5, () => { state.agents.push({ id: "writer-c", name: "WRITER-C", parent: "root", gen: 1, model: "haiku", task: "結果レポートの下書き", status: "standby", startedAt: null, progress: null, result: null }); L("指令塔", "WRITER-C 配備（待機）"); }],
+    [9, () => { state.agents.push({ id: "probe-a1", name: "PROBE-A1", parent: "scout-a", gen: 2, model: "haiku", task: "compaction仕様の深掘り", status: "running", startedAt: iso(9), progress: null, result: null }); L("SCOUT-A", "PROBE-A1 誕生（自己申告）"); }],
+    [14, () => { A("probe-a1").status = "done"; A("probe-a1").progress = 100; A("probe-a1").result = { durationSec: 45, tokens: 9800, toolUses: 6, summary: "compactionは古いrun行を落とす。asks/が正" }; L("SCOUT-A", "PROBE-A1 帰還"); }],
+    [17, () => { A("scout-a").status = "done"; A("scout-a").result = { durationSec: 142, tokens: 38210, toolUses: 21, summary: "Event enumは9種。parent_run_idでツリー構築可" }; L("指令塔", "SCOUT-A 帰還 — 調査完了 (38.2k tok)"); }],
+    [20, () => { A("builder-b").status = "done"; A("builder-b").result = { durationSec: 300, tokens: 61400, toolUses: 34, summary: "HTML1枚+Node配信のモックが完成" }; L("指令塔", "BUILDER-B 帰還 — 試作完了"); }],
+    [21.5, () => { const w = A("writer-c"); w.status = "running"; w.startedAt = iso(21.5); w.progress = 30; L("指令塔", "WRITER-C 起動 — レポート執筆へ"); }],
+    [26, () => { A("writer-c").status = "done"; A("writer-c").result = { durationSec: 90, tokens: 12050, toolUses: 4, summary: "ミッションレポート v1 を出力" }; L("指令塔", "WRITER-C 帰還"); }],
+    [27.5, () => { A("root").status = "done"; A("root").progress = 100; A("root").result = { durationSec: 26, tokens: 121460, toolUses: 65, summary: "全機帰還。成果を統合済み" }; state.mission.phase = "complete"; state.mission.summary = { agents: 5, totalTokens: 121460, durationSec: 26 }; L("SYSTEM", "ミッション完了 — 全機帰還"); }],
+  ];
+  const progTick = setInterval(() => {
+    const b = state && A("builder-b");
+    if (b && b.status === "running" && typeof b.progress === "number") { b.progress = Math.min(96, b.progress + 7); render(); }
+  }, 1100);
+  for (const [sec, fn] of steps) setTimeout(() => { fn(); render(); if (state.mission.phase === "complete") clearInterval(progTick); }, sec * 1000);
+  render();
+}
+
+if (new URLSearchParams(location.search).has("live")) {
+  poll();
+  setInterval(poll, 1000);
+} else {
+  runDemo();
+}
+</script>
+</body>
+</html>

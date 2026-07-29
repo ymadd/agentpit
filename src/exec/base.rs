@@ -459,6 +459,47 @@ mod tests {
         );
     }
 
+    /// The `dropped == 0` fallthrough's guarantee, driven through the full `run_spec` path:
+    /// a final line of exactly [`MAX_LINE_BYTES`] that ends at EOF with no newline is
+    /// complete, and must decode instead of being reported as dropped.
+    #[tokio::test]
+    async fn cap_sized_final_line_at_eof_still_decodes() {
+        let spec = ExecSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                // Exactly MAX_LINE_BYTES of 'a', no trailing newline, as the whole output.
+                format!("head -c {MAX_LINE_BYTES} /dev/zero | tr '\\0' 'a'"),
+            ],
+            env: vec![],
+            stdin_input: None,
+        };
+        let outcome = run_spec(
+            BackendId::Codex,
+            spec,
+            ExecRunOptions {
+                cwd: std::env::current_dir().unwrap(),
+                cancel: CancellationToken::new(),
+                on_stdout: None,
+                model: None,
+            },
+            StreamFormat::CodexJsonl,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !outcome.output.contains("[agentpit] dropped"),
+            "a complete cap-sized final line must not be reported as dropped"
+        );
+        // Not JSON → the decoder's plain-text fallback keeps it as the answer, whole.
+        assert_eq!(
+            outcome.output.matches('a').count() as u64,
+            MAX_LINE_BYTES,
+            "the line must survive the reader intact"
+        );
+    }
+
     #[test]
     fn raw_text_stream_holds_incomplete_utf8_until_the_next_chunk() {
         let mut pending = vec![0xe3, 0x81];

@@ -104,6 +104,11 @@ pub fn suspended_backends(log: &str, now: u64) -> HashSet<BackendId> {
 
 /// [`suspended_backends`] over the live event log at the current time — what dispatch call
 /// sites hand the router. A missing or unreadable log suspends nothing.
+///
+/// Runs on the REPL/rescue dispatch path, so the full-file parse matters: it is bounded
+/// because `RunStarted` compacts `events.jsonl` at 4 MiB / 500 runs
+/// (`compact_events_log` in agentpit-events), so the worst case is a few-MiB scan —
+/// noise next to the dispatch it precedes. Revisit only if those bounds change.
 pub fn recently_suspended() -> HashSet<BackendId> {
     suspended_backends(
         &std::fs::read_to_string(crate::events::events_path()).unwrap_or_default(),

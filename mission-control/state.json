@@ -1,0 +1,82 @@
+{
+  "mission": {
+    "phase": "active",
+    "startedAt": "2026-07-29T10:00:00+09:00",
+    "title": "リポジトリ横断調査ミッション",
+    "summary": null
+  },
+  "agents": [
+    {
+      "id": "root",
+      "name": "指令塔",
+      "parent": null,
+      "gen": 0,
+      "model": "fable-5",
+      "task": "ミッション統括・成果の統合",
+      "status": "running",
+      "startedAt": "2026-07-29T10:00:00+09:00",
+      "progress": null,
+      "result": null
+    },
+    {
+      "id": "scout-a",
+      "name": "SCOUT-A",
+      "parent": "root",
+      "gen": 1,
+      "model": "sonnet",
+      "task": "イベント層のスキーマ調査",
+      "status": "done",
+      "startedAt": "2026-07-29T10:00:05+09:00",
+      "progress": 100,
+      "result": {
+        "durationSec": 142,
+        "tokens": 38210,
+        "toolUses": 21,
+        "summary": "Event enumは9種。parent_run_idで実行ツリー構築可"
+      }
+    },
+    {
+      "id": "builder-b",
+      "name": "BUILDER-B",
+      "parent": "root",
+      "gen": 1,
+      "model": "opus",
+      "task": "ダッシュボードUIの試作",
+      "status": "running",
+      "startedAt": "2026-07-29T10:00:12+09:00",
+      "progress": 62,
+      "result": null
+    },
+    {
+      "id": "writer-c",
+      "name": "WRITER-C",
+      "parent": "root",
+      "gen": 1,
+      "model": "haiku",
+      "task": "結果レポートの下書き（待機中）",
+      "status": "standby",
+      "startedAt": null,
+      "progress": null,
+      "result": null
+    },
+    {
+      "id": "probe-a1",
+      "name": "PROBE-A1",
+      "parent": "scout-a",
+      "gen": 2,
+      "model": "haiku",
+      "task": "compaction仕様の深掘り",
+      "status": "running",
+      "startedAt": "2026-07-29T10:01:40+09:00",
+      "progress": null,
+      "result": null
+    }
+  ],
+  "log": [
+    { "ts": "10:00:00", "who": "指令塔", "text": "ミッション開始" },
+    { "ts": "10:00:05", "who": "指令塔", "text": "SCOUT-A 誕生 — イベント層の調査へ" },
+    { "ts": "10:00:12", "who": "指令塔", "text": "BUILDER-B 誕生 — UI試作を開始" },
+    { "ts": "10:01:40", "who": "SCOUT-A", "text": "PROBE-A1 誕生（自己申告）" },
+    { "ts": "10:02:27", "who": "SCOUT-A", "text": "帰還 — スキーマ調査完了 (38.2kトークン)" }
+  ]
+}

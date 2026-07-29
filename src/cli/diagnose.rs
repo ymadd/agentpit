@@ -268,6 +268,36 @@ mod tests {
         assert_eq!(report.routing.category, Some(TaskCategory::Coding));
     }
 
+    /// Strata review 2026-07-29: every other test passes an empty suspension set, which left
+    /// the entire user-visible `suspended` surface — the human line, the JSON field, and the
+    /// routing detour itself — unexecuted by the suite.
+    #[test]
+    fn a_suspended_backend_is_reported_and_routed_around() {
+        let suspended: HashSet<BackendId> = [BackendId::Antigravity].into_iter().collect();
+        // Antigravity is the seeded Docs argmax (86): with it suspended the profile stage
+        // must fall to the next best, exactly as dispatch would.
+        let report = build_report(
+            "summarize the docs for the payment api documentation",
+            &auto_route_config(BackendId::Opencode),
+            &all_seeded_available(),
+            &suspended,
+            seeded_profiles(),
+        );
+
+        assert_eq!(report.suspended, vec![BackendId::Antigravity]);
+        assert_eq!(report.routing.backend, BackendId::Claude);
+        assert_eq!(report.routing.category, Some(TaskCategory::Docs));
+
+        let human = render_human(&report);
+        assert!(
+            human.contains("suspended  antigravity"),
+            "human render must name the suspended backend, got:\n{human}"
+        );
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains(r#""suspended":["antigravity"]"#));
+    }
+
     /// Eval finding 6 (2026-07): diagnose used to mirror only the profile stage, so its
     /// printed route could differ from the deployed router. It now reproduces every stage —
     /// a `[routes] rescue` pin must win exactly like it does at dispatch time.

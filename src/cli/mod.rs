@@ -13,6 +13,7 @@ pub mod diagnose;
 pub mod ensemble;
 pub mod explain;
 pub mod init;
+pub mod learning;
 pub mod login;
 pub mod mcp_cmd;
 mod menu;
@@ -216,6 +217,15 @@ pub enum Command {
     Profile {
         #[command(subcommand)]
         action: Option<profile::Action>,
+    },
+
+    /// Show what the routing layer has learned: matrix coverage by provenance, the evidence
+    /// behind each cell and what it still needs, which decisions learning has moved, and the
+    /// learned policy's replay accuracy. `--json` feeds the desktop dashboard.
+    Learning {
+        /// Emit machine-readable JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Dry-run task diagnosis + profile routing (features → category → backend). `--json`
@@ -496,6 +506,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Status { backend } => status::run(backend).await,
 
         Command::Profile { action } => profile::run(action).await,
+        Command::Learning { json } => learning::run(json),
 
         Command::Diagnose { task, json } => diagnose::run(task, json).await,
 

@@ -6,6 +6,7 @@ pub mod category;
 pub mod learn;
 pub mod model;
 pub mod seed;
+pub mod status;
 pub mod store;
 
 use std::collections::{BTreeMap, HashSet};

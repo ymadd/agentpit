@@ -16,6 +16,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::events::{Event, LegStatus, OutcomeLabel, RunKind};
 use crate::profile::model::Score;
 use crate::profile::{ProfileSource, TaskCategory};
@@ -36,6 +38,43 @@ const WEIGHT_OUTCOME: f32 = 3.0;
 const WEIGHT_GRADE: f32 = 2.0;
 const WEIGHT_RERUN: f32 = 1.0;
 const WEIGHT_EXIT: f32 = 0.5;
+
+/// Which of the four evidence sources produced a label. Carried on the label rather than
+/// inferred back from its weight, so anything reporting the *quality* of the evidence
+/// (`agentpit learning`) reads the fact instead of reverse-engineering a float.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LabelSource {
+    /// The human's explicit verdict (`OutcomeNoted`).
+    Outcome,
+    /// An aggregator grade (`MemberGraded`).
+    Grade,
+    /// The task was re-dispatched elsewhere shortly after, failing this attempt.
+    Rerun,
+    /// Exit status alone, discounted.
+    Exit,
+}
+
+impl LabelSource {
+    /// This source's fold weight. The single place the constants are read.
+    pub fn weight(&self) -> f32 {
+        match self {
+            LabelSource::Outcome => WEIGHT_OUTCOME,
+            LabelSource::Grade => WEIGHT_GRADE,
+            LabelSource::Rerun => WEIGHT_RERUN,
+            LabelSource::Exit => WEIGHT_EXIT,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LabelSource::Outcome => "outcome",
+            LabelSource::Grade => "grade",
+            LabelSource::Rerun => "rerun",
+            LabelSource::Exit => "exit",
+        }
+    }
+}
 
 /// Aggregator grade thresholds: ≥ pass succeeds, < fail fails, in between is ignored.
 const GRADE_PASS: u8 = 70;
@@ -74,9 +113,16 @@ pub struct Label {
     pub backend: BackendId,
     pub category: TaskCategory,
     pub success: bool,
-    pub weight: f32,
+    pub source: LabelSource,
     pub task_hash: Option<String>,
     pub ts: u64,
+}
+
+impl Label {
+    /// The fold weight this label contributes, derived from its source.
+    pub fn weight(&self) -> f32 {
+        self.source.weight()
+    }
 }
 
 /// Group the log's event lines into per-run records, in first-seen order. Unparseable lines
@@ -206,7 +252,7 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                 backend,
                 category,
                 success: outcome == OutcomeLabel::Good,
-                weight: WEIGHT_OUTCOME,
+                source: LabelSource::Outcome,
                 task_hash: run.task_hash.clone(),
                 ts: run.route_ts,
             });
@@ -232,7 +278,7 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                     backend: *backend,
                     category,
                     success,
-                    weight: WEIGHT_GRADE,
+                    source: LabelSource::Grade,
                     task_hash: run.task_hash.clone(),
                     ts: run.route_ts,
                 });
@@ -250,7 +296,7 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                 backend,
                 category,
                 success: false,
-                weight: WEIGHT_RERUN,
+                source: LabelSource::Rerun,
                 task_hash: run.task_hash.clone(),
                 ts: run.route_ts,
             });
@@ -263,7 +309,7 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                 backend,
                 category,
                 success: true,
-                weight: WEIGHT_EXIT,
+                source: LabelSource::Exit,
                 task_hash: run.task_hash.clone(),
                 ts: run.route_ts,
             }),
@@ -271,7 +317,7 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                 backend,
                 category,
                 success: false,
-                weight: WEIGHT_EXIT,
+                source: LabelSource::Exit,
                 task_hash: run.task_hash.clone(),
                 ts: run.route_ts,
             }),
@@ -298,9 +344,9 @@ pub fn fold_scores(
     for label in labels {
         let cell = cells.entry((label.backend, label.category)).or_default();
         if label.success {
-            cell.success_weight += label.weight;
+            cell.success_weight += label.weight();
         } else {
-            cell.failure_weight += label.weight;
+            cell.failure_weight += label.weight();
         }
         cell.samples = cell.samples.saturating_add(1);
     }
@@ -402,7 +448,7 @@ mod tests {
                     backend: BackendId::Claude,
                     category: TaskCategory::Coding,
                     success: false,
-                    weight: WEIGHT_OUTCOME,
+                    source: LabelSource::Outcome,
                     task_hash: Some("aa".into()),
                     ts: 5,
                 },
@@ -410,7 +456,7 @@ mod tests {
                     backend: BackendId::Claude,
                     category: TaskCategory::Review,
                     success: true,
-                    weight: WEIGHT_GRADE,
+                    source: LabelSource::Grade,
                     task_hash: Some("bb".into()),
                     ts: 6,
                 },
@@ -418,7 +464,7 @@ mod tests {
                     backend: BackendId::Codex,
                     category: TaskCategory::Review,
                     success: false,
-                    weight: WEIGHT_GRADE,
+                    source: LabelSource::Grade,
                     task_hash: Some("bb".into()),
                     ts: 6,
                 },
@@ -446,7 +492,7 @@ mod tests {
                     backend: BackendId::Claude,
                     category: TaskCategory::Coding,
                     success: false,
-                    weight: WEIGHT_RERUN,
+                    source: LabelSource::Rerun,
                     task_hash: Some("aa".into()),
                     ts: 1_000,
                 },
@@ -454,7 +500,7 @@ mod tests {
                     backend: BackendId::Codex,
                     category: TaskCategory::Coding,
                     success: true,
-                    weight: WEIGHT_EXIT,
+                    source: LabelSource::Exit,
                     task_hash: Some("aa".into()),
                     ts: 2_000,
                 },
@@ -494,7 +540,7 @@ mod tests {
                     backend,
                     category: TaskCategory::Coding,
                     success: true,
-                    weight: WEIGHT_OUTCOME,
+                    source: LabelSource::Outcome,
                     task_hash: None,
                     ts: 0,
                 },
@@ -506,7 +552,7 @@ mod tests {
             backend: BackendId::Codex,
             category: TaskCategory::Coding,
             success: false,
-            weight: WEIGHT_OUTCOME,
+            source: LabelSource::Outcome,
             task_hash: None,
             ts: 0,
         });

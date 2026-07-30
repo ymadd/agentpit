@@ -5,6 +5,7 @@ mod app_update;
 mod asks;
 mod cli_runner;
 mod cli_versions;
+mod learning;
 mod model_catalog;
 mod settings;
 mod state;
@@ -266,6 +267,7 @@ fn main() {
             update_agent_cli,
             get_model_catalogs,
             get_output,
+            learning::learning_status,
             asks::get_pending_asks,
             asks::answer_ask,
             settings::settings_get,

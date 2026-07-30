@@ -2,6 +2,7 @@ import { createRoot } from "react-dom/client";
 import SettingsApp from "./settings/SettingsApp.jsx";
 import { startAutoUpdater } from "./settings/app-update.js";
 import WorkflowRunApp from "./workflow-run/WorkflowRunApp.jsx";
+import LearningApp from "./learning/LearningApp.jsx";
 
 // Strangler bridge (Phase 2). The legacy vanilla dashboard (public/app.js) owns
 // the page — statusbar, cockpit, swarm, CLI rail — and renders first. React
@@ -31,6 +32,14 @@ const wrEl = document.createElement("div");
 wrEl.id = "agentpit-workflow-run";
 document.body.appendChild(wrEl);
 createRoot(wrEl).render(<WorkflowRunApp />);
+
+// "Learning" view — the same island shape: its own container, its own launcher, and a
+// full-screen overlay. Data comes from `agentpit learning --json` via the learning_status
+// command, so the desktop view and the CLI report identical numbers.
+const lrEl = document.createElement("div");
+lrEl.id = "agentpit-learning";
+document.body.appendChild(lrEl);
+createRoot(lrEl).render(<LearningApp />);
 
 // Desktop is the release owner. Check the paired release after startup and, when
 // enabled in Settings, let the bundled CLI install it in the background.

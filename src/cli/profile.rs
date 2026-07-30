@@ -130,11 +130,90 @@ type VerdictKey = (String, crate::profile::TaskCategory, BackendId);
 
 /// What `replay_core` measured: routing decisions replayed, how many were evaluable, and
 /// how many of those the policy would have gotten right.
-struct ReplayReport {
-    labels: usize,
-    decisions: usize,
-    evaluable: usize,
-    correct: usize,
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub(super) struct ReplayReport {
+    pub(super) labels: usize,
+    pub(super) decisions: usize,
+    pub(super) evaluable: usize,
+    pub(super) correct: usize,
+}
+
+/// Group an event log into runs and derive their outcome labels, filling in categories the
+/// router never recorded by re-diagnosing the task text saved at dispatch time.
+///
+/// Shared by `profile learn`, `profile replay`, and `agentpit learning` so all three read
+/// the telemetry exactly the same way.
+pub(super) fn labels_from_log(
+    log: &str,
+) -> (
+    Vec<crate::profile::learn::RunRecord>,
+    Vec<crate::profile::learn::Label>,
+) {
+    use crate::profile::learn::{
+        DEFAULT_RERUN_WINDOW_MS, derive_labels, parse_runs, resolve_categories,
+    };
+
+    let mut runs = parse_runs(log);
+    resolve_categories(&mut runs, |task_hash| {
+        let text =
+            fs::read_to_string(crate::events::tasks_dir().join(format!("{task_hash}.txt"))).ok()?;
+        Some(crate::diagnose::diagnose(&text).primary)
+    });
+    let labels = derive_labels(&runs, DEFAULT_RERUN_WINDOW_MS);
+    (runs, labels)
+}
+
+/// Score one named policy against `labels`. The picker construction is the deployed
+/// auto-route chain; see [`replay`] for what this measure does and does not cover.
+pub(super) fn policy_report(
+    policy: &str,
+    labels: &[crate::profile::learn::Label],
+) -> Result<ReplayReport> {
+    // Every backend ever labelled counts as available for the what-if.
+    let available: std::collections::HashSet<BackendId> =
+        labels.iter().map(|l| l.backend).collect();
+
+    // The deployed router's tiebreak inputs come from the live config, so `learned`
+    // replays what this machine's router would actually do.
+    let config = super::load_context()?.loaded.config;
+    let margin = config.auto_route.quality_margin;
+    let costs: std::collections::HashMap<BackendId, u8> = config
+        .backends
+        .iter()
+        .filter_map(|(backend, o)| o.cost.map(|c| (*backend, c)))
+        .collect();
+
+    let pick_for: PolicyPicker = match policy {
+        "seeded" => {
+            profile_stage_picker(seeded_profiles(), available.clone(), margin, costs.clone())
+        }
+        "learned" => {
+            // The deployed auto-route chain: similarity stage first (when this build has
+            // it and samples exist — leave-one-out, so a task never matches itself), then
+            // the profile stage over the current profiles.toml.
+            let profile = profile_stage_picker(
+                load_profiles(None)?,
+                available.clone(),
+                margin,
+                costs.clone(),
+            );
+            match similarity_replay_picker(&available)? {
+                Some(sim) => {
+                    Box::new(move |l: &crate::profile::learn::Label| sim(l).or_else(|| profile(l)))
+                }
+                None => profile,
+            }
+        }
+        "similarity" => similarity_replay_picker(&available)?.ok_or_else(|| {
+            anyhow!(
+                "similarity policy unavailable: needs a --features similarity build and \
+                 recorded samples (run `agentpit similarity init`, then `agentpit profile learn`)"
+            )
+        })?,
+        other => bail!("unknown policy `{other}` (expected seeded|learned|similarity)"),
+    };
+
+    Ok(replay_core(labels, &pick_for))
 }
 
 /// Collapse all labels for one `(task, category, backend)` into a single verdict by
@@ -168,9 +247,9 @@ fn fold_verdicts(
                 latest_success: label.success,
             });
         if label.success {
-            entry.good += label.weight;
+            entry.good += label.weight();
         } else {
-            entry.bad += label.weight;
+            entry.bad += label.weight();
         }
         if label.ts >= entry.latest_ts {
             entry.latest_ts = label.ts;
@@ -259,69 +338,15 @@ fn profile_stage_picker(
 /// is *evaluable* only when some label exists for the same task on the picked backend.
 /// The report separates coverage (evaluable/decisions) from accuracy (correct/evaluable).
 fn replay(policy: &str) -> Result<()> {
-    use crate::profile::learn::{
-        DEFAULT_RERUN_WINDOW_MS, derive_labels, parse_runs, resolve_categories,
-    };
-
     let events = crate::events::events_path();
     let log = fs::read_to_string(&events)
         .with_context(|| format!("no telemetry at {}", events.display()))?;
-    let mut runs = parse_runs(&log);
-    resolve_categories(&mut runs, |task_hash| {
-        let text =
-            fs::read_to_string(crate::events::tasks_dir().join(format!("{task_hash}.txt"))).ok()?;
-        Some(crate::diagnose::diagnose(&text).primary)
-    });
-    let labels = derive_labels(&runs, DEFAULT_RERUN_WINDOW_MS);
+    let (_, labels) = labels_from_log(&log);
     if labels.is_empty() {
         bail!("no labelled runs to replay yet");
     }
 
-    // Every backend ever labelled counts as available for the what-if.
-    let available: std::collections::HashSet<BackendId> =
-        labels.iter().map(|l| l.backend).collect();
-
-    // The deployed router's tiebreak inputs come from the live config, so `learned`
-    // replays what this machine's router would actually do.
-    let config = super::load_context()?.loaded.config;
-    let margin = config.auto_route.quality_margin;
-    let costs: std::collections::HashMap<BackendId, u8> = config
-        .backends
-        .iter()
-        .filter_map(|(backend, o)| o.cost.map(|c| (*backend, c)))
-        .collect();
-
-    let pick_for: PolicyPicker = match policy {
-        "seeded" => {
-            profile_stage_picker(seeded_profiles(), available.clone(), margin, costs.clone())
-        }
-        "learned" => {
-            // The deployed auto-route chain: similarity stage first (when this build has
-            // it and samples exist — leave-one-out, so a task never matches itself), then
-            // the profile stage over the current profiles.toml.
-            let profile = profile_stage_picker(
-                load_profiles(None)?,
-                available.clone(),
-                margin,
-                costs.clone(),
-            );
-            match similarity_replay_picker(&available)? {
-                Some(sim) => {
-                    Box::new(move |l: &crate::profile::learn::Label| sim(l).or_else(|| profile(l)))
-                }
-                None => profile,
-            }
-        }
-        "similarity" => similarity_replay_picker(&available)?.ok_or_else(|| {
-            anyhow!(
-                "similarity policy unavailable: needs a --features similarity build and \
-                 recorded samples (run `agentpit similarity init`, then `agentpit profile learn`)"
-            )
-        })?,
-        other => bail!("unknown policy `{other}` (expected seeded|learned|similarity)"),
-    };
-
-    let report = replay_core(&labels, &pick_for);
+    let report = policy_report(policy, &labels)?;
     println!(
         "policy={policy}: {} labels -> {} routing decisions, {} evaluable, {} would-have-gone-well ({}%)",
         report.labels,
@@ -384,9 +409,7 @@ fn similarity_replay_picker(
 /// `agentpit profile learn`: fold the event log into Learned scores and merge them into
 /// `profiles.toml` under the `benchmarked > learned > seeded` gate.
 fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
-    use crate::profile::learn::{
-        DEFAULT_RERUN_WINDOW_MS, derive_labels, fold_scores, parse_runs, resolve_categories,
-    };
+    use crate::profile::learn::fold_scores;
 
     let events = crate::events::events_path();
     let log = fs::read_to_string(&events).with_context(|| {
@@ -396,15 +419,9 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
         )
     })?;
 
-    let mut runs = parse_runs(&log);
     // Runs routed without a category (route table / default / ensemble) get one by
     // re-diagnosing the task text saved at dispatch time.
-    resolve_categories(&mut runs, |task_hash| {
-        let text =
-            fs::read_to_string(crate::events::tasks_dir().join(format!("{task_hash}.txt"))).ok()?;
-        Some(crate::diagnose::diagnose(&text).primary)
-    });
-    let labels = derive_labels(&runs, DEFAULT_RERUN_WINDOW_MS);
+    let (runs, labels) = labels_from_log(&log);
     let scores = fold_scores(&labels, min_samples);
     println!(
         "telemetry: {} runs, {} labels -> {} cell(s) with >= {} samples",
@@ -522,7 +539,7 @@ fn update_route_samples(labels: &[crate::profile::learn::Label]) {
         }
         best.entry((hash, label.backend))
             .and_modify(|held| {
-                if (label.weight, label.ts) > (held.weight, held.ts) {
+                if (label.weight(), label.ts) > (held.weight(), held.ts) {
                     *held = label;
                 }
             })
@@ -535,9 +552,9 @@ fn update_route_samples(labels: &[crate::profile::learn::Label]) {
         let verdict = if label.success { "good" } else { "bad" };
         if let Some(sample) = store.get_mut(&key) {
             // Update in place only when the new evidence is at least as strong.
-            if label.weight >= sample.weight {
+            if label.weight() >= sample.weight {
                 sample.label = verdict.into();
-                sample.weight = label.weight;
+                sample.weight = label.weight();
                 sample.category = Some(label.category.as_str().to_string());
                 sample.ts = if label.ts > 0 { label.ts } else { sample.ts };
             }
@@ -568,7 +585,7 @@ fn update_route_samples(labels: &[crate::profile::learn::Label]) {
                     embedding,
                     backend,
                     label: if label.success { "good" } else { "bad" }.into(),
-                    weight: label.weight,
+                    weight: label.weight(),
                     category: Some(label.category.as_str().to_string()),
                     ts: if label.ts > 0 { label.ts } else { now },
                 },
@@ -1190,14 +1207,14 @@ mod tests {
         backend: BackendId,
         hash: &str,
         success: bool,
-        weight: f32,
+        source: crate::profile::learn::LabelSource,
         ts: u64,
     ) -> crate::profile::learn::Label {
         crate::profile::learn::Label {
             backend,
             category: crate::profile::TaskCategory::Coding,
             success,
-            weight,
+            source,
             task_hash: Some(hash.into()),
             ts,
         }
@@ -1207,11 +1224,12 @@ mod tests {
     /// OR fold collapsed good1/bad4 to good).
     #[test]
     fn fold_verdicts_uses_weighted_majority_with_latest_tie_break() {
+        use crate::profile::learn::LabelSource::{Exit, Outcome, Rerun};
         let labels = vec![
-            lbl(BackendId::Opencode, "h1", true, 0.5, 1),  // exit ok
-            lbl(BackendId::Opencode, "h1", false, 3.0, 2), // human verdict: bad
-            lbl(BackendId::Codex, "h1", true, 1.0, 3),
-            lbl(BackendId::Codex, "h1", false, 1.0, 4), // tie by weight → latest wins
+            lbl(BackendId::Opencode, "h1", true, Exit, 1), // exit ok
+            lbl(BackendId::Opencode, "h1", false, Outcome, 2), // human verdict: bad
+            lbl(BackendId::Codex, "h1", true, Rerun, 3),
+            lbl(BackendId::Codex, "h1", false, Rerun, 4), // tie by weight → latest wins
         ];
         let verdicts = fold_verdicts(&labels);
         let coding = crate::profile::TaskCategory::Coding;
@@ -1225,7 +1243,7 @@ mod tests {
             backend: BackendId::Opencode,
             category: crate::profile::TaskCategory::Docs,
             success: true,
-            weight: 3.0,
+            source: Outcome,
             task_hash: Some("h1".into()),
             ts: 9,
         });
@@ -1244,8 +1262,9 @@ mod tests {
     /// of the same task score the deterministic pick once.
     #[test]
     fn replay_core_scores_each_task_category_decision_once() {
+        use crate::profile::learn::LabelSource;
         let labels: Vec<_> = (0..5)
-            .map(|i| lbl(BackendId::Opencode, "h1", true, 3.0, i))
+            .map(|i| lbl(BackendId::Opencode, "h1", true, LabelSource::Outcome, i))
             .collect();
         let picker: PolicyPicker = Box::new(|_| Some(BackendId::Opencode));
         let report = replay_core(&labels, &picker);
@@ -1259,6 +1278,7 @@ mod tests {
     /// within `quality_margin`, the cheaper backend wins, unlike a raw `best_for` argmax.
     #[test]
     fn profile_stage_picker_applies_the_deployed_cost_tiebreak() {
+        use crate::profile::learn::LabelSource;
         use crate::profile::{CapabilityProfile, ProfileSet, ProfileSource, Score, TaskCategory};
         use std::collections::{HashMap, HashSet};
 
@@ -1277,7 +1297,7 @@ mod tests {
         let costs: HashMap<BackendId, u8> =
             [(BackendId::Claude, 80), (BackendId::Opencode, 20)].into();
 
-        let label = lbl(BackendId::Opencode, "h1", true, 1.0, 0);
+        let label = lbl(BackendId::Opencode, "h1", true, LabelSource::Rerun, 0);
         // Margin 5: Opencode (87, cost 20) is within reach of Claude (90, cost 80) → cheaper wins.
         let picker = profile_stage_picker(set.clone(), available.clone(), 5, costs.clone());
         assert_eq!(picker(&label), Some(BackendId::Opencode));

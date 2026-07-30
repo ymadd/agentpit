@@ -114,6 +114,7 @@ agentpit workflow new "a strict PR review flow"  # generate a workflow from a de
 agentpit rescue "..." --role reviewer --model opus  # dispatch to a role, pinned to a model
 
 agentpit status                       # config + per-backend auth state
+agentpit learning                     # what the routing layer has learned (--json for the dashboard)
 agentpit login antigravity            # opens `agy auth login` in a terminal
 agentpit dashboard                    # launch a separately installed desktop app
 agentpit update                       # update a standalone CLI / portable desktop pair
@@ -248,6 +249,13 @@ works, and capability scores deliberately don't encode plan-dependent availabili
 1, 2 and 7 are user decisions and always route as written. `agentpit diagnose "<task>"`
 prints exactly what this chain would pick — including any currently suspended backends —
 and `agentpit status` warns when a `[routes]` pin is suppressing steps 3–6 for a tool.
+
+`agentpit learning` reports the state of steps 3–5: how much of the matrix is still a seeded
+guess rather than a measurement, which `(backend, category)` cells are accruing labels without
+having reached the promotion gate yet, how strong that evidence is (a human verdict outweighs
+six exit codes), which categories learning has actually moved off their priors, and the learned
+policy's replay accuracy over recorded telemetry. The desktop app renders the same report —
+matrix heatmap, per-cell evidence, daily labels — from `agentpit learning --json`.
 
 ## Workspace
 

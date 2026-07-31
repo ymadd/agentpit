@@ -50,15 +50,50 @@ pub enum Action {
         cwd: Option<String>,
     },
     /// Judge a finished round: each pair of submissions, shown blind, one vote each.
+    ///
+    /// Interactive by default. `--winner`/`--loser`/`--tie` record one vote without prompting,
+    /// which is how the desktop app casts them — always by BLIND LABEL (A, B, …), never by
+    /// backend, so a caller cannot vote for an identity even by accident.
     Vote {
         /// Round to judge. Defaults to the most recent one.
         #[arg(long)]
         round: Option<String>,
+        /// Blind label of the winner, e.g. `A`.
+        #[arg(long, requires = "loser", conflicts_with = "tie")]
+        winner: Option<char>,
+        /// Blind label of the loser.
+        #[arg(long, requires = "winner")]
+        loser: Option<char>,
+        /// Record the pair as too close to call, e.g. `--tie A,B`.
+        #[arg(long, value_delimiter = ',', num_args = 2)]
+        tie: Option<Vec<char>>,
     },
     /// Bradley–Terry standings over every vote cast so far.
-    Leaderboard,
+    Leaderboard {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// List the built-in probes, one per capability the matrix tracks.
-    Templates,
+    Templates {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// List recorded rounds, newest first, with how much of each is still unjudged.
+    Rounds {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show one round's submissions under their blind labels.
+    Show {
+        /// Round id. Defaults to the most recent one.
+        round: Option<String>,
+        /// Include which backend produced each submission. Off by default: the labels exist so
+        /// the work can be judged without knowing whose it is.
+        #[arg(long, default_value_t = false)]
+        reveal: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 pub async fn run(action: Action) -> Result<()> {
@@ -75,13 +110,236 @@ pub async fn run(action: Action) -> Result<()> {
             let task = resolve_task(task, template.as_deref(), target.as_deref())?;
             run_round(task, contenders, model, effort, cwd).await
         }
-        Action::Vote { round } => vote(round),
-        Action::Leaderboard => leaderboard(),
-        Action::Templates => {
-            print!("{}", render_templates());
+        Action::Vote {
+            round,
+            winner,
+            loser,
+            tie,
+        } => match (winner, loser, tie) {
+            (Some(w), Some(l), _) => vote_once(round, w, l, false),
+            (_, _, Some(pair)) => vote_once(round, pair[0], pair[1], true),
+            _ => vote(round),
+        },
+        Action::Leaderboard { json } => leaderboard(json),
+        Action::Templates { json } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&templates_json())?);
+            } else {
+                print!("{}", render_templates());
+            }
             Ok(())
         }
+        Action::Rounds { json } => rounds(json),
+        Action::Show {
+            round,
+            reveal,
+            json,
+        } => show(round, reveal, json),
     }
+}
+
+/// The most recent round, or a clear error when none exist.
+fn latest_round() -> Result<String> {
+    store::list_rounds()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no arena rounds yet — run `agentpit arena run` first"))
+}
+
+/// Map a round's blind labels back to submission indices.
+fn label_index(round: &Round) -> std::collections::BTreeMap<char, usize> {
+    round.blind_order().into_iter().collect()
+}
+
+/// Record one vote non-interactively, addressed by blind label.
+fn vote_once(round_id: Option<String>, a: char, b: char, tie: bool) -> Result<()> {
+    let round_id = match round_id {
+        Some(id) => id,
+        None => latest_round()?,
+    };
+    let round = store::load_round(&round_id)?;
+    let by_label = label_index(&round);
+    let a = a.to_ascii_uppercase();
+    let b = b.to_ascii_uppercase();
+    if a == b {
+        bail!("a submission cannot be compared with itself");
+    }
+    let resolve = |l: char| -> Result<BackendId> {
+        by_label
+            .get(&l)
+            .map(|i| round.submissions[*i].backend)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "round {round_id} has no submission labelled {l} (labels: {})",
+                    by_label.keys().collect::<String>()
+                )
+            })
+    };
+    let (first, second) = (resolve(a)?, resolve(b)?);
+    let vote = store::Vote {
+        round_id: round_id.clone(),
+        ts: now_ms(),
+        winner: (!tie).then_some(first),
+        loser: (!tie).then_some(second),
+        tie,
+    };
+    store::append_vote(&vote)?;
+    emit_grades(&round);
+    println!(
+        "recorded: {}",
+        match tie {
+            true => format!("{a} / {b} tie"),
+            false => format!("{a} beats {b}"),
+        }
+    );
+    Ok(())
+}
+
+/// The built-in probes as data, for the desktop app's picker.
+fn templates_json() -> serde_json::Value {
+    serde_json::json!(
+        arena::templates::ALL
+            .iter()
+            .map(|t| serde_json::json!({
+                "id": t.id,
+                "category": t.category.as_str(),
+                "probes": t.probes,
+                "target": t.target,
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// Every recorded round, newest first, with how much of it is still unjudged.
+fn rounds(json: bool) -> Result<()> {
+    let votes = store::load_votes();
+    let mut out = Vec::new();
+    for id in store::list_rounds() {
+        let Ok(round) = store::load_round(&id) else {
+            continue;
+        };
+        let cast = votes.iter().filter(|v| v.round_id == id).count();
+        let total = round.matchups().len();
+        out.push(serde_json::json!({
+            "round_id": id,
+            "task": round.task,
+            "cwd": round.cwd,
+            "contenders": round.submissions.iter().map(|s| s.backend.as_str()).collect::<Vec<_>>(),
+            "judgeable": round.blind_order().len(),
+            "matchups": total,
+            "votes": cast,
+            "pending": total.saturating_sub(cast),
+        }));
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if out.is_empty() {
+        println!("no arena rounds yet — run `agentpit arena run` first.");
+        return Ok(());
+    }
+    for r in &out {
+        println!(
+            "  {}  {}/{} judged  [{}]\n      {}",
+            r["round_id"].as_str().unwrap_or(""),
+            r["votes"],
+            r["matchups"],
+            r["contenders"]
+                .as_array()
+                .map(|a| a
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default(),
+            r["task"]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+/// One round's submissions under their blind labels.
+fn show(round_id: Option<String>, reveal: bool, json: bool) -> Result<()> {
+    let round_id = match round_id {
+        Some(id) => id,
+        None => latest_round()?,
+    };
+    let round = store::load_round(&round_id)?;
+    let cast = store::load_votes()
+        .iter()
+        .filter(|v| v.round_id == round_id)
+        .count();
+    let entries: Vec<serde_json::Value> = round
+        .blind_order()
+        .into_iter()
+        .map(|(label, i)| {
+            let s = &round.submissions[i];
+            let (added, removed) = arena::worktree::patch_size(&s.patch);
+            let mut e = serde_json::json!({
+                "label": label.to_string(),
+                "added": added,
+                "removed": removed,
+                "patch": s.patch,
+                "summary": s.summary,
+                "binary_files": s.binary_files,
+            });
+            // Identity is withheld unless asked for: the labels exist so the work can be judged
+            // without knowing whose it is, and a UI that received the names would have to
+            // remember not to show them.
+            if reveal {
+                e["backend"] = serde_json::json!(s.backend.as_str());
+                e["model"] = serde_json::json!(s.model);
+                e["effort"] = serde_json::json!(s.effort.map(|x| x.to_string()));
+            }
+            e
+        })
+        .collect();
+    let pairs: Vec<serde_json::Value> = {
+        let by_index: std::collections::BTreeMap<usize, char> = round
+            .blind_order()
+            .into_iter()
+            .map(|(l, i)| (i, l))
+            .collect();
+        round
+            .matchups()
+            .into_iter()
+            .map(|(a, b)| serde_json::json!([by_index[&a].to_string(), by_index[&b].to_string()]))
+            .collect()
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "round_id": round_id,
+                "task": round.task,
+                "cwd": round.cwd,
+                "votes": cast,
+                "matchups": pairs,
+                "submissions": entries,
+            }))?
+        );
+        return Ok(());
+    }
+    println!("\nround {round_id}\ntask: {}\n", round.task);
+    for e in &entries {
+        println!(
+            "  {}  +{}/-{}{}",
+            e["label"].as_str().unwrap_or(""),
+            e["added"],
+            e["removed"],
+            match reveal {
+                true => format!("  [{}]", e["backend"].as_str().unwrap_or("?")),
+                false => String::new(),
+            }
+        );
+    }
+    Ok(())
 }
 
 /// The task text for this round: a free-text one, or a template rendered with its target. Pure so
@@ -433,10 +691,36 @@ fn clamp_lines(text: &str, max: usize) -> String {
     )
 }
 
-fn leaderboard() -> Result<()> {
+fn leaderboard(json: bool) -> Result<()> {
     let votes = store::load_votes();
     let decisive = arena::pairs(&votes);
     let table = rating::rate(&decisive);
+    if json {
+        let rows: Vec<serde_json::Value> = table
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "backend": r.backend.as_str(),
+                    "score": r.score,
+                    "low": r.low,
+                    "high": r.high,
+                    "wins": r.wins,
+                    "losses": r.losses,
+                    "provisional": r.provisional(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "votes": votes.len(),
+                "ties": votes.iter().filter(|v| v.tie).count(),
+                "min_comparisons": rating::MIN_COMPARISONS,
+                "standings": rows,
+            }))?
+        );
+        return Ok(());
+    }
     if table.is_empty() {
         println!("no arena votes yet — run `agentpit arena run` then `agentpit arena vote`.");
         return Ok(());

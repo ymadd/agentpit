@@ -16,6 +16,16 @@ import {
   setAutoUpdateEnabled,
   subscribeToUpdates,
 } from "./app-update.js";
+import {
+  arenaLeaderboard,
+  arenaReveal,
+  arenaRound,
+  arenaRounds,
+  arenaRun,
+  arenaTemplates,
+  arenaVote,
+  pendingMatchups,
+} from "./arena.js";
 import { buildConfigPayload, draftFromConfig, ENSEMBLE_KEYS, validateConfigDraft } from "./config.js";
 import "./settings.css";
 
@@ -25,6 +35,7 @@ const NAV = [
   { id: "backends", table: "[backends.*]", label: "バックエンド", caption: "CLI・モデル・接続" },
   { id: "ensembles", table: "[ensemble]", label: "アンサンブル", caption: "並列実行と集約" },
   { id: "workflow", table: "[workflow]", label: "ワークフロー", caption: "ロールと設計図" },
+  { id: "arena", table: "arena", label: "アリーナ", caption: "対戦・判定・順位" },
   { id: "updates", table: "desktop", label: "アプリと更新", caption: "同梱CLI・自動更新" },
 ];
 
@@ -378,6 +389,288 @@ function CliLinkCard() {
   );
 }
 
+
+/// The arena, as a desktop surface: start a round, judge it blind, read the standings.
+///
+/// The three live in one pane because they are one loop — a round is worth starting only if it
+/// gets judged, and the standings mean nothing until it has been.
+function ArenaPanel() {
+  const [templates, setTemplates] = useState([]);
+  const [rounds, setRounds] = useState([]);
+  const [board, setBoard] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const [templateId, setTemplateId] = useState("");
+  const [target, setTarget] = useState("");
+  const [task, setTask] = useState("");
+  const [cwd, setCwd] = useState("");
+  const [contenders, setContenders] = useState([]);
+
+  const [judging, setJudging] = useState(null);
+
+  const load = async () => {
+    try {
+      const [t, r, b] = await Promise.all([arenaTemplates(), arenaRounds(), arenaLeaderboard()]);
+      setTemplates(t || []);
+      setRounds(r || []);
+      setBoard(b);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  useEffect(() => {
+    load();
+  }, []);
+
+  const chosen = templates.find((t) => t.id === templateId);
+  const toggle = (id) =>
+    setContenders((prev) => (prev.includes(id) ? prev.filter((b) => b !== id) : [...prev, id]));
+
+  const start = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setRounds((await arenaRun({ task, template: templateId || null, target, contenders, cwd })) || []);
+      setTask("");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="set-page">
+      <SectionIntro
+        eyebrow="HUMAN VERDICT"
+        title="アリーナ"
+        copy="同じお題を各バックエンドに別々のworktreeで解かせ、結果を伏せたまま2つずつ見比べて選びます。票はそのまま学習ラベルになります。"
+        command="agentpit arena"
+      />
+      {error ? <div className="set-error-banner"><span>{error}</span></div> : null}
+
+      <Card>
+        <span className="set-card-kicker">NEW ROUND</span>
+        <h2>お題を出す</h2>
+        <p>
+          組み込みプローブは能力マトリクスの各セルに1つずつ対応していて、票が落ちるセルを自分で決めます。
+          自由記述にすると、カテゴリは本文から推測されます。
+        </p>
+        <label className="set-field set-arena-field">
+          <span>プローブ</span>
+          <select className="set-select" value={templateId} onChange={(e) => setTemplateId(e.target.value)}>
+            <option value="">（自由記述）</option>
+            {templates.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.id} — {t.category}
+              </option>
+            ))}
+          </select>
+        </label>
+        {chosen ? (
+          <>
+            <p className="set-skills-note">{chosen.probes}</p>
+            {chosen.target ? (
+              <label className="set-field set-arena-field">
+                <span>対象</span>
+                <input className="set-input" value={target} onChange={(e) => setTarget(e.target.value)} placeholder={chosen.target} />
+              </label>
+            ) : null}
+          </>
+        ) : (
+          <label className="set-field set-arena-field">
+            <span>お題</span>
+            <input className="set-input" value={task} onChange={(e) => setTask(e.target.value)} placeholder="何を作らせるか" />
+          </label>
+        )}
+        <label className="set-field set-arena-field">
+          <span>作業ディレクトリ</span>
+          <input className="set-input" value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="空欄でカレント（gitリポジトリであること）" />
+        </label>
+        <div className="set-arena-picks">
+          {["claude", "codex", "antigravity", "opencode"].map((b) => (
+            <button
+              key={b}
+              className={contenders.includes(b) ? "set-arena-pick on" : "set-arena-pick"}
+              onClick={() => toggle(b)}
+            >
+              {b}
+            </button>
+          ))}
+        </div>
+        <div className="set-skills-actions">
+          <button className="set-primary" disabled={busy || contenders.length < 2} onClick={start}>
+            {busy ? "実行中… 数分かかります" : "ラウンド開始"}
+          </button>
+          {busy ? <span className="set-skills-note">各バックエンドが自分のworktreeで作業しています。</span> : null}
+        </div>
+      </Card>
+
+      <Card>
+        <span className="set-card-kicker">ROUNDS</span>
+        <h2>判定待ち</h2>
+        {rounds.length === 0 ? (
+          <p>まだラウンドがありません。</p>
+        ) : (
+          <ul className="set-arena-rounds">
+            {rounds.map((r) => (
+              <li key={r.round_id}>
+                <div>
+                  <b>{(r.task || "").split("\n").filter((l) => !l.startsWith("CATEGORY:"))[0]}</b>
+                  <small>
+                    {r.contenders.join(" · ")} — {r.votes}/{r.matchups} 判定済み
+                  </small>
+                </div>
+                <button
+                  className="set-secondary"
+                  disabled={r.pending === 0}
+                  onClick={() => setJudging(r.round_id)}
+                >
+                  {r.pending === 0 ? "判定済み" : "判定する"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      {judging ? (
+        <JudgeDialog
+          roundId={judging}
+          onClose={() => {
+            setJudging(null);
+            load();
+          }}
+        />
+      ) : null}
+
+      <ArenaBoard board={board} />
+    </div>
+  );
+}
+
+/// One blind comparison at a time. The identities are fetched only after the last pair is voted,
+/// never between comparisons — seeing that A was your usual favourite would steer every remaining
+/// pick in the round.
+function JudgeDialog({ roundId, onClose }) {
+  const [round, setRound] = useState(null);
+  const [reveal, setReveal] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    arenaRound(roundId).then(setRound).catch((e) => setError(String(e)));
+  }, [roundId]);
+
+  const pending = pendingMatchups(round);
+  const pair = pending[0];
+  const sub = (label) => round?.submissions?.find((s) => s.label === label);
+
+  const cast = async (winner, loser, tie) => {
+    setBusy(true);
+    try {
+      await arenaVote(roundId, winner, loser, tie);
+      const next = await arenaRound(roundId);
+      setRound(next);
+      if (pendingMatchups(next).length === 0) setReveal(await arenaReveal(roundId));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="set-arena-judge">
+      <div className="set-arena-judge-hd">
+        <b>{reveal ? "内訳" : pair ? `${pair[0]} と ${pair[1]} を見比べる` : "判定"}</b>
+        <button className="set-close" onClick={onClose}>×</button>
+      </div>
+      {error ? <div className="set-error-banner"><span>{error}</span></div> : null}
+      {reveal ? (
+        <div className="set-arena-reveal">
+          {reveal.submissions.map((s) => (
+            <p key={s.label}>
+              <b>{s.label}</b> = {s.backend}
+              {s.model ? ` (${s.model}${s.effort ? " / " + s.effort : ""})` : ""}
+            </p>
+          ))}
+        </div>
+      ) : pair ? (
+        <>
+          <div className="set-arena-pair">
+            {pair.map((label) => (
+              <div key={label} className="set-arena-side">
+                <div className="set-arena-side-hd">
+                  <b>{label}</b>
+                  <small>+{sub(label)?.added ?? 0}/-{sub(label)?.removed ?? 0}</small>
+                </div>
+                <pre>{sub(label)?.patch || ""}</pre>
+              </div>
+            ))}
+          </div>
+          <div className="set-skills-actions">
+            <button className="set-primary" disabled={busy} onClick={() => cast(pair[0], pair[1], false)}>
+              {pair[0]} が良い
+            </button>
+            <button className="set-primary" disabled={busy} onClick={() => cast(pair[1], pair[0], false)}>
+              {pair[1]} が良い
+            </button>
+            <button className="set-secondary" disabled={busy} onClick={() => cast(pair[0], pair[1], true)}>
+              甲乙つけがたい
+            </button>
+          </div>
+        </>
+      ) : (
+        <p>このラウンドは判定済みです。</p>
+      )}
+    </div>
+  );
+}
+
+/// Standings. The interval and the provisional flag are shown, never trimmed away: these ratings
+/// rest on dozens of votes, not millions, and a table that hid that would invite exactly the
+/// false confidence the arena exists to remove.
+function ArenaBoard({ board }) {
+  if (!board) return null;
+  const rows = board.standings || [];
+  return (
+    <Card>
+      <span className="set-card-kicker">LEADERBOARD</span>
+      <h2>順位</h2>
+      {rows.length === 0 ? (
+        <p>まだ票がありません。</p>
+      ) : (
+        <>
+          <table className="set-arena-board">
+            <thead>
+              <tr><th>バックエンド</th><th>スコア</th><th>90%区間</th><th>戦績</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.backend} className={r.provisional ? "provisional" : ""}>
+                  <td>{r.backend}</td>
+                  <td>{r.score}</td>
+                  <td>{r.low}–{r.high}</td>
+                  <td>{r.wins}-{r.losses}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="set-skills-note">
+            {board.votes} 票（うち引き分け {board.ties}）。
+            {rows.some((r) => r.provisional)
+              ? ` 薄い行は暫定 — 比較 ${board.min_comparisons} 件未満か、順位が入れ替わりうる幅です。測定値ではありません。`
+              : ""}
+          </p>
+        </>
+      )}
+    </Card>
+  );
+}
+
 function useUpdateState() {
   const [state, setState] = useState(getUpdateSnapshot);
   useEffect(() => subscribeToUpdates(setState), []);
@@ -518,7 +811,7 @@ export default function SettingsApp() {
         <div className={`set-workflow-stage ${section === "workflow" ? "active" : ""}`}>{visitedWorkflow ? <StudioApp embedded /> : null}</div>
         {section !== "workflow" ? (
           <main className="set-scroll">
-            {!draft ? <div className="set-loading"><span /><p>設定ファイルを読み込んでいます…</p></div> : section === "general" ? <GeneralPanel draft={draft} change={change} /> : section === "routing" ? <RoutingPanel draft={draft} change={change} /> : section === "backends" ? <BackendsPanel draft={draft} change={change} modelCatalogs={modelCatalogs} /> : section === "ensembles" ? <EnsemblesPanel draft={draft} change={change} /> : <UpdatesPanel />}
+            {!draft ? <div className="set-loading"><span /><p>設定ファイルを読み込んでいます…</p></div> : section === "general" ? <GeneralPanel draft={draft} change={change} /> : section === "routing" ? <RoutingPanel draft={draft} change={change} /> : section === "backends" ? <BackendsPanel draft={draft} change={change} modelCatalogs={modelCatalogs} /> : section === "ensembles" ? <EnsemblesPanel draft={draft} change={change} /> : section === "arena" ? <ArenaPanel /> : <UpdatesPanel />}
           </main>
         ) : null}
       </section>

@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_update;
+mod arena;
 mod asks;
 mod cli_link;
 mod cli_runner;
@@ -275,6 +276,13 @@ fn main() {
             settings::settings_save,
             settings::config_get,
             settings::config_save,
+            arena::arena_templates,
+            arena::arena_rounds,
+            arena::arena_round,
+            arena::arena_reveal,
+            arena::arena_leaderboard,
+            arena::arena_vote,
+            arena::arena_run,
             cli_link::cli_link_status,
             cli_link::cli_link_install,
             cli_link::cli_link_remove,

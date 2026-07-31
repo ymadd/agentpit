@@ -30,6 +30,11 @@ Download the installer for your platform from the latest GitHub Release (`.dmg` 
 the matching `agentpit` CLI sidecar used for workflows, settings, and updates. Automatic updates
 are enabled by default and can be changed under **Settings → App & updates**.
 
+Once installed, put the bundled CLI on your `PATH` from **Settings → アプリと更新 → BUNDLED CLI**.
+That writes a small `exec` shim at `~/.local/bin/agentpit` pointing into the bundle, so the
+terminal always runs the same build as the app and updating either one updates both. Prefer this
+over a second standalone install, which drifts out of sync silently.
+
 ### Standalone CLI (optional)
 
 Use this only when you want `agentpit` directly on `PATH` without installing the desktop app:

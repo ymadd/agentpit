@@ -8,6 +8,9 @@ import {
   checkForUpdates,
   getUpdateSnapshot,
   installAvailableUpdate,
+  cliLinkInstall,
+  cliLinkRemove,
+  cliLinkStatus,
   refreshSkills,
   restartDesktopApp,
   setAutoUpdateEnabled,
@@ -293,6 +296,88 @@ function SkillsCard() {
   );
 }
 
+/// Puts the bundled CLI on PATH.
+///
+/// The app is the primary distribution and owns the sidecar, but a terminal cannot reach into the
+/// bundle — so people install the standalone CLI as well and the two drift apart silently. This
+/// card removes the second copy: PATH points at the bundle through a small `exec` shim, and the
+/// app's own updates carry the terminal along with them.
+function CliLinkCard() {
+  const [link, setLink] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const load = async () => {
+    try {
+      setLink(await cliLinkStatus());
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  useEffect(() => {
+    load();
+  }, []);
+
+  const act = async (fn) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setLink(await fn());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const state = link?.state ?? "absent";
+  const copy = {
+    linked: "ターミナルの agentpit はこのアプリの同梱CLIを指しています。アプリを更新すれば、ターミナル側も一緒に上がります。",
+    stale: "シムが古い場所を指しています。アプリを移動した場合は貼り直してください。",
+    foreign: "PATH 上に別の agentpit があります。アプリとは独立して古いままになるため、置き換えを推奨します。",
+    absent: "ターミナルから agentpit を使うには、同梱CLIへのシムを PATH に置きます。",
+    unavailable: "この起動には同梱CLIがありません（開発ビルド）。",
+  }[state];
+
+  return (
+    <Card>
+      <span className="set-card-kicker">BUNDLED CLI</span>
+      <h2>ターミナルからも同じCLIを使う</h2>
+      <p>{copy}</p>
+      {link ? (
+        <div className="set-cli-contract">
+          <code>{link.shim_path}</code>
+          <i>→</i>
+          <code>{link.sidecar_path || "—"}</code>
+        </div>
+      ) : null}
+      {link?.resolved_on_path ? (
+        <p className="set-skills-note">
+          いまのシェル: <code>{link.resolved_on_path}</code>
+          {link.resolved_version ? ` (${link.resolved_version})` : ""}
+        </p>
+      ) : null}
+      <div className="set-skills-actions">
+        {state === "linked" ? (
+          <button className="set-secondary" disabled={busy} onClick={() => act(cliLinkRemove)}>
+            解除
+          </button>
+        ) : state === "unavailable" ? null : (
+          <button
+            className="set-primary"
+            disabled={busy}
+            onClick={() => act(() => cliLinkInstall(state === "foreign"))}
+          >
+            {busy ? "設置中…" : state === "foreign" ? "置き換えて設置" : "PATH に設置"}
+          </button>
+        )}
+        {error ? <span className="set-skills-note error">{error}</span> : null}
+      </div>
+    </Card>
+  );
+}
+
 function useUpdateState() {
   const [state, setState] = useState(getUpdateSnapshot);
   useEffect(() => subscribeToUpdates(setState), []);
@@ -334,12 +419,7 @@ function UpdatesPanel() {
           <p>新しいリリースがあれば、バックグラウンドで取得して次の再起動に備えます。</p>
           <Switch checked={automatic} onChange={(enabled) => { setAutomatic(enabled); setAutoUpdateEnabled(enabled); }} label={automatic ? "自動更新：オン" : "自動更新：オフ"} description="オフでも「更新を確認」から手動実行できます。" />
         </Card>
-        <Card>
-          <span className="set-card-kicker">BUNDLED CLI</span>
-          <h2>アプリと同じバージョンを同梱</h2>
-          <p>ワークフロー生成・説明・更新は、PATH上の別バージョンではなくアプリ内のCLIを優先します。</p>
-          <div className="set-cli-contract"><code>agentpit</code><span>sidecar</span><i>→</i><code>config.toml</code></div>
-        </Card>
+        <CliLinkCard />
       </div>
       <SkillsCard />
     </div>

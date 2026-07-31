@@ -212,6 +212,23 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
             "latest release tag {latest:?} is not a plain vMAJOR.MINOR.PATCH — refusing to update"
         ));
     }
+    // Before spending a download: refuse to update through a symlink that points into an app
+    // bundle. `current_exe()` does not resolve symlinks on macOS, so `self_replace` below would
+    // overwrite the LINK with a regular file — silently detaching PATH from the bundle it was
+    // deliberately attached to, and skipping the bundle re-sign because no bundle appears in the
+    // path. The desktop app installs an `exec` shim instead of a symlink precisely so that
+    // `current_exe()` reports the real binary and this case never arises.
+    let current_exe = std::env::current_exe().context("cannot locate the running executable")?;
+    if let Some(bundle) = symlinked_into_bundle(&current_exe) {
+        return Err(anyhow!(
+            "{} is a symlink into {} — updating here would replace the link with a plain file and \
+             detach it from the app bundle. Update the desktop app instead (it updates this CLI \
+             with it), or reinstall the link from Settings → アプリと更新.",
+            current_exe.display(),
+            bundle.display()
+        ));
+    }
+
     let tag = format!("v{}", normalized_version(&latest));
     let target = self_update::get_target();
     let asset_name = format!("{}.gz", asset_identifier(BIN_NAME, target));
@@ -224,7 +241,6 @@ pub fn perform_update(quiet: bool) -> Result<UpdateOutcome> {
     // same mechanism self_update used, minus its unverified download. Make it executable
     // BEFORE it is ever swapped in, so no window exists where the installed path is a
     // non-executable file.
-    let current_exe = std::env::current_exe().context("cannot locate the running executable")?;
     let staged = current_exe.with_extension(format!("update.{}", std::process::id()));
     write_new_file(&staged, &binary)
         .with_context(|| format!("failed to stage update at {}", staged.display()))?;
@@ -387,6 +403,19 @@ fn gunzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
         )));
     }
     Ok(out)
+}
+
+/// The `.app` bundle a symlinked executable points INTO, if that is what `path` is.
+///
+/// `None` when `path` is a regular file (the normal standalone install), when it is a symlink to
+/// somewhere outside a bundle, or when the link cannot be read. Only the resolved target is
+/// inspected: a link one hop away from a bundle is still a link into it.
+fn symlinked_into_bundle(path: &Path) -> Option<PathBuf> {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(path).ok()?;
+    enclosing_app_bundle(&resolved)
 }
 
 /// The nearest proper ancestor of the executable `path` that is a macOS `.app` bundle root.
@@ -927,6 +956,39 @@ mod tests {
     /// symlink, so a pre-placed symlink at the predictable staging path could redirect the
     /// update's bytes onto another file. `create_new` fails closed instead.
     #[cfg(unix)]
+    /// A symlink into a bundle is the arrangement that `self_replace` would silently destroy, so
+    /// the updater has to recognise it before downloading anything.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_an_app_bundle_is_detected_and_a_plain_file_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("agentpit.app/Contents/MacOS");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let sidecar = bundle.join("agentpit");
+        std::fs::write(&sidecar, b"cli").unwrap();
+
+        let link = dir.path().join("agentpit");
+        std::os::unix::fs::symlink(&sidecar, &link).unwrap();
+        assert_eq!(
+            symlinked_into_bundle(&link)
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "agentpit.app"
+        );
+
+        // The ordinary standalone install must stay updatable.
+        let plain = dir.path().join("standalone");
+        std::fs::write(&plain, b"cli").unwrap();
+        assert!(symlinked_into_bundle(&plain).is_none());
+
+        // A symlink that does not lead into a bundle is not our business either.
+        let elsewhere = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(&plain, &elsewhere).unwrap();
+        assert!(symlinked_into_bundle(&elsewhere).is_none());
+    }
+
     #[test]
     fn staging_refuses_to_follow_a_pre_placed_symlink() {
         let temp = tempfile::tempdir().unwrap();

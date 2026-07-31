@@ -3,6 +3,7 @@
 
 mod app_update;
 mod asks;
+mod cli_link;
 mod cli_runner;
 mod cli_versions;
 mod learning;
@@ -274,6 +275,9 @@ fn main() {
             settings::settings_save,
             settings::config_get,
             settings::config_save,
+            cli_link::cli_link_status,
+            cli_link::cli_link_install,
+            cli_link::cli_link_remove,
             app_update::app_update_check,
             app_update::skills_refresh,
             app_update::app_update_install,

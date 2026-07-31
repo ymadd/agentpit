@@ -100,6 +100,27 @@ export async function refreshSkills() {
   return call("skills_refresh");
 }
 
+/// Where the terminal `agentpit` currently resolves, and whether it is the app's shim.
+export async function cliLinkStatus() {
+  const call = invoke();
+  if (!call) throw new Error("デスクトップアプリの外では実行できません。");
+  return call("cli_link_status");
+}
+
+/// Put this bundle's CLI on PATH. `replace` is required to overwrite a file the app did not
+/// write — usually a standalone CLI install the user would not want silently deleted.
+export async function cliLinkInstall(replace = false) {
+  const call = invoke();
+  if (!call) throw new Error("デスクトップアプリの外では実行できません。");
+  return call("cli_link_install", { replace });
+}
+
+export async function cliLinkRemove() {
+  const call = invoke();
+  if (!call) throw new Error("デスクトップアプリの外では実行できません。");
+  return call("cli_link_remove");
+}
+
 export async function restartDesktopApp() {
   const call = invoke();
   if (call) await call("app_restart");

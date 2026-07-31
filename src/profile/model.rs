@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::category::TaskCategory;
+use crate::effort::Effort;
 use crate::types::BackendId;
 
 /// A single backend×category competency reading on a 0–100 scale.
@@ -112,6 +113,15 @@ pub struct CapabilityProfile {
     pub source: ProfileSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_at: Option<String>,
+    /// The model this row is ABOUT, together with `backend` and `effort` — see
+    /// [`ProfileKey`](super::ProfileKey). `None` = unpinned: the row describes the backend on its
+    /// CLI's own default model. Every seeded prior is unpinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The reasoning effort this row is about (already clamped to what the backend can express).
+    /// `None` = unpinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
 }
 
 impl CapabilityProfile {
@@ -123,6 +133,22 @@ impl CapabilityProfile {
             telemetry: TelemetryStats::default(),
             source: ProfileSource::Seeded,
             measured_at: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    /// This row's identity: the `(backend, model, effort)` triple it was measured for.
+    pub fn key(&self) -> super::ProfileKey {
+        super::ProfileKey::new(self.backend, self.model.clone(), self.effort)
+    }
+
+    /// An empty row for one measured variant, ready to receive benchmark or learned cells.
+    pub fn for_variant(backend: BackendId, model: Option<String>, effort: Option<Effort>) -> Self {
+        Self {
+            model,
+            effort,
+            ..Self::seeded(backend)
         }
     }
 
@@ -140,6 +166,12 @@ pub struct BenchmarkResult {
     pub scores: BTreeMap<TaskCategory, Score>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_at: Option<String>,
+    /// The model these scores were measured with; carried onto the profile by [`apply_benchmark`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_model: Option<String>,
+    /// The reasoning effort these scores were measured at, clamped per backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_effort: Option<Effort>,
 }
 
 /// Merge incoming cells into a copy of `base.scores`, gating **per cell**: an incoming
@@ -199,6 +231,11 @@ pub fn apply_benchmark(base: &CapabilityProfile, result: &BenchmarkResult) -> Ca
             .measured_at
             .clone()
             .or_else(|| base.measured_at.clone()),
+        // A row's identity never changes under a merge: the caller picked WHICH row to fold
+        // into (see `merge_into_profiles`), and the benchmark's own model/effort is what made
+        // that choice. Rewriting it here would let a run relabel a row it did not measure.
+        model: base.model.clone(),
+        effort: base.effort,
     }
 }
 
@@ -217,6 +254,8 @@ pub fn apply_learned(
         scores,
         telemetry: base.telemetry.clone(),
         measured_at: base.measured_at.clone(),
+        model: base.model.clone(),
+        effort: base.effort,
     }
 }
 

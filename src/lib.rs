@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod arena;
 pub mod ask;
 pub mod auth;
 pub mod availability;
@@ -6,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod diagnose;
 pub mod dispatch;
+pub mod effort;
 pub mod events;
 pub mod exec;
 pub mod mcp;

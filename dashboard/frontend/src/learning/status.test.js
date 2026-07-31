@@ -30,6 +30,7 @@ test("evidenceCells keeps only cells with telemetry, heaviest first", () => {
   const status = {
     rows: [
       {
+        id: "claude",
         backend: "claude",
         cells: [
           { category: "coding", evidence: { labels: 2, projected: 40 } },
@@ -37,16 +38,27 @@ test("evidenceCells keeps only cells with telemetry, heaviest first", () => {
         ],
       },
       {
+        id: "codex",
         backend: "codex",
         cells: [{ category: "review", evidence: { labels: 5, projected: 80 } }],
+      },
+      // Same backend, different measured variant: a separate row, and it must stay separate
+      // in the evidence list rather than merging into the unpinned codex row.
+      {
+        id: "codex@gpt-5.4-codex/xhigh",
+        backend: "codex",
+        model: "gpt-5.4-codex",
+        effort: "xhigh",
+        cells: [{ category: "review", evidence: { labels: 9, projected: 91 } }],
       },
     ],
   };
   const cells = evidenceCells(status);
-  assert.equal(cells.length, 2, "cells without evidence are dropped");
+  assert.equal(cells.length, 3, "cells without evidence are dropped");
   assert.deepEqual(
     cells.map((c) => [c.backend, c.cell.category]),
     [
+      ["codex@gpt-5.4-codex/xhigh", "review"],
       ["codex", "review"],
       ["claude", "coding"],
     ]

@@ -18,14 +18,15 @@ use clap::Subcommand;
 use console::style;
 use tokio_util::sync::CancellationToken;
 
+use crate::effort::Effort;
 use crate::events::{LegStatus, RunKind, RunLogger, output_streamer};
 use crate::profile::bench::{
     RawFixture, RawScored, ReplayFixture, all_tasks, merge_into_profiles, run_live, score_fixture,
     score_raw,
 };
 use crate::profile::{
-    BenchmarkResult, CapabilityProfile, ProfileSet, apply_benchmark, load_profiles, profiles_path,
-    save_profiles, seeded_profiles,
+    BenchmarkResult, CapabilityProfile, Pins, ProfileKey, ProfileSet, apply_benchmark,
+    load_profiles, profiles_path, save_profiles, seeded_profiles,
 };
 use crate::types::BackendId;
 
@@ -52,6 +53,14 @@ pub enum Action {
         /// fixture's backend; otherwise the fixture's own backend is used.
         #[arg(long)]
         backend: Option<BackendId>,
+        /// Pin the model to measure (e.g. opus, gpt-5-codex). Unset = the backend's
+        /// `[backends.<id>].model` default, then the CLI's own. Recorded on the result.
+        #[arg(long)]
+        model: Option<String>,
+        /// Pin the reasoning effort to measure. Unset = the backend's `[backends.<id>].effort`
+        /// default, then the CLI's own. Recorded on the result, clamped per backend.
+        #[arg(long, value_enum)]
+        effort: Option<Effort>,
         /// Replay a recorded fixture (JSON) of already-graded per-task `passed/total` counts.
         #[arg(long, value_name = "FILE")]
         replay: Option<PathBuf>,
@@ -98,6 +107,8 @@ pub async fn run(action: Option<Action>) -> Result<()> {
         Action::Reset => reset(&profiles_path()),
         Action::Run {
             backend,
+            model,
+            effort,
             replay,
             raw_replay,
             save_raw,
@@ -105,6 +116,8 @@ pub async fn run(action: Option<Action>) -> Result<()> {
         } => {
             run_bench(
                 backend,
+                model.as_deref(),
+                effort,
                 replay.as_deref(),
                 raw_replay.as_deref(),
                 save_raw.as_deref(),
@@ -191,8 +204,10 @@ pub(super) fn policy_report(
             // The deployed auto-route chain: similarity stage first (when this build has
             // it and samples exist — leave-one-out, so a task never matches itself), then
             // the profile stage over the current profiles.toml.
+            // Collapsed the same way `Router::new` does, so the replay scores the variant
+            // each backend would actually be dispatched as.
             let profile = profile_stage_picker(
-                load_profiles(None)?,
+                load_profiles(None)?.resolved(&Pins::from_config(&config)),
                 available.clone(),
                 margin,
                 costs.clone(),
@@ -445,11 +460,21 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
     let base = load_profiles(Some(profiles))?;
     let mut merged = base.clone();
     let mut changed = 0usize;
-    for (backend, learned) in &scores {
+    for (key, learned) in &scores {
+        // A variant with no row of its own starts from the backend's unpinned row, so the
+        // categories the telemetry says nothing about keep sensible values instead of vanishing.
+        let label = row_label(key);
         let before = base
-            .get(*backend)
+            .resolve(key.backend, key.model.as_deref(), key.effort)
             .cloned()
-            .unwrap_or_else(|| CapabilityProfile::seeded(*backend));
+            .map(|p| CapabilityProfile {
+                model: key.model.clone(),
+                effort: key.effort,
+                ..p
+            })
+            .unwrap_or_else(|| {
+                CapabilityProfile::for_variant(key.backend, key.model.clone(), key.effort)
+            });
         let after = crate::profile::apply_learned(&before, learned);
         for (category, score) in learned {
             let old = before.score(*category);
@@ -459,7 +484,7 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
             }
             changed += 1;
             println!(
-                "  [{backend}] {:<18} {} -> {}  (samples={}, conf={:.2})",
+                "  [{label}] {:<18} {} -> {}  (samples={}, conf={:.2})",
                 category.as_str(),
                 old.map(|s| s.value.to_string())
                     .unwrap_or_else(|| "-".into()),
@@ -476,7 +501,7 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
             })
             .count();
         if frozen > 0 {
-            println!("  [{backend}] {frozen} benchmarked cell(s) left untouched");
+            println!("  [{label}] {frozen} benchmarked cell(s) left untouched");
         }
         merged.insert(after);
     }
@@ -636,8 +661,8 @@ fn render_show(set: &ProfileSet, path: &Path, persisted: bool) -> String {
         return out;
     }
 
-    for (backend, profile) in set.iter() {
-        out.push_str(&render_backend_section(*backend, profile));
+    for (key, profile) in set.iter() {
+        out.push_str(&render_backend_section(key, profile));
     }
 
     out
@@ -645,7 +670,7 @@ fn render_show(set: &ProfileSet, path: &Path, persisted: bool) -> String {
 
 /// Render one backend's section of the capability matrix (header line plus its score rows).
 /// Pure: builds and returns a fresh `String`, mutating nothing.
-fn render_backend_section(backend: BackendId, profile: &CapabilityProfile) -> String {
+fn render_backend_section(key: &ProfileKey, profile: &CapabilityProfile) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
@@ -654,12 +679,20 @@ fn render_backend_section(backend: BackendId, profile: &CapabilityProfile) -> St
         .as_deref()
         .map(|m| format!("  measured_at={m}"))
         .unwrap_or_default();
+    // WHAT this row is about. A score belongs to a (backend, model, effort) triple, so an
+    // unpinned row says "CLI default" rather than reading as if the number were a property of
+    // the backend's name.
     let _ = writeln!(
         out,
-        "\n[{}]  source={}{}",
-        style(backend).cyan(),
+        "\n[{}]  model={}  effort={}  source={}{}",
+        style(key.backend).cyan(),
+        profile.model.as_deref().unwrap_or("CLI default"),
+        profile
+            .effort
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "CLI default".into()),
         profile.source,
-        measured
+        measured,
     );
 
     if profile.scores.is_empty() {
@@ -694,6 +727,15 @@ fn render_backend_section(backend: BackendId, profile: &CapabilityProfile) -> St
     out
 }
 
+/// How one capability row is named in CLI output: the bare backend for an unpinned row, else
+/// `backend model/effort` so two rungs of the same backend are never confused for each other.
+fn row_label(key: &ProfileKey) -> String {
+    match key.is_unpinned() {
+        true => key.backend.to_string(),
+        false => format!("{} {}", key.backend, key.variant_label()),
+    }
+}
+
 /// Write the seeded priors to `path`. Refuses to overwrite an existing file unless `force`.
 fn seed(path: &Path, force: bool) -> Result<()> {
     if path.exists() && !force {
@@ -726,8 +768,11 @@ fn reset(path: &Path) -> Result<()> {
 
 /// `profile run` dispatch. `--backend` runs the suite live; `--raw-replay` re-grades recorded raw
 /// outputs offline; `--replay` folds pre-graded counts; bare `--dry-run` prints the suite plan.
+#[allow(clippy::too_many_arguments)]
 async fn run_bench(
     backend: Option<BackendId>,
+    model: Option<&str>,
+    effort: Option<Effort>,
     replay: Option<&Path>,
     raw_replay: Option<&Path>,
     save_raw: Option<&Path>,
@@ -739,7 +784,7 @@ async fn run_bench(
         (Some(fixture), None) => replay_fixture(fixture, backend, dry_run, profiles),
         (None, Some(fixture)) => raw_replay_fixture(fixture, backend, dry_run, profiles),
         (None, None) => match backend {
-            Some(b) => run_live_bench(b, save_raw, dry_run, profiles).await,
+            Some(b) => run_live_bench(b, model, effort, save_raw, dry_run, profiles).await,
             None if dry_run => {
                 print!("{}", render_plan());
                 Ok(())
@@ -757,6 +802,8 @@ async fn run_bench(
 /// raw outputs for later offline re-grading.
 async fn run_live_bench(
     backend: BackendId,
+    model: Option<&str>,
+    effort: Option<Effort>,
     save_raw: Option<&Path>,
     dry_run: bool,
     profiles: &Path,
@@ -777,11 +824,38 @@ async fn run_live_bench(
     let cancel = CancellationToken::new();
     super::install_ctrlc_cancel(cancel.clone());
 
+    // A gold-bench number measures harness + model + effort, so resolve both the same way a
+    // real dispatch would (flag > `[backends.<id>]` default) and print what is being measured —
+    // an unpinned run says "(CLI default)" rather than implying agentpit knows.
+    let effective_model = crate::workflow::roles::resolve_model(
+        model,
+        None,
+        ctx.loaded
+            .config
+            .backends
+            .get(&backend)
+            .and_then(|o| o.model.as_deref()),
+    );
+    let effective_effort = crate::effort::resolve_effort(
+        effort,
+        None,
+        ctx.loaded
+            .config
+            .backends
+            .get(&backend)
+            .and_then(|o| o.effort),
+    )
+    .map(|e| e.clamp_for(backend));
+
     let tasks = all_tasks();
     eprintln!(
-        "running {} gold task(s) against [{}] …",
+        "running {} gold task(s) against [{}] (model={}, effort={}) …",
         tasks.len(),
-        backend
+        backend,
+        effective_model.as_deref().unwrap_or("CLI default"),
+        effective_effort
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "CLI default".into()),
     );
 
     // Make the sweep visible in the dashboard swarm: a single-member `bench` run whose member
@@ -792,7 +866,19 @@ async fn run_live_bench(
     let started = std::time::Instant::now();
     let sink = output_streamer(logger.run_id(), backend, false);
 
-    let fixture = match run_live(backend, &tasks, &cwd, &ctx.regs, None, cancel, sink).await {
+    let fixture = match run_live(
+        backend,
+        &tasks,
+        &cwd,
+        &ctx.regs,
+        None,
+        effective_model.as_deref(),
+        effective_effort,
+        cancel,
+        sink,
+    )
+    .await
+    {
         Ok(f) => f,
         Err(e) => {
             logger.member_finished(
@@ -912,6 +998,7 @@ fn replay_fixture(
     let result = score_fixture(&tasks, &fixture)?;
 
     let set = load_profiles(Some(profiles))?;
+    // A graded-counts fixture records no model/effort, so it always folds into the UNPINNED row.
     let base = set
         .get(fixture.backend)
         .cloned()
@@ -921,10 +1008,11 @@ fn replay_fixture(
     print!("{}", render_run(fixture.backend, &merged, &result, dry_run));
 
     if !dry_run {
-        // Rebuild the set with the target backend replaced — never mutate the loaded one.
+        // Rebuild the set with the target row replaced — never mutate the loaded one.
+        let key = merged.key();
         let others = set
             .iter()
-            .filter(|(b, _)| **b != fixture.backend)
+            .filter(|(k, _)| **k != key)
             .map(|(_, p)| p.clone());
         let next = ProfileSet::from_profiles(others.chain(std::iter::once(merged)));
         save_profiles(&next, profiles)?;
@@ -1091,9 +1179,18 @@ mod tests {
         let profiles = dir.path().join("profiles.toml");
         let fixture = write_fixture(dir.path(), CODEX_FIXTURE);
 
-        run_bench(None, Some(&fixture), None, None, false, &profiles)
-            .await
-            .unwrap();
+        run_bench(
+            None,
+            None,
+            None,
+            Some(&fixture),
+            None,
+            None,
+            false,
+            &profiles,
+        )
+        .await
+        .unwrap();
 
         // The fixture's scores were merged and persisted.
         let reloaded = load_profiles(Some(&profiles)).unwrap();
@@ -1111,9 +1208,18 @@ mod tests {
         let profiles = dir.path().join("profiles.toml");
         let fixture = write_fixture(dir.path(), CODEX_FIXTURE);
 
-        run_bench(None, Some(&fixture), None, None, true, &profiles)
-            .await
-            .unwrap();
+        run_bench(
+            None,
+            None,
+            None,
+            Some(&fixture),
+            None,
+            None,
+            true,
+            &profiles,
+        )
+        .await
+        .unwrap();
 
         assert!(!profiles.exists(), "dry-run must not write profiles.toml");
     }
@@ -1126,6 +1232,8 @@ mod tests {
 
         let err = run_bench(
             Some(BackendId::Claude),
+            None,
+            None,
             Some(&fixture),
             None,
             None,
@@ -1149,9 +1257,18 @@ mod tests {
 
         // The offline raw path runs judge::grade for real: an empty defect array misses every
         // embedded defect, so the Review score is 0 — and it still merges + persists.
-        run_bench(None, None, Some(&fixture), None, false, &profiles)
-            .await
-            .unwrap();
+        run_bench(
+            None,
+            None,
+            None,
+            None,
+            Some(&fixture),
+            None,
+            false,
+            &profiles,
+        )
+        .await
+        .unwrap();
 
         let reloaded = load_profiles(Some(&profiles)).unwrap();
         let codex = reloaded.get(BackendId::Codex).expect("codex measured");
@@ -1165,9 +1282,18 @@ mod tests {
         let profiles = dir.path().join("profiles.toml");
         let fixture = write_fixture(dir.path(), CODEX_FIXTURE);
 
-        let err = run_bench(None, Some(&fixture), Some(&fixture), None, false, &profiles)
-            .await
-            .unwrap_err();
+        let err = run_bench(
+            None,
+            None,
+            None,
+            Some(&fixture),
+            Some(&fixture),
+            None,
+            false,
+            &profiles,
+        )
+        .await
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("mutually exclusive"),
             "got: {err:#}"
@@ -1180,7 +1306,7 @@ mod tests {
         let profiles = dir.path().join("profiles.toml");
 
         // The plan path scores nothing and writes nothing.
-        run_bench(None, None, None, None, true, &profiles)
+        run_bench(None, None, None, None, None, None, true, &profiles)
             .await
             .unwrap();
         assert!(!profiles.exists());
@@ -1194,7 +1320,7 @@ mod tests {
     async fn run_without_target_demands_one() {
         let dir = tempdir().unwrap();
         let profiles = dir.path().join("profiles.toml");
-        let err = run_bench(None, None, None, None, false, &profiles)
+        let err = run_bench(None, None, None, None, None, None, false, &profiles)
             .await
             .unwrap_err();
         assert!(
@@ -1212,6 +1338,8 @@ mod tests {
     ) -> crate::profile::learn::Label {
         crate::profile::learn::Label {
             backend,
+            model: None,
+            effort: None,
             category: crate::profile::TaskCategory::Coding,
             success,
             source,
@@ -1241,6 +1369,8 @@ mod tests {
         let mut cross = labels.clone();
         cross.push(crate::profile::learn::Label {
             backend: BackendId::Opencode,
+            model: None,
+            effort: None,
             category: crate::profile::TaskCategory::Docs,
             success: true,
             source: Outcome,

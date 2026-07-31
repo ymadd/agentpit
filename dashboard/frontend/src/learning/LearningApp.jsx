@@ -309,8 +309,10 @@ function SimilarityCard({ t, status }) {
 // behind them. Seeded cells are dimmed: they are priors, not measurements.
 function Matrix({ t, status, selected, onSelect }) {
   const categories = status.categories;
-  const isSel = (backend, category) =>
-    selected && selected.backend === backend && selected.category === category;
+  // Selection is per ROW, not per backend: one backend can occupy several rows now (one per
+  // measured model/effort variant), and they must be independently selectable.
+  const isSel = (rowId, category) =>
+    selected && selected.row === rowId && selected.category === category;
 
   return (
     <section className="lr-section">
@@ -336,8 +338,15 @@ function Matrix({ t, status, selected, onSelect }) {
           </thead>
           <tbody>
             {status.rows.map((row) => (
-              <tr key={row.backend}>
-                <th className="lr-matrix-row">{row.backend}</th>
+              <tr key={row.id}>
+                <th className="lr-matrix-row">
+                  {row.backend}
+                  {row.model || row.effort ? (
+                    <span className="lr-variant">
+                      {[row.model, row.effort].filter(Boolean).join(" · ")}
+                    </span>
+                  ) : null}
+                </th>
                 {categories.map((category) => {
                   const cell = row.cells.find((c) => c.category === category);
                   if (!cell)
@@ -350,17 +359,17 @@ function Matrix({ t, status, selected, onSelect }) {
                     <td key={category} className="lr-cell-td">
                       <button
                         className={`lr-cell src-${cell.source} ${
-                          isSel(row.backend, category) ? "sel" : ""
+                          isSel(row.id, category) ? "sel" : ""
                         }`}
                         style={{ background: scoreColor(cell.value) }}
                         onClick={() =>
                           onSelect(
-                            isSel(row.backend, category)
+                            isSel(row.id, category)
                               ? null
-                              : { backend: row.backend, category }
+                              : { row: row.id, backend: row.backend, category }
                           )
                         }
-                        title={`${row.backend} / ${category}: ${cell.value} (${cell.source}, conf ${cell.confidence.toFixed(2)}, ${cell.samples} samples)`}
+                        title={`${row.id} / ${category}: ${cell.value} (${cell.source}, conf ${cell.confidence.toFixed(2)}, ${cell.samples} samples)`}
                       >
                         <span className="lr-cell-v">{cell.value}</span>
                         <span className="lr-cell-src">{SOURCE_BADGE[cell.source] || "?"}</span>
@@ -379,14 +388,14 @@ function Matrix({ t, status, selected, onSelect }) {
 }
 
 function CellDetail({ t, status, selected }) {
-  const row = status.rows.find((r) => r.backend === selected.backend);
+  const row = status.rows.find((r) => r.id === selected.row);
   const cell = row?.cells.find((c) => c.category === selected.category);
   if (!cell) return null;
   const e = cell.evidence;
   return (
     <section className="lr-detail">
       <div className="lr-detail-hd">
-        {selected.backend} · {t(selected.category)}
+        {selected.row} · {t(selected.category)}
       </div>
       <dl className="lr-kv">
         <dt>{t("Stored score")}</dt>

@@ -409,7 +409,9 @@ async fn ensemble_flow() -> anyhow::Result<()> {
     let nav = prompt(cliclack::input("Prompt to fan out").interact())?;
     match nav {
         Nav::Back => Ok(()),
-        Nav::Value(prompt_text) => super::ensemble::run(prompt_text, None, None, None, None).await,
+        Nav::Value(prompt_text) => {
+            super::ensemble::run(prompt_text, None, None, None, None, None).await
+        }
     }
 }
 

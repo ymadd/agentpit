@@ -1,0 +1,491 @@
+//! `agentpit arena run | vote | leaderboard` — blind head-to-head comparison of backends on a
+//! real build task, judged by a human.
+//!
+//! The three subcommands are deliberately separate steps rather than one blocking flow. A round
+//! is N full agentic runs and takes minutes; nobody should have to sit at the terminal for it,
+//! and a judgement made while impatient is a worse judgement. So `run` finishes and exits, `vote`
+//! is picked up whenever the human is ready, and `leaderboard` reads the accumulated record.
+
+use anyhow::{Result, bail};
+use clap::Subcommand;
+use console::style;
+
+use super::cancel::{self, Nav};
+use crate::arena::{
+    self, Contender,
+    rating::{self, Rating},
+    store::{self, Round, Submission},
+};
+use crate::effort::Effort;
+use crate::events::{LegStatus, RunKind, RunLogger};
+use crate::types::BackendId;
+
+/// How much of a patch is printed inline before the judge is pointed at the file instead.
+const PATCH_PREVIEW_LINES: usize = 120;
+
+#[derive(Subcommand, Debug)]
+pub enum Action {
+    /// Run one round: every contender builds the same thing in its own git worktree.
+    Run {
+        /// What to build. Quote multi-word tasks.
+        task: String,
+        /// Backends to enter (comma-separated). Defaults to the `[ensemble]` members.
+        #[arg(long, value_delimiter = ',')]
+        contenders: Option<Vec<BackendId>>,
+        /// Pin the model for every contender. Otherwise each uses its `[backends.<id>].model`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Pin the reasoning effort for every contender. Otherwise each uses its own default.
+        #[arg(long, value_enum)]
+        effort: Option<Effort>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+    /// Judge a finished round: each pair of submissions, shown blind, one vote each.
+    Vote {
+        /// Round to judge. Defaults to the most recent one.
+        #[arg(long)]
+        round: Option<String>,
+    },
+    /// Bradley–Terry standings over every vote cast so far.
+    Leaderboard,
+}
+
+pub async fn run(action: Action) -> Result<()> {
+    match action {
+        Action::Run {
+            task,
+            contenders,
+            model,
+            effort,
+            cwd,
+        } => run_round(task, contenders, model, effort, cwd).await,
+        Action::Vote { round } => vote(round),
+        Action::Leaderboard => leaderboard(),
+    }
+}
+
+async fn run_round(
+    task: String,
+    contenders: Option<Vec<BackendId>>,
+    model: Option<String>,
+    effort: Option<Effort>,
+    cwd: Option<String>,
+) -> Result<()> {
+    let ctx = super::load_context()?;
+    let cwd = super::resolve_cwd(cwd)?;
+
+    let available = ctx.regs.available();
+    let entered: Vec<BackendId> = contenders
+        .unwrap_or_else(|| ctx.loaded.config.ensemble.default_members.clone())
+        .into_iter()
+        .filter(|b| available.contains(b))
+        .collect();
+    if entered.len() < 2 {
+        bail!(
+            "an arena needs at least two available contenders (got {}). Pass --contenders a,b or \
+             configure [ensemble].default_members.",
+            entered.len()
+        );
+    }
+
+    // Each contender runs at ITS OWN model/effort unless a flag pins one for everybody: that is
+    // what makes the result attributable to a (backend, model, effort) triple rather than to a
+    // CLI's name. Resolved up front so the round records what it actually ran.
+    let field: Vec<Contender> = entered
+        .iter()
+        .map(|b| Contender {
+            backend: *b,
+            model: crate::workflow::roles::resolve_model(
+                model.as_deref(),
+                None,
+                ctx.loaded
+                    .config
+                    .backends
+                    .get(b)
+                    .and_then(|o| o.model.as_deref()),
+            ),
+            effort: crate::effort::resolve_effort(
+                effort,
+                None,
+                ctx.loaded.config.backends.get(b).and_then(|o| o.effort),
+            )
+            .map(|e| e.clamp_for(*b)),
+        })
+        .collect();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    super::install_ctrlc_cancel(cancel.clone());
+
+    let logger = RunLogger::start(RunKind::Arena, &entered, &cwd);
+    // The learning fold reads a run's category from its `RouteDecided` line (or re-diagnoses the
+    // task text saved with it), so without this the votes would have nowhere to land. No router
+    // ran — the contenders were chosen by the human — hence the "arena" reason, matching how the
+    // ensemble path labels its own fan-out.
+    logger.route_decided(
+        entered[0],
+        "arena",
+        None,
+        None,
+        None,
+        model.as_deref(),
+        effort.map(|e| e.as_str()),
+        &task,
+    );
+    let round_id = format!("arena-{}", logger.run_id());
+    eprintln!(
+        "{} arena round {round_id}: {} contenders, one worktree each",
+        style("→").bold(),
+        field.len()
+    );
+
+    let round = arena::run_round(
+        &round_id,
+        logger.run_id(),
+        &task,
+        &cwd,
+        &field,
+        &ctx.regs,
+        cancel,
+        |c, i, n| {
+            eprintln!(
+                "  [{}/{n}] {} (model={}, effort={}) …",
+                i,
+                c.backend,
+                c.model.as_deref().unwrap_or("CLI default"),
+                c.effort
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "CLI default".into()),
+            );
+        },
+    )
+    .await;
+
+    let round = match round {
+        Ok(r) => r,
+        Err(e) => {
+            logger.finished(LegStatus::Error);
+            return Err(e);
+        }
+    };
+    logger.finished(LegStatus::Ok);
+
+    let path = store::save_round(&round)?;
+    print!("{}", render_round_summary(&round));
+    println!("saved → {}", style(path.display()).dim());
+    let judgeable = round.blind_order().len();
+    if judgeable < 2 {
+        println!(
+            "{} only {judgeable} contender(s) produced changes — nothing to compare.",
+            style("⚠").yellow()
+        );
+        return Ok(());
+    }
+    println!("judge it with: agentpit arena vote");
+    Ok(())
+}
+
+/// The round as it stands: who produced what, and who is eligible to be judged. Pure.
+fn render_round_summary(round: &Round) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "\nround {} — {}", round.round_id, round.task);
+    for s in &round.submissions {
+        let (added, removed) = arena::worktree::patch_size(&s.patch);
+        let state = match (&s.error, s.judgeable()) {
+            (Some(e), _) => format!("failed: {e}"),
+            (None, false) => "no changes".to_string(),
+            (None, true) => format!("+{added}/-{removed}"),
+        };
+        let _ = writeln!(out, "  [{}] {state}", s.backend);
+    }
+    out
+}
+
+fn vote(round_id: Option<String>) -> Result<()> {
+    let round_id = match round_id {
+        Some(id) => id,
+        None => store::list_rounds().into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("no arena rounds yet — run `agentpit arena run` first")
+        })?,
+    };
+    let round = store::load_round(&round_id)?;
+    let labels: std::collections::BTreeMap<usize, char> = round
+        .blind_order()
+        .into_iter()
+        .map(|(l, i)| (i, l))
+        .collect();
+    let matchups = round.matchups();
+    if matchups.is_empty() {
+        bail!("round {round_id} has fewer than two judgeable submissions");
+    }
+
+    println!("\n{}", style(format!("round {round_id}")).bold());
+    println!("task: {}\n", round.task);
+    println!(
+        "{}",
+        style("Submissions are anonymous until every vote is in.").dim()
+    );
+
+    let mut cast = 0usize;
+    for (a, b) in &matchups {
+        let (sa, sb) = (&round.submissions[*a], &round.submissions[*b]);
+        let (la, lb) = (labels[a], labels[b]);
+        print_submission(la, sa);
+        print_submission(lb, sb);
+
+        let choice = cancel::prompt(
+            cliclack::select(format!("Which is the better work — {la} or {lb}?"))
+                .item(Some(true), format!("{la}"), "")
+                .item(Some(false), format!("{lb}"), "")
+                .item(None, "too close to call", "recorded as a tie")
+                .interact(),
+        )?;
+        let Nav::Value(pick) = choice else {
+            println!("(stopped — {cast} vote(s) recorded)");
+            break;
+        };
+
+        let vote = match pick {
+            Some(true) => store::Vote {
+                round_id: round_id.clone(),
+                ts: now_ms(),
+                winner: Some(sa.backend),
+                loser: Some(sb.backend),
+                tie: false,
+            },
+            Some(false) => store::Vote {
+                round_id: round_id.clone(),
+                ts: now_ms(),
+                winner: Some(sb.backend),
+                loser: Some(sa.backend),
+                tie: false,
+            },
+            None => store::Vote {
+                round_id: round_id.clone(),
+                ts: now_ms(),
+                winner: None,
+                loser: None,
+                tie: true,
+            },
+        };
+        store::append_vote(&vote)?;
+        cast += 1;
+    }
+
+    if cast > 0 {
+        // The reveal comes only after voting, never between comparisons: seeing that A was your
+        // usual favourite would steer every remaining pick in the same round.
+        println!("\n{}", style("reveal").bold());
+        for (label, i) in round.blind_order() {
+            let s = &round.submissions[i];
+            println!("  {label} = {}", describe(s));
+        }
+        emit_grades(&round);
+    }
+    println!("\n{cast} vote(s) recorded. `agentpit arena leaderboard` for the standings.");
+    Ok(())
+}
+
+/// Feed this round's votes into the ordinary learning fold as `MemberGraded` labels.
+///
+/// A human's head-to-head verdict is the strongest signal agentpit can get, but it is emitted
+/// through the SAME channel as every other grade rather than as a new privileged score: the
+/// sample gate and the `benchmarked > learned` rule still apply. A pile of arena votes should
+/// move the learned scores, not silently outrank a measured benchmark.
+fn emit_grades(round: &Round) {
+    let votes: Vec<store::Vote> = store::load_votes()
+        .into_iter()
+        .filter(|v| v.round_id == round.round_id)
+        .collect();
+    if votes.is_empty() {
+        return;
+    }
+    let table = rating::rate(&arena::pairs(&votes));
+    if table.is_empty() {
+        return;
+    }
+    let logger = RunLogger::resume(&round.run_id);
+    for (rank, r) in table.iter().enumerate() {
+        logger.member_graded(r.backend, r.score, Some((rank + 1) as u8));
+    }
+}
+
+fn describe(s: &Submission) -> String {
+    let variant = match (&s.model, s.effort) {
+        (None, None) => String::new(),
+        (m, e) => format!(
+            " ({} / {})",
+            m.as_deref().unwrap_or("CLI default"),
+            e.map(|e| e.to_string())
+                .unwrap_or_else(|| "CLI default".into())
+        ),
+    };
+    format!("{}{variant}", s.backend)
+}
+
+fn print_submission(label: char, s: &Submission) {
+    let (added, removed) = arena::worktree::patch_size(&s.patch);
+    println!(
+        "\n{} {}",
+        style(format!("── {label} ──")).cyan().bold(),
+        style(format!("+{added}/-{removed}")).dim()
+    );
+    if !s.binary_files.is_empty() {
+        println!(
+            "{}",
+            style(format!(
+                "({} binary file(s) omitted: {})",
+                s.binary_files.len(),
+                s.binary_files.join(", ")
+            ))
+            .dim()
+        );
+    }
+    if !s.summary.is_empty() {
+        println!("{}", style(clamp_lines(&s.summary, 12)).dim());
+    }
+    println!("{}", clamp_lines(&s.patch, PATCH_PREVIEW_LINES));
+}
+
+/// First `max` lines, with an explicit marker when there was more. Silently truncating would let
+/// a judge compare a whole small patch against the opening of a large one without knowing it.
+fn clamp_lines(text: &str, max: usize) -> String {
+    let total = text.lines().count();
+    if total <= max {
+        return text.to_string();
+    }
+    let head: Vec<&str> = text.lines().take(max).collect();
+    format!(
+        "{}\n… {} more line(s) not shown",
+        head.join("\n"),
+        total - max
+    )
+}
+
+fn leaderboard() -> Result<()> {
+    let votes = store::load_votes();
+    let decisive = arena::pairs(&votes);
+    let table = rating::rate(&decisive);
+    if table.is_empty() {
+        println!("no arena votes yet — run `agentpit arena run` then `agentpit arena vote`.");
+        return Ok(());
+    }
+    print!("{}", render_leaderboard(&table, votes.len()));
+    Ok(())
+}
+
+/// The standings. Pure so the wording of the provisional warning is testable.
+fn render_leaderboard(table: &[Rating], total_votes: usize) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let ties = total_votes - table.iter().map(|r| r.wins as usize).sum::<usize>();
+    let _ = writeln!(
+        out,
+        "\narena — {total_votes} vote(s), {ties} tie(s)\n  {:<14} {:>5}  {:>11}  {:>7}",
+        "contender", "score", "90% range", "record"
+    );
+    for r in table {
+        let _ = writeln!(
+            out,
+            "  {:<14} {:>5}  {:>11}  {:>7}{}",
+            r.backend.as_str(),
+            r.score,
+            format!("{}–{}", r.low, r.high),
+            format!("{}-{}", r.wins, r.losses),
+            match r.provisional() {
+                true => "  provisional",
+                false => "",
+            }
+        );
+    }
+    if table.iter().any(Rating::provisional) {
+        let _ = writeln!(
+            out,
+            "\n  provisional = fewer than {} comparisons, or a range wide enough that the order \
+             could flip.\n  These are rankings from a handful of votes, not measurements.",
+            rating::MIN_COMPARISONS
+        );
+    }
+    out
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn submission(backend: BackendId, patch: &str, error: Option<&str>) -> Submission {
+        Submission {
+            backend,
+            model: None,
+            effort: None,
+            patch: patch.into(),
+            binary_files: Vec::new(),
+            summary: String::new(),
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn round_summary_separates_failed_from_empty_from_real_work() {
+        let round = Round {
+            round_id: "r1".into(),
+            run_id: "run".into(),
+            task: "add a flag".into(),
+            cwd: "/tmp".into(),
+            submissions: vec![
+                submission(BackendId::Claude, "+++ b/x\n+one\n+two\n-old\n", None),
+                submission(BackendId::Codex, "", None),
+                submission(BackendId::Opencode, "", Some("timed out")),
+            ],
+        };
+        let out = render_round_summary(&round);
+        assert!(out.contains("[claude] +2/-1"), "{out}");
+        // "produced nothing" and "crashed" are different facts and must not both read as a loss.
+        assert!(out.contains("[codex] no changes"), "{out}");
+        assert!(out.contains("[opencode] failed: timed out"), "{out}");
+    }
+
+    #[test]
+    fn a_truncated_patch_says_so() {
+        let long = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shown = clamp_lines(&long, 10);
+        assert_eq!(shown.lines().count(), 11, "10 lines plus the marker");
+        assert!(shown.contains("190 more line(s) not shown"), "{shown}");
+        // Short input is passed through untouched — no marker to mislead the judge.
+        assert_eq!(clamp_lines("a\nb", 10), "a\nb");
+    }
+
+    #[test]
+    fn the_leaderboard_marks_a_thin_record_provisional_and_explains_why() {
+        let thin = rating::rate(&[rating::Pair {
+            winner: BackendId::Codex,
+            loser: BackendId::Claude,
+        }]);
+        let out = render_leaderboard(&thin, 1);
+        assert!(out.contains("provisional"), "{out}");
+        assert!(out.contains("not measurements"), "{out}");
+    }
+
+    #[test]
+    fn ties_are_counted_in_the_header_rather_than_dropped() {
+        let table = rating::rate(&[rating::Pair {
+            winner: BackendId::Codex,
+            loser: BackendId::Claude,
+        }]);
+        // Three votes were cast, one was decisive: the other two were ties and the header has
+        // to say so, else the record looks more decisive than the judge was.
+        let out = render_leaderboard(&table, 3);
+        assert!(out.contains("3 vote(s), 2 tie(s)"), "{out}");
+    }
+}

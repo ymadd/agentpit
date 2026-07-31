@@ -97,6 +97,10 @@ pub enum RunKind {
     /// A `profile run` gold-bench sweep: one backend graded across the suite. Single-member,
     /// sequential — it shows in the dashboard swarm like any other run rather than staying invisible.
     Bench,
+    /// An `agentpit arena` round: every contender builds the same thing in its own worktree, to
+    /// be judged blind afterwards. Multi-member like an ensemble, but the members never see each
+    /// other's work and no aggregator synthesizes them.
+    Arena,
 }
 
 impl RunKind {
@@ -111,6 +115,7 @@ impl RunKind {
             RunKind::Ensemble => "ensemble",
             RunKind::Workflow => "workflow",
             RunKind::Bench => "bench",
+            RunKind::Arena => "arena",
         }
     }
 }
@@ -266,6 +271,12 @@ pub enum Event {
         /// opencode above all) can be analyzed before any model-level routing exists.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// The reasoning effort the dispatch actually ran at (`--effort` > role effort > backend
+        /// default), already clamped to what the backend can express. Same best-effort contract
+        /// as `model`: paths that pin no single effort omit it. Recorded so the learning fold and
+        /// the gold bench can tell a backend's rungs apart rather than averaging over them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
         task_hash: String,
     },
     /// A per-member grade extracted from an ensemble aggregator's structured verdict
@@ -644,6 +655,16 @@ impl RunLogger {
         Self::start_with_role(kind, members, cwd, None)
     }
 
+    /// Attach to an ALREADY-STARTED run to append more events to it, without emitting a second
+    /// `RunStarted`. For work that is judged after the fact — an arena round voted on hours
+    /// later — whose events belong to the original run rather than to the moment of judging.
+    pub fn resume(run_id: &str) -> Self {
+        RunLogger {
+            run_id: run_id.to_string(),
+            enabled: events_enabled(),
+        }
+    }
+
     /// Like [`start`], but also records the workflow ROLE this run plays (e.g. "reviewer") so the
     /// dashboard can label a dispatched sub-agent by role, not just its backend. `parent_run_id`
     /// and `depth` are read from the environment (`AGENTPIT_PARENT_RUN_ID` / `AGENTPIT_WORKFLOW_DEPTH`,
@@ -750,6 +771,7 @@ impl RunLogger {
         score: Option<u8>,
         diagnose_confidence: Option<f32>,
         model: Option<&str>,
+        effort: Option<&str>,
         task: &str,
     ) {
         let task_hash = record_task_text(task);
@@ -762,6 +784,7 @@ impl RunLogger {
             score,
             diagnose_confidence,
             model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
             task_hash,
         });
     }
@@ -1105,6 +1128,7 @@ mod tests {
             score: Some(90),
             diagnose_confidence: Some(0.7),
             model: Some("gpt-5-codex".into()),
+            effort: Some("xhigh".into()),
             task_hash: "deadbeefdeadbeef".into(),
         };
         let json = serde_json::to_string(&route).unwrap();

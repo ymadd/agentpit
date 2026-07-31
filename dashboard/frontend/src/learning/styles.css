@@ -179,6 +179,15 @@
   padding-right: 8px;
   white-space: nowrap;
 }
+/* The measured (model, effort) a row is about — a second, dimmer line under the backend name,
+   so several rungs of one backend read as variants of it rather than as unrelated backends. */
+.lr-variant {
+  display: block;
+  font-size: 9px;
+  font-weight: 400;
+  color: var(--text-3, var(--text-2));
+  opacity: 0.75;
+}
 .lr-matrix-corner { min-width: 70px; }
 .lr-cell-td { padding: 0; }
 .lr-cell {

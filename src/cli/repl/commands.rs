@@ -137,7 +137,8 @@ pub async fn handle_slash(
                 eprintln!("{}", style("usage: /ensemble <prompt>").yellow());
             } else {
                 let cwd_str = state.cwd.display().to_string();
-                let _ = crate::cli::ensemble::run(prompt, None, None, None, Some(cwd_str)).await;
+                let _ =
+                    crate::cli::ensemble::run(prompt, None, None, None, None, Some(cwd_str)).await;
             }
             Ok((state, LoopControl::Continue))
         }
@@ -165,6 +166,7 @@ pub async fn handle_slash(
                     None,
                     None,
                     false,
+                    None,
                     None,
                     Some(cwd_str),
                 )

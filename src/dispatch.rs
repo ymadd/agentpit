@@ -136,6 +136,7 @@ async fn with_timeout<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     backend: BackendId,
     task: &str,
@@ -144,6 +145,7 @@ pub async fn dispatch(
     on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
     regs: &Registries,
     model: Option<&str>,
+    effort: Option<crate::effort::Effort>,
 ) -> Result<DispatchResult> {
     // A child of the caller's token: the parent (Ctrl-C) still cancels every member, but a
     // per-member timeout cancels only this child, leaving concurrent siblings untouched.
@@ -154,6 +156,7 @@ pub async fn dispatch(
             cancel: child.clone(),
             on_stdout: Some(on_chunk.clone()),
             model: model.map(str::to_string),
+            effort,
         };
         let fut = crate::exec::run(exec.as_ref(), task, options);
         let outcome = with_timeout(backend, &child, fut).await?;
@@ -168,7 +171,15 @@ pub async fn dispatch(
         });
     }
     if let Some(acp) = regs.acps.get(&backend) {
-        let fut = crate::acp::run(acp.as_ref(), task, cwd, on_chunk, child.clone(), model);
+        let fut = crate::acp::run(
+            acp.as_ref(),
+            task,
+            cwd,
+            on_chunk,
+            child.clone(),
+            model,
+            effort,
+        );
         let outcome = with_timeout(backend, &child, fut).await?;
         return Ok(DispatchResult {
             backend,
@@ -195,7 +206,12 @@ mod tests {
         fn id(&self) -> BackendId {
             BackendId::Opencode
         }
-        fn build_spec(&self, _task: &str, _model: Option<&str>) -> ExecSpec {
+        fn build_spec(
+            &self,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<crate::effort::Effort>,
+        ) -> ExecSpec {
             ExecSpec {
                 command: "true".into(),
                 args: vec![],
@@ -210,7 +226,11 @@ mod tests {
         fn id(&self) -> BackendId {
             BackendId::Opencode
         }
-        fn spawn_spec(&self, _model: Option<&str>) -> crate::acp::SpawnSpec {
+        fn spawn_spec(
+            &self,
+            _model: Option<&str>,
+            _effort: Option<crate::effort::Effort>,
+        ) -> crate::acp::SpawnSpec {
             crate::acp::SpawnSpec {
                 command_line: "true".into(),
             }
@@ -247,7 +267,11 @@ mod tests {
             fn id(&self) -> BackendId {
                 BackendId::Opencode
             }
-            fn spawn_spec(&self, _model: Option<&str>) -> crate::acp::SpawnSpec {
+            fn spawn_spec(
+                &self,
+                _model: Option<&str>,
+                _effort: Option<crate::effort::Effort>,
+            ) -> crate::acp::SpawnSpec {
                 crate::acp::SpawnSpec {
                     command_line: "true".into(),
                 }

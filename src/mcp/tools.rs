@@ -37,6 +37,7 @@ use crate::cli::ensemble::{
     dispatch_to_outcome, render_concatenated,
 };
 use crate::dispatch::{Registries, dispatch, resolve_transport};
+use crate::effort::Effort;
 use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::types::BackendId;
 
@@ -54,6 +55,10 @@ pub struct DispatchTaskRequest {
     /// Optional model to pin (e.g. "opus"). Overrides the role's configured model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional reasoning effort to pin (low | medium | high | xhigh | max). Overrides the role's
+    /// configured effort; a rung the backend cannot express is clamped down.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// The task / prompt to give the backend.
     pub task: String,
 }
@@ -71,6 +76,10 @@ pub struct RunEnsembleRequest {
     /// Optional model to pin for every member + the aggregator (e.g. "opus").
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional reasoning effort for every member + the aggregator (low | medium | high | xhigh |
+    /// max). Clamped per backend to the rungs that backend can express.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// Parameters for the `run_workflow` tool.
@@ -243,7 +252,12 @@ impl AgentpitTools {
         // At most one of backend|role addresses the dispatch (both is ambiguous — a structured
         // error mirroring the CLI's `--role`/`--backend` mutual exclusion). Passing NEITHER
         // routes the task through the learned router, exactly like a bare `agentpit rescue`.
-        let (backend, task, model, role, decision) = match (&req.backend, &req.role) {
+        let req_effort = match req.effort.as_deref().map(str::parse::<Effort>) {
+            Some(Ok(e)) => Some(e),
+            Some(Err(e)) => return Ok(tool_error(e)),
+            None => None,
+        };
+        let (backend, task, model, effort, role, decision) = match (&req.backend, &req.role) {
             (Some(_), Some(_)) => {
                 return Ok(tool_error(
                     "'backend' and 'role' are mutually exclusive; pass at most one".to_string(),
@@ -270,10 +284,26 @@ impl AgentpitTools {
                         .get(&backend)
                         .and_then(|o| o.model.as_deref()),
                 );
-                (backend, req.task, model, None, Some(decision))
+                let effort = crate::effort::resolve_effort(
+                    req_effort,
+                    None,
+                    self.config.backends.get(&backend).and_then(|o| o.effort),
+                );
+                (backend, req.task, model, effort, None, Some(decision))
             }
             (Some(b), None) => match b.parse::<BackendId>() {
-                Ok(b) => (b, req.task, req.model.clone(), None, None),
+                Ok(b) => (
+                    b,
+                    req.task,
+                    req.model.clone(),
+                    crate::effort::resolve_effort(
+                        req_effort,
+                        None,
+                        self.config.backends.get(&b).and_then(|o| o.effort),
+                    ),
+                    None,
+                    None,
+                ),
                 Err(e) => return Ok(tool_error(format!("unknown backend '{b}': {e}"))),
             },
             (None, Some(role_name)) => {
@@ -292,7 +322,16 @@ impl AgentpitTools {
                             resolved.model.as_deref(),
                             None,
                         );
-                        (resolved.backend, wrapped, model, Some(resolved.name), None)
+                        let effort =
+                            crate::effort::resolve_effort(req_effort, resolved.effort, None);
+                        (
+                            resolved.backend,
+                            wrapped,
+                            model,
+                            effort,
+                            Some(resolved.name),
+                            None,
+                        )
                     }
                     Err(e) => return Ok(tool_error(format!("{e:#}"))),
                 }
@@ -308,8 +347,9 @@ impl AgentpitTools {
         // An address-less dispatch logs the router's real decision (reason/category/confidence),
         // so workflow sub-dispatches both use and feed the learned routing loop; a pinned one
         // logs "explicit"/"role" as before.
+        let effort = effort.map(|e| e.clamp_for(backend));
         match &decision {
-            Some(d) => d.log(&logger, &task, model.as_deref()),
+            Some(d) => d.log(&logger, &task, model.as_deref(), effort),
             None => logger.route_decided(
                 backend,
                 if role.is_some() { "role" } else { "explicit" },
@@ -317,6 +357,7 @@ impl AgentpitTools {
                 None,
                 None,
                 model.as_deref(),
+                effort.map(|e| e.as_str()),
                 &task,
             ),
         }
@@ -328,6 +369,7 @@ impl AgentpitTools {
             self.regs.clone(),
             logger.clone(),
             model,
+            effort,
         )
         .await;
         logger.finished(if outcome.output.is_some() {
@@ -351,6 +393,11 @@ impl AgentpitTools {
         // while preserving order: running the same backend twice on one prompt is wasteful, and
         // deduping bounds the fan-out to the distinct known backends so a client cannot ask us to
         // spawn thousands of identical processes.
+        let req_effort = match req.effort.as_deref().map(str::parse::<Effort>) {
+            Some(Ok(e)) => Some(e),
+            Some(Err(e)) => return Ok(tool_error(e)),
+            None => None,
+        };
         let mut members = Vec::with_capacity(req.members.len());
         let mut seen = HashSet::new();
         for m in &req.members {
@@ -396,6 +443,7 @@ impl AgentpitTools {
                 None,
                 None,
                 req.model.as_deref(),
+                req_effort.map(|e| e.as_str()),
                 &req.prompt,
             );
         }
@@ -407,8 +455,16 @@ impl AgentpitTools {
             let cancel = cancel.clone();
             let logger = logger.clone();
             let model = req.model.clone();
+            // Each member falls back to its own `[backends.<id>].effort` and is clamped to the
+            // rungs it can express, exactly like the CLI ensemble.
+            let effort = crate::effort::resolve_effort(
+                req_effort,
+                None,
+                self.config.backends.get(&b).and_then(|o| o.effort),
+            )
+            .map(|e| e.clamp_for(b));
             set.spawn(async move {
-                dispatch_member_logged(b, prompt, cwd, cancel, regs, logger, model).await
+                dispatch_member_logged(b, prompt, cwd, cancel, regs, logger, model, effort).await
             });
         }
         let mut outcomes: Vec<MemberOutcome> = Vec::with_capacity(set.len());
@@ -446,6 +502,12 @@ impl AgentpitTools {
                     on_chunk,
                     &self.regs,
                     req.model.as_deref(),
+                    crate::effort::resolve_effort(
+                        req_effort,
+                        None,
+                        self.config.backends.get(&agg).and_then(|o| o.effort),
+                    )
+                    .map(|e| e.clamp_for(agg)),
                 )
                 .await
                 {
@@ -556,6 +618,7 @@ impl AgentpitTools {
             req.max_depth,
             req.use_mcp.unwrap_or(false),
             req.model,
+            None, // effort: the MCP workflow tool has no effort knob; config defaults still apply
             self.cwd.clone(),
             CancellationToken::new(),
             noop_sink(),
@@ -686,7 +749,7 @@ impl AgentpitTools {
             &self.cwd,
         );
         // The critic leg carries the refutation; log it as the run's routed backend.
-        logger.route_decided(critic, "refute", None, None, None, None, &req.task);
+        logger.route_decided(critic, "refute", None, None, None, None, None, &req.task);
 
         let bundle = crate::workflow::converse::run_refute(
             &req.task,
@@ -763,6 +826,7 @@ fn parse_opt_backend(value: Option<&str>, role: &str) -> Result<Option<BackendId
 /// `cli::ensemble::run_one_member` minus the TTY reporting the MCP server has no terminal for. A
 /// `not registered` outcome is recorded as `Skipped` (the backend was never dispatched), not an
 /// execution error.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_member_logged(
     backend: BackendId,
     prompt: String,
@@ -771,6 +835,7 @@ async fn dispatch_member_logged(
     regs: Arc<Registries>,
     logger: RunLogger,
     model: Option<String>,
+    effort: Option<Effort>,
 ) -> MemberOutcome {
     logger.member_started(backend, false);
     let started = Instant::now();
@@ -783,6 +848,7 @@ async fn dispatch_member_logged(
         on_chunk,
         &regs,
         model.as_deref(),
+        effort,
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -828,7 +894,12 @@ mod tests {
         fn id(&self) -> BackendId {
             BackendId::Codex
         }
-        fn build_spec(&self, _task: &str, _model: Option<&str>) -> ExecSpec {
+        fn build_spec(
+            &self,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<Effort>,
+        ) -> ExecSpec {
             ExecSpec {
                 command: "true".into(),
                 args: vec![],
@@ -901,6 +972,7 @@ mod tests {
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
+                effort: None,
                 backend: Some("codex".into()),
                 role: None,
                 task: "noop".into(),
@@ -915,6 +987,7 @@ mod tests {
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
+                effort: None,
                 backend: Some("imaginary".into()),
                 role: None,
                 task: "noop".into(),
@@ -939,6 +1012,7 @@ mod tests {
                 backends: vec![BackendId::Codex],
                 prompt: Some("You review.".into()),
                 model: None,
+                effort: None,
             },
         );
         tools().with_roles(roles)
@@ -951,6 +1025,7 @@ mod tests {
         let res = tools_with_reviewer_role()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
+                effort: None,
                 backend: None,
                 role: Some("reviewer".into()),
                 task: "noop".into(),
@@ -976,6 +1051,7 @@ mod tests {
         let res = tools_with_reviewer_role()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
+                effort: None,
                 backend: None,
                 role: Some("ghost".into()),
                 task: "noop".into(),
@@ -998,6 +1074,7 @@ mod tests {
         let res = tools_with_reviewer_role()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
+                effort: None,
                 backend: Some("codex".into()),
                 role: Some("reviewer".into()),
                 task: "noop".into(),
@@ -1024,6 +1101,7 @@ mod tests {
         let res = tools()
             .dispatch_task(Parameters(DispatchTaskRequest {
                 model: None,
+                effort: None,
                 backend: None,
                 role: None,
                 task: "noop".into(),
@@ -1047,6 +1125,7 @@ mod tests {
         let res = tools()
             .run_ensemble(Parameters(RunEnsembleRequest {
                 model: None,
+                effort: None,
                 members: vec![],
                 prompt: "hi".into(),
                 aggregator: None,
@@ -1065,6 +1144,7 @@ mod tests {
         let res = tools()
             .run_ensemble(Parameters(RunEnsembleRequest {
                 model: None,
+                effort: None,
                 members: vec!["codex".into(), "codex".into(), "codex".into()],
                 prompt: "noop".into(),
                 aggregator: None,

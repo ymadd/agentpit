@@ -39,6 +39,8 @@ fn seeded_profile(backend: BackendId, rows: &[(TaskCategory, u8)]) -> Capability
         telemetry: Default::default(),
         source: ProfileSource::Seeded,
         measured_at: None,
+        model: None,
+        effort: None,
     }
 }
 

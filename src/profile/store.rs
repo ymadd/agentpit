@@ -24,11 +24,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use super::ProfileSet;
 use super::category::TaskCategory;
 use super::model::{CapabilityProfile, ProfileSource, Score, TelemetryStats};
 use super::seed::seeded_profiles;
+use super::{ProfileKey, ProfileSet};
 use crate::config::xdg_config_home;
+use crate::effort::Effort;
 use crate::types::BackendId;
 
 /// Path to `profiles.toml` under the XDG config home (`~/.config/agentpit/profiles.toml`).
@@ -37,14 +38,26 @@ pub fn profiles_path() -> PathBuf {
     xdg_config_home().join("agentpit").join("profiles.toml")
 }
 
-/// One backend's row on the wire. The backend itself is the map key, so it is not repeated
-/// here. Scalar fields (`source`, `measured_at`) precede the table fields (`scores`,
-/// `telemetry`) so the TOML serializer never has to emit a value after a table.
+/// One row on the wire. Scalar fields (`source`, `measured_at`, `model`, `effort`) precede the
+/// table fields (`scores`, `telemetry`) so the TOML serializer never has to emit a value after a
+/// table.
+///
+/// The map key names the backend and, for a measured variant, decorates it with the variant —
+/// `codex` vs `codex@gpt-5.4-codex/xhigh`. The DECORATION IS COSMETIC: `model` / `effort` inside
+/// the entry are authoritative, so a model id containing any character at all round-trips
+/// without an escaping scheme. Only the part before the first `@` is parsed back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProfileEntry {
     source: ProfileSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     measured_at: Option<String>,
+    /// What this row is about. Absent in every file written before the effort ladder existed,
+    /// which is why both are `#[serde(default)]` — an old file loads as the unpinned row it
+    /// always was, and routing is unchanged for anyone who never pins anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<Effort>,
     #[serde(default)]
     scores: BTreeMap<TaskCategory, WireScore>,
     #[serde(default, skip_serializing_if = "telemetry_is_empty")]
@@ -126,9 +139,9 @@ impl ProfilesFile {
     fn from_set(set: &ProfileSet) -> Self {
         let profile = set
             .iter()
-            .map(|(backend, p)| {
+            .map(|(key, p)| {
                 (
-                    backend.to_string(),
+                    wire_key(key),
                     ProfileEntry {
                         source: p.source,
                         measured_at: p.measured_at.clone(),
@@ -138,6 +151,8 @@ impl ProfilesFile {
                             .map(|(category, score)| (*category, WireScore::from_score(score)))
                             .collect(),
                         telemetry: p.telemetry.clone(),
+                        model: p.model.clone(),
+                        effort: p.effort,
                     },
                 )
             })
@@ -151,7 +166,7 @@ impl ProfilesFile {
         let profiles = self
             .profile
             .into_iter()
-            .filter_map(|(name, entry)| Some((name.parse::<BackendId>().ok()?, entry)))
+            .filter_map(|(name, entry)| Some((backend_of(&name)?, entry)))
             .map(|(backend, entry)| CapabilityProfile {
                 backend,
                 scores: entry
@@ -162,9 +177,26 @@ impl ProfilesFile {
                 telemetry: entry.telemetry,
                 source: entry.source,
                 measured_at: entry.measured_at,
+                model: entry.model,
+                effort: entry.effort,
             });
         ProfileSet::from_profiles(profiles)
     }
+}
+
+/// The TOML table name for one row: the bare backend for an unpinned row (byte-identical to
+/// every file written before variants existed), else `<backend>@<model>/<effort>`.
+fn wire_key(key: &ProfileKey) -> String {
+    match key.is_unpinned() {
+        true => key.backend.to_string(),
+        false => format!("{}@{}", key.backend, key.variant_label()),
+    }
+}
+
+/// The backend a wire key names: everything before the first `@`. The variant decoration is not
+/// parsed — the entry's own `model`/`effort` fields carry that.
+fn backend_of(name: &str) -> Option<BackendId> {
+    name.split('@').next()?.parse::<BackendId>().ok()
 }
 
 /// Load the capability profiles from `profiles.toml`.
@@ -266,9 +298,11 @@ mod tests {
         let reloaded = load_profiles(Some(&path)).unwrap();
 
         assert_eq!(reloaded.len(), original.len());
-        for (backend, profile) in original.iter() {
-            let got = reloaded.get(*backend).expect("backend survives round-trip");
-            assert_eq!(got, profile, "profile for {backend:?} differs after reload");
+        for (key, profile) in original.iter() {
+            let got = reloaded
+                .resolve(key.backend, key.model.as_deref(), key.effort)
+                .expect("row survives round-trip");
+            assert_eq!(got, profile, "profile for {key:?} differs after reload");
         }
     }
 
@@ -301,6 +335,57 @@ mod tests {
         let reloaded = load_profiles(Some(&path)).unwrap();
 
         assert_eq!(reloaded.get(BackendId::Codex).unwrap(), &profile);
+    }
+
+    /// Variant rows survive the TOML round-trip, including a model id full of characters that
+    /// would break any separator-based key encoding — the key decoration is cosmetic, the
+    /// entry's own `model`/`effort` fields are what is read back.
+    #[test]
+    fn round_trips_variant_rows_keyed_by_model_and_effort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("profiles.toml");
+
+        let hostile = "cloudflare-ai-gateway/workers-ai/@cf/zai-org/glm-5.2";
+        let cell = |value: u8| Score {
+            value,
+            samples: 3,
+            confidence: 0.6,
+            source: ProfileSource::Benchmarked,
+        };
+        let mut low = CapabilityProfile::for_variant(
+            BackendId::Opencode,
+            Some(hostile.into()),
+            Some(Effort::Low),
+        );
+        low.source = ProfileSource::Benchmarked;
+        low.scores.insert(TaskCategory::Coding, cell(41));
+        let mut max = CapabilityProfile::for_variant(
+            BackendId::Opencode,
+            Some(hostile.into()),
+            Some(Effort::Max),
+        );
+        max.source = ProfileSource::Benchmarked;
+        max.scores.insert(TaskCategory::Coding, cell(88));
+        let unpinned = CapabilityProfile::seeded(BackendId::Opencode);
+
+        let set = ProfileSet::from_profiles([low.clone(), max.clone(), unpinned.clone()]);
+        save_profiles(&set, &path).unwrap();
+        let reloaded = load_profiles(Some(&path)).unwrap();
+
+        assert_eq!(reloaded.len(), 3, "three rows for one backend");
+        assert_eq!(
+            reloaded
+                .resolve(BackendId::Opencode, Some(hostile), Some(Effort::Low))
+                .unwrap(),
+            &low
+        );
+        assert_eq!(
+            reloaded
+                .resolve(BackendId::Opencode, Some(hostile), Some(Effort::Max))
+                .unwrap(),
+            &max
+        );
+        assert_eq!(reloaded.get(BackendId::Opencode).unwrap(), &unpinned);
     }
 
     #[test]

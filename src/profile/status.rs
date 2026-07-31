@@ -15,10 +15,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
-use super::ProfileSet;
 use super::category::TaskCategory;
 use super::learn::{Label, LabelSource, fold_scores};
 use super::model::ProfileSource;
+use super::{ProfileKey, ProfileSet};
 use crate::types::BackendId;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -91,7 +91,17 @@ pub struct Cell {
 /// One backend's row of the matrix.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Row {
+    /// Stable identity of this ROW, not of the backend: `codex` for the unpinned row,
+    /// `codex@gpt-5.4-codex/xhigh` for a measured variant. The frontend keys and selects on
+    /// this, since one backend can now occupy several rows.
+    pub id: String,
     pub backend: BackendId,
+    /// What this row is about beyond the backend: the pinned model / effort it was measured
+    /// for. Both `None` = the unpinned row (the backend on its CLI's own defaults).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// The profile-level summary provenance (highest-priority cell present).
     pub summary_source: ProfileSource,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,7 +162,10 @@ pub fn label_mix(labels: &[Label]) -> SourceMix {
     mix
 }
 
-/// Per-cell evidence for every `(backend, category)` pair that has at least one label.
+/// Per-cell evidence for every `(variant, category)` pair that has at least one label.
+///
+/// Keyed by [`ProfileKey`] rather than by backend so the evidence bar under a `high`-effort row
+/// counts only the runs that actually ran at `high`.
 ///
 /// `projected` reuses the real fold (`fold_scores` with the gate opened to 1) rather than
 /// re-deriving the posterior here, so the number shown is the number that would be written.
@@ -160,12 +173,15 @@ pub fn evidence(
     labels: &[Label],
     min_samples: u16,
     set: &ProfileSet,
-) -> BTreeMap<(BackendId, TaskCategory), Evidence> {
+) -> BTreeMap<(ProfileKey, TaskCategory), Evidence> {
     let projected = fold_scores(labels, 1);
-    let mut out: BTreeMap<(BackendId, TaskCategory), Evidence> = BTreeMap::new();
+    let mut out: BTreeMap<(ProfileKey, TaskCategory), Evidence> = BTreeMap::new();
 
     for label in labels {
-        let key = (label.backend, label.category);
+        let key = (
+            ProfileKey::new(label.backend, label.model.clone(), label.effort),
+            label.category,
+        );
         let entry = out.entry(key).or_insert_with(|| Evidence {
             labels: 0,
             good: 0,
@@ -187,14 +203,14 @@ pub fn evidence(
         entry.last_ts = entry.last_ts.max(label.ts);
     }
 
-    for ((backend, category), entry) in out.iter_mut() {
-        if let Some(score) = projected.get(backend).and_then(|c| c.get(category)) {
+    for ((key, category), entry) in out.iter_mut() {
+        if let Some(score) = projected.get(key).and_then(|c| c.get(category)) {
             entry.projected = score.value;
             entry.projected_confidence = score.confidence;
         }
         entry.promoted = entry.labels >= min_samples;
         entry.outranked = set
-            .get(*backend)
+            .resolve(key.backend, key.model.as_deref(), key.effort)
             .and_then(|p| p.score(*category))
             .is_some_and(|s| s.source == ProfileSource::Benchmarked);
     }
@@ -204,11 +220,17 @@ pub fn evidence(
 /// The matrix as rows, each cell carrying the telemetry behind it.
 pub fn rows(
     set: &ProfileSet,
-    evidence: &BTreeMap<(BackendId, TaskCategory), Evidence>,
+    evidence: &BTreeMap<(ProfileKey, TaskCategory), Evidence>,
 ) -> Vec<Row> {
     set.iter()
-        .map(|(backend, profile)| Row {
-            backend: *backend,
+        .map(|(key, profile)| Row {
+            id: match key.is_unpinned() {
+                true => key.backend.to_string(),
+                false => format!("{}@{}", key.backend, key.variant_label()),
+            },
+            backend: key.backend,
+            model: profile.model.clone(),
+            effort: profile.effort.map(|e| e.to_string()),
             summary_source: profile.source,
             measured_at: profile.measured_at.clone(),
             cells: profile
@@ -220,7 +242,7 @@ pub fn rows(
                     confidence: score.confidence,
                     samples: score.samples,
                     source: score.source,
-                    evidence: evidence.get(&(*backend, *category)).cloned(),
+                    evidence: evidence.get(&(key.clone(), *category)).cloned(),
                 })
                 .collect(),
         })
@@ -315,6 +337,8 @@ mod tests {
     ) -> Label {
         Label {
             backend,
+            model: None,
+            effort: None,
             category,
             success,
             source,
@@ -389,7 +413,7 @@ mod tests {
         ];
         let set = ProfileSet::default();
         let found = evidence(&labels, 5, &set);
-        let cell = &found[&(BackendId::Codex, TaskCategory::Coding)];
+        let cell = &found[&(ProfileKey::unpinned(BackendId::Codex), TaskCategory::Coding)];
 
         assert_eq!(cell.labels, 3);
         assert_eq!((cell.good, cell.bad), (2, 1));
@@ -407,7 +431,11 @@ mod tests {
         // α = 3+2+1 = 6, β = 0.5+1 = 1.5 → 100·6/7.5 = 80.
         assert_eq!(cell.projected, 80);
         // The same labels with the gate at 3 promote.
-        assert!(evidence(&labels, 3, &set)[&(BackendId::Codex, TaskCategory::Coding)].promoted);
+        assert!(
+            evidence(&labels, 3, &set)
+                [&(ProfileKey::unpinned(BackendId::Codex), TaskCategory::Coding)]
+                .promoted
+        );
     }
 
     #[test]
@@ -424,7 +452,11 @@ mod tests {
             .scores
             .insert(TaskCategory::Debug, cell(95, ProfileSource::Benchmarked));
         let benched = ProfileSet::from_profiles([codex]);
-        assert!(evidence(&labels, 1, &benched)[&(BackendId::Codex, TaskCategory::Debug)].outranked);
+        assert!(
+            evidence(&labels, 1, &benched)
+                [&(ProfileKey::unpinned(BackendId::Codex), TaskCategory::Debug)]
+                .outranked
+        );
 
         let mut codex = CapabilityProfile::seeded(BackendId::Codex);
         codex
@@ -432,7 +464,9 @@ mod tests {
             .insert(TaskCategory::Debug, cell(70, ProfileSource::Learned));
         let learned = ProfileSet::from_profiles([codex]);
         assert!(
-            !evidence(&labels, 1, &learned)[&(BackendId::Codex, TaskCategory::Debug)].outranked
+            !evidence(&labels, 1, &learned)
+                [&(ProfileKey::unpinned(BackendId::Codex), TaskCategory::Debug)]
+                .outranked
         );
     }
 

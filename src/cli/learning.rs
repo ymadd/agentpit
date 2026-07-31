@@ -350,6 +350,9 @@ mod tests {
             },
             categories: TaskCategory::ALL.to_vec(),
             rows: vec![Row {
+                id: "claude".into(),
+                model: None,
+                effort: None,
                 backend: BackendId::Codex,
                 summary_source: ProfileSource::Learned,
                 measured_at: None,

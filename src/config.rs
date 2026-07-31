@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::effort::Effort;
 use crate::types::{BackendId, Transport};
 
 #[derive(
@@ -218,6 +219,11 @@ pub struct RoleConfig {
     /// backend's `[backends.<id>].model` when unset. Passed to the backend CLI's model flag.
     #[serde(default)]
     pub model: Option<String>,
+    /// Reasoning effort to run this role at. `None` = fall through to the backend's
+    /// `[backends.<id>].effort`, then the CLI's own default. Overridden by an explicit
+    /// `--effort` at dispatch — the same precedence `model` follows.
+    #[serde(default)]
+    pub effort: Option<Effort>,
 }
 
 /// One step of a sketched workflow PLAN (`[[workflow.steps]]`, `[[workflow.types.<name>.steps]]`).
@@ -377,6 +383,12 @@ pub struct BackendOverride {
     /// default. This is the lowest-precedence source: `--model` and a role's `model` both win.
     #[serde(default)]
     pub model: Option<String>,
+    /// Default reasoning effort for this backend (`low`|`medium`|`high`|`xhigh`|`max`). `None` =
+    /// the CLI's own default. Lowest-precedence source, exactly like `model`: `--effort` and a
+    /// role's `effort` both win. Rungs the backend cannot express are clamped down at dispatch
+    /// (see [`Effort::clamp_for`](crate::effort::Effort::clamp_for)).
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// Relative cost on a 0–100 scale (0 = free, e.g. a local model). `None` = unranked:
     /// the router's cost tiebreak treats it as mid-range (50) so an unconfigured backend
     /// neither wins nor loses on cost alone.
@@ -672,6 +684,7 @@ review_members = ["antigravity", "opencode"]
 # backends = ["claude", "codex"]     # preference order; first AVAILABLE backend wins
 # prompt   = "You are the implementer. Write the smallest correct change with tests."
 # model    = "opus"                  # optional: pin this role's model (--model wins; else backend default)
+# effort   = "high"                  # optional: low|medium|high|xhigh|max (--effort wins; else backend default)
 #
 # [workflow.roles.reviewer]
 # backends = ["codex", "antigravity"]
@@ -690,10 +703,12 @@ review_members = ["antigravity", "opencode"]
 # manager_backend = "claude"            # optional per-type override
 # enable_ask_human = true               # optional per-type knob override
 
-# Per-backend transport + default model override.
+# Per-backend transport + default model / effort override.
 # [backends.antigravity]
 # transport = "acp"
 # model     = "gemini-3-pro"   # default model for this backend (lowest precedence; --model / role.model win)
+# effort    = "high"           # default reasoning effort: low|medium|high|xhigh|max (same precedence as model;
+#                              # rungs the backend cannot express are clamped down — agy stops at high, codex at xhigh)
 "#;
 
 #[cfg(test)]

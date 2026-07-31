@@ -205,7 +205,7 @@ async fn run_leg(
     }
     let started = Instant::now();
     let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_chunk: &str| {});
-    let outcome = match dispatch(backend, prompt, cwd, cancel, sink, regs, None).await {
+    let outcome = match dispatch(backend, prompt, cwd, cancel, sink, regs, None, None).await {
         Ok(res) if res.auth_failed => Err(format!("{backend}: auth failure during execution")),
         Ok(res) => Ok(res.output.trim().to_string()),
         Err(e) => Err(format!("{backend}: {e:#}")),

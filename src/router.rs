@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::config::{HubConfig, RouteKey};
 use crate::diagnose::{self, LLM_ASSIST_CONFIDENCE_THRESHOLD};
-use crate::profile::{ProfileSet, TaskCategory};
+use crate::profile::{Pins, ProfileSet, TaskCategory};
 use crate::types::BackendId;
 
 #[derive(Debug, Clone)]
@@ -72,7 +72,13 @@ impl RouteDecision {
     /// Emit this decision as a `RouteDecided` event on `logger` (and save the task text under
     /// `tasks/<hash>.txt`). One call per run, right after the run starts. `model` is the
     /// dispatch's resolved model when the caller knows it — the router itself never does.
-    pub fn log(&self, logger: &crate::events::RunLogger, task: &str, model: Option<&str>) {
+    pub fn log(
+        &self,
+        logger: &crate::events::RunLogger,
+        task: &str,
+        model: Option<&str>,
+        effort: Option<crate::effort::Effort>,
+    ) {
         let (category, score) = match self.reason {
             RouteReason::Profile {
                 category, score, ..
@@ -86,6 +92,7 @@ impl RouteDecision {
             score,
             self.diagnose_confidence,
             model,
+            effort.map(|e| e.as_str()),
             task,
         );
     }
@@ -104,7 +111,12 @@ pub struct Router {
 }
 
 impl Router {
+    /// `profiles` is the RAW multi-variant set as loaded; it is collapsed here to the row each
+    /// backend would actually run under `[backends.<id>]`. Routing must score the variant that
+    /// will really be dispatched — otherwise a `max`-effort measurement would decide a route
+    /// whose dispatch then runs at the CLI default.
     pub fn new(config: HubConfig, available: HashSet<BackendId>, profiles: ProfileSet) -> Self {
+        let profiles = profiles.resolved(&Pins::from_config(&config));
         let review_keywords_lower = config
             .auto_route
             .review_keywords

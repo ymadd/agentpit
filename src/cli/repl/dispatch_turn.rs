@@ -113,9 +113,20 @@ pub async fn dispatch_free_text(
             .get(&backend_id)
             .and_then(|o| o.model.as_deref()),
     );
+    // The REPL has no --effort of its own; the backend's configured default still applies.
+    let effective_effort = crate::effort::resolve_effort(
+        None,
+        None,
+        state
+            .config
+            .backends
+            .get(&backend_id)
+            .and_then(|o| o.effort),
+    )
+    .map(|e| e.clamp_for(backend_id));
 
     let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &state.cwd);
-    decision.log(&logger, &task, effective_model.as_deref());
+    decision.log(&logger, &task, effective_model.as_deref(), effective_effort);
     logger.member_started(backend_id, false);
     let started = Instant::now();
 
@@ -171,7 +182,7 @@ pub async fn dispatch_free_text(
     let cwd = state.cwd.clone();
 
     let result = tokio::select! {
-        res = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &regs_ref, effective_model.as_deref()) => {
+        res = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &regs_ref, effective_model.as_deref(), effective_effort) => {
             indicator_cancel.cancel();
             // Erase indicator if no streaming output has arrived.
             if !first_chunk_seen.load(std::sync::atomic::Ordering::Relaxed) {

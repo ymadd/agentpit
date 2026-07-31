@@ -10,6 +10,7 @@ use crate::auth::{
 };
 use crate::config::RouteKey;
 use crate::dispatch::{dispatch, resolve_transport};
+use crate::effort::Effort;
 use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::router::{RouteRequest, Router};
 use crate::types::BackendId;
@@ -42,16 +43,19 @@ pub async fn run(
     cwd: Option<String>,
     auto_login: bool,
 ) -> Result<()> {
-    run_with_role(task, None, backend, None, cwd, auto_login).await
+    run_with_role(task, None, backend, None, None, cwd, auto_login).await
 }
 
-/// `agentpit rescue` entry point used by the CLI command dispatcher, with `--role` + `--model`.
-/// `model` is the explicit `--model`; it wins over the role's / backend's configured model.
+/// `agentpit rescue` entry point used by the CLI command dispatcher, with `--role`, `--model`
+/// and `--effort`. `model` / `effort` are the explicit flags; each wins over the role's and the
+/// backend's configured value.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_role(
     task: String,
     role: Option<String>,
     backend: Option<BackendId>,
     model: Option<String>,
+    effort: Option<Effort>,
     cwd: Option<String>,
     auto_login: bool,
 ) -> Result<()> {
@@ -85,6 +89,8 @@ pub async fn run_with_role(
                 Some(resolved.name.as_str()),
                 model,
                 resolved.model,
+                effort,
+                resolved.effort,
             )
             .await
         }
@@ -106,6 +112,7 @@ pub async fn run_with_role(
                         members,
                         aggregator,
                         model,
+                        effort,
                         false,
                         cwd,
                     )
@@ -121,6 +128,8 @@ pub async fn run_with_role(
                 None,
                 model,
                 None,
+                effort,
+                None,
             )
             .await
         }
@@ -134,9 +143,12 @@ pub async fn run_with_route(
     auto_login: bool,
     route_key: RouteKey,
 ) -> Result<()> {
-    // explain/refactor/review reach here with no model concept of their own — pass None/None so
-    // the backend's `[backends.<id>].model` default still applies inside run_with_route_inner.
-    run_with_route_inner(task, backend, cwd, auto_login, route_key, None, None, None).await
+    // explain/refactor/review reach here with no model or effort concept of their own — pass
+    // None so the backend's `[backends.<id>]` defaults still apply inside run_with_route_inner.
+    run_with_route_inner(
+        task, backend, cwd, auto_login, route_key, None, None, None, None, None,
+    )
+    .await
 }
 
 /// Shared implementation behind [`run_with_route`]. `role_label`, when set, is a resolved
@@ -154,6 +166,8 @@ async fn run_with_route_inner(
     role_label: Option<&str>,
     model: Option<String>,
     role_model: Option<String>,
+    effort: Option<Effort>,
+    role_effort: Option<Effort>,
 ) -> Result<()> {
     let ctx = load_context()?;
     let available = ctx.regs.available();
@@ -238,9 +252,20 @@ async fn run_with_route_inner(
             .get(&backend_id)
             .and_then(|o| o.model.as_deref()),
     );
+    // Same precedence one rung over, and recorded clamped so telemetry says what actually ran.
+    let effective_effort = crate::effort::resolve_effort(
+        effort,
+        role_effort,
+        ctx.loaded
+            .config
+            .backends
+            .get(&backend_id)
+            .and_then(|o| o.effort),
+    )
+    .map(|e| e.clamp_for(backend_id));
 
     let logger = RunLogger::start_with_role(kind, &[backend_id], &cwd, role_label);
-    decision.log(&logger, &task, effective_model.as_deref());
+    decision.log(&logger, &task, effective_model.as_deref(), effective_effort);
     logger.member_started(backend_id, false);
     let started = Instant::now();
 
@@ -260,6 +285,7 @@ async fn run_with_route_inner(
         on_chunk,
         &ctx.regs,
         effective_model.as_deref(),
+        effective_effort,
     )
     .await;
     match result {
@@ -403,6 +429,7 @@ pub async fn run_cascade(
     task: String,
     cwd: Option<String>,
     model: Option<String>,
+    effort: Option<Effort>,
     auto_login: bool,
 ) -> Result<()> {
     let ctx = load_context()?;
@@ -429,10 +456,14 @@ pub async fn run_cascade(
             None,
             model,
             None,
+            effort,
+            None,
         )
         .await;
     }
 
+    // Score each backend at the variant the cascade would actually dispatch it as.
+    let profiles = profiles.resolved(&crate::profile::Pins::from_config(&ctx.loaded.config));
     let candidates = profiles.candidates_for(diagnosis.primary, &available);
     let cost_of = |b: BackendId| {
         ctx.loaded
@@ -462,6 +493,8 @@ pub async fn run_cascade(
             RouteKey::Rescue,
             None,
             model,
+            None,
+            effort,
             None,
         )
         .await;
@@ -503,6 +536,16 @@ pub async fn run_cascade(
                 .get(&backend_id)
                 .and_then(|o| o.model.as_deref()),
         );
+        let effective_effort = crate::effort::resolve_effort(
+            effort,
+            None,
+            ctx.loaded
+                .config
+                .backends
+                .get(&backend_id)
+                .and_then(|o| o.effort),
+        )
+        .map(|e| e.clamp_for(backend_id));
         let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &resolved_cwd);
         logger.route_decided(
             backend_id,
@@ -511,6 +554,7 @@ pub async fn run_cascade(
             None,
             Some(diagnosis.confidence),
             effective_model.as_deref(),
+            effective_effort.map(|e| e.as_str()),
             &task,
         );
         logger.member_started(backend_id, false);
@@ -532,6 +576,7 @@ pub async fn run_cascade(
             on_chunk,
             &ctx.regs,
             effective_model.as_deref(),
+            effective_effort,
         )
         .await;
         let elapsed = started.elapsed().as_millis() as u64;

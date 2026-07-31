@@ -79,6 +79,10 @@ pub fn score_fixture(tasks: &[GoldTask], fixture: &ReplayFixture) -> Result<Benc
     Ok(BenchmarkResult {
         scores,
         measured_at: fixture.measured_at.clone(),
+        // A graded-counts fixture records no model/effort: it is `passed/total` numbers only,
+        // with nothing left to say which model produced them.
+        measured_model: None,
+        measured_effort: None,
     })
 }
 

@@ -44,6 +44,10 @@ pub struct ExecRunOptions {
     /// Optional model to pin for this run. `None` = the backend CLI's own default (no `--model`
     /// flag emitted — byte-identical to the pre-model behaviour). Threaded to `build_spec`.
     pub model: Option<String>,
+    /// Optional reasoning effort to pin for this run. `None` = the backend CLI's own default
+    /// (no effort flag emitted). Threaded to `build_spec`, which clamps it to what the backend
+    /// can express.
+    pub effort: Option<crate::effort::Effort>,
 }
 
 pub struct ExecOutcome {
@@ -381,6 +385,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 on_stdout: None,
                 model: None,
+                effort: None,
             },
             StreamFormat::Text,
         )
@@ -441,6 +446,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 on_stdout: None,
                 model: None,
+                effort: None,
             },
             StreamFormat::CodexJsonl,
         )
@@ -482,6 +488,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 on_stdout: None,
                 model: None,
+                effort: None,
             },
             StreamFormat::CodexJsonl,
         )

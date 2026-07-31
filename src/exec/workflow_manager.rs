@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use super::{AutonomyLevel, ExecAdapter, ExecSpec, StreamFormat};
+use crate::effort::Effort;
 use crate::types::BackendId;
 
 /// Manager exec adapter. Holds the resolved manager backend and the guard env to inject.
@@ -90,7 +91,7 @@ impl ExecAdapter for WorkflowManagerExec {
         self.backend
     }
 
-    fn build_spec(&self, task: &str, model: Option<&str>) -> ExecSpec {
+    fn build_spec(&self, task: &str, model: Option<&str>, effort: Option<Effort>) -> ExecSpec {
         match self.backend {
             // `bypassPermissions` is required so the manager can run `agentpit` via its Bash tool
             // non-interactively — `acceptEdits` only auto-accepts file edits, not Bash commands.
@@ -117,6 +118,11 @@ impl ExecAdapter for WorkflowManagerExec {
                 if let Some(m) = model {
                     args.push("--model".into());
                     args.push(m.to_string());
+                }
+                // Same ordering constraint as `--model`: ahead of the variadic `--allowedTools`.
+                if let Some(e) = effort {
+                    args.push("--effort".into());
+                    args.push(e.clamp_for(BackendId::Claude).as_str().into());
                 }
                 match &self.mcp_config_path {
                     // MCP mode: the manager orchestrates via the agentpit MCP server's tools
@@ -161,6 +167,13 @@ impl ExecAdapter for WorkflowManagerExec {
                 if let Some(m) = model {
                     args.push("--model".into());
                     args.push(m.to_string());
+                }
+                if let Some(e) = effort {
+                    args.push("-c".into());
+                    args.push(format!(
+                        "model_reasoning_effort={}",
+                        e.clamp_for(BackendId::Codex)
+                    ));
                 }
                 args.push("-".into());
                 ExecSpec {
@@ -221,7 +234,7 @@ mod tests {
 
     #[test]
     fn claude_spec_bypasses_permissions_with_bash_allowlist() {
-        let spec = exec(BackendId::Claude).build_spec("drive the workflow", None);
+        let spec = exec(BackendId::Claude).build_spec("drive the workflow", None, None);
         assert_eq!(spec.command, "claude");
         assert!(spec.args.iter().any(|a| a == "bypassPermissions"));
         assert!(spec.args.iter().any(|a| a == "stream-json"));
@@ -249,7 +262,7 @@ mod tests {
     fn claude_mcp_mode_uses_mcp_config_and_tool_allowlist() {
         let mut e = exec(BackendId::Claude);
         e.mcp_config_path = Some(PathBuf::from("/tmp/agentpit-mcp-run-1.json"));
-        let spec = e.build_spec("drive the workflow", None);
+        let spec = e.build_spec("drive the workflow", None, None);
         assert_eq!(spec.command, "claude");
         assert!(spec.args.iter().any(|a| a == "bypassPermissions"));
         // MCP mode wires --mcp-config <path> + the mcp__agentpit__* tool scope.
@@ -289,7 +302,7 @@ mod tests {
 
     #[test]
     fn codex_spec_uses_danger_full_access_and_stdin() {
-        let spec = exec(BackendId::Codex).build_spec("drive the workflow", None);
+        let spec = exec(BackendId::Codex).build_spec("drive the workflow", None, None);
         assert_eq!(spec.command, "codex");
         assert!(spec.args.iter().any(|a| a == "danger-full-access"));
         assert!(spec.args.iter().any(|a| a == "--json"));
@@ -308,13 +321,13 @@ mod tests {
     #[test]
     fn manager_model_flag_precedes_allowedtools_for_claude_and_dash_for_codex() {
         // claude: --model must land before the variadic --allowedTools.
-        let c = exec(BackendId::Claude).build_spec("go", Some("opus"));
+        let c = exec(BackendId::Claude).build_spec("go", Some("opus"), None);
         let mi = c.args.iter().position(|a| a == "--model").unwrap();
         let ti = c.args.iter().position(|a| a == "--allowedTools").unwrap();
         assert_eq!(c.args[mi + 1], "opus");
         assert!(mi < ti, "--model must precede --allowedTools");
         // codex: --model before the stdin `-`.
-        let x = exec(BackendId::Codex).build_spec("go", Some("gpt-5-codex"));
+        let x = exec(BackendId::Codex).build_spec("go", Some("gpt-5-codex"), None);
         let mi = x.args.iter().position(|a| a == "--model").unwrap();
         assert_eq!(x.args[mi + 1], "gpt-5-codex");
         assert_eq!(x.args.last().unwrap(), "-");

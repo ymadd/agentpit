@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use crate::config::RoleConfig;
+use crate::effort::Effort;
 use crate::types::BackendId;
 
 /// The reserved role name that configures the workflow orchestrator itself.
@@ -31,6 +32,9 @@ pub struct ResolvedRole {
     /// The role's configured model, if any (`[workflow.roles.<name>].model`). Threaded to the
     /// backend CLI's model flag at dispatch, unless an explicit `--model` overrides it.
     pub model: Option<String>,
+    /// The role's configured reasoning effort, if any (`[workflow.roles.<name>].effort`). Same
+    /// contract as `model`, one rung over: an explicit `--effort` overrides it.
+    pub effort: Option<Effort>,
 }
 
 /// The manager role's contribution to a workflow run. `backend` is `None` when the role only
@@ -42,6 +46,8 @@ pub struct ManagerRole {
     pub prompt: Option<String>,
     /// The manager role's configured model (`[workflow.roles.manager].model`), if any.
     pub model: Option<String>,
+    /// The manager role's configured reasoning effort (`[workflow.roles.manager].effort`), if any.
+    pub effort: Option<Effort>,
 }
 
 /// Resolve a WORKER role by name against the available backends: the first entry of the role's
@@ -94,6 +100,7 @@ pub fn resolve_role(
         backend,
         prompt: role.prompt.clone(),
         model: role.model.clone(),
+        effort: role.effort,
     })
 }
 
@@ -131,12 +138,14 @@ pub fn resolve_manager(
         backend,
         prompt: role.prompt.clone(),
         model: role.model.clone(),
+        effort: role.effort,
     }))
 }
 
 /// Resolve the effective model for a dispatch by precedence: an explicit `--model` wins, then the
 /// role's `model`, then the backend's `[backends.<id>].model` default; `None` = the CLI's own
-/// default (no `--model` flag emitted). Pure so the CLI and MCP layers share one rule.
+/// default (no `--model` flag emitted). Pure so the CLI and MCP layers share one rule. The effort
+/// twin of this rule is [`crate::effort::resolve_effort`].
 pub fn resolve_model(
     explicit: Option<&str>,
     role_model: Option<&str>,
@@ -213,6 +222,7 @@ mod tests {
                         backends: backends.to_vec(),
                         prompt: prompt.map(str::to_string),
                         model: None,
+                        effort: None,
                     },
                 )
             })
@@ -380,6 +390,7 @@ mod tests {
             backends: vec![],
             prompt: Some("   ".into()),
             model: None,
+            effort: None,
         };
         assert_eq!(summary_line(&blank), "(no persona)");
     }
@@ -390,12 +401,14 @@ mod tests {
             backends: vec![],
             prompt: Some("\n\n  You review code.  \nSecond line.".into()),
             model: None,
+            effort: None,
         };
         assert_eq!(summary_line(&role), "You review code.");
         let long = RoleConfig {
             backends: vec![],
             prompt: Some("あ".repeat(100)),
             model: None,
+            effort: None,
         };
         let s = summary_line(&long);
         assert!(s.ends_with('…'));
@@ -404,6 +417,7 @@ mod tests {
             backends: vec![],
             prompt: None,
             model: None,
+            effort: None,
         };
         assert_eq!(summary_line(&none), "(no persona)");
     }
@@ -417,6 +431,7 @@ mod tests {
                 backends: vec![BackendId::Codex],
                 prompt: Some("x".into()),
                 model: Some("gpt-5-codex".into()),
+                effort: None,
             },
         );
         let resolved = resolve_role("reviewer", &r, &[BackendId::Codex]).unwrap();

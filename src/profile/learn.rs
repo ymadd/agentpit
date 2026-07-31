@@ -18,9 +18,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::effort::Effort;
 use crate::events::{Event, LegStatus, OutcomeLabel, RunKind};
 use crate::profile::model::Score;
-use crate::profile::{ProfileSource, TaskCategory};
+use crate::profile::{ProfileKey, ProfileSource, TaskCategory};
 use crate::types::BackendId;
 
 /// Cells with fewer labels than this are not written back (too little evidence).
@@ -88,6 +89,13 @@ pub struct RunRecord {
     pub backend: Option<BackendId>,
     /// Category from `RouteDecided`, else resolved later from the saved task text.
     pub category: Option<TaskCategory>,
+    /// The model / effort `RouteDecided` recorded for this run, which is what its labels are
+    /// ABOUT. For a fan-out run these are the run-wide `--model` / `--effort` (they applied to
+    /// every member); both `None` means the run left each backend on its configured default and
+    /// the log does not say which — so the labels belong to the UNPINNED row, whose meaning is
+    /// exactly "this backend on unspecified settings".
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
     pub task_hash: Option<String>,
     /// `RouteDecided` timestamp; orders same-task runs for re-dispatch detection.
     pub route_ts: u64,
@@ -106,11 +114,17 @@ impl RunRecord {
     }
 }
 
-/// One weighted outcome observation for a `(backend, category)` cell. `task_hash`/`ts`
-/// carry the source run's identity through to the similarity sample store (routes.jsonl).
+/// One weighted outcome observation for a `(backend, model, effort, category)` cell.
+/// `task_hash`/`ts` carry the source run's identity through to the similarity sample store
+/// (routes.jsonl).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Label {
     pub backend: BackendId,
+    /// The variant this observation is about — see [`RunRecord::model`]. Folded into the
+    /// matching `profiles.toml` row so a `high`-effort run's evidence never lands on the `low`
+    /// row's score.
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
     pub category: TaskCategory,
     pub success: bool,
     pub source: LabelSource,
@@ -170,6 +184,8 @@ pub fn parse_runs(log: &str) -> Vec<RunRecord> {
                 category,
                 task_hash,
                 ts,
+                model,
+                effort,
                 ..
             } => {
                 let r = record(&mut order, &mut runs, &run_id);
@@ -177,6 +193,8 @@ pub fn parse_runs(log: &str) -> Vec<RunRecord> {
                 r.category = category.and_then(|c| c.parse().ok());
                 r.task_hash = Some(task_hash);
                 r.route_ts = ts;
+                r.model = model;
+                r.effort = effort.and_then(|e| e.parse().ok());
             }
             Event::MemberGraded {
                 run_id,
@@ -250,6 +268,8 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
         if let (Some(outcome), Some(backend)) = (run.outcome, run.single_backend()) {
             labels.push(Label {
                 backend,
+                model: run.model.clone(),
+                effort: run.effort,
                 category,
                 success: outcome == OutcomeLabel::Good,
                 source: LabelSource::Outcome,
@@ -276,6 +296,8 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                 };
                 labels.push(Label {
                     backend: *backend,
+                    model: run.model.clone(),
+                    effort: run.effort,
                     category,
                     success,
                     source: LabelSource::Grade,
@@ -294,6 +316,8 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
         if superseded.contains(&run.run_id.as_str()) {
             labels.push(Label {
                 backend,
+                model: run.model.clone(),
+                effort: run.effort,
                 category,
                 success: false,
                 source: LabelSource::Rerun,
@@ -307,6 +331,8 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
         match run.finished {
             Some(LegStatus::Ok) => labels.push(Label {
                 backend,
+                model: run.model.clone(),
+                effort: run.effort,
                 category,
                 success: true,
                 source: LabelSource::Exit,
@@ -315,6 +341,8 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
             }),
             Some(LegStatus::Error) => labels.push(Label {
                 backend,
+                model: run.model.clone(),
+                effort: run.effort,
                 category,
                 success: false,
                 source: LabelSource::Exit,
@@ -333,16 +361,20 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
 pub fn fold_scores(
     labels: &[Label],
     min_samples: u16,
-) -> BTreeMap<BackendId, BTreeMap<TaskCategory, Score>> {
+) -> BTreeMap<ProfileKey, BTreeMap<TaskCategory, Score>> {
     #[derive(Default)]
     struct Cell {
         success_weight: f32,
         failure_weight: f32,
         samples: u16,
     }
-    let mut cells: BTreeMap<(BackendId, TaskCategory), Cell> = BTreeMap::new();
+    // Bucketed by the VARIANT, not the backend: evidence from a `high`-effort run and a
+    // `low`-effort run of the same backend are observations of two different things, and
+    // averaging them together is the mistake this keying exists to prevent.
+    let mut cells: BTreeMap<(ProfileKey, TaskCategory), Cell> = BTreeMap::new();
     for label in labels {
-        let cell = cells.entry((label.backend, label.category)).or_default();
+        let key = ProfileKey::new(label.backend, label.model.clone(), label.effort);
+        let cell = cells.entry((key, label.category)).or_default();
         if label.success {
             cell.success_weight += label.weight();
         } else {
@@ -351,8 +383,8 @@ pub fn fold_scores(
         cell.samples = cell.samples.saturating_add(1);
     }
 
-    let mut scores: BTreeMap<BackendId, BTreeMap<TaskCategory, Score>> = BTreeMap::new();
-    for ((backend, category), cell) in cells {
+    let mut scores: BTreeMap<ProfileKey, BTreeMap<TaskCategory, Score>> = BTreeMap::new();
+    for ((key, category), cell) in cells {
         if cell.samples < min_samples {
             continue;
         }
@@ -361,7 +393,7 @@ pub fn fold_scores(
         let value = (100.0 * alpha / (alpha + beta)).round() as u8;
         let confidence =
             (CONFIDENCE_BASE + CONFIDENCE_PER_SAMPLE * f32::from(cell.samples)).min(CONFIDENCE_CAP);
-        scores.entry(backend).or_default().insert(
+        scores.entry(key).or_default().insert(
             category,
             Score {
                 value,
@@ -446,6 +478,8 @@ mod tests {
             vec![
                 Label {
                     backend: BackendId::Claude,
+                    model: None,
+                    effort: None,
                     category: TaskCategory::Coding,
                     success: false,
                     source: LabelSource::Outcome,
@@ -454,6 +488,8 @@ mod tests {
                 },
                 Label {
                     backend: BackendId::Claude,
+                    model: None,
+                    effort: None,
                     category: TaskCategory::Review,
                     success: true,
                     source: LabelSource::Grade,
@@ -462,6 +498,8 @@ mod tests {
                 },
                 Label {
                     backend: BackendId::Codex,
+                    model: None,
+                    effort: None,
                     category: TaskCategory::Review,
                     success: false,
                     source: LabelSource::Grade,
@@ -490,6 +528,8 @@ mod tests {
             vec![
                 Label {
                     backend: BackendId::Claude,
+                    model: None,
+                    effort: None,
                     category: TaskCategory::Coding,
                     success: false,
                     source: LabelSource::Rerun,
@@ -498,6 +538,8 @@ mod tests {
                 },
                 Label {
                     backend: BackendId::Codex,
+                    model: None,
+                    effort: None,
                     category: TaskCategory::Coding,
                     success: true,
                     source: LabelSource::Exit,
@@ -538,6 +580,8 @@ mod tests {
             std::iter::repeat_n(
                 Label {
                     backend,
+                    model: None,
+                    effort: None,
                     category: TaskCategory::Coding,
                     success: true,
                     source: LabelSource::Outcome,
@@ -550,6 +594,8 @@ mod tests {
         let mut labels: Vec<Label> = win(BackendId::Codex, 10).collect();
         labels.push(Label {
             backend: BackendId::Codex,
+            model: None,
+            effort: None,
             category: TaskCategory::Coding,
             success: false,
             source: LabelSource::Outcome,
@@ -561,10 +607,10 @@ mod tests {
 
         let scores = fold_scores(&labels, DEFAULT_MIN_SAMPLES);
         assert!(
-            !scores.contains_key(&BackendId::Claude),
+            !scores.contains_key(&ProfileKey::unpinned(BackendId::Claude)),
             "under min_samples must not produce a cell"
         );
-        let codex = &scores[&BackendId::Codex][&TaskCategory::Coding];
+        let codex = &scores[&ProfileKey::unpinned(BackendId::Codex)][&TaskCategory::Coding];
         // α = 31, β = 4 → 100·31/35 ≈ 89.
         assert_eq!(codex.value, 89);
         assert_eq!(codex.samples, 11);

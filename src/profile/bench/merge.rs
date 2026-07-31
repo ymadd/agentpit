@@ -24,12 +24,13 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::profile::ProfileSet;
+use crate::effort::Effort;
 use crate::profile::category::TaskCategory;
 use crate::profile::model::{
     BenchmarkResult, CapabilityProfile, ProfileSource, Score, apply_benchmark,
 };
 use crate::profile::store::{load_profiles, save_profiles};
+use crate::profile::{ProfileKey, ProfileSet};
 use crate::types::BackendId;
 
 /// Largest variance achievable by fractions in `[0, 1]` (a 50/50 split between 0 and 1 gives
@@ -57,8 +58,15 @@ impl GradedTask {
 ///
 /// Tasks are bucketed by category; each bucket becomes one [`Score`] (see [`score_for_bucket`]).
 /// `measured_at` is carried through verbatim onto the result — this function never generates a
-/// timestamp itself. Pure: borrows `graded`, returns a fresh result.
-pub fn aggregate(graded: &[GradedTask], measured_at: Option<String>) -> BenchmarkResult {
+/// timestamp itself. So are `measured_model` / `measured_effort`, the provenance of WHAT was
+/// measured: a gold-bench score belongs to a (backend, model, effort) triple, not to the backend
+/// name alone. Pure: borrows `graded`, returns a fresh result.
+pub fn aggregate(
+    graded: &[GradedTask],
+    measured_at: Option<String>,
+    measured_model: Option<String>,
+    measured_effort: Option<Effort>,
+) -> BenchmarkResult {
     let mut buckets: BTreeMap<TaskCategory, Vec<f64>> = BTreeMap::new();
     for task in graded {
         buckets
@@ -75,6 +83,8 @@ pub fn aggregate(graded: &[GradedTask], measured_at: Option<String>) -> Benchmar
     BenchmarkResult {
         scores,
         measured_at,
+        measured_model,
+        measured_effort,
     }
 }
 
@@ -123,17 +133,35 @@ fn confidence(samples: u16, variance: f64) -> f32 {
 ///
 /// A missing file is not an error — [`load_profiles`] returns the seeded matrix, so a first-run
 /// merge promotes a seeded profile to benchmarked. Immutable: the loaded set is never mutated; a
-/// fresh set with the target backend's profile replaced is constructed and written.
+/// fresh set with the target row replaced is constructed and written.
+///
+/// WHICH row is folded into comes from the result's own `measured_model` / `measured_effort`: a
+/// bench of codex at `xhigh` updates the `codex@…/xhigh` row and leaves every other rung alone.
+/// A variant measured for the first time starts from the backend's UNPINNED row (the seeded
+/// priors) so the categories the suite did not cover still have sensible values, rather than
+/// appearing as a hole.
 pub fn merge_into_profiles(
     backend: BackendId,
     result: &BenchmarkResult,
     profiles_path: &Path,
 ) -> Result<CapabilityProfile> {
     let set = load_profiles(Some(profiles_path))?;
+    let key = ProfileKey::new(
+        backend,
+        result.measured_model.clone(),
+        result.measured_effort,
+    );
     let base = set
-        .get(backend)
+        .resolve(backend, key.model.as_deref(), key.effort)
         .cloned()
-        .unwrap_or_else(|| CapabilityProfile::seeded(backend));
+        // `resolve` may have fallen back to the unpinned row; re-stamp the identity so the merge
+        // writes the variant rather than overwriting the fallback it borrowed values from.
+        .map(|p| CapabilityProfile {
+            model: key.model.clone(),
+            effort: key.effort,
+            ..p
+        })
+        .unwrap_or_else(|| CapabilityProfile::for_variant(backend, key.model.clone(), key.effort));
 
     let merged = apply_benchmark(&base, result);
 
@@ -142,13 +170,14 @@ pub fn merge_into_profiles(
     Ok(merged)
 }
 
-/// Rebuild a [`ProfileSet`] with `profile`'s backend replaced by `profile`. Pure: reads `set`,
-/// returns a brand-new set; the input is untouched.
+/// Rebuild a [`ProfileSet`] with `profile`'s ROW replaced by `profile` — the row being its
+/// `(backend, model, effort)` key, so sibling rungs of the same backend survive untouched.
+/// Pure: reads `set`, returns a brand-new set; the input is untouched.
 fn with_profile(set: &ProfileSet, profile: CapabilityProfile) -> ProfileSet {
-    let backend = profile.backend;
+    let key = profile.key();
     let others = set
         .iter()
-        .filter(|(b, _)| **b != backend)
+        .filter(|(k, _)| **k != key)
         .map(|(_, p)| p.clone());
     ProfileSet::from_profiles(others.chain(std::iter::once(profile)))
 }
@@ -172,7 +201,7 @@ mod tests {
             task(TaskCategory::Review, 1.0),
         ];
 
-        let result = aggregate(&graded, Some("2026-06-30T00:00:00Z".into()));
+        let result = aggregate(&graded, Some("2026-06-30T00:00:00Z".into()), None, None);
 
         let coding = result.scores.get(&TaskCategory::Coding).unwrap();
         assert_eq!(coding.value, 75);
@@ -189,7 +218,7 @@ mod tests {
     #[test]
     fn aggregate_never_generates_a_timestamp() {
         // With no measured_at supplied the result carries none — the function does not invent one.
-        let result = aggregate(&[task(TaskCategory::Docs, 1.0)], None);
+        let result = aggregate(&[task(TaskCategory::Docs, 1.0)], None, None, None);
         assert!(result.measured_at.is_none());
     }
 
@@ -200,7 +229,7 @@ mod tests {
             task(TaskCategory::Planning, 1.5),
             task(TaskCategory::Planning, -0.5),
         ];
-        let result = aggregate(&graded, None);
+        let result = aggregate(&graded, None, None, None);
         assert_eq!(
             result.scores.get(&TaskCategory::Planning).unwrap().value,
             50
@@ -217,12 +246,16 @@ mod tests {
                 task(TaskCategory::Coding, 1.0),
             ],
             None,
+            None,
+            None,
         );
         let split = aggregate(
             &[
                 task(TaskCategory::Coding, 1.0),
                 task(TaskCategory::Coding, 0.0),
             ],
+            None,
+            None,
             None,
         );
 
@@ -238,13 +271,15 @@ mod tests {
 
     #[test]
     fn confidence_climbs_with_more_samples() {
-        let one = aggregate(&[task(TaskCategory::Debug, 1.0)], None);
+        let one = aggregate(&[task(TaskCategory::Debug, 1.0)], None, None, None);
         let many = aggregate(
             &[
                 task(TaskCategory::Debug, 1.0),
                 task(TaskCategory::Debug, 1.0),
                 task(TaskCategory::Debug, 1.0),
             ],
+            None,
+            None,
             None,
         );
         let c1 = one.scores.get(&TaskCategory::Debug).unwrap().confidence;
@@ -283,6 +318,8 @@ mod tests {
                 task(TaskCategory::Coding, 1.0),
             ],
             Some("2026-06-30T00:00:00Z".into()),
+            Some("opus".into()),
+            Some(Effort::XHigh),
         );
         let merged = merge_into_profiles(BackendId::Claude, &result, &path).unwrap();
 
@@ -290,17 +327,37 @@ mod tests {
         assert_eq!(merged.source, ProfileSource::Benchmarked);
         assert_eq!(merged.score(TaskCategory::Coding).unwrap().value, 100);
         assert_eq!(merged.measured_at.as_deref(), Some("2026-06-30T00:00:00Z"));
+        // The merged row records WHAT was measured, not just when.
+        assert_eq!(merged.model.as_deref(), Some("opus"));
+        assert_eq!(merged.effort, Some(Effort::XHigh));
 
-        // save → load round-trips the merged profile to the isolated path.
+        // save → load round-trips the merged row to the isolated path — and lands on the
+        // VARIANT, addressed by the triple it was measured for.
         let reloaded = load_profiles(Some(&path)).unwrap();
-        let claude = reloaded.get(BackendId::Claude).unwrap();
+        let claude = reloaded
+            .resolve(BackendId::Claude, Some("opus"), Some(Effort::XHigh))
+            .unwrap();
         assert_eq!(claude.source, ProfileSource::Benchmarked);
         assert_eq!(claude.score(TaskCategory::Coding).unwrap().value, 100);
         assert_eq!(claude.score(TaskCategory::Coding).unwrap().samples, 2);
         assert_eq!(claude.measured_at.as_deref(), Some("2026-06-30T00:00:00Z"));
 
-        // The merge is immutable over the rest of the set: every other backend survives, seeded.
-        assert_eq!(reloaded.len(), backend_count);
+        // The unpinned row is UNTOUCHED: measuring opus at xhigh says nothing about claude on
+        // its CLI defaults, so that row keeps its seeded prior of 88.
+        let unpinned = reloaded.get(BackendId::Claude).unwrap();
+        assert_eq!(unpinned.source, ProfileSource::Seeded);
+        assert_eq!(unpinned.score(TaskCategory::Coding).unwrap().value, 88);
+
+        // Nor does a run at one rung answer for another: `low` has never been measured, so it
+        // falls back to the unpinned prior rather than borrowing the xhigh number.
+        let at_low = reloaded
+            .resolve(BackendId::Claude, Some("opus"), Some(Effort::Low))
+            .unwrap();
+        assert_eq!(at_low.score(TaskCategory::Coding).unwrap().value, 88);
+
+        // The merge is immutable over the rest of the set: every other backend survives, seeded,
+        // and the new variant is an ADDITIONAL row.
+        assert_eq!(reloaded.len(), backend_count + 1);
         let codex = reloaded.get(BackendId::Codex).unwrap();
         assert_eq!(codex.source, ProfileSource::Seeded);
     }
@@ -317,7 +374,7 @@ mod tests {
             .unwrap()
             .score(TaskCategory::Docs);
 
-        let result = aggregate(&[task(TaskCategory::Coding, 1.0)], None);
+        let result = aggregate(&[task(TaskCategory::Coding, 1.0)], None, None, None);
         merge_into_profiles(BackendId::Claude, &result, &path).unwrap();
 
         let reloaded = load_profiles(Some(&path)).unwrap();

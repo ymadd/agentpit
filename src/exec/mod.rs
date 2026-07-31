@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::effort::Effort;
 use crate::types::BackendId;
 
 pub mod antigravity;
@@ -21,7 +22,9 @@ pub trait ExecAdapter: Send + Sync {
     /// Build the spawn spec for `task`. `model` optionally pins the backend's model: `Some(m)`
     /// emits the CLI's model flag (e.g. `--model m`), `None` leaves the CLI on its own default
     /// (no flag — the pre-model behaviour, so an unset model is a zero-diff regression guard).
-    fn build_spec(&self, task: &str, model: Option<&str>) -> ExecSpec;
+    /// `effort` is the same contract one rung over: `Some(e)` emits the CLI's reasoning-effort
+    /// flag at [`e.clamp_for(id)`](Effort::clamp_for), `None` emits nothing.
+    fn build_spec(&self, task: &str, model: Option<&str>, effort: Option<Effort>) -> ExecSpec;
 
     /// Describe how stdout should be decoded before it reaches callers. Structured backends use
     /// this to expose live text/progress while keeping the collected final answer free of JSONL.
@@ -43,6 +46,6 @@ pub async fn run<A: ExecAdapter + ?Sized>(
     task: &str,
     options: ExecRunOptions,
 ) -> Result<ExecOutcome> {
-    let spec = adapter.build_spec(task, options.model.as_deref());
+    let spec = adapter.build_spec(task, options.model.as_deref(), options.effort);
     run_spec(adapter.id(), spec, options, adapter.stream_format()).await
 }

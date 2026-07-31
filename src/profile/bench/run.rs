@@ -21,6 +21,7 @@ use super::judge::{GradeOutcome, grade};
 use super::merge::{GradedTask, aggregate};
 use super::suite::GoldTask;
 use crate::dispatch::{Registries, dispatch};
+use crate::effort::Effort;
 use crate::profile::model::BenchmarkResult;
 use crate::types::BackendId;
 
@@ -45,6 +46,16 @@ pub struct RawFixture {
     /// Optional ISO-8601 measurement time, carried through onto the merged profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_at: Option<String>,
+    /// The model the outputs were produced with, when one was pinned. A gold-bench number is a
+    /// property of harness + model + effort, not of the CLI's name alone, so the fixture records
+    /// what actually ran and the merge carries it onto the profile. `None` = the backend CLI's
+    /// own default (agentpit did not pin one, so it cannot claim to know which model answered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The reasoning effort the outputs were produced at, clamped to what the backend can
+    /// express. `None` = the CLI's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
 }
 
 /// The result of grading a set of raw outputs: the aggregated benchmark result, plus the ids of
@@ -77,7 +88,14 @@ pub fn score_raw(tasks: &[GoldTask], fixture: &RawFixture) -> Result<RawScored> 
         }
     }
 
-    let result = aggregate(&graded, fixture.measured_at.clone());
+    // The fixture is the record of what ran, so its model/effort provenance rides along to the
+    // merged profile — a re-grade months later still says which model earned the score.
+    let result = aggregate(
+        &graded,
+        fixture.measured_at.clone(),
+        fixture.model.clone(),
+        fixture.effort,
+    );
     Ok(RawScored {
         result,
         skipped,
@@ -91,12 +109,15 @@ pub fn score_raw(tasks: &[GoldTask], fixture: &RawFixture) -> Result<RawScored> 
 /// dashboard can tail the sweep live) while the full captured output is what gets graded. This is
 /// the live, network-touching path — auth is the caller's responsibility (checked before this
 /// runs). A `cancel` trip aborts the in-flight dispatch and propagates the error.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_live(
     backend: BackendId,
     tasks: &[GoldTask],
     cwd: &Path,
     regs: &Registries,
     measured_at: Option<String>,
+    model: Option<&str>,
+    effort: Option<Effort>,
     cancel: CancellationToken,
     on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<RawFixture> {
@@ -109,7 +130,8 @@ pub async fn run_live(
             cancel.clone(),
             on_chunk.clone(),
             regs,
-            None,
+            model,
+            effort,
         )
         .await
         .with_context(|| format!("dispatch failed for gold task {}", task.id))?;
@@ -122,6 +144,8 @@ pub async fn run_live(
         backend,
         outputs,
         measured_at,
+        model: model.map(str::to_string),
+        effort,
     })
 }
 
@@ -151,6 +175,8 @@ mod tests {
                 "no issues found\n```json\n[]\n```",
             )],
             measured_at: Some("2026-06-30T00:00:00Z".into()),
+            model: None,
+            effort: None,
         };
         let scored = score_raw(&tasks, &fixture).unwrap();
         assert_eq!(scored.graded, 1);
@@ -167,6 +193,8 @@ mod tests {
             backend: BackendId::Codex,
             outputs: vec![raw("coding/does_not_exist", "```python\n```")],
             measured_at: None,
+            model: None,
+            effort: None,
         };
         let err = score_raw(&tasks, &fixture).unwrap_err();
         assert!(
@@ -181,6 +209,8 @@ mod tests {
             backend: BackendId::Claude,
             outputs: vec![raw("review/api_handler_bug", "```json\n[]\n```")],
             measured_at: Some("2026-06-30T00:00:00Z".into()),
+            model: None,
+            effort: None,
         };
         let json = serde_json::to_string(&fixture).unwrap();
         let back: RawFixture = serde_json::from_str(&json).unwrap();

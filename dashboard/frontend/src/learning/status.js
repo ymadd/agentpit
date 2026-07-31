@@ -39,7 +39,7 @@ export function evidenceCells(status) {
   const out = [];
   for (const row of status.rows || []) {
     for (const cell of row.cells || []) {
-      if (cell.evidence) out.push({ backend: row.backend, cell, evidence: cell.evidence });
+      if (cell.evidence) out.push({ backend: row.id, cell, evidence: cell.evidence });
     }
   }
   return out.sort(

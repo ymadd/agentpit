@@ -60,7 +60,9 @@ pub async fn run(
         .clone();
     let members = members.unwrap_or_else(|| match routed {
         Some(n) => super::ensemble::routed_members(
-            &crate::profile::load_profiles(None).unwrap_or_default(),
+            &crate::profile::load_profiles(None)
+                .unwrap_or_default()
+                .resolved(&crate::profile::Pins::from_config(&ctx.loaded.config)),
             crate::profile::TaskCategory::AdversarialReview,
             &ctx.regs.available(),
             &crate::availability::recently_suspended(),
@@ -77,6 +79,7 @@ pub async fn run(
         members,
         aggregator,
         None, // model: no --model; each member uses its backend default
+        None, // effort: same — each member uses its backend default
         routed.is_some(),
         cwd,
     )

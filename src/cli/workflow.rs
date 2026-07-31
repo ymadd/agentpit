@@ -20,6 +20,7 @@ use super::{install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer};
 use crate::auth::check_auth;
 use crate::config::{HubConfig, RoleConfig, WorkflowSection, WorkflowStep};
 use crate::dispatch::{Registries, dispatch};
+use crate::effort::Effort;
 use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::exec::{AskTier, McpConfigGuard, WorkflowManagerExec, is_supported_manager};
 use crate::types::BackendId;
@@ -37,6 +38,7 @@ pub async fn run(
     max_depth: Option<u32>,
     use_mcp: bool,
     model: Option<String>,
+    effort: Option<Effort>,
     cwd: Option<String>,
 ) -> Result<()> {
     // Resolve cwd and install Ctrl-C cancellation here (CLI-only concerns); `run_capture` itself
@@ -56,6 +58,7 @@ pub async fn run(
         max_depth,
         use_mcp,
         model,
+        effort,
         cwd,
         cancel,
         terminal_sink,
@@ -89,6 +92,7 @@ pub(crate) async fn run_capture(
     max_depth: Option<u32>,
     use_mcp: bool,
     model: Option<String>,
+    effort: Option<Effort>,
     cwd: PathBuf,
     cancel: CancellationToken,
     terminal_sink: Arc<dyn Fn(&str) + Send + Sync>,
@@ -108,13 +112,14 @@ pub(crate) async fn run_capture(
     //    The manager role's persona applies whenever the role exists, even when the backend came
     //    from another step.
     let implicit_manager = select_implicit_manager(config.default.backend).await;
-    let (manager, manager_persona, manager_role_model) = resolve_manager_backend(
-        manager,
-        eff.type_manager_backend,
-        &config.workflow.roles,
-        eff.manager_backend,
-        implicit_manager,
-    )?;
+    let (manager, manager_persona, manager_role_model, manager_role_effort) =
+        resolve_manager_backend(
+            manager,
+            eff.type_manager_backend,
+            &config.workflow.roles,
+            eff.manager_backend,
+            implicit_manager,
+        )?;
     if !is_supported_manager(manager) {
         anyhow::bail!("supported workflow managers: claude, codex (got: {manager})");
     }
@@ -128,6 +133,14 @@ pub(crate) async fn run_capture(
             .get(&manager)
             .and_then(|o| o.model.as_deref()),
     );
+    // The manager's effort follows the same precedence one rung over, clamped to what the
+    // manager backend can express.
+    let manager_effort = crate::effort::resolve_effort(
+        effort,
+        manager_role_effort,
+        config.backends.get(&manager).and_then(|o| o.effort),
+    )
+    .map(|e| e.clamp_for(manager));
 
     // 1b. MCP mode: the `--use-mcp` flag OR the effective use_mcp knob, but only the claude manager
     //     supports it (codex MCP mode is out of scope). Fall back to shell-out otherwise.
@@ -191,7 +204,16 @@ pub(crate) async fn run_capture(
     let logger = RunLogger::start(RunKind::Workflow, &[manager], &cwd);
     // The manager backend comes from config/flags, not the router; the RouteDecided line exists
     // for its task_hash (re-run detection, kNN) and for the learning fold's per-run coverage.
-    logger.route_decided(manager, "workflow_manager", None, None, None, None, &goal);
+    logger.route_decided(
+        manager,
+        "workflow_manager",
+        None,
+        None,
+        None,
+        manager_model.as_deref(),
+        manager_effort.map(|e| e.as_str()),
+        &goal,
+    );
     logger.member_started(manager, false);
 
     // 9. Build the manager prompt (needs the run id from step 8 as the parent run id). MCP mode
@@ -295,6 +317,7 @@ pub(crate) async fn run_capture(
         on_chunk,
         &regs,
         manager_model.as_deref(),
+        manager_effort,
     )
     .await;
 
@@ -566,7 +589,7 @@ fn build_types_listing(
             eff.manager_backend,
             implicit_manager,
         ) {
-            Ok((backend, _, _)) => (backend.to_string(), is_supported_manager(backend)),
+            Ok((backend, _, _, _)) => (backend.to_string(), is_supported_manager(backend)),
             Err(_) => ("(invalid [workflow.roles.manager])".to_string(), false),
         };
         let (roles, missing) = match &eff.role_filter {
@@ -745,13 +768,17 @@ fn truncate_line(s: &str, max: usize) -> String {
 /// colors an implicitly resolved manager.
 /// Pure and unit-tested; the `is_supported_manager` check on the final choice stays in
 /// `run_capture` (an explicit arg may still name an unsupported backend).
+/// What manager resolution yields: the backend, plus the manager role's persona / model /
+/// effort when a `[workflow.roles.manager]` entry supplied them.
+type ResolvedManager = (BackendId, Option<String>, Option<String>, Option<Effort>);
+
 fn resolve_manager_backend(
     explicit: Option<BackendId>,
     type_manager: Option<BackendId>,
     role_map: &BTreeMap<String, RoleConfig>,
     manager_backend: Option<BackendId>,
     implicit_manager: BackendId,
-) -> Result<(BackendId, Option<String>, Option<String>)> {
+) -> Result<ResolvedManager> {
     let manager_role = roles::resolve_manager(role_map, is_supported_manager)?;
     let backend = explicit
         .or(type_manager)
@@ -759,8 +786,9 @@ fn resolve_manager_backend(
         .or(manager_backend)
         .unwrap_or(implicit_manager);
     let persona = manager_role.as_ref().and_then(|m| m.prompt.clone());
+    let effort = manager_role.as_ref().and_then(|m| m.effort);
     let model = manager_role.and_then(|m| m.model);
-    Ok((backend, persona, model))
+    Ok((backend, persona, model, effort))
 }
 
 /// Candidate order for an unconfigured workflow manager. A supported global default keeps its
@@ -1432,6 +1460,12 @@ pub async fn generate(
             .get(&backend)
             .and_then(|o| o.model.as_deref()),
     );
+    let designer_effort = crate::effort::resolve_effort(
+        None,
+        None,
+        config.backends.get(&backend).and_then(|o| o.effort),
+    )
+    .map(|e| e.clamp_for(backend));
     let res = dispatch(
         backend,
         &prompt,
@@ -1440,6 +1474,7 @@ pub async fn generate(
         noop,
         &ctx.regs,
         designer_model.as_deref(),
+        designer_effort,
     )
     .await?;
     if res.auth_failed {
@@ -1590,6 +1625,12 @@ pub async fn describe(
             .get(&backend)
             .and_then(|o| o.model.as_deref()),
     );
+    let describe_effort = crate::effort::resolve_effort(
+        None,
+        None,
+        config.backends.get(&backend).and_then(|o| o.effort),
+    )
+    .map(|e| e.clamp_for(backend));
     let res = dispatch(
         backend,
         &prompt,
@@ -1598,6 +1639,7 @@ pub async fn describe(
         noop,
         &ctx.regs,
         describe_model.as_deref(),
+        describe_effort,
     )
     .await?;
     if res.auth_failed {
@@ -2483,6 +2525,7 @@ goal\n";
                         backends: backends.to_vec(),
                         prompt: prompt.map(str::to_string),
                         model: None,
+                        effort: None,
                     },
                 )
             })
@@ -2538,7 +2581,7 @@ goal\n";
     fn manager_resolution_order_explicit_then_type_then_role_then_config_then_implicit() {
         let roles = role_map(&[("manager", &[BackendId::Codex], Some("plan tightly"))]);
         // Explicit CLI arg wins over everything; the persona still applies.
-        let (backend, persona, _) = resolve_manager_backend(
+        let (backend, persona, _, _) = resolve_manager_backend(
             Some(BackendId::Claude),
             Some(BackendId::Codex),
             &roles,
@@ -2550,7 +2593,7 @@ goal\n";
         assert_eq!(persona.as_deref(), Some("plan tightly"));
         // The TYPE's manager_backend wins over the role (selecting a type is an explicit
         // per-kind choice); the role persona still applies.
-        let (backend, persona, _) = resolve_manager_backend(
+        let (backend, persona, _, _) = resolve_manager_backend(
             None,
             Some(BackendId::Claude),
             &roles,
@@ -2561,7 +2604,7 @@ goal\n";
         assert_eq!(backend, BackendId::Claude);
         assert_eq!(persona.as_deref(), Some("plan tightly"));
         // The role wins over [workflow].manager_backend.
-        let (backend, _, _) = resolve_manager_backend(
+        let (backend, _, _, _) = resolve_manager_backend(
             None,
             None,
             &roles,
@@ -2572,7 +2615,7 @@ goal\n";
         assert_eq!(backend, BackendId::Codex);
         // No role → config → caller-provided implicit manager.
         let empty = BTreeMap::new();
-        let (backend, persona, _) = resolve_manager_backend(
+        let (backend, persona, _, _) = resolve_manager_backend(
             None,
             None,
             &empty,
@@ -2582,7 +2625,7 @@ goal\n";
         .unwrap();
         assert_eq!(backend, BackendId::Claude);
         assert_eq!(persona, None);
-        let (backend, _, _) =
+        let (backend, _, _, _) =
             resolve_manager_backend(None, None, &empty, None, BackendId::Codex).unwrap();
         assert_eq!(backend, BackendId::Codex);
     }
@@ -2606,7 +2649,7 @@ goal\n";
     #[test]
     fn persona_only_manager_role_keeps_legacy_backend_but_carries_persona() {
         let roles = role_map(&[("manager", &[], Some("persona only"))]);
-        let (backend, persona, _) = resolve_manager_backend(
+        let (backend, persona, _, _) = resolve_manager_backend(
             None,
             None,
             &roles,
@@ -2955,6 +2998,7 @@ goal\n";
                 backends: vec![BackendId::Claude],
                 prompt: Some("coordinate".into()),
                 model: None,
+                effort: None,
             },
         );
         s.types.get_mut("review").unwrap().manager_backend = Some(BackendId::Codex);

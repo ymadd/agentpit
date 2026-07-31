@@ -1,9 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::effort::Effort;
 use crate::types::BackendId;
 
 pub mod adversarial_review;
+pub mod arena;
 pub mod ask;
 pub(crate) mod cancel;
 mod common;
@@ -64,6 +66,10 @@ pub enum Command {
         /// Pin the model (e.g. opus, gpt-5-codex). Overrides the role's and the backend's default.
         #[arg(long)]
         model: Option<String>,
+        /// Pin the reasoning effort. Overrides the role's and the backend's default; a rung the
+        /// backend cannot express is clamped down (agy stops at high, codex at xhigh).
+        #[arg(long, value_enum)]
+        effort: Option<Effort>,
         /// Working directory (defaults to current).
         #[arg(long)]
         cwd: Option<String>,
@@ -161,6 +167,10 @@ pub enum Command {
         /// uses its own `[backends.<id>].model` default.
         #[arg(long)]
         model: Option<String>,
+        /// Pin the reasoning effort for every member + the aggregator. Otherwise each backend
+        /// uses its own `[backends.<id>].effort` default. Clamped per backend.
+        #[arg(long, value_enum)]
+        effort: Option<Effort>,
         #[arg(long)]
         cwd: Option<String>,
     },
@@ -193,6 +203,10 @@ pub enum Command {
         /// and the backend default. With `new`, pins the designer's model.
         #[arg(long)]
         model: Option<String>,
+        /// Pin the manager's reasoning effort. Overrides roles.manager.effort and the backend
+        /// default; clamped to what the manager backend can express.
+        #[arg(long, value_enum)]
+        effort: Option<Effort>,
         /// (`new`/`list`) Emit JSON instead of the human-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -201,6 +215,12 @@ pub enum Command {
         write: bool,
         #[arg(long)]
         cwd: Option<String>,
+    },
+
+    /// Blind head-to-head: several backends build the same thing, a human picks the better work.
+    Arena {
+        #[command(subcommand)]
+        action: arena::Action,
     },
 
     /// Launch the live desktop dashboard (separate app).
@@ -379,6 +399,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             role,
             backend,
             model,
+            effort,
             cwd,
             no_auto_login,
             cascade,
@@ -388,12 +409,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .map(|c| c.config.default.cascade)
                     .unwrap_or(false);
             if ctx_cascade && role.is_none() && backend.is_none() {
-                rescue::run_cascade(task, cwd, model, !no_auto_login).await
+                rescue::run_cascade(task, cwd, model, effort, !no_auto_login).await
             } else {
                 if cascade && (role.is_some() || backend.is_some()) {
                     anyhow::bail!("--cascade is mutually exclusive with --role/--backend");
                 }
-                rescue::run_with_role(task, role, backend, model, cwd, !no_auto_login).await
+                rescue::run_with_role(task, role, backend, model, effort, cwd, !no_auto_login).await
             }
         }
 
@@ -443,8 +464,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             members,
             aggregator,
             model,
+            effort,
             cwd,
-        } => ensemble::run(prompt, members, aggregator, model, cwd).await,
+        } => ensemble::run(prompt, members, aggregator, model, effort, cwd).await,
 
         Command::Workflow {
             type_or_goal,
@@ -454,6 +476,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             max_depth,
             use_mcp,
             model,
+            effort,
             json,
             write,
             cwd,
@@ -495,11 +518,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                     max_depth,
                     use_mcp,
                     model,
+                    effort,
                     cwd,
                 )
                 .await
             }
         }
+
+        Command::Arena { action } => arena::run(action).await,
 
         Command::Dashboard => dashboard::run().await,
 

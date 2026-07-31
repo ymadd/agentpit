@@ -11,6 +11,7 @@ use super::common::Context;
 use super::{install_ctrlc_cancel, load_context, resolve_cwd};
 use crate::auth::check_auth;
 use crate::dispatch::{Registries, dispatch, resolve_transport};
+use crate::effort::Effort;
 use crate::events::{LegStatus, RunKind, RunLogger};
 use crate::profile::{ProfileSet, TaskCategory};
 use crate::types::{BackendId, Transport};
@@ -256,6 +257,7 @@ pub(crate) fn emit_member_grades(logger: &RunLogger, reply: &str, outcomes: &[Me
 /// [`run_one_member`] (which layers on TTY + event reporting) and the MCP `dispatch_task` /
 /// `run_ensemble` tools (which stream nothing) — so the not-registered / auth-failure / error
 /// wording lives in exactly one place.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_to_outcome(
     backend: BackendId,
     prompt: &str,
@@ -264,6 +266,7 @@ pub(crate) async fn dispatch_to_outcome(
     on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
     regs: &Registries,
     model: Option<&str>,
+    effort: Option<Effort>,
 ) -> MemberOutcome {
     let transport = resolve_transport(backend, regs);
     if transport.is_none() {
@@ -274,7 +277,7 @@ pub(crate) async fn dispatch_to_outcome(
             error: Some("not registered".into()),
         };
     }
-    match dispatch(backend, prompt, cwd, cancel, on_chunk, regs, model).await {
+    match dispatch(backend, prompt, cwd, cancel, on_chunk, regs, model, effort).await {
         Ok(res) if res.auth_failed => MemberOutcome {
             backend,
             transport: Some(res.transport),
@@ -296,6 +299,7 @@ pub(crate) async fn dispatch_to_outcome(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one_member(
     backend: BackendId,
     prompt: String,
@@ -304,6 +308,7 @@ async fn run_one_member(
     regs: Arc<Registries>,
     logger: RunLogger,
     model: Option<String>,
+    effort: Option<Effort>,
 ) -> MemberOutcome {
     let started = Instant::now();
     let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
@@ -315,6 +320,7 @@ async fn run_one_member(
         on_chunk,
         &regs,
         model.as_deref(),
+        effort,
     )
     .await;
     let elapsed_s = started.elapsed().as_secs_f32();
@@ -398,6 +404,7 @@ pub async fn run(
     members: Option<Vec<BackendId>>,
     aggregator: Option<BackendId>,
     model: Option<String>,
+    effort: Option<Effort>,
     cwd: Option<String>,
 ) -> Result<()> {
     let ctx = load_context()?;
@@ -410,6 +417,7 @@ pub async fn run(
         members,
         aggregator,
         model,
+        effort,
         false,
         cwd,
     )
@@ -424,6 +432,7 @@ pub async fn run_resolved(
     members: Vec<BackendId>,
     aggregator: Option<BackendId>,
     model: Option<String>,
+    effort: Option<Effort>,
     routed: bool,
     cwd: Option<String>,
 ) -> Result<()> {
@@ -441,6 +450,11 @@ pub async fn run_resolved(
             None,
             backend_models.get(&b).and_then(|o| o.model.as_deref()),
         )
+    };
+    // Same rule for reasoning effort, clamped per member since the ladders differ by backend.
+    let effort_for = |b: BackendId| -> Option<Effort> {
+        crate::effort::resolve_effort(effort, None, backend_models.get(&b).and_then(|o| o.effort))
+            .map(|e| e.clamp_for(b))
     };
 
     let regs = Arc::new(ctx.regs);
@@ -461,6 +475,7 @@ pub async fn run_resolved(
             None,
             None,
             model.as_deref(),
+            effort.map(|e| e.as_str()),
             &prompt,
         );
     }
@@ -501,8 +516,12 @@ pub async fn run_resolved(
         let prompt_c = prompt.clone();
         let logger_c = logger.clone();
         let model_c = model_for(m);
+        let effort_c = effort_for(m);
         let handle = tokio::spawn(async move {
-            run_one_member(m, prompt_c, cwd_c, cancel_c, regs_c, logger_c, model_c).await
+            run_one_member(
+                m, prompt_c, cwd_c, cancel_c, regs_c, logger_c, model_c, effort_c,
+            )
+            .await
         });
         handles.push((m, handle));
     }
@@ -589,6 +608,7 @@ pub async fn run_resolved(
         let agg_prompt = build_aggregator_prompt(&prompt, &outcomes);
         let on_chunk = crate::events::output_streamer(logger.run_id(), aggregator_id, true);
         let agg_model = model_for(aggregator_id);
+        let agg_effort = effort_for(aggregator_id);
         match dispatch(
             aggregator_id,
             &agg_prompt,
@@ -597,6 +617,7 @@ pub async fn run_resolved(
             on_chunk,
             &regs,
             agg_model.as_deref(),
+            agg_effort,
         )
         .await
         {

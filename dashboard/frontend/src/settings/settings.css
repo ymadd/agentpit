@@ -369,8 +369,11 @@
 .set-version-pairs b { color: #cfd7de; font-family: "IBM Plex Mono", monospace; font-size: 9px; }
 .set-update-actions { align-self: stretch; display: flex; align-items: flex-end; }
 .set-secondary { padding: 7px 13px; border: 1px solid var(--set-line-strong); background: var(--set-raised); color: var(--set-muted); font-size: 11px; }
-.set-cli-contract { display: flex; align-items: center; gap: 8px; margin-top: 14px; padding: 9px; border: 1px solid var(--set-line); border-radius: 8px; background: #0a0e14; }
-.set-cli-contract code { color: #cfd7de; font-family: "IBM Plex Mono", monospace; font-size: 9px; }
+/* Holds two absolute filesystem paths, either of which can be longer than the card. The row
+   wraps and the paths break anywhere rather than pushing past the card's edge — `min-width: 0`
+   is what lets a flex child shrink below its content width at all. */
+.set-cli-contract { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; padding: 9px; border: 1px solid var(--set-line); border-radius: 8px; background: #0a0e14; }
+.set-cli-contract code { min-width: 0; overflow-wrap: anywhere; color: #cfd7de; font-family: "IBM Plex Mono", monospace; font-size: 9px; }
 .set-cli-contract span { padding: 2px 5px; border-radius: 4px; background: var(--set-accent-soft); color: var(--set-accent); font-size: 8px; }
 .set-cli-contract i { color: var(--set-faint); font-style: normal; }
 
@@ -433,6 +436,7 @@
 .set-skills-note {
   font-size: 12px;
   opacity: 0.75;
+  overflow-wrap: anywhere;
 }
 .set-skills-note.error {
   color: #e06c6c;

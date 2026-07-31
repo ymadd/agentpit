@@ -952,10 +952,6 @@ mod tests {
         }
     }
 
-    /// Security-review finding (2026-07-25): staging used `fs::write`, which follows a
-    /// symlink, so a pre-placed symlink at the predictable staging path could redirect the
-    /// update's bytes onto another file. `create_new` fails closed instead.
-    #[cfg(unix)]
     /// A symlink into a bundle is the arrangement that `self_replace` would silently destroy, so
     /// the updater has to recognise it before downloading anything.
     #[cfg(unix)]
@@ -989,6 +985,10 @@ mod tests {
         assert!(symlinked_into_bundle(&elsewhere).is_none());
     }
 
+    /// Security-review finding (2026-07-25): staging used `fs::write`, which follows a
+    /// symlink, so a pre-placed symlink at the predictable staging path could redirect the
+    /// update's bytes onto another file. `create_new` fails closed instead.
+    #[cfg(unix)]
     #[test]
     fn staging_refuses_to_follow_a_pre_placed_symlink() {
         let temp = tempfile::tempdir().unwrap();

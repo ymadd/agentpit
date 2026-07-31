@@ -27,8 +27,16 @@ const PATCH_PREVIEW_LINES: usize = 120;
 pub enum Action {
     /// Run one round: every contender builds the same thing in its own git worktree.
     Run {
-        /// What to build. Quote multi-word tasks.
-        task: String,
+        /// What to build. Quote multi-word tasks. Omit when using --template.
+        task: Option<String>,
+        /// Use a built-in probe instead (see `agentpit arena templates`). Its declared category
+        /// decides which capability cell the round's votes land in.
+        #[arg(long, conflicts_with = "task")]
+        template: Option<String>,
+        /// The subject the template works on — a path, a symptom, or a goal, depending on the
+        /// template. `arena templates` says which.
+        #[arg(long, requires = "template")]
+        target: Option<String>,
         /// Backends to enter (comma-separated). Defaults to the `[ensemble]` members.
         #[arg(long, value_delimiter = ',')]
         contenders: Option<Vec<BackendId>>,
@@ -49,20 +57,82 @@ pub enum Action {
     },
     /// Bradley–Terry standings over every vote cast so far.
     Leaderboard,
+    /// List the built-in probes, one per capability the matrix tracks.
+    Templates,
 }
 
 pub async fn run(action: Action) -> Result<()> {
     match action {
         Action::Run {
             task,
+            template,
+            target,
             contenders,
             model,
             effort,
             cwd,
-        } => run_round(task, contenders, model, effort, cwd).await,
+        } => {
+            let task = resolve_task(task, template.as_deref(), target.as_deref())?;
+            run_round(task, contenders, model, effort, cwd).await
+        }
         Action::Vote { round } => vote(round),
         Action::Leaderboard => leaderboard(),
+        Action::Templates => {
+            print!("{}", render_templates());
+            Ok(())
+        }
     }
+}
+
+/// The task text for this round: a free-text one, or a template rendered with its target. Pure so
+/// the "neither was given" message is covered by a test rather than only reachable by hand.
+fn resolve_task(
+    task: Option<String>,
+    template: Option<&str>,
+    target: Option<&str>,
+) -> Result<String> {
+    match (task, template) {
+        (Some(task), _) => Ok(task),
+        (None, Some(id)) => {
+            let t = arena::templates::find(id).ok_or_else(|| {
+                anyhow::anyhow!("unknown template '{id}'. `agentpit arena templates` lists them.")
+            })?;
+            t.render(target).map_err(|e| anyhow::anyhow!(e))
+        }
+        (None, None) => {
+            bail!("give a task, or pick a probe with --template (see `agentpit arena templates`)")
+        }
+    }
+}
+
+/// The built-in probes, grouped by the capability cell each one fills. Pure.
+fn render_templates() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\nBuilt-in arena probes — one per capability the matrix tracks. Each declares its own\n\
+         category, so a round's votes land in the cell named here rather than one guessed from\n\
+         the task text.\n"
+    );
+    for t in arena::templates::ALL {
+        let _ = writeln!(
+            out,
+            "  {:<34} [{}]\n      {}",
+            style(t.id).cyan(),
+            t.category.as_str(),
+            t.probes
+        );
+        if let Some(what) = t.target {
+            let _ = writeln!(out, "      --target: {what}");
+        }
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(
+        out,
+        "  agentpit arena run --template <id> --target <subject>"
+    );
+    out
 }
 
 async fn run_round(
@@ -430,6 +500,40 @@ mod tests {
             binary_files: Vec::new(),
             summary: String::new(),
             error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_template_renders_into_the_task_and_free_text_still_wins() {
+        let rendered =
+            resolve_task(None, Some("refactor/untangle"), Some("src/router.rs")).unwrap();
+        assert!(rendered.starts_with("CATEGORY: refactor"), "{rendered}");
+        assert!(rendered.contains("src/router.rs"));
+        // An explicit task is used verbatim — no declaration is bolted onto it, because the
+        // caller did not say what it is and guessing would defeat the point of the marker.
+        assert_eq!(
+            resolve_task(Some("do a thing".into()), None, None).unwrap(),
+            "do a thing"
+        );
+    }
+
+    #[test]
+    fn an_unknown_template_and_a_bare_run_both_say_what_to_do() {
+        let err = format!(
+            "{:#}",
+            resolve_task(None, Some("nope/nope"), None).unwrap_err()
+        );
+        assert!(err.contains("arena templates"), "{err}");
+        let err = format!("{:#}", resolve_task(None, None, None).unwrap_err());
+        assert!(err.contains("--template"), "{err}");
+    }
+
+    #[test]
+    fn the_listing_names_every_probe_and_the_cell_it_fills() {
+        let out = render_templates();
+        for t in arena::templates::ALL {
+            assert!(out.contains(t.id), "{} missing from the listing", t.id);
+            assert!(out.contains(t.category.as_str()), "{}", t.id);
         }
     }
 

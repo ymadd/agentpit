@@ -25,6 +25,7 @@
 
 pub mod rating;
 pub mod store;
+pub mod templates;
 pub mod worktree;
 
 use std::path::Path;

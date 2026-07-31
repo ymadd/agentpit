@@ -6,7 +6,9 @@
 //! and a judgement made while impatient is a worse judgement. So `run` finishes and exits, `vote`
 //! is picked up whenever the human is ready, and `leaderboard` reads the accumulated record.
 
-use anyhow::{Result, bail};
+use std::fs;
+
+use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use console::style;
 
@@ -91,6 +93,20 @@ pub enum Action {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Apply a stored submission's patch to the working tree.
+    ///
+    /// A round's worktrees are gone by the time it is judged; the patch is what survives, and
+    /// without this the only way to land a winner is to dig it out of the round JSON by hand.
+    Apply {
+        /// Round id. Defaults to the most recent one.
+        round: Option<String>,
+        /// Blind label to apply, e.g. `A`. Defaults to the round's vote winner.
+        #[arg(long)]
+        label: Option<char>,
+        /// Apply even when the working tree already has changes.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Show one round's submissions under their blind labels.
     Show {
         /// Round id. Defaults to the most recent one.
@@ -139,6 +155,11 @@ pub async fn run(action: Action) -> Result<()> {
             Ok(())
         }
         Action::Rounds { json } => rounds(json),
+        Action::Apply {
+            round,
+            label,
+            force,
+        } => apply(round, label, force),
         Action::Show {
             round,
             reveal,
@@ -202,6 +223,121 @@ fn vote_once(round_id: Option<String>, a: char, b: char, tie: bool) -> Result<()
         }
     );
     Ok(())
+}
+
+/// Apply one submission's patch to the working tree.
+///
+/// Refuses on a dirty tree unless forced: a patch landing on top of unrelated edits is hard to
+/// unpick afterwards, and the mistake is silent. Refuses to guess a winner when the votes do not
+/// name one — a tie, or an unjudged round, is not a decision.
+fn apply(round_id: Option<String>, label: Option<char>, force: bool) -> Result<()> {
+    let round_id = match round_id {
+        Some(id) => id,
+        None => latest_round()?,
+    };
+    let round = store::load_round(&round_id)?;
+    let by_label = label_index(&round);
+
+    let index = match label {
+        Some(l) => {
+            let l = l.to_ascii_uppercase();
+            *by_label.get(&l).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "round {round_id} has no submission labelled {l} (labels: {})",
+                    by_label.keys().collect::<String>()
+                )
+            })?
+        }
+        None => winning_index(&round, &round_id)?,
+    };
+    let submission = &round.submissions[index];
+    if submission.patch.trim().is_empty() {
+        bail!("that submission changed nothing — there is no patch to apply");
+    }
+
+    if !force && !git(&["status", "--porcelain"])?.trim().is_empty() {
+        bail!(
+            "the working tree has uncommitted changes. Commit or stash them first, or pass \
+             --force to apply on top of them."
+        );
+    }
+
+    let staged = std::env::temp_dir().join(format!("agentpit-arena-apply-{}.patch", round_id));
+    fs::write(&staged, &submission.patch)
+        .with_context(|| format!("failed to stage the patch at {}", staged.display()))?;
+    let result = git(&["apply", &staged.display().to_string()]);
+    let _ = fs::remove_file(&staged);
+    result?;
+
+    let (added, removed) = arena::worktree::patch_size(&submission.patch);
+    println!(
+        "applied {} from {round_id} (+{added}/-{removed}) — {}",
+        submission.backend,
+        match &submission.verify {
+            Some(v) => v.summary(),
+            None => "no check was run".into(),
+        }
+    );
+    if !submission.binary_files.is_empty() {
+        println!(
+            "  note: {} binary file(s) were omitted from the patch and are NOT applied: {}",
+            submission.binary_files.len(),
+            submission.binary_files.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The submission this round's votes chose. Errors when they did not choose one.
+fn winning_index(round: &Round, round_id: &str) -> Result<usize> {
+    let mut wins: std::collections::BTreeMap<BackendId, usize> = Default::default();
+    for v in store::load_votes()
+        .iter()
+        .filter(|v| v.round_id == round_id)
+    {
+        if let Some(w) = v.winner {
+            *wins.entry(w).or_default() += 1;
+        }
+    }
+    let best = wins.values().copied().max().unwrap_or(0);
+    if best == 0 {
+        bail!("round {round_id} has no decisive vote yet — judge it first, or pass --label");
+    }
+    let leaders: Vec<BackendId> = wins
+        .iter()
+        .filter(|(_, n)| **n == best)
+        .map(|(b, _)| *b)
+        .collect();
+    if leaders.len() > 1 {
+        bail!(
+            "round {round_id} is tied between {} — pass --label to choose",
+            leaders
+                .iter()
+                .map(|b| b.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        );
+    }
+    round
+        .submissions
+        .iter()
+        .position(|s| s.backend == leaders[0])
+        .ok_or_else(|| anyhow::anyhow!("the winning backend has no submission in this round"))
+}
+
+fn git(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The built-in probes as data, for the desktop app's picker.
@@ -297,6 +433,7 @@ fn show(round_id: Option<String>, reveal: bool, json: bool) -> Result<()> {
                 "patch": s.patch,
                 "summary": s.summary,
                 "binary_files": s.binary_files,
+                "verify": s.verify,
             });
             // Identity is withheld unless asked for: the labels exist so the work can be judged
             // without knowing whose it is, and a UI that received the names would have to
@@ -487,6 +624,7 @@ async fn run_round(
         &ctx.regs,
         cancel,
         concurrency,
+        ctx.loaded.config.arena.verify.as_deref(),
         |c, i, n, progress| match progress {
             arena::Progress::Started => {
                 eprintln!(
@@ -544,7 +682,11 @@ fn render_round_summary(round: &Round) -> String {
             (None, false) => "no changes".to_string(),
             (None, true) => format!("+{added}/-{removed}"),
         };
-        let _ = writeln!(out, "  [{}] {state}", s.backend);
+        let check = match &s.verify {
+            Some(v) => format!("  {}", v.summary()),
+            None => String::new(),
+        };
+        let _ = writeln!(out, "  [{}] {state}{check}", s.backend);
     }
     out
 }
@@ -678,6 +820,21 @@ fn print_submission(label: char, s: &Submission) {
         style(format!("── {label} ──")).cyan().bold(),
         style(format!("+{added}/-{removed}")).dim()
     );
+    // The check's verdict, next to the diff. A red check is a fact for the judge to weigh, not
+    // a disqualification — see `arena::verify`.
+    if let Some(v) = &s.verify {
+        let line = format!("{} — {}", v.summary(), v.command);
+        println!(
+            "{}",
+            match v.passed {
+                true => style(line).green(),
+                false => style(line).yellow(),
+            }
+        );
+        if !v.passed && !v.output.is_empty() {
+            println!("{}", style(clamp_lines(&v.output, 12)).dim());
+        }
+    }
     if !s.binary_files.is_empty() {
         println!(
             "{}",
@@ -810,6 +967,7 @@ mod tests {
             binary_files: Vec::new(),
             summary: String::new(),
             error: error.map(str::to_string),
+            verify: None,
         }
     }
 
@@ -891,6 +1049,37 @@ mod tests {
         assert!(shown.contains("190 more line(s) not shown"), "{shown}");
         // Short input is passed through untouched — no marker to mislead the judge.
         assert_eq!(clamp_lines("a\nb", 10), "a\nb");
+    }
+
+    /// A red check is information for the judge, never a disqualification: `judgeable` is about
+    /// whether there is work to compare, and a failing build is very much work to compare.
+    #[test]
+    fn a_failing_check_does_not_remove_a_submission_from_judging() {
+        let failed = Submission {
+            verify: Some(crate::arena::verify::VerifyOutcome {
+                command: "cargo test".into(),
+                passed: false,
+                exit_code: Some(101),
+                output: "FAILED".into(),
+            }),
+            ..submission(BackendId::Codex, "+ real work", None)
+        };
+        assert!(failed.judgeable());
+        let round = Round {
+            round_id: "r1".into(),
+            run_id: "run".into(),
+            task: "t".into(),
+            cwd: "/tmp".into(),
+            submissions: vec![failed, submission(BackendId::Claude, "+ other work", None)],
+        };
+        assert_eq!(round.blind_order().len(), 2);
+        assert_eq!(round.matchups().len(), 1);
+        // And the summary states it rather than hiding it.
+        assert!(
+            render_round_summary(&round).contains("check failed (exit 101)"),
+            "{}",
+            render_round_summary(&round)
+        );
     }
 
     #[test]

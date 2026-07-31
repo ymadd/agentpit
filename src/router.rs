@@ -351,6 +351,7 @@ mod tests {
             workflow: WorkflowSection::default(),
             backends: BTreeMap::new(),
             cascade: Default::default(),
+            arena: Default::default(),
         }
     }
 

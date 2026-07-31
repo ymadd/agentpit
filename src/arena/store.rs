@@ -40,6 +40,11 @@ pub struct Submission {
     /// Set when the dispatch itself failed; such a contender is excluded from voting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What the project's own check said about this submission, when one is configured. Shown
+    /// beside the diff; deliberately NOT part of [`Submission::judgeable`] — see
+    /// [`crate::arena::verify`], the verdict stays the human's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::arena::verify::VerifyOutcome>,
 }
 
 impl Submission {
@@ -199,6 +204,7 @@ mod tests {
             binary_files: Vec::new(),
             summary: String::new(),
             error: None,
+            verify: None,
         }
     }
 

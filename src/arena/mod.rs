@@ -26,6 +26,7 @@
 pub mod rating;
 pub mod store;
 pub mod templates;
+pub mod verify;
 pub mod worktree;
 
 use std::num::NonZeroUsize;
@@ -76,6 +77,10 @@ pub async fn run_round(
     regs: &Registries,
     cancel: CancellationToken,
     concurrency: usize,
+    // `verify_command`: the project's own check, run against each submission in its own
+    // worktree. `None` = no check configured; the round is still judged, the judge just gets no
+    // build signal.
+    verify_command: Option<&str>,
     on_progress: impl Fn(&Contender, usize, usize, Progress),
 ) -> Result<Round> {
     if contenders.len() < 2 {
@@ -94,8 +99,17 @@ pub async fn run_round(
             let cancel = &cancel;
             async move {
                 on_progress(contender, index + 1, total, Progress::Started);
-                let submission =
-                    run_one(round_id, index, task, repo, contender, regs, cancel).await;
+                let submission = run_one(
+                    round_id,
+                    index,
+                    task,
+                    repo,
+                    contender,
+                    regs,
+                    verify_command,
+                    cancel,
+                )
+                .await;
                 on_progress(
                     contender,
                     index + 1,
@@ -131,6 +145,7 @@ pub async fn run_round(
 /// Dispatch one contender inside a fresh worktree and reduce its work to a patch. Every failure
 /// mode — worktree creation, dispatch, diff capture — becomes a recorded error on the submission
 /// rather than an aborted round, so one broken backend cannot cost the others their runs.
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     round_id: &str,
     contender_index: usize,
@@ -138,6 +153,7 @@ async fn run_one(
     repo: &Path,
     contender: &Contender,
     regs: &Registries,
+    verify_command: Option<&str>,
     cancel: &CancellationToken,
 ) -> Submission {
     let mut submission = Submission {
@@ -146,6 +162,7 @@ async fn run_one(
         effort: contender.effort,
         patch: String::new(),
         binary_files: Vec::new(),
+        verify: None,
         summary: String::new(),
         error: None,
     };
@@ -194,6 +211,12 @@ async fn run_one(
                     submission.binary_files = capture.binary;
                 }
                 Err(e) => submission.error = Some(format!("{e:#}")),
+            }
+            // Inside the worktree and before it is removed: the check has to see this
+            // contender's tree, and only this contender's. Skipped for a submission that
+            // changed nothing — there is nothing to check and it will not be judged anyway.
+            if submission.error.is_none() && !submission.patch.trim().is_empty() {
+                submission.verify = verify::run(verify_command, tree.path(), cancel).await;
             }
         }
         Err(e) => submission.error = Some(format!("{e:#}")),
@@ -380,7 +403,8 @@ mod tests {
                 &regs,
                 CancellationToken::new(),
                 2,
-                move |contender, _, _, progress| {
+                None,
+                move |contender: &Contender, _, _, progress| {
                     if matches!(progress, Progress::Finished { .. }) {
                         finishes_for_progress
                             .lock()
@@ -444,6 +468,7 @@ mod tests {
             &regs,
             CancellationToken::new(),
             2,
+            None,
             |_, _, _, _| {},
         )
         .await
@@ -504,6 +529,7 @@ mod tests {
                 &regs,
                 cancel,
                 2,
+                None,
                 |_, _, _, _| {},
             ),
         )

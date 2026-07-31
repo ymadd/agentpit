@@ -396,6 +396,17 @@ pub struct BackendOverride {
     pub cost: Option<u8>,
 }
 
+/// `[arena]`: how a blind head-to-head round is run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArenaSection {
+    /// Shell command run inside each contender's worktree once its work is captured, e.g.
+    /// "cargo test". Its result is shown next to that submission's diff and is NEVER an
+    /// automatic disqualification — the arena's verdict is the human's, and a red check is one
+    /// more fact to weigh, not a substitute for judging. Unset = no check.
+    #[serde(default)]
+    pub verify: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HubConfig {
     #[serde(default)]
@@ -416,6 +427,8 @@ pub struct HubConfig {
     pub backends: BTreeMap<BackendId, BackendOverride>,
     #[serde(default)]
     pub cascade: CascadeSection,
+    #[serde(default)]
+    pub arena: ArenaSection,
 }
 
 /// Used for both `default.backend` and `auto_route.long_context_backend`. Claude since
@@ -702,6 +715,11 @@ review_members = ["antigravity", "opencode"]
 # roles    = ["reviewer", "security"]   # subset of the shared cast; empty/omitted = all worker roles
 # manager_backend = "claude"            # optional per-type override
 # enable_ask_human = true               # optional per-type knob override
+
+# Blind head-to-head rounds (`agentpit arena`).
+# [arena]
+# verify = "cargo test"   # run in each contender's worktree; shown beside its diff, never an
+#                         # automatic disqualification — the verdict stays yours
 
 # Per-backend transport + default model / effort override.
 # [backends.antigravity]

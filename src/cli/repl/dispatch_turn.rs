@@ -127,7 +127,12 @@ pub async fn dispatch_free_text(
 
     let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &state.cwd);
     decision.log(&logger, &task, effective_model.as_deref(), effective_effort);
-    logger.member_started(backend_id, false);
+    logger.member_started(
+        backend_id,
+        false,
+        effective_model.as_deref(),
+        effective_effort.map(|e| e.as_str()),
+    );
     let started = Instant::now();
 
     // Tee output to terminal and to dashboard's capture file.

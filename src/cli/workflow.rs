@@ -214,7 +214,12 @@ pub(crate) async fn run_capture(
         manager_effort.map(|e| e.as_str()),
         &goal,
     );
-    logger.member_started(manager, false);
+    logger.member_started(
+        manager,
+        false,
+        manager_model.as_deref(),
+        manager_effort.map(|e| e.as_str()),
+    );
 
     // 9. Build the manager prompt (needs the run id from step 8 as the parent run id). MCP mode
     //    gets a variant that drives the workflow via MCP tools instead of the Bash grammar.

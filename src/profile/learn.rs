@@ -2,7 +2,7 @@
 //!
 //! The fold reads the event log, derives at most one outcome label per run (per-member for
 //! graded ensemble runs), aggregates weighted success/failure counts per
-//! `(BackendId, TaskCategory)` cell as a Beta posterior, and returns the cells with enough
+//! `(backend, model, effort, category)` cell as a Beta posterior, and returns the cells with enough
 //! samples to trust. `agentpit profile learn` merges them into `profiles.toml` under the
 //! standing `benchmarked > learned > seeded` gate, so a gold-bench measurement is never
 //! overwritten by noisy telemetry.
@@ -89,11 +89,8 @@ pub struct RunRecord {
     pub backend: Option<BackendId>,
     /// Category from `RouteDecided`, else resolved later from the saved task text.
     pub category: Option<TaskCategory>,
-    /// The model / effort `RouteDecided` recorded for this run, which is what its labels are
-    /// ABOUT. For a fan-out run these are the run-wide `--model` / `--effort` (they applied to
-    /// every member); both `None` means the run left each backend on its configured default and
-    /// the log does not say which — so the labels belong to the UNPINNED row, whose meaning is
-    /// exactly "this backend on unspecified settings".
+    /// The run-level model / effort from `RouteDecided`. Single-backend labels use this variant;
+    /// old fan-out logs also fall back to it when their `MemberStarted` lines lack variant data.
     pub model: Option<String>,
     pub effort: Option<Effort>,
     pub task_hash: Option<String>,
@@ -102,6 +99,8 @@ pub struct RunRecord {
     pub members: Vec<BackendId>,
     pub kind: Option<RunKind>,
     pub finished: Option<LegStatus>,
+    /// Resolved variants for non-aggregator fan-out members, keyed by backend.
+    member_variants: BTreeMap<BackendId, (Option<String>, Option<Effort>)>,
     pub grades: Vec<(BackendId, u8)>,
     pub outcome: Option<OutcomeLabel>,
 }
@@ -111,6 +110,17 @@ impl RunRecord {
     /// shape whose run-level outcome is attributable to a single backend.
     fn single_backend(&self) -> Option<BackendId> {
         (self.members.len() <= 1).then_some(self.backend).flatten()
+    }
+
+    /// A graded member's own variant, with per-field fallback to the run variant for old logs.
+    fn member_variant(&self, backend: BackendId) -> (Option<String>, Option<Effort>) {
+        match self.member_variants.get(&backend) {
+            Some((model, effort)) => (
+                model.clone().or_else(|| self.model.clone()),
+                (*effort).or(self.effort),
+            ),
+            None => (self.model.clone(), self.effort),
+        }
     }
 }
 
@@ -195,6 +205,18 @@ pub fn parse_runs(log: &str) -> Vec<RunRecord> {
                 r.route_ts = ts;
                 r.model = model;
                 r.effort = effort.and_then(|e| e.parse().ok());
+            }
+            Event::MemberStarted {
+                run_id,
+                backend,
+                aggregator: false,
+                model,
+                effort,
+                ..
+            } => {
+                record(&mut order, &mut runs, &run_id)
+                    .member_variants
+                    .insert(backend, (model, effort.and_then(|e| e.parse().ok())));
             }
             Event::MemberGraded {
                 run_id,
@@ -294,10 +316,11 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
                     g if g < GRADE_FAIL => false,
                     _ => continue, // middling grade: no signal
                 };
+                let (model, effort) = run.member_variant(*backend);
                 labels.push(Label {
                     backend: *backend,
-                    model: run.model.clone(),
-                    effort: run.effort,
+                    model,
+                    effort,
                     category,
                     success,
                     source: LabelSource::Grade,
@@ -508,6 +531,66 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn fan_out_grades_fold_into_each_members_resolved_effort_row() {
+        let log = [
+            started("r-1", "review", &["claude", "codex"]),
+            route("r-1", "claude", Some("review"), "aa", 5),
+            r#"{"event":"member_started","ts":6,"run_id":"r-1","backend":"claude","aggregator":false,"effort":"low"}"#.into(),
+            r#"{"event":"member_started","ts":6,"run_id":"r-1","backend":"codex","aggregator":false,"effort":"high"}"#.into(),
+            r#"{"event":"member_graded","ts":7,"run_id":"r-1","backend":"claude","grade":90}"#.into(),
+            r#"{"event":"member_graded","ts":7,"run_id":"r-1","backend":"codex","grade":20}"#.into(),
+            finished("r-1", "ok"),
+        ]
+        .join("\n");
+
+        let labels = derive_labels(&parse_runs(&log), DEFAULT_RERUN_WINDOW_MS);
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].effort, Some(Effort::Low));
+        assert_eq!(labels[1].effort, Some(Effort::High));
+
+        let scores = fold_scores(&labels, 1);
+        let claude_low = ProfileKey::new(BackendId::Claude, None, Some(Effort::Low));
+        let codex_high = ProfileKey::new(BackendId::Codex, None, Some(Effort::High));
+        assert_eq!(scores.len(), 2);
+        assert!(scores.contains_key(&claude_low));
+        assert!(scores.contains_key(&codex_high));
+        assert!(!scores.contains_key(&ProfileKey::unpinned(BackendId::Claude)));
+        assert!(!scores.contains_key(&ProfileKey::unpinned(BackendId::Codex)));
+    }
+
+    #[test]
+    fn old_member_started_lines_fall_back_to_the_run_variant() {
+        let route = r#"{"event":"route_decided","ts":5,"run_id":"r-1","backend":"claude","reason":"ensemble","category":"review","model":"shared-model","effort":"medium","task_hash":"aa"}"#;
+        let grade =
+            r#"{"event":"member_graded","ts":7,"run_id":"r-1","backend":"claude","grade":90}"#;
+        let without_member_started = [
+            started("r-1", "review", &["claude"]),
+            route.into(),
+            grade.into(),
+        ]
+        .join("\n");
+        let with_old_member_started = [
+            started("r-1", "review", &["claude"]),
+            route.into(),
+            r#"{"event":"member_started","ts":6,"run_id":"r-1","backend":"claude","aggregator":false}"#.into(),
+            grade.into(),
+        ]
+        .join("\n");
+
+        let expected = derive_labels(
+            &parse_runs(&without_member_started),
+            DEFAULT_RERUN_WINDOW_MS,
+        );
+        let actual = derive_labels(
+            &parse_runs(&with_old_member_started),
+            DEFAULT_RERUN_WINDOW_MS,
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0].model.as_deref(), Some("shared-model"));
+        assert_eq!(actual[0].effort, Some(Effort::Medium));
     }
 
     #[test]

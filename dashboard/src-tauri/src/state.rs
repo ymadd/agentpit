@@ -245,6 +245,7 @@ impl Tracker {
                 run_id,
                 backend,
                 aggregator,
+                ..
             } => {
                 let run = self.ensure(&run_id);
                 let m = find_or_push(&mut run.members, backend.as_str(), aggregator);

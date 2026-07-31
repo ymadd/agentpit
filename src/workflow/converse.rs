@@ -201,7 +201,7 @@ async fn run_leg(
     logger: Option<&RunLogger>,
 ) -> Result<String, String> {
     if let Some(l) = logger {
-        l.member_started(backend, false);
+        l.member_started(backend, false, None, None);
     }
     let started = Instant::now();
     let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_chunk: &str| {});

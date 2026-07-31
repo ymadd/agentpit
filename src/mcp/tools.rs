@@ -454,7 +454,14 @@ impl AgentpitTools {
             let regs = self.regs.clone();
             let cancel = cancel.clone();
             let logger = logger.clone();
-            let model = req.model.clone();
+            let model = crate::workflow::roles::resolve_model(
+                req.model.as_deref(),
+                None,
+                self.config
+                    .backends
+                    .get(&b)
+                    .and_then(|o| o.model.as_deref()),
+            );
             // Each member falls back to its own `[backends.<id>].effort` and is clamped to the
             // rungs it can express, exactly like the CLI ensemble.
             let effort = crate::effort::resolve_effort(
@@ -491,7 +498,26 @@ impl AgentpitTools {
             } else {
                 let agg_prompt = build_aggregator_prompt(&req.prompt, &outcomes);
                 let cancel = CancellationToken::new();
-                logger.member_started(agg, true);
+                let agg_model = crate::workflow::roles::resolve_model(
+                    req.model.as_deref(),
+                    None,
+                    self.config
+                        .backends
+                        .get(&agg)
+                        .and_then(|o| o.model.as_deref()),
+                );
+                let agg_effort = crate::effort::resolve_effort(
+                    req_effort,
+                    None,
+                    self.config.backends.get(&agg).and_then(|o| o.effort),
+                )
+                .map(|e| e.clamp_for(agg));
+                logger.member_started(
+                    agg,
+                    true,
+                    agg_model.as_deref(),
+                    agg_effort.map(|e| e.as_str()),
+                );
                 let started = Instant::now();
                 let on_chunk = crate::events::output_streamer(logger.run_id(), agg, true);
                 match dispatch(
@@ -501,13 +527,8 @@ impl AgentpitTools {
                     cancel,
                     on_chunk,
                     &self.regs,
-                    req.model.as_deref(),
-                    crate::effort::resolve_effort(
-                        req_effort,
-                        None,
-                        self.config.backends.get(&agg).and_then(|o| o.effort),
-                    )
-                    .map(|e| e.clamp_for(agg)),
+                    agg_model.as_deref(),
+                    agg_effort,
                 )
                 .await
                 {
@@ -837,7 +858,7 @@ async fn dispatch_member_logged(
     model: Option<String>,
     effort: Option<Effort>,
 ) -> MemberOutcome {
-    logger.member_started(backend, false);
+    logger.member_started(backend, false, model.as_deref(), effort.map(|e| e.as_str()));
     let started = Instant::now();
     let on_chunk = crate::events::output_streamer(logger.run_id(), backend, false);
     let outcome = dispatch_to_outcome(

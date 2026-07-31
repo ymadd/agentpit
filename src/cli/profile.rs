@@ -862,7 +862,7 @@ async fn run_live_bench(
     // streams every task's output to the run's capture file, so it can be tailed live instead of
     // running invisibly. The bench is sequential single-backend, so one member is the honest shape.
     let logger = RunLogger::start(RunKind::Bench, &[backend], &cwd);
-    logger.member_started(backend, false);
+    logger.member_started(backend, false, None, None);
     let started = std::time::Instant::now();
     let sink = output_streamer(logger.run_id(), backend, false);
 

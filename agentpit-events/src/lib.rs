@@ -188,6 +188,12 @@ pub enum Event {
         /// True when this leg is the aggregator pass rather than a parallel member.
         #[serde(default)]
         aggregator: bool,
+        /// The model resolved for this member dispatch, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The already-clamped reasoning effort resolved for this member dispatch, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
     MemberFinished {
         ts: u64,
@@ -722,12 +728,20 @@ impl RunLogger {
         }
     }
 
-    pub fn member_started(&self, backend: BackendId, aggregator: bool) {
+    pub fn member_started(
+        &self,
+        backend: BackendId,
+        aggregator: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) {
         self.emit(Event::MemberStarted {
             ts: now_ms(),
             run_id: self.run_id.clone(),
             backend,
             aggregator,
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
         });
     }
 
@@ -963,6 +977,37 @@ mod tests {
     }
 
     #[test]
+    fn member_started_variants_round_trip_and_old_lines_still_parse() {
+        let event = Event::MemberStarted {
+            ts: 123,
+            run_id: "1-0".into(),
+            backend: BackendId::Codex,
+            aggregator: false,
+            model: Some("gpt-5-codex".into()),
+            effort: Some("xhigh".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"model\":\"gpt-5-codex\""));
+        assert!(json.contains("\"effort\":\"xhigh\""));
+        match serde_json::from_str::<Event>(&json).unwrap() {
+            Event::MemberStarted { model, effort, .. } => {
+                assert_eq!(model.as_deref(), Some("gpt-5-codex"));
+                assert_eq!(effort.as_deref(), Some("xhigh"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let old = r#"{"event":"member_started","ts":123,"run_id":"1-0","backend":"codex","aggregator":false}"#;
+        match serde_json::from_str::<Event>(old).unwrap() {
+            Event::MemberStarted { model, effort, .. } => {
+                assert_eq!(model, None);
+                assert_eq!(effort, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn bench_run_kind_serializes_as_bench_and_round_trips() {
         // The dashboard deserializes RunStarted via this crate, so the `bench` wire tag is a
         // contract: a gold-bench sweep must label its swarm row "bench", not silently fail to parse.
@@ -1101,7 +1146,7 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", tmp.path());
         }
         let logger = RunLogger::start(RunKind::Rescue, &[BackendId::Opencode], tmp.path());
-        logger.member_started(BackendId::Opencode, false);
+        logger.member_started(BackendId::Opencode, false, None, None);
         logger.member_finished(BackendId::Opencode, false, LegStatus::Ok, 10, Some(5), None);
         logger.finished(LegStatus::Ok);
 

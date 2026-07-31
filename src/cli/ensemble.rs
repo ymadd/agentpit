@@ -509,14 +509,14 @@ pub async fn run_resolved(
     let mut handles = Vec::new();
     for m in pre.runnable {
         report_member_start(m);
-        logger.member_started(m, false);
+        let model_c = model_for(m);
+        let effort_c = effort_for(m);
+        logger.member_started(m, false, model_c.as_deref(), effort_c.map(|e| e.as_str()));
         let cwd_c = cwd.clone();
         let cancel_c = cancel.clone();
         let regs_c = regs.clone();
         let prompt_c = prompt.clone();
         let logger_c = logger.clone();
-        let model_c = model_for(m);
-        let effort_c = effort_for(m);
         let handle = tokio::spawn(async move {
             run_one_member(
                 m, prompt_c, cwd_c, cancel_c, regs_c, logger_c, model_c, effort_c,
@@ -603,12 +603,17 @@ pub async fn run_resolved(
         }
 
         report_member_start(aggregator_id);
-        logger.member_started(aggregator_id, true);
+        let agg_model = model_for(aggregator_id);
+        let agg_effort = effort_for(aggregator_id);
+        logger.member_started(
+            aggregator_id,
+            true,
+            agg_model.as_deref(),
+            agg_effort.map(|e| e.as_str()),
+        );
         let started = Instant::now();
         let agg_prompt = build_aggregator_prompt(&prompt, &outcomes);
         let on_chunk = crate::events::output_streamer(logger.run_id(), aggregator_id, true);
-        let agg_model = model_for(aggregator_id);
-        let agg_effort = effort_for(aggregator_id);
         match dispatch(
             aggregator_id,
             &agg_prompt,

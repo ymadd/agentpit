@@ -27,6 +27,7 @@ clap = { version = "4.5", features = ["derive"] }
 cliclack = "0.5"
 console = "0.15"
 dirs = "5"
+futures-util = "0.3"
 # kNN similarity routing (feature `similarity`): local ONNX embeddings. Optional so the
 # default single-binary build carries no ONNX runtime.
 fastembed = { version = "5", optional = true }

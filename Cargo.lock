@@ -72,6 +72,7 @@ dependencies = [
  "dirs 5.0.1",
  "fastembed",
  "flate2",
+ "futures-util",
  "regex",
  "reqwest 0.13.3",
  "rmcp",

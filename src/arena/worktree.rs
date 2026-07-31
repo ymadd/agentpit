@@ -256,8 +256,13 @@ diff --git a/x.rs b/x.rs
         );
 
         let path_a = a.path().to_path_buf();
+        let path_b = b.path().to_path_buf();
         drop(a);
         drop(b);
         assert!(!path_a.exists(), "the worktree is removed on drop");
+        assert!(
+            !path_b.exists(),
+            "each concurrently-live worktree is removed by its own guard"
+        );
     }
 }

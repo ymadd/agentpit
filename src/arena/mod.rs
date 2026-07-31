@@ -28,16 +28,22 @@ pub mod store;
 pub mod templates;
 pub mod worktree;
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use futures_util::{StreamExt, stream};
 use tokio_util::sync::CancellationToken;
 
 use crate::dispatch::{Registries, dispatch};
 use crate::effort::Effort;
 use crate::types::BackendId;
 use store::{Round, Submission};
+
+/// Conservative default because every concurrent contender is a full agentic run, multiplying
+/// both token spend and local CPU use.
+pub const DEFAULT_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 /// One contender: a backend at the model/effort it will actually run.
 #[derive(Debug, Clone)]
@@ -47,12 +53,19 @@ pub struct Contender {
     pub effort: Option<Effort>,
 }
 
+/// A contender's visible lifecycle within a concurrent round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    Started,
+    Finished { failed: bool },
+}
+
 /// Run `task` once per contender, each in its own worktree, and collect their patches.
 ///
-/// Sequential on purpose for the MVP: N coding agents in parallel is N times the token spend and
-/// N times the CPU, and the arena is already the most expensive thing agentpit can do — one round
-/// is a full agentic run per contender. Failures do not abort the round; a contender that errored
-/// is recorded with its error and simply is not offered for judging.
+/// At most `concurrency` contenders run at once. Completion order does not affect storage order:
+/// submissions are restored to the order of `contenders`, keeping blind labels deterministic.
+/// Failures do not abort the round; a contender that errored is recorded with its error and simply
+/// is not offered for judging.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_round(
     round_id: &str,
@@ -62,18 +75,49 @@ pub async fn run_round(
     contenders: &[Contender],
     regs: &Registries,
     cancel: CancellationToken,
-    on_progress: impl Fn(&Contender, usize, usize),
+    concurrency: usize,
+    on_progress: impl Fn(&Contender, usize, usize, Progress),
 ) -> Result<Round> {
     if contenders.len() < 2 {
         bail!("an arena needs at least two contenders to compare");
     }
+    if concurrency == 0 {
+        bail!("arena concurrency must be at least 1");
+    }
     let repo = worktree::repo_root(cwd)?;
 
-    let mut submissions = Vec::with_capacity(contenders.len());
-    for (i, contender) in contenders.iter().enumerate() {
-        on_progress(contender, i + 1, contenders.len());
-        submissions.push(run_one(round_id, task, &repo, contender, regs, &cancel).await);
-    }
+    let total = contenders.len();
+    let on_progress = &on_progress;
+    let mut indexed = stream::iter(contenders.iter().enumerate())
+        .map(|(index, contender)| {
+            let repo = &repo;
+            let cancel = &cancel;
+            async move {
+                on_progress(contender, index + 1, total, Progress::Started);
+                let submission =
+                    run_one(round_id, index, task, repo, contender, regs, cancel).await;
+                on_progress(
+                    contender,
+                    index + 1,
+                    total,
+                    Progress::Finished {
+                        failed: submission.error.is_some(),
+                    },
+                );
+                (index, submission)
+            }
+        })
+        .buffer_unordered(concurrency.min(total))
+        .collect::<Vec<_>>()
+        .await;
+
+    // `buffer_unordered` yields in completion order. Restore input order so persisted submissions
+    // — and therefore their blind labels — never depend on which backend happened to finish first.
+    indexed.sort_unstable_by_key(|(index, _)| *index);
+    let submissions = indexed
+        .into_iter()
+        .map(|(_, submission)| submission)
+        .collect();
 
     Ok(Round {
         round_id: round_id.to_string(),
@@ -89,6 +133,7 @@ pub async fn run_round(
 /// rather than an aborted round, so one broken backend cannot cost the others their runs.
 async fn run_one(
     round_id: &str,
+    contender_index: usize,
     task: &str,
     repo: &Path,
     contender: &Contender,
@@ -105,7 +150,18 @@ async fn run_one(
         error: None,
     };
 
-    let tree = match worktree::create(repo, &format!("{round_id}-{}", contender.backend)) {
+    // A cancelled round must not start queued contenders after the in-flight dispatches unwind.
+    if cancel.is_cancelled() {
+        submission.error = Some("cancelled before execution".into());
+        return submission;
+    }
+
+    // Include the stable slice index as well as the backend. Besides making the tag genuinely
+    // per-contender, this prevents duplicate backend entries from racing for the same checkout.
+    let tree = match worktree::create(
+        repo,
+        &format!("{round_id}-{}-{}", contender_index + 1, contender.backend),
+    ) {
         Ok(t) => t,
         Err(e) => {
             submission.error = Some(format!("{e:#}"));
@@ -162,7 +218,101 @@ pub fn pairs(votes: &[store::Vote]) -> Vec<rating::Pair> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
     use super::*;
+    use crate::exec::{ExecAdapter, ExecSpec};
+
+    static NEXT_ROUND: AtomicU64 = AtomicU64::new(0);
+
+    struct ScriptedExec {
+        backend: BackendId,
+        script: String,
+        env: Vec<(String, String)>,
+    }
+
+    impl ScriptedExec {
+        fn new(backend: BackendId, script: impl Into<String>) -> Self {
+            Self {
+                backend,
+                script: script.into(),
+                env: Vec::new(),
+            }
+        }
+
+        fn with_env(mut self, key: &str, value: String) -> Self {
+            self.env.push((key.to_string(), value));
+            self
+        }
+    }
+
+    impl ExecAdapter for ScriptedExec {
+        fn id(&self) -> BackendId {
+            self.backend
+        }
+
+        fn build_spec(
+            &self,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<Effort>,
+        ) -> ExecSpec {
+            ExecSpec {
+                command: "sh".into(),
+                args: vec!["-c".into(), self.script.clone()],
+                env: self.env.clone(),
+                stdin_input: None,
+            }
+        }
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "arena@example.com"][..],
+            &["config", "user.name", "Arena Test"][..],
+        ] {
+            git(dir.path(), args);
+        }
+        std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "base"]);
+        dir
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn contender(backend: BackendId) -> Contender {
+        Contender {
+            backend,
+            model: None,
+            effort: None,
+        }
+    }
+
+    fn round_id(label: &str) -> String {
+        format!(
+            "test-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ROUND.fetch_add(1, Ordering::Relaxed)
+        )
+    }
 
     fn vote(winner: Option<BackendId>, loser: Option<BackendId>, tie: bool) -> store::Vote {
         store::Vote {
@@ -188,5 +338,187 @@ mod tests {
             "only the decisive, complete vote is fitted"
         );
         assert_eq!(fitted[0].winner, BackendId::Codex);
+    }
+
+    #[tokio::test]
+    async fn submissions_keep_contender_order_when_completion_order_differs() {
+        let repo = init_repo();
+        let release = repo.path().join("release-slow-contender");
+        let mut regs = Registries::empty();
+        regs.execs.insert(
+            BackendId::Claude,
+            Box::new(
+                ScriptedExec::new(
+                    BackendId::Claude,
+                    "while [ ! -f \"$ARENA_TEST_RELEASE\" ]; do sleep 0.01; done; \
+                     printf slow > result.txt",
+                )
+                .with_env("ARENA_TEST_RELEASE", release.display().to_string()),
+            ),
+        );
+        regs.execs.insert(
+            BackendId::Codex,
+            Box::new(ScriptedExec::new(
+                BackendId::Codex,
+                "printf fast > result.txt",
+            )),
+        );
+        let contenders = vec![contender(BackendId::Claude), contender(BackendId::Codex)];
+        let finishes = Arc::new(Mutex::new(Vec::new()));
+        let finishes_for_progress = finishes.clone();
+        let release_for_progress = release.clone();
+        let id = round_id("order");
+
+        let round = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_round(
+                &id,
+                "test-run",
+                "make a result",
+                repo.path(),
+                &contenders,
+                &regs,
+                CancellationToken::new(),
+                2,
+                move |contender, _, _, progress| {
+                    if matches!(progress, Progress::Finished { .. }) {
+                        finishes_for_progress
+                            .lock()
+                            .unwrap()
+                            .push(contender.backend);
+                        if contender.backend == BackendId::Codex {
+                            std::fs::write(&release_for_progress, "go").unwrap();
+                        }
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("the concurrently released round should finish")
+        .unwrap();
+
+        assert_eq!(
+            *finishes.lock().unwrap(),
+            vec![BackendId::Codex, BackendId::Claude],
+            "the test must actually complete in reverse order"
+        );
+        assert_eq!(
+            round
+                .submissions
+                .iter()
+                .map(|submission| submission.backend)
+                .collect::<Vec<_>>(),
+            vec![BackendId::Claude, BackendId::Codex],
+            "stored order follows the contender slice, not completion order"
+        );
+        assert!(round.submissions[0].patch.contains("slow"));
+        assert!(round.submissions[1].patch.contains("fast"));
+    }
+
+    #[tokio::test]
+    async fn one_contender_failure_does_not_prevent_siblings_being_recorded() {
+        let repo = init_repo();
+        let mut regs = Registries::empty();
+        regs.execs.insert(
+            BackendId::Claude,
+            Box::new(ScriptedExec::new(
+                BackendId::Claude,
+                "printf boom >&2; exit 7",
+            )),
+        );
+        regs.execs.insert(
+            BackendId::Codex,
+            Box::new(ScriptedExec::new(
+                BackendId::Codex,
+                "printf success > result.txt",
+            )),
+        );
+        let contenders = vec![contender(BackendId::Claude), contender(BackendId::Codex)];
+
+        let round = run_round(
+            &round_id("failure"),
+            "test-run",
+            "make a result",
+            repo.path(),
+            &contenders,
+            &regs,
+            CancellationToken::new(),
+            2,
+            |_, _, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(round.submissions.len(), 2);
+        assert!(
+            round.submissions[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("exited with code 7")),
+            "the failed contender is retained with its error: {:?}",
+            round.submissions[0]
+        );
+        assert!(round.submissions[1].error.is_none());
+        assert!(round.submissions[1].patch.contains("success"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_round_stops_every_in_flight_contender() {
+        let repo = init_repo();
+        let started_a = repo.path().join("started-a");
+        let started_b = repo.path().join("started-b");
+        let mut regs = Registries::empty();
+        for (backend, marker) in [
+            (BackendId::Claude, started_a.clone()),
+            (BackendId::Codex, started_b.clone()),
+        ] {
+            regs.execs.insert(
+                backend,
+                Box::new(
+                    ScriptedExec::new(backend, "touch \"$ARENA_TEST_STARTED\"; exec sleep 30")
+                        .with_env("ARENA_TEST_STARTED", marker.display().to_string()),
+                ),
+            );
+        }
+        let contenders = vec![contender(BackendId::Claude), contender(BackendId::Codex)];
+        let cancel = CancellationToken::new();
+        let cancel_when_started = cancel.clone();
+        let monitor = tokio::spawn(async move {
+            loop {
+                if started_a.exists() && started_b.exists() {
+                    cancel_when_started.cancel();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let round = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_round(
+                &round_id("cancel"),
+                "test-run",
+                "wait forever",
+                repo.path(),
+                &contenders,
+                &regs,
+                cancel,
+                2,
+                |_, _, _, _| {},
+            ),
+        )
+        .await
+        .expect("cancellation should stop both long-running contenders")
+        .unwrap();
+        monitor.await.unwrap();
+
+        assert!(
+            round
+                .submissions
+                .iter()
+                .all(|submission| submission.error.is_some()),
+            "both cancelled contenders should be retained as failures: {:?}",
+            round.submissions
+        );
     }
 }

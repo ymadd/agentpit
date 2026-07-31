@@ -57,9 +57,9 @@ pub async fn run(
         vec![critic, defender]
     };
     let logger = RunLogger::start(RunKind::Bench, &members, &cwd);
-    logger.member_started(critic, false);
+    logger.member_started(critic, false, None, None);
     if defender != critic {
-        logger.member_started(defender, false);
+        logger.member_started(defender, false, None, None);
     }
 
     let results = run_refute_bench(&tasks, critic, defender, &cwd, &ctx.regs, cancel).await;

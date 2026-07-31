@@ -40,6 +40,14 @@ pub enum Action {
         /// Backends to enter (comma-separated). Defaults to the `[ensemble]` members.
         #[arg(long, value_delimiter = ',')]
         contenders: Option<Vec<BackendId>>,
+        /// Maximum contenders to run at once. The default is deliberately small rather than all
+        /// contenders: every slot is a full agentic run and multiplies token spend and local CPU.
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = arena::DEFAULT_CONCURRENCY
+        )]
+        concurrency: std::num::NonZeroUsize,
         /// Pin the model for every contender. Otherwise each uses its `[backends.<id>].model`.
         #[arg(long)]
         model: Option<String>,
@@ -103,12 +111,13 @@ pub async fn run(action: Action) -> Result<()> {
             template,
             target,
             contenders,
+            concurrency,
             model,
             effort,
             cwd,
         } => {
             let task = resolve_task(task, template.as_deref(), target.as_deref())?;
-            run_round(task, contenders, model, effort, cwd).await
+            run_round(task, contenders, concurrency.get(), model, effort, cwd).await
         }
         Action::Vote {
             round,
@@ -396,6 +405,7 @@ fn render_templates() -> String {
 async fn run_round(
     task: String,
     contenders: Option<Vec<BackendId>>,
+    concurrency: usize,
     model: Option<String>,
     effort: Option<Effort>,
     cwd: Option<String>,
@@ -462,9 +472,10 @@ async fn run_round(
     );
     let round_id = format!("arena-{}", logger.run_id());
     eprintln!(
-        "{} arena round {round_id}: {} contenders, one worktree each",
+        "{} arena round {round_id}: {} contenders, one worktree each, up to {} running at once",
         style("→").bold(),
-        field.len()
+        field.len(),
+        concurrency.min(field.len())
     );
 
     let round = arena::run_round(
@@ -475,16 +486,24 @@ async fn run_round(
         &field,
         &ctx.regs,
         cancel,
-        |c, i, n| {
-            eprintln!(
-                "  [{}/{n}] {} (model={}, effort={}) …",
-                i,
-                c.backend,
-                c.model.as_deref().unwrap_or("CLI default"),
-                c.effort
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "CLI default".into()),
-            );
+        concurrency,
+        |c, i, n, progress| match progress {
+            arena::Progress::Started => {
+                eprintln!(
+                    "  [{i}/{n}] {} started (model={}, effort={})",
+                    c.backend,
+                    c.model.as_deref().unwrap_or("CLI default"),
+                    c.effort
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "CLI default".into()),
+                );
+            }
+            arena::Progress::Finished { failed: false } => {
+                eprintln!("  [{i}/{n}] {} finished", c.backend);
+            }
+            arena::Progress::Finished { failed: true } => {
+                eprintln!("  [{i}/{n}] {} failed", c.backend);
+            }
         },
     )
     .await;
@@ -774,6 +793,13 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct ArenaArgs {
+        #[command(subcommand)]
+        action: Action,
+    }
 
     fn submission(backend: BackendId, patch: &str, error: Option<&str>) -> Submission {
         Submission {
@@ -810,6 +836,19 @@ mod tests {
         assert!(err.contains("arena templates"), "{err}");
         let err = format!("{:#}", resolve_task(None, None, None).unwrap_err());
         assert!(err.contains("--template"), "{err}");
+    }
+
+    #[test]
+    fn run_concurrency_defaults_to_two_and_rejects_zero() {
+        let parsed = ArenaArgs::try_parse_from(["arena", "run", "do work"]).unwrap();
+        let Action::Run { concurrency, .. } = parsed.action else {
+            panic!("expected arena run")
+        };
+        assert_eq!(concurrency, arena::DEFAULT_CONCURRENCY);
+
+        let error = ArenaArgs::try_parse_from(["arena", "run", "do work", "--concurrency", "0"])
+            .unwrap_err();
+        assert!(error.to_string().contains("non-zero"), "{error}");
     }
 
     #[test]

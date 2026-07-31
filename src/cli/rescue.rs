@@ -266,7 +266,12 @@ async fn run_with_route_inner(
 
     let logger = RunLogger::start_with_role(kind, &[backend_id], &cwd, role_label);
     decision.log(&logger, &task, effective_model.as_deref(), effective_effort);
-    logger.member_started(backend_id, false);
+    logger.member_started(
+        backend_id,
+        false,
+        effective_model.as_deref(),
+        effective_effort.map(|e| e.as_str()),
+    );
     let started = Instant::now();
 
     // Tee streamed output to both the terminal and the dashboard's capture file.
@@ -557,7 +562,12 @@ pub async fn run_cascade(
             effective_effort.map(|e| e.as_str()),
             &task,
         );
-        logger.member_started(backend_id, false);
+        logger.member_started(
+            backend_id,
+            false,
+            effective_model.as_deref(),
+            effective_effort.map(|e| e.as_str()),
+        );
         let started = Instant::now();
 
         let to_stdout = stdout_streamer();

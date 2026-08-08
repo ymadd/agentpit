@@ -255,6 +255,7 @@ pub(crate) async fn run_capture(
             logger.run_id(),
             ask,
             &prompt_roles,
+            eff.enable_repl,
         )
     };
 
@@ -429,6 +430,8 @@ struct EffectiveWorkflow {
     max_calls_per_manager: u32,
     use_mcp: bool,
     enable_ask_human: bool,
+    /// Teach the manager the orchestration REPL block (design §10.9 R3).
+    enable_repl: bool,
     /// Which worker roles to dispatch to. `None` = every configured worker role (base behavior);
     /// `Some(names)` = the type's ordered subset of the shared cast.
     role_filter: Option<Vec<String>>,
@@ -459,6 +462,7 @@ fn resolve_workflow_type(
         max_calls_per_manager: section.max_calls_per_manager,
         use_mcp: section.use_mcp,
         enable_ask_human: section.enable_ask_human,
+        enable_repl: section.enable_repl,
         role_filter: None,
         brief: None,
         flow: section.flow.clone(),
@@ -485,6 +489,7 @@ fn resolve_workflow_type(
             .unwrap_or(base.max_calls_per_manager),
         use_mcp: t.use_mcp.unwrap_or(base.use_mcp),
         enable_ask_human: t.enable_ask_human.unwrap_or(base.enable_ask_human),
+        enable_repl: t.enable_repl.unwrap_or(base.enable_repl),
         role_filter: (!t.roles.is_empty()).then(|| t.roles.clone()),
         brief: t.prompt.clone(),
         // A type that was never sketched inherits the base canvas's flow hint, mirroring how
@@ -1140,6 +1145,7 @@ pub fn build_manager_prompt(
     parent_run_id: &str,
     ask: Option<AskTier>,
     roles: &PromptRoles<'_>,
+    repl: bool,
 ) -> String {
     let agents_csv = agents_csv(agents);
     // The model embeds `self_path` directly into Bash commands; single-quote it so a binary path
@@ -1172,6 +1178,23 @@ pub fn build_manager_prompt(
         String::new()
     };
     let conversation = conversation.as_str();
+    // The orchestration-REPL block (§10.9 R3): opt-in via [workflow] enable_repl so the
+    // default prompt stays byte-identical and managers are never taught a tool that needs
+    // an uninstalled deno.
+    let repl_block = if repl {
+        format!(
+            "ORCHESTRATION REPL (persistent TypeScript cells; keeps large intermediate results OUT of your context):\n\
+             \x20 First cell:  {self_path} orchestrate --cell \"<ts code>\"   (stderr prints `session: <id>` — reuse it)\n\
+             \x20 Later cells: {self_path} orchestrate --session <id> --cell \"<ts code>\"\n\
+             \x20 In cells: S.x = await dispatch(\"<sub-task>\", {{backend: \"<id>\"}}) fans work out; store.put/get \
+             persists across crashes; end a cell with `return <expr>` to see a truncated repr. \
+             const/let are cell-local — persist on S. Prefer cells when combining many sub-results: \
+             reference S instead of pasting large outputs back into your own context.\n\n"
+        )
+    } else {
+        String::new()
+    };
+    let repl_block = repl_block.as_str();
     // Roster + dispatch-grammar blocks: role mode teaches `rescue --role`, legacy mode keeps the
     // flat backend grammar. Composed as blocks so the legacy assembly stays byte-identical.
     let (roster_block, grammar_block) = match roles.roster {
@@ -1235,6 +1258,7 @@ BUDGET: workflow depth {depth}/{max_depth}; aim for <= {max_calls} sub-dispatch 
 \n\
 {discipline}\
 {conversation}\
+{repl_block}\
 PROCEDURE:\n\
   1. Briefly state your plan (the sub-tasks).\n\
   2. Dispatch each sub-task; read its output; adjust the remaining plan as needed.\n\
@@ -1999,6 +2023,7 @@ mod tests {
             "run-42",
             None,
             &PromptRoles::default(),
+            false,
         );
         // Each agent id appears.
         assert!(text.contains("codex"));
@@ -2031,6 +2056,7 @@ mod tests {
             "run-1",
             None,
             &PromptRoles::default(),
+            false,
         );
         // The path is single-quoted so it survives word-splitting in the model's Bash commands.
         assert!(text.contains("'/Users/a b/bin/agentpit' rescue --backend"));
@@ -2081,6 +2107,7 @@ mod tests {
             "run-1",
             None,
             &PromptRoles::default(),
+            false,
         );
         assert!(!text.contains("mcp__agentpit__"));
     }
@@ -2098,6 +2125,7 @@ mod tests {
             "run-1",
             None,
             &PromptRoles::default(),
+            false,
         );
         let mcp = build_manager_prompt_mcp(
             "goal",
@@ -2141,6 +2169,7 @@ mod tests {
             "run-1",
             Some(AskTier::High),
             &PromptRoles::default(),
+            false,
         );
         assert!(cli.contains("CONVERSATION LAYER"));
         // The CLI grammar for both moves is taught.
@@ -2187,6 +2216,7 @@ mod tests {
             "run-1",
             Some(AskTier::High),
             &PromptRoles::default(),
+            false,
         );
         assert!(text.contains("HUMAN BACK-CHANNEL"));
         assert!(text.contains("tier: high"));
@@ -2216,6 +2246,7 @@ mod tests {
             "run-1",
             Some(AskTier::Low),
             &PromptRoles::default(),
+            false,
         );
         assert!(text.contains("tier: low"));
         assert!(text.contains("A genuine A/B fork"));
@@ -2246,6 +2277,49 @@ mod tests {
     /// before the roles layer landed. If this test fails, existing users' manager prompts
     /// drifted — treat as a bug, not a test to update casually.
     #[test]
+    fn repl_flag_injects_the_orchestration_block() {
+        let agents = vec![BackendId::Codex];
+        let roles = PromptRoles {
+            roster: None,
+            persona: None,
+            brief: None,
+            flow: None,
+            steps: &[],
+        };
+        let with = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            0,
+            3,
+            8,
+            "r-1",
+            None,
+            &roles,
+            true,
+        );
+        assert!(with.contains("ORCHESTRATION REPL"), "block must appear");
+        assert!(with.contains("orchestrate --cell"));
+        assert!(with.contains("orchestrate --session"));
+        let without = build_manager_prompt(
+            "goal",
+            &agents,
+            "/bin/agentpit",
+            0,
+            3,
+            8,
+            "r-1",
+            None,
+            &roles,
+            false,
+        );
+        assert!(
+            !without.contains("ORCHESTRATION REPL"),
+            "off = unchanged prompt"
+        );
+    }
+
+    #[test]
     fn legacy_prompt_is_byte_identical_without_roles() {
         let agents = [BackendId::Codex];
         let text = build_manager_prompt(
@@ -2258,6 +2332,7 @@ mod tests {
             "run-1",
             None,
             &PromptRoles::default(),
+            false,
         );
         let expected = "=== AGENTPIT WORKFLOW ORCHESTRATOR ===\n\
 You are the MANAGER agent for a multi-step coding workflow. Decompose the goal into\n\
@@ -2363,6 +2438,7 @@ goal\n";
             "run-1",
             None,
             &sample_roster(),
+            false,
         );
         assert!(text.contains("AVAILABLE ROLES"));
         assert!(text.contains("implementer (claude): You implement."));
@@ -2418,6 +2494,7 @@ goal\n";
             "run-1",
             None,
             &roles,
+            false,
         );
         let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &roles);
         for text in [&shell, &mcp] {
@@ -2457,6 +2534,7 @@ goal\n";
             "run-1",
             None,
             &with_plan,
+            false,
         );
         let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &with_plan);
         for text in [&shell, &mcp] {
@@ -2495,6 +2573,7 @@ goal\n";
             "run-1",
             None,
             &with_flow,
+            false,
         );
         let mcp = build_manager_prompt_mcp("goal", &agents, 1, 3, 8, "run-1", None, &with_flow);
         for text in [&shell, &mcp] {
@@ -2514,6 +2593,7 @@ goal\n";
             "run-1",
             None,
             &PromptRoles::default(),
+            false,
         );
         assert!(!default_shell.contains("SUGGESTED FLOW"));
     }
@@ -2697,6 +2777,7 @@ goal\n";
                 max_calls_per_manager: None,
                 use_mcp: None,
                 enable_ask_human: Some(true),
+                enable_repl: None,
                 flow: Some("diagnose → plan → implement".into()),
                 steps: Vec::new(),
             },

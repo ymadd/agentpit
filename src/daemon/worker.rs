@@ -40,6 +40,9 @@ pub struct WorkerShared {
     shutdown: CancellationToken,
     /// The session's default backend override (REPL `/backend` equivalent, per-worker).
     active_backend: Mutex<Option<BackendId>>,
+    /// The orchestration-REPL sidecar (§10), spawned lazily on the first cell. A tokio
+    /// mutex: cell evaluation holds it across awaits (cells are serialized anyway).
+    repl: tokio::sync::Mutex<Option<crate::orchestrate::DenoRepl>>,
 }
 
 impl WorkerShared {
@@ -54,6 +57,7 @@ impl WorkerShared {
             last_activity: Mutex::new(Instant::now()),
             shutdown: CancellationToken::new(),
             active_backend: Mutex::new(None),
+            repl: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -447,6 +451,68 @@ async fn handle_request(
             }
         }
 
+        RequestBody::ReplCell { code } => {
+            // Cells share the turn's busy flag: a cell can dispatch, so it IS a turn.
+            if shared
+                .busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Response::err(
+                    id,
+                    "busy: a turn or cell is already running. Wait for it or `cancel` it first.",
+                );
+            }
+            shared.touch();
+            let started = std::time::Instant::now();
+            let response = run_repl_cell(shared, &code).await;
+            // Log the cell into the session (§10.7) — code + outcome, never the heap.
+            if let Ok(mut rec) = shared.recorder.lock() {
+                let (ok, detail) = match &response {
+                    Ok(crate::orchestrate::CellOutcome::Ok { repr }) => (true, repr.clone()),
+                    Ok(crate::orchestrate::CellOutcome::RuntimeError { error })
+                    | Ok(crate::orchestrate::CellOutcome::CheckFailed { error }) => {
+                        (false, error.clone())
+                    }
+                    Err(e) => (false, format!("{e:#}")),
+                };
+                let _ =
+                    rec.append_repl_cell(&code, ok, &detail, started.elapsed().as_millis() as u64);
+            }
+            shared.busy.store(false, Ordering::SeqCst);
+            shared.touch();
+            match response {
+                Ok(crate::orchestrate::CellOutcome::Ok { repr }) => Response::ok(
+                    id,
+                    ResponseData::Cell {
+                        ok: true,
+                        repr,
+                        error: None,
+                        check_failed: false,
+                    },
+                ),
+                Ok(crate::orchestrate::CellOutcome::RuntimeError { error }) => Response::ok(
+                    id,
+                    ResponseData::Cell {
+                        ok: false,
+                        repr: String::new(),
+                        error: Some(error),
+                        check_failed: false,
+                    },
+                ),
+                Ok(crate::orchestrate::CellOutcome::CheckFailed { error }) => Response::ok(
+                    id,
+                    ResponseData::Cell {
+                        ok: false,
+                        repr: String::new(),
+                        error: Some(error),
+                        check_failed: true,
+                    },
+                ),
+                Err(e) => Response::err(id, format!("{e:#}")),
+            }
+        }
+
         RequestBody::Status => Response::ok(id, shared.status_data()),
 
         RequestBody::Shutdown { all: _ } => {
@@ -469,6 +535,108 @@ async fn handle_request(
             "this is a WORKER socket; daemon verbs go to daemon.sock (`agentpit daemon status`)",
         ),
     }
+}
+
+/// Run one orchestration cell: lazy-spawn the sidecar, optionally typecheck, evaluate
+/// with host calls wired to the worker's engine/store/session (§10.2).
+async fn run_repl_cell(
+    shared: &Arc<WorkerShared>,
+    code: &str,
+) -> Result<crate::orchestrate::CellOutcome> {
+    let repl_cfg = shared.engine.config.repl.clone();
+    let artifacts = crate::orchestrate::artifacts_dir(&shared.session_id);
+    let mut guard = shared.repl.lock().await;
+    if guard.is_none() {
+        let deno = crate::orchestrate::find_deno(&repl_cfg.deno_path)?;
+        *guard = Some(crate::orchestrate::DenoRepl::spawn(
+            &deno,
+            &shared.engine.cwd,
+            &artifacts,
+            repl_cfg.max_heap_mb,
+        )?);
+    }
+    let repl = guard.as_mut().expect("just initialized");
+
+    if repl_cfg.typecheck
+        && let Some(error) = repl.typecheck(code).await?
+    {
+        return Ok(crate::orchestrate::CellOutcome::CheckFailed { error });
+    }
+
+    let engine = Arc::clone(&shared.engine);
+    let recorder = Arc::clone(&shared.recorder);
+    let broadcast_shared = Arc::clone(shared);
+    let active = shared.active_backend.lock().ok().and_then(|b| *b);
+    let outcome = repl
+        .eval_cell(code, move |call| {
+            let engine = Arc::clone(&engine);
+            let recorder = Arc::clone(&recorder);
+            let broadcast_shared = Arc::clone(&broadcast_shared);
+            let artifacts = artifacts.clone();
+            async move {
+                crate::orchestrate::handle_host_call(
+                    call,
+                    &artifacts,
+                    |n| {
+                        recorder
+                            .lock()
+                            .map(|rec| {
+                                let items = rec.context_items();
+                                let skip = items.len().saturating_sub(n);
+                                items.into_iter().skip(skip).collect()
+                            })
+                            .unwrap_or_default()
+                    },
+                    |task, backend| async move {
+                        let explicit = match backend.as_deref().map(str::parse::<BackendId>) {
+                            None => None,
+                            Some(Ok(b)) => Some(b),
+                            Some(Err(e)) => return Err(anyhow::anyhow!("unknown backend: {e}")),
+                        };
+                        // Cell dispatches stream to attached clients like turn chunks but
+                        // are NOT recorded as session exchanges — the cell log carries the
+                        // orchestration story; run-level telemetry still lands (§10.7).
+                        let sink_shared = Arc::clone(&broadcast_shared);
+                        let on_event: Arc<dyn Fn(EngineEvent) + Send + Sync> =
+                            Arc::new(move |ev| {
+                                if let EngineEvent::Chunk { text } = ev {
+                                    sink_shared.broadcast(&Event::Chunk { text });
+                                }
+                            });
+                        let outcome = engine
+                            .run_turn(
+                                None,
+                                active,
+                                explicit,
+                                &task,
+                                CancellationToken::new(),
+                                on_event,
+                            )
+                            .await;
+                        match outcome {
+                            TurnOutcome::Completed {
+                                backend,
+                                status,
+                                answer,
+                            } => Ok(serde_json::json!({
+                                "backend": backend.to_string(),
+                                "status": serde_json::to_value(status)
+                                    .ok()
+                                    .and_then(|v| v.as_str().map(str::to_string))
+                                    .unwrap_or_else(|| "ok".into()),
+                                "answer": answer,
+                            })),
+                            TurnOutcome::Unavailable { backend, .. } => {
+                                Err(anyhow::anyhow!("backend {backend} unavailable"))
+                            }
+                        }
+                    },
+                )
+                .await
+            }
+        })
+        .await?;
+    Ok(outcome)
 }
 
 #[cfg(test)]

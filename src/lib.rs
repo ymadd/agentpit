@@ -12,6 +12,7 @@ pub mod effort;
 pub mod events;
 pub mod exec;
 pub mod mcp;
+pub mod orchestrate;
 pub mod profile;
 pub mod router;
 pub mod session;

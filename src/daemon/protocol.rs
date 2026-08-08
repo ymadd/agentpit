@@ -71,6 +71,9 @@ pub enum RequestBody {
     Compact,
     /// Cancel the in-flight turn, if any (the remote Ctrl-C).
     Cancel,
+    /// Run one orchestration-REPL cell (TypeScript) in the session's deno sidecar
+    /// (design §10). Serialized with turns via the same busy flag.
+    ReplCell { code: String },
     /// Cheap liveness/state probe.
     Status,
 }
@@ -137,6 +140,16 @@ pub enum ResponseData {
     },
     Forked {
         session_id: String,
+    },
+    /// A REPL cell's ending: `check_error` = refused before execution (§10.5),
+    /// `error` = threw at runtime, otherwise `repr` displays the returned value.
+    Cell {
+        ok: bool,
+        repr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default)]
+        check_failed: bool,
     },
     WorkerStatus {
         session_id: String,

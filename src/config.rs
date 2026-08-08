@@ -301,6 +301,9 @@ pub struct WorkflowType {
     pub use_mcp: Option<bool>,
     #[serde(default)]
     pub enable_ask_human: Option<bool>,
+    /// Per-type override for the orchestration-REPL block (design §10.9 R3).
+    #[serde(default)]
+    pub enable_repl: Option<bool>,
     /// A soft "suggested flow" for this type — the ordered step names the user sketched on the
     /// dashboard canvas (distilled from the drawn edges). Injected into the manager prompt as a
     /// non-binding hint ("you sketched this; adapt freely"); the manager still improvises. Unset =
@@ -340,6 +343,11 @@ pub struct WorkflowSection {
     /// it off the manager is never told to call a back-channel that would otherwise 404.
     #[serde(default)]
     pub enable_ask_human: bool,
+    /// Teach the manager the orchestration REPL (`agentpit orchestrate --cell`, design §10.9
+    /// R3): persistent TypeScript cells whose intermediate results stay out of the manager's
+    /// context. Default OFF: it needs deno installed, and with it off the prompt is unchanged.
+    #[serde(default)]
+    pub enable_repl: bool,
     /// A soft "suggested flow" for the BASE workflow — the ordered step names sketched on the
     /// dashboard canvas, injected as a non-binding hint (same treatment as a type's `flow`).
     /// A type without its own `flow` inherits this one. `None`/empty = no hint (the default).
@@ -362,6 +370,7 @@ impl Default for WorkflowSection {
             max_calls_per_manager: 8,
             use_mcp: false,
             enable_ask_human: false,
+            enable_repl: false,
             flow: None,
             steps: Vec::new(),
         }
@@ -431,6 +440,42 @@ pub struct HubConfig {
     pub arena: ArenaSection,
     #[serde(default)]
     pub session: SessionSection,
+    #[serde(default)]
+    pub repl: ReplSection,
+}
+
+/// Orchestration-REPL knobs (design §10.9).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ReplSection {
+    /// Run `deno check` on every cell before execution (§10.5). Costs ~100s of ms per
+    /// cell; catching an API misuse before it runs is usually cheaper than the failed
+    /// round-trip it prevents.
+    #[serde(default = "default_repl_typecheck")]
+    pub typecheck: bool,
+    /// V8 heap cap for the sidecar (`--max-old-space-size`).
+    #[serde(default = "default_repl_max_heap_mb")]
+    pub max_heap_mb: u64,
+    /// Explicit deno binary path. Empty = find on $PATH.
+    #[serde(default)]
+    pub deno_path: String,
+}
+
+fn default_repl_typecheck() -> bool {
+    true
+}
+
+fn default_repl_max_heap_mb() -> u64 {
+    512
+}
+
+impl Default for ReplSection {
+    fn default() -> Self {
+        ReplSection {
+            typecheck: default_repl_typecheck(),
+            max_heap_mb: default_repl_max_heap_mb(),
+            deno_path: String::new(),
+        }
+    }
 }
 
 /// Session-persistence knobs (design: docs/session-persistence-design.md §4.3/§7).
@@ -769,6 +814,13 @@ review_members = ["antigravity", "opencode"]
 #                         # resume (claude/codex resume natively; others get composed context)
 # transcript_tail = 400   # entries rendered on attach (display only; context stays complete)
 # idle_evict_minutes = 30 # idle worker eviction (0 = never); the session file always survives
+
+# Orchestration REPL (`agentpit orchestrate`): TypeScript cells in a sandboxed Deno
+# sidecar; dispatch()/store/session are the only exits. Needs deno on $PATH.
+# [repl]
+# typecheck   = true      # deno-check every cell before running it
+# max_heap_mb = 512       # V8 heap cap for the sidecar
+# deno_path   = ""        # explicit deno binary; empty = $PATH
 
 # Per-backend transport + default model / effort override.
 # [backends.antigravity]

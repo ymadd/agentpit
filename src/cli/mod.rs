@@ -23,6 +23,7 @@ pub mod login;
 pub mod mcp_cmd;
 mod menu;
 pub mod note;
+pub mod orchestrate_cmd;
 pub mod outcome;
 pub mod profile;
 pub mod refactor;
@@ -333,6 +334,17 @@ pub enum Command {
         action: daemon_cmd::Action,
     },
 
+    /// Drive a session's orchestration REPL: TypeScript cells in a sandboxed Deno
+    /// sidecar, with dispatch()/store/session as the only exits (needs deno).
+    Orchestrate {
+        /// Session id (unique prefix/suffix). Omit to start a fresh session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Evaluate one cell and exit (state persists in the worker across invocations).
+        #[arg(long)]
+        cell: Option<String>,
+    },
+
     /// Ask the supervising human a question and block for an answer (the CLI back-channel a
     /// shell-out workflow manager uses; prints the answer or HUMAN_UNAVAILABLE to stdout).
     Ask {
@@ -587,6 +599,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Attach { session } => attach::run(session).await,
 
         Command::Daemon { action } => daemon_cmd::run(action).await,
+
+        Command::Orchestrate { session, cell } => orchestrate_cmd::run(session, cell).await,
 
         Command::Ask {
             prompt,

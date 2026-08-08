@@ -185,6 +185,27 @@ impl SessionRecorder {
         Ok(())
     }
 
+    /// Log one orchestration-REPL cell (§10.7): the code and its outcome — never the
+    /// deno heap, which is rebuildable only through `store` by design.
+    pub fn append_repl_cell(
+        &mut self,
+        code: &str,
+        ok: bool,
+        detail: &str,
+        duration_ms: u64,
+    ) -> Result<()> {
+        self.log.append_ext(
+            crate::orchestrate::REPL_CELL_EXT_TYPE,
+            serde_json::json!({
+                "code": code,
+                "ok": ok,
+                "detail": detail,
+                "duration_ms": duration_ms,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Compact: fold everything up to (excluding) the current leaf into `summary_text`.
     /// Replay afterwards = summary + the leaf entry onward.
     pub fn record_summary(&mut self, summary_text: &str, reason: SummaryReason) -> Result<()> {

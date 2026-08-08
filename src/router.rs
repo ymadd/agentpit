@@ -353,6 +353,7 @@ mod tests {
             cascade: Default::default(),
             arena: Default::default(),
             session: Default::default(),
+            repl: Default::default(),
         }
     }
 

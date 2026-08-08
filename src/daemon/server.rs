@@ -328,22 +328,20 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
 /// one is dead or absent (lazy crash recovery, §5.4).
 pub async fn ensure_worker(session_id: &str) -> Result<PathBuf> {
     let workers = workers_dir();
-    if let Some(record) = registry::load(&workers, session_id) {
-        if record.alive() {
-            // Verify the socket actually answers — a live pid with a dead socket is a
-            // wedged worker; treat as dead.
-            if request_worker(Path::new(&record.socket), RequestBody::Status)
-                .await
-                .is_ok()
-            {
-                return Ok(PathBuf::from(record.socket));
-            }
-        }
-        registry::remove(&workers, session_id);
+    let socket = worker_socket_path(session_id);
+
+    // A live worker's socket path is DETERMINISTIC from the session id, so probe it first —
+    // even if the registry record is missing or corrupt (H6/M6). A worker that answers is
+    // reused, so a corrupt record never causes a duplicate spawn over a healthy worker
+    // (which would fail the lease and error after 10s while the original stays healthy).
+    if request_worker(&socket, RequestBody::Status).await.is_ok() {
+        return Ok(socket);
     }
 
+    // Not answering: clear any stale/corrupt record and the dead socket, then spawn fresh.
+    registry::remove(&workers, session_id);
+
     ensure_runtime_dir()?;
-    let socket = worker_socket_path(session_id);
     let _ = std::fs::remove_file(&socket);
 
     let exe = std::env::current_exe().context("resolve agentpit binary path")?;
@@ -401,8 +399,24 @@ pub async fn ensure_worker(session_id: &str) -> Result<PathBuf> {
     Ok(socket)
 }
 
-/// One request/response against a worker socket (fresh connection, hello included).
+/// How long a single worker request may take before it is abandoned (H7): a worker that
+/// accepts the connection but never answers must not hang `ensure`/`list`/`doctor`/sweep.
+const WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One request/response against a worker socket (fresh connection, hello included),
+/// bounded by [`WORKER_REQUEST_TIMEOUT`].
 pub async fn request_worker(socket: &Path, body: RequestBody) -> Result<Response> {
+    match tokio::time::timeout(WORKER_REQUEST_TIMEOUT, request_worker_inner(socket, body)).await {
+        Ok(res) => res,
+        Err(_) => Err(anyhow!(
+            "worker at {} did not respond within {}s",
+            socket.display(),
+            WORKER_REQUEST_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn request_worker_inner(socket: &Path, body: RequestBody) -> Result<Response> {
     let stream = UnixStream::connect(socket).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -455,14 +469,19 @@ async fn probe_worker_state(record: &WorkerRecord) -> Option<&'static str> {
     }
 }
 
+/// Force-kill a pid. Used only on the `--force` fallback, where the worker already
+/// refused (or failed to answer) a graceful shutdown — so SIGKILL, not SIGTERM, is what
+/// "force" must mean (M10): a worker ignoring TERM would otherwise survive a "forced"
+/// stop that reported success.
 fn kill_pid(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
         let status = std::process::Command::new("kill")
+            .arg("-9")
             .arg(pid.to_string())
             .status()?;
         if !status.success() {
-            return Err(anyhow!("kill {pid} failed"));
+            return Err(anyhow!("kill -9 {pid} failed"));
         }
     }
     #[cfg(not(unix))]

@@ -109,11 +109,20 @@ pub struct DenoRepl {
     cells: Vec<String>,
     deno: PathBuf,
     artifacts: PathBuf,
+    /// Kill a cell that emits no frame for this long (runaway-loop guard, M2). `None` = off.
+    idle_timeout: Option<std::time::Duration>,
 }
 
 impl DenoRepl {
-    /// Spawn the sidecar with the §10.2 permission set.
-    pub fn spawn(deno: &Path, cwd: &Path, artifacts: &Path, max_heap_mb: u64) -> Result<DenoRepl> {
+    /// Spawn the sidecar with the §10.2 permission set. `idle_timeout` bounds a cell that
+    /// emits no frame (a runaway loop); `None` disables it.
+    pub fn spawn(
+        deno: &Path,
+        cwd: &Path,
+        artifacts: &Path,
+        max_heap_mb: u64,
+        idle_timeout: Option<std::time::Duration>,
+    ) -> Result<DenoRepl> {
         std::fs::create_dir_all(artifacts.join("store"))?;
         std::fs::create_dir_all(artifacts.join("checks"))?;
         // The bootstrap is embedded; materialize it into the artifacts dir so deno can
@@ -123,12 +132,19 @@ impl DenoRepl {
 
         let mut cmd = tokio::process::Command::new(deno);
         cmd.arg("run")
+            // Read scope: cwd + artifacts. Write scope: artifacts only. No --allow-net,
+            // --allow-run, or --allow-env — dispatch()/store are the only exits (§10.2).
             .arg(format!(
                 "--allow-read={},{}",
                 cwd.display(),
                 artifacts.display()
             ))
             .arg(format!("--allow-write={}", artifacts.display()))
+            // No remote/npm/jsr imports (H4): a cell that `import`s a third-party module
+            // would otherwise run its code with the cwd-read grant, independent of
+            // --allow-net. --no-remote makes the module graph local-only, so cells are
+            // confined to the user's own code.
+            .arg("--no-remote")
             .arg(format!("--v8-flags=--max-old-space-size={max_heap_mb}"))
             .arg(&bootstrap)
             .arg(artifacts)
@@ -148,6 +164,7 @@ impl DenoRepl {
             cells: Vec::new(),
             deno: deno.to_path_buf(),
             artifacts: artifacts.to_path_buf(),
+            idle_timeout,
         })
     }
 
@@ -167,15 +184,20 @@ impl DenoRepl {
         module.push_str("\n  }\n  return undefined;\n}\nvoid __cells;\n");
         let check_file = self.artifacts.join("checks").join("cells.ts");
         tokio::fs::write(&check_file, module).await?;
-        let out = tokio::process::Command::new(&self.deno)
-            .args(["check", "--quiet"])
+        let check = tokio::process::Command::new(&self.deno)
+            .args(["check", "--quiet", "--no-remote"])
             .arg(&check_file)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("run deno check")?;
+            .output();
+        let out = match self.idle_timeout {
+            Some(d) => tokio::time::timeout(d, check)
+                .await
+                .map_err(|_| anyhow!("deno check timed out after {}s", d.as_secs()))?
+                .context("run deno check")?,
+            None => check.await.context("run deno check")?,
+        };
         if out.status.success() {
             return Ok(None);
         }
@@ -205,7 +227,23 @@ impl DenoRepl {
         let mut line = String::new();
         loop {
             line.clear();
-            let n = self.stdout.read_line(&mut line).await?;
+            // A cell that emits no frame for `idle_timeout` is a runaway loop — kill it
+            // (M2) instead of blocking here forever and holding the worker's busy flag. A
+            // cell awaiting a dispatch does not reach this read (the host is servicing the
+            // call), so a legitimately slow dispatch is unaffected.
+            let n = match self.idle_timeout {
+                Some(d) => match tokio::time::timeout(d, self.stdout.read_line(&mut line)).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "cell produced no output for {}s — killed as a runaway loop. \
+                             Heap lost; store/* survives; the next cell respawns.",
+                            d.as_secs()
+                        ));
+                    }
+                },
+                None => self.stdout.read_line(&mut line).await?,
+            };
             if n == 0 {
                 return Err(anyhow!(
                     "deno exited mid-cell — heap variables are lost (store/* survives). \
@@ -240,6 +278,12 @@ impl DenoRepl {
                     self.stdin.flush().await?;
                 }
                 Some("cell_result") => {
+                    // Match the frame's id against THIS cell (H5): a forged cell_result
+                    // (e.g. a stray console write that slipped the redirect) with the
+                    // wrong id is ignored rather than mistaken for the real outcome.
+                    if value.get("id").and_then(Value::as_u64) != Some(id) {
+                        continue;
+                    }
                     let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
                     if ok {
                         self.cells.push(code.to_string());
@@ -421,7 +465,8 @@ mod tests {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
-        let mut repl = DenoRepl::spawn(&deno, tmp.path(), &tmp.path().join("art"), 128).unwrap();
+        let mut repl =
+            DenoRepl::spawn(&deno, tmp.path(), &tmp.path().join("art"), 128, None).unwrap();
 
         // Cell 1: persist a big string via S; return a repr that must carry TOTAL size.
         let out = repl
@@ -493,7 +538,8 @@ mod tests {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
-        let mut repl = DenoRepl::spawn(&deno, tmp.path(), &tmp.path().join("art"), 128).unwrap();
+        let mut repl =
+            DenoRepl::spawn(&deno, tmp.path(), &tmp.path().join("art"), 128, None).unwrap();
 
         assert!(
             repl.typecheck("const n: number = 1; return n;")
@@ -528,6 +574,34 @@ mod tests {
         assert!(
             repl.typecheck("return S.count;").await.unwrap().is_none(),
             "S is typed for later cells"
+        );
+        repl.shutdown().await;
+    }
+
+    /// A runaway loop that emits no frame is killed by the idle timeout (M2), rather than
+    /// wedging the worker's shared busy flag forever.
+    #[tokio::test]
+    async fn runaway_cell_is_killed_by_the_idle_timeout() {
+        let Some(deno) = deno() else {
+            eprintln!("skipping: deno not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut repl = DenoRepl::spawn(
+            &deno,
+            tmp.path(),
+            &tmp.path().join("art"),
+            128,
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        let err = repl
+            .eval_cell("while (true) {}", |_c| async move { Ok(Value::Null) })
+            .await
+            .expect_err("a runaway cell must error, not hang");
+        assert!(
+            format!("{err:#}").contains("runaway"),
+            "expected a runaway-timeout error, got: {err:#}"
         );
         repl.shutdown().await;
     }

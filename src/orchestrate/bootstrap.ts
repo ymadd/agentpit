@@ -24,6 +24,23 @@ function writeLine(obj: unknown): void {
   Deno.stdout.writeSync(enc.encode(JSON.stringify(obj) + "\n"));
 }
 
+// stdout is the protocol channel ONLY. Redirect the cell's console.* to stderr so a
+// `console.log('{"type":"cell_result",…}')` cannot forge a protocol frame (H5). Direct
+// Deno.stdout writes from cell code could still forge, but `--no-remote` keeps cells to
+// the user's own code, and the host also matches cell_result ids — so an accidental
+// collision can't happen and a deliberate one is self-inflicted.
+function toStderr(...parts: unknown[]): void {
+  const text = parts
+    .map((p) => (typeof p === "string" ? p : Deno.inspect(p)))
+    .join(" ");
+  Deno.stderr.writeSync(enc.encode(text + "\n"));
+}
+globalThis.console.log = toStderr;
+globalThis.console.info = toStderr;
+globalThis.console.warn = toStderr;
+globalThis.console.error = toStderr;
+globalThis.console.debug = toStderr;
+
 // ── host-call plumbing ──────────────────────────────────────────────────────
 let nextHostId = 1;
 const pendingHost = new Map<

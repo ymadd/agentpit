@@ -458,6 +458,11 @@ pub struct ReplSection {
     /// Explicit deno binary path. Empty = find on $PATH.
     #[serde(default)]
     pub deno_path: String,
+    /// Seconds a cell may run without emitting a protocol frame before it is killed
+    /// (§10 M2). A `while(true){}` cell emits nothing, so this bounds it; a cell awaiting
+    /// a dispatch is not affected (the host is servicing the call, not reading). 0 = off.
+    #[serde(default = "default_repl_cell_idle_timeout_secs")]
+    pub cell_idle_timeout_secs: u64,
 }
 
 fn default_repl_typecheck() -> bool {
@@ -468,12 +473,17 @@ fn default_repl_max_heap_mb() -> u64 {
     512
 }
 
+fn default_repl_cell_idle_timeout_secs() -> u64 {
+    120
+}
+
 impl Default for ReplSection {
     fn default() -> Self {
         ReplSection {
             typecheck: default_repl_typecheck(),
             max_heap_mb: default_repl_max_heap_mb(),
             deno_path: String::new(),
+            cell_idle_timeout_secs: default_repl_cell_idle_timeout_secs(),
         }
     }
 }
@@ -821,6 +831,7 @@ review_members = ["antigravity", "opencode"]
 # typecheck   = true      # deno-check every cell before running it
 # max_heap_mb = 512       # V8 heap cap for the sidecar
 # deno_path   = ""        # explicit deno binary; empty = $PATH
+# cell_idle_timeout_secs = 120  # kill a cell that emits no frame this long (runaway loop); 0 = off
 
 # Per-backend transport + default model / effort override.
 # [backends.antigravity]

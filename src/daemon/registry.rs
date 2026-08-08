@@ -75,6 +75,31 @@ pub fn load_all(dir: &Path) -> Vec<WorkerRecord> {
         .collect()
 }
 
+/// session_ids whose `<id>.json` exists but does NOT parse. A running worker with a
+/// corrupt record would otherwise be invisible to `load_all`, so `doctor` must not treat
+/// its (still-live) socket as an orphan (H6).
+pub fn corrupt_session_ids(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter(|e| {
+            fs::read_to_string(e.path())
+                .ok()
+                .and_then(|b| serde_json::from_str::<WorkerRecord>(&b).ok())
+                .is_none()
+        })
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// The daemon's own single-instance record. Same alive() discipline as workers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OwnerRecord {
@@ -156,6 +181,17 @@ mod tests {
         let all = load_all(tmp.path());
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].session_id, "good");
+    }
+
+    #[test]
+    fn corrupt_session_ids_names_the_unparseable_records_only() {
+        // H6: doctor uses this to shield a live-but-corrupt worker's socket from reaping.
+        let tmp = tempfile::tempdir().unwrap();
+        save(tmp.path(), &rec("good", 1, "x")).unwrap();
+        fs::write(tmp.path().join("019fe0-broken.json"), "{ not valid").unwrap();
+        fs::write(tmp.path().join("ignore.txt"), "not a record file").unwrap();
+        let corrupt = corrupt_session_ids(tmp.path());
+        assert_eq!(corrupt, vec!["019fe0-broken".to_string()]);
     }
 
     #[test]

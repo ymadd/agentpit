@@ -283,6 +283,33 @@ async fn handle_request(
             // The turn runs on its OWN task: the requesting connection may die mid-turn
             // and the exchange still completes and lands in the log (§5.3).
             tokio::spawn(async move {
+                // A drop guard clears the busy flag and cancel slot even if run_turn PANICS
+                // (M1) — otherwise a panicked turn leaves busy=true forever, which also makes
+                // Shutdown refuse and wedges the whole worker. `finished` suppresses the
+                // guard's fallback TurnFinished on the normal path (which sends a richer one).
+                struct TurnGuard {
+                    shared: Arc<WorkerShared>,
+                    finished: bool,
+                }
+                impl Drop for TurnGuard {
+                    fn drop(&mut self) {
+                        if let Ok(mut slot) = self.shared.cancel_current.lock() {
+                            *slot = None;
+                        }
+                        self.shared.busy.store(false, Ordering::SeqCst);
+                        self.shared.touch();
+                        if !self.finished {
+                            self.shared.broadcast(&Event::TurnFinished {
+                                status: "error".into(),
+                            });
+                        }
+                    }
+                }
+                let mut guard = TurnGuard {
+                    shared: Arc::clone(&turn_shared),
+                    finished: false,
+                };
+
                 let sink_shared = Arc::clone(&turn_shared);
                 let on_event: Arc<dyn Fn(EngineEvent) + Send + Sync> =
                     Arc::new(move |ev| match ev {
@@ -314,11 +341,8 @@ async fn handle_request(
                     TurnOutcome::Unavailable { .. } => "unavailable".into(),
                 };
                 turn_shared.broadcast(&Event::TurnFinished { status });
-                if let Ok(mut slot) = turn_shared.cancel_current.lock() {
-                    *slot = None;
-                }
-                turn_shared.busy.store(false, Ordering::SeqCst);
-                turn_shared.touch();
+                guard.finished = true; // richer TurnFinished sent; suppress the guard's fallback
+                drop(guard); // clears cancel slot + busy before handing back the outcome
                 let _ = done_tx.send(outcome);
             });
 
@@ -516,11 +540,13 @@ async fn handle_request(
         RequestBody::Status => Response::ok(id, shared.status_data()),
 
         RequestBody::Shutdown { all: _ } => {
-            if shared.busy.load(Ordering::SeqCst) {
-                return Response::err(
-                    id,
-                    "busy: a turn is running. `cancel` it first, or wait for it to finish.",
-                );
+            // Cancel any in-flight turn first, then shut down. Refusing while busy would
+            // make a wedged worker impossible to stop from `daemon stop`/`doctor`; the
+            // process exit (run_worker returning) kills whatever the cancel can't (M1/M2).
+            if let Ok(mut slot) = shared.cancel_current.lock()
+                && let Some(token) = slot.take()
+            {
+                token.cancel();
             }
             shared.shutdown.cancel();
             Response::ok(id, ResponseData::Unit)
@@ -548,11 +574,14 @@ async fn run_repl_cell(
     let mut guard = shared.repl.lock().await;
     if guard.is_none() {
         let deno = crate::orchestrate::find_deno(&repl_cfg.deno_path)?;
+        let idle = (repl_cfg.cell_idle_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(repl_cfg.cell_idle_timeout_secs));
         *guard = Some(crate::orchestrate::DenoRepl::spawn(
             &deno,
             &shared.engine.cwd,
             &artifacts,
             repl_cfg.max_heap_mb,
+            idle,
         )?);
     }
     let repl = guard.as_mut().expect("just initialized");

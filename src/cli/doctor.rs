@@ -120,15 +120,36 @@ pub async fn run(fix: bool) -> Result<()> {
         });
     }
 
-    // Orphan worker sockets: a socket file with no live record behind it.
+    // A running worker whose record is corrupt is invisible to `load_all` (H6); its
+    // session id must NOT have its live socket reaped as an orphan. Report the corrupt
+    // record instead, and shield the matching socket below.
+    let corrupt = registry::corrupt_session_ids(&workers);
+    for id in &corrupt {
+        findings.push(Finding {
+            what: format!(
+                "worker {}: record is corrupt — its socket is preserved, not reaped",
+                short(id)
+            ),
+            status: FindingStatus::Warn,
+            fixable: None,
+        });
+    }
+
+    // Orphan worker sockets: a socket file with no live record behind it — and not a
+    // corrupt-record worker that may still be alive.
     if let Ok(entries) = std::fs::read_dir(runtime_dir()) {
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("worker-") || !name.ends_with(".sock") {
+            let Some(id) = name
+                .strip_prefix("worker-")
+                .and_then(|n| n.strip_suffix(".sock"))
+            else {
                 continue;
-            }
+            };
             let path = entry.path();
-            if !live_sockets.iter().any(|s| Path::new(s) == path) {
+            let live = live_sockets.iter().any(|s| Path::new(s) == path);
+            let shielded = corrupt.iter().any(|c| c == id);
+            if !live && !shielded {
                 findings.push(Finding {
                     what: format!("socket {name}: no live worker behind it"),
                     status: FindingStatus::Stale,

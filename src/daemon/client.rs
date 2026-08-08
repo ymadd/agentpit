@@ -22,7 +22,9 @@ pub struct Conn {
 }
 
 impl Conn {
-    /// Connect + handshake. Errors carry the next actionable step (A1 discipline).
+    /// Connect + handshake. Errors carry the next actionable step (A1 discipline). The
+    /// handshake is bounded (H7) so a socket that accepts but never answers hello cannot
+    /// hang `attach`/`daemon status`/`doctor` indefinitely.
     pub async fn connect(socket: &Path) -> Result<Conn> {
         let stream = UnixStream::connect(socket)
             .await
@@ -34,11 +36,18 @@ impl Conn {
             next_id: 0,
             role: String::new(),
         };
-        let data = conn
-            .request(RequestBody::Hello {
-                proto: PROTO_VERSION,
-            })
-            .await?;
+        let hello = conn.request(RequestBody::Hello {
+            proto: PROTO_VERSION,
+        });
+        let data = match tokio::time::timeout(Duration::from_secs(5), hello).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "{} accepted the connection but did not answer within 5s",
+                    socket.display()
+                ));
+            }
+        };
         match data {
             ResponseData::Hello { role, .. } => conn.role = role,
             other => return Err(anyhow!("unexpected hello response: {other:?}")),

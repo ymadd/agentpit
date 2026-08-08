@@ -223,17 +223,22 @@ impl TurnEngine {
         let raw_ref = format!("runs/{}/{}.log", logger.run_id(), backend_id);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let (status, answer, backend_ref) = match &result {
-            Ok(res) if res.auth_failed => (
-                ExchangeStatus::Auth,
-                res.output.clone(),
-                res.backend_session_ref.clone(),
-            ),
+            // Auth failure: drop the ref (L2). Claude emits a session id even on an auth
+            // error, and resuming a session whose only content is that error is useless —
+            // the next turn should start fresh once auth is fixed.
+            Ok(res) if res.auth_failed => (ExchangeStatus::Auth, res.output.clone(), None),
             Ok(res) => (
                 ExchangeStatus::Ok,
                 res.output.clone(),
                 res.backend_session_ref.clone(),
             ),
             Err(_) if cancel.is_cancelled() => (ExchangeStatus::Cancelled, String::new(), None),
+            // A dispatch timeout surfaces as an error string from `with_timeout`; record it
+            // as the distinct Timeout status (M5) rather than a generic error, so the
+            // Timeout variant and its renderers are reachable.
+            Err(e) if format!("{e:#}").contains("timed out") => {
+                (ExchangeStatus::Timeout, format!("{e:#}"), None)
+            }
             Err(e) => (ExchangeStatus::Error, format!("{e:#}"), None),
         };
 

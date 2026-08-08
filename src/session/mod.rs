@@ -139,7 +139,13 @@ impl SessionRecorder {
         task: &str,
         compose_window: usize,
     ) -> TurnPlan {
-        if supports_native && let Some(r) = self.log.last_backend_ref(backend.as_str()) {
+        // Native resume, UNLESS the last native attempt for this backend already errored:
+        // a stale ref (expired session) would fail identically forever, so fall through to
+        // a composed retry once, which records a fresh ref and lets native resume again (H1).
+        if supports_native
+            && !self.log.last_native_failed(backend.as_str())
+            && let Some(r) = self.log.last_backend_ref(backend.as_str())
+        {
             return TurnPlan::Native {
                 continue_from: r.to_string(),
             };

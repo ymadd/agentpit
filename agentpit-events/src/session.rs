@@ -672,8 +672,17 @@ impl SessionLog {
                     items.push(ContextItem::User(text));
                 }
                 LoadedEntry::Known(SessionEntry::ExchangeResult {
-                    parent_id, answer, ..
+                    parent_id,
+                    answer,
+                    status,
+                    ..
                 }) => {
+                    // Only successful answers become context. An error dump or an empty
+                    // cancellation must never be replayed to the next backend as if the
+                    // assistant had said it (M3).
+                    if *status != ExchangeStatus::Ok {
+                        continue;
+                    }
                     let backend = match self.entry(parent_id) {
                         Some(LoadedEntry::Known(SessionEntry::Exchange { backend, .. })) => {
                             backend.as_str()
@@ -710,6 +719,33 @@ impl SessionLog {
             },
             _ => None,
         })
+    }
+
+    /// True when the most recent exchange for `backend` on the current branch resumed
+    /// natively (`continue_from` set) AND its result errored — the ref is stale (the
+    /// backend expired the session), so the next turn must compose rather than resume the
+    /// same dead ref again and fail identically forever (H1).
+    pub fn last_native_failed(&self, backend: &str) -> bool {
+        for e in self.path_from_root().iter().rev() {
+            let LoadedEntry::Known(SessionEntry::ExchangeResult {
+                parent_id, status, ..
+            }) = e
+            else {
+                continue;
+            };
+            if let Some(LoadedEntry::Known(SessionEntry::Exchange {
+                backend: b,
+                continue_from,
+                ..
+            })) = self.entry(parent_id)
+            {
+                if b == backend {
+                    // The most recent exchange for this backend decides.
+                    return continue_from.is_some() && *status == ExchangeStatus::Error;
+                }
+            }
+        }
+        false
     }
 
     /// Exchanges (anywhere in the tree) with no result child and no recovery marker yet —
@@ -1068,6 +1104,79 @@ mod tests {
             )
             .unwrap();
         (e, r)
+    }
+
+    /// Append one native-continuation exchange for `backend` that ends in `status`.
+    fn native_turn(log: &mut SessionLog, backend: &str, status: ExchangeStatus, answer: &str) {
+        log.append_user("q").unwrap();
+        let e = log
+            .append_exchange(NewExchange {
+                backend,
+                transport: "exec",
+                run_id: "r",
+                model: None,
+                effort: None,
+                prompt: "q",
+                continue_from: Some("old-ref"),
+            })
+            .unwrap();
+        log.append_result(
+            &e,
+            NewResult {
+                status,
+                answer,
+                exit_code: None,
+                duration_ms: 1,
+                backend_session_ref: (status == ExchangeStatus::Ok).then_some("fresh-ref"),
+                raw_ref: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn last_native_failed_detects_a_stale_ref_and_clears_after_success() {
+        // H1: a native resume that errored must be visible so the planner falls back to
+        // composed, and a subsequent success must clear the flag.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = seed(tmp.path());
+        assert!(
+            !log.last_native_failed("codex"),
+            "fresh session: no failure"
+        );
+
+        native_turn(&mut log, "codex", ExchangeStatus::Error, "boom");
+        assert!(log.last_native_failed("codex"), "native error must be seen");
+        // Only the failing backend is affected.
+        assert!(!log.last_native_failed("claude"));
+
+        native_turn(&mut log, "codex", ExchangeStatus::Ok, "recovered");
+        assert!(
+            !log.last_native_failed("codex"),
+            "a later success clears the stale-ref flag"
+        );
+    }
+
+    #[test]
+    fn context_excludes_error_and_cancelled_results() {
+        // M3: only successful answers replay into composed context.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = seed(tmp.path());
+        native_turn(&mut log, "codex", ExchangeStatus::Error, "error dump here");
+        native_turn(&mut log, "codex", ExchangeStatus::Ok, "the real answer");
+        let items = log.context();
+        assert!(
+            items.iter().any(
+                |i| matches!(i, ContextItem::Answer { text, .. } if *text == "the real answer")
+            ),
+            "the successful answer is kept"
+        );
+        assert!(
+            !items.iter().any(
+                |i| matches!(i, ContextItem::Answer { text, .. } if text.contains("error dump"))
+            ),
+            "the error dump must not become an answer"
+        );
     }
 
     #[test]

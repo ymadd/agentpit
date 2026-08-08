@@ -31,6 +31,8 @@ pub struct SessionRecorder {
     _lease: SessionLease,
 }
 
+pub mod turn_engine;
+
 pub type SharedRecorder = Arc<Mutex<SessionRecorder>>;
 
 /// How the next exchange will carry the conversation (§4.3).
@@ -45,6 +47,12 @@ pub enum TurnPlan {
 }
 
 impl SessionRecorder {
+    /// Assemble from an already-opened log and an already-held lease (worker startup and
+    /// tests, which manage their own lease roots).
+    pub fn from_parts(log: SessionLog, lease: SessionLease) -> SessionRecorder {
+        SessionRecorder { log, _lease: lease }
+    }
+
     /// Create a fresh session under the default sessions dir, lease held.
     pub fn create(cwd: &Path) -> Result<SessionRecorder> {
         let dir = sessions_dir();
@@ -94,6 +102,11 @@ impl SessionRecorder {
 
     pub fn path(&self) -> &Path {
         self.log.path()
+    }
+
+    /// The session's working directory, from the header entry.
+    pub fn cwd_string(&self) -> String {
+        self.log.cwd().to_string()
     }
 
     /// Mark exchanges that never got a result (a previous writer died mid-dispatch) and

@@ -192,22 +192,38 @@ fn owner_alive(owner: &OwnerInfo) -> bool {
     current == owner.start_id
 }
 
-fn pid_alive(pid: u32) -> bool {
+/// Probe whether `pid` is alive — and actually RUNNING, not a zombie. A SIGKILLed child
+/// whose parent has not reaped it yet still answers `kill -0` and still has a /proc dir,
+/// which made a crashed worker's lease look held forever (found 2026-08-08 in the daemon
+/// crash-recovery test). Zombies are the walking dead: treat them as dead.
+pub fn pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        Path::new(&format!("/proc/{pid}")).exists()
+        // /proc/<pid>/stat state field (first char after the comm's closing paren):
+        // Z = zombie.
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => false,
+            Ok(stat) => !matches!(
+                stat.rsplit_once(')')
+                    .map(|(_, tail)| tail.trim_start().chars().next()),
+                Some(Some('Z')) | None
+            ),
+        }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // `kill -0` probes liveness without signaling. EPERM (foreign-uid process) exits
-        // non-zero, but every agentpit writer runs as the same user, so that's acceptable.
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        // `ps -o stat=` answers only for existing processes; a leading 'Z' is a zombie.
+        // Same-uid processes only (foreign-uid EPERM cases don't arise for agentpit).
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                let stat = String::from_utf8_lossy(&o.stdout);
+                let stat = stat.trim();
+                !stat.is_empty() && !stat.starts_with('Z')
+            })
             .unwrap_or(false)
     }
     #[cfg(not(unix))]
@@ -219,7 +235,8 @@ fn pid_alive(pid: u32) -> bool {
 
 /// A string that identifies THIS incarnation of `pid` — stable across the process's life,
 /// different for a later process that recycles the pid. Empty when unavailable.
-fn process_start_id(pid: u32) -> String {
+/// Exposed for the daemon's worker registry (PID-reuse guard on reconnect).
+pub fn process_start_id(pid: u32) -> String {
     #[cfg(target_os = "linux")]
     {
         // /proc/<pid>/stat: fields after the last ')' — comm can contain spaces/parens.
@@ -353,6 +370,26 @@ mod tests {
         fs::write(key_dir.join("owner.json"), b"not json").unwrap();
 
         SessionLease::acquire_at(&root, &file).expect("corrupt owner must be reclaimed");
+    }
+
+    #[test]
+    fn killed_unreaped_child_is_dead_not_alive() {
+        // Regression (2026-08-08): a SIGKILLed worker left as a zombie (parent never
+        // waited) kept answering `kill -0`, so its lease was never reclaimed. pid_alive
+        // must see through zombies.
+        let mut child = std::process::Command::new("sleep")
+            .arg("100")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(pid_alive(pid), "freshly spawned child is alive");
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        // Deliberately do NOT reap yet: the child is now a zombie.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!pid_alive(pid), "a zombie must be treated as dead");
+        let _ = child.wait(); // clean up
     }
 
     #[test]

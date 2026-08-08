@@ -7,9 +7,11 @@ use crate::types::BackendId;
 pub mod adversarial_review;
 pub mod arena;
 pub mod ask;
+pub mod attach;
 pub(crate) mod cancel;
 mod common;
 pub mod config;
+pub mod daemon_cmd;
 pub mod dashboard;
 pub mod diagnose;
 pub mod ensemble;
@@ -318,6 +320,18 @@ pub enum Command {
         action: Option<sessions::Action>,
     },
 
+    /// Attach to a session's worker (daemon-backed: survives closing the terminal).
+    Attach {
+        /// Session id (unique prefix/suffix accepted). Omit to start a fresh session.
+        session: Option<String>,
+    },
+
+    /// Manage the background daemon that keeps sessions running while detached.
+    Daemon {
+        #[command(subcommand)]
+        action: daemon_cmd::Action,
+    },
+
     /// Ask the supervising human a question and block for an answer (the CLI back-channel a
     /// shell-out workflow manager uses; prints the answer or HUMAN_UNAVAILABLE to stdout).
     Ask {
@@ -568,6 +582,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Repl { resume } => repl::run_repl(resume).await,
 
         Command::Sessions { action } => sessions::run(action).await,
+
+        Command::Attach { session } => attach::run(session).await,
+
+        Command::Daemon { action } => daemon_cmd::run(action).await,
 
         Command::Ask {
             prompt,

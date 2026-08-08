@@ -440,16 +440,34 @@ pub struct SessionSection {
     /// without native resume. Bounds prompt growth (and file growth) to O(window).
     #[serde(default = "default_compose_window")]
     pub compose_window: usize,
+    /// How many transcript entries an attach renders (§5.3: display only — the model's
+    /// context is always complete).
+    #[serde(default = "default_transcript_tail")]
+    pub transcript_tail: usize,
+    /// Minutes of inactivity before an idle worker is evicted from memory (§7.1).
+    /// 0 = never evict. The session file survives either way.
+    #[serde(default = "default_idle_evict_minutes")]
+    pub idle_evict_minutes: u64,
 }
 
 fn default_compose_window() -> usize {
     4
 }
 
+fn default_transcript_tail() -> usize {
+    400
+}
+
+fn default_idle_evict_minutes() -> u64 {
+    30
+}
+
 impl Default for SessionSection {
     fn default() -> Self {
         SessionSection {
             compose_window: default_compose_window(),
+            transcript_tail: default_transcript_tail(),
+            idle_evict_minutes: default_idle_evict_minutes(),
         }
     }
 }
@@ -749,6 +767,8 @@ review_members = ["antigravity", "opencode"]
 # [session]
 # compose_window = 4      # recent turns included when continuing a backend without native
 #                         # resume (claude/codex resume natively; others get composed context)
+# transcript_tail = 400   # entries rendered on attach (display only; context stays complete)
+# idle_evict_minutes = 30 # idle worker eviction (0 = never); the session file always survives
 
 # Per-backend transport + default model / effort override.
 # [backends.antigravity]

@@ -5,6 +5,7 @@ pub mod auth;
 pub mod availability;
 pub mod cli;
 pub mod config;
+pub mod daemon;
 pub mod diagnose;
 pub mod dispatch;
 pub mod effort;

@@ -30,20 +30,51 @@ pub enum Action {
 
 pub async fn run(action: Option<Action>) -> Result<()> {
     match action.unwrap_or(Action::List { json: false }) {
-        Action::List { json } => list(json),
+        Action::List { json } => list(json).await,
         Action::Show { id } => show(&id),
         Action::Export { id } => export(&id),
     }
 }
 
-fn list(json: bool) -> Result<()> {
+/// Live states from the daemon roster, when one is running (probe only — listing must
+/// never boot a daemon). Absent daemon = every session shows as inactive.
+async fn roster_states() -> std::collections::HashMap<String, String> {
+    let mut states = std::collections::HashMap::new();
+    if let Ok(mut conn) = crate::daemon::client::connect_daemon(false).await
+        && let Ok(crate::daemon::protocol::ResponseData::Sessions { sessions }) = conn
+            .request(crate::daemon::protocol::RequestBody::List)
+            .await
+    {
+        for row in sessions {
+            states.insert(row.session_id, row.state);
+        }
+    }
+    states
+}
+
+/// The roster glyph language imported from prime's Agents View (§7.2 B1): running ◇,
+/// idle ●, inactive ✓.
+fn state_glyph(state: &str) -> console::StyledObject<&'static str> {
+    match state {
+        "running" => style("◇ running ").cyan(),
+        "idle" => style("● idle    ").yellow(),
+        _ => style("✓ inactive").dim(),
+    }
+}
+
+async fn list(json: bool) -> Result<()> {
     let sessions = session::list_all();
+    let states = roster_states().await;
     if json {
         let rows: Vec<serde_json::Value> = sessions
             .iter()
             .map(|m| {
                 serde_json::json!({
                     "session_id": m.session_id,
+                    "state": states
+                        .get(&m.session_id)
+                        .map(String::as_str)
+                        .unwrap_or("inactive"),
                     "path": m.path.display().to_string(),
                     "title": m.title,
                     "cwd": m.cwd,
@@ -72,8 +103,13 @@ fn list(json: bool) -> Result<()> {
             .elapsed()
             .map(format_age)
             .unwrap_or_else(|_| "?".into());
+        let state = states
+            .get(&m.session_id)
+            .map(String::as_str)
+            .unwrap_or("inactive");
         println!(
-            "{}  {}  {}  {}",
+            "{}  {}  {}  {}  {}",
+            state_glyph(state),
             style(tail).cyan(),
             style(format!("{age:>8}")).dim(),
             m.title.as_deref().unwrap_or("-"),
@@ -82,7 +118,7 @@ fn list(json: bool) -> Result<()> {
     }
     println!(
         "\n{}",
-        style("resume with: agentpit repl --resume <id>").dim()
+        style("attach with: agentpit attach <id>   (or agentpit repl --resume <id> for the local REPL)").dim()
     );
     Ok(())
 }

@@ -43,6 +43,30 @@ pub async fn run_daemon() -> Result<()> {
     registry::save_owner(&owner_path, &OwnerRecord::current(&socket))?;
 
     let shutdown = tokio_util::sync::CancellationToken::new();
+    // Idle-eviction sweeper (§7.1): every 5 minutes, unload workers that have been idle
+    // past [session] idle_evict_minutes with no attached clients. Config is re-read per
+    // sweep so edits apply without a daemon restart. Files always survive; the next
+    // address rehydrates lazily via ensure_worker.
+    let sweeper = {
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            interval.tick().await; // skip the immediate tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let minutes = crate::config::load_config(None)
+                            .map(|l| l.config.session.idle_evict_minutes)
+                            .unwrap_or(30);
+                        if minutes > 0 {
+                            sweep_idle_workers(&workers_dir(), minutes * 60_000).await;
+                        }
+                    }
+                    _ = stop.cancelled() => break,
+                }
+            }
+        })
+    };
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -54,9 +78,46 @@ pub async fn run_daemon() -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    sweeper.abort();
     registry::remove_owner(&owner_path);
     let _ = std::fs::remove_file(&socket);
     Ok(())
+}
+
+/// One eviction pass: gracefully shut down every worker that is not busy, has no attached
+/// clients, and has idled at least `min_idle_ms`. A worker's own `shutdown` handler
+/// re-checks busyness, so a turn that starts mid-probe still refuses eviction — Running is
+/// never unloaded (§7.1).
+pub async fn sweep_idle_workers(workers: &Path, min_idle_ms: u64) {
+    for record in registry::load_all(workers) {
+        if !record.alive() {
+            registry::remove(workers, &record.session_id);
+            continue;
+        }
+        let status = request_worker(Path::new(&record.socket), RequestBody::Status).await;
+        let Ok(resp) = status else { continue };
+        let Some(ResponseData::WorkerStatus {
+            busy,
+            attached_clients,
+            idle_ms,
+            ..
+        }) = resp.data
+        else {
+            continue;
+        };
+        if busy || attached_clients > 0 || idle_ms < min_idle_ms {
+            continue;
+        }
+        if let Ok(resp) = request_worker(
+            Path::new(&record.socket),
+            RequestBody::Shutdown { all: false },
+        )
+        .await
+            && resp.ok
+        {
+            registry::remove(workers, &record.session_id);
+        }
+    }
 }
 
 async fn handle_connection(stream: UnixStream, shutdown: tokio_util::sync::CancellationToken) {

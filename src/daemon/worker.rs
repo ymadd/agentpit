@@ -665,6 +665,70 @@ mod tests {
 
     /// A second `send` while one is in flight is refused (§5.3 serialization), and a
     /// disconnected client does not kill the in-flight turn.
+    /// P3 (§7.1): the sweeper evicts a worker only when it is idle past the threshold,
+    /// unattached, and not busy — and eviction ends the serve loop + removes the record.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sweeper_evicts_only_idle_unattached_workers() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let workers_dir = tmp.path().join("workers");
+
+        let make_worker = |name: &str| {
+            let shared = test_shared(tmp.path());
+            let sock = tmp.path().join(format!("{name}.sock"));
+            let listener = UnixListener::bind(&sock).unwrap();
+            let serve_task = tokio::spawn(serve(Arc::clone(&shared), listener));
+            let record = crate::daemon::registry::WorkerRecord {
+                session_id: shared.session_id.clone(),
+                pid: std::process::id(),
+                start_id: agentpit_events::session_lease::process_start_id(std::process::id()),
+                socket: sock.display().to_string(),
+            };
+            crate::daemon::registry::save(&workers_dir, &record).unwrap();
+            (shared, serve_task)
+        };
+
+        // Worker A: idle + unattached → must be evicted.
+        let (a_shared, a_serve) = make_worker("a");
+        // Worker B: busy → must survive.
+        let (b_shared, _b_serve) = make_worker("b");
+        b_shared.busy.store(true, Ordering::SeqCst);
+        // Worker C: a client is attached → must survive.
+        let (c_shared, _c_serve) = make_worker("c");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        c_shared.clients.lock().unwrap().insert(1, tx);
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        crate::daemon::server::sweep_idle_workers(&workers_dir, 1).await;
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), a_serve)
+            .await
+            .expect("idle worker A must shut down");
+        assert!(
+            crate::daemon::registry::load(&workers_dir, &a_shared.session_id).is_none(),
+            "evicted worker's record must be removed"
+        );
+        assert!(
+            crate::daemon::registry::load(&workers_dir, &b_shared.session_id).is_some(),
+            "busy worker must survive the sweep"
+        );
+        assert!(
+            !b_shared.shutdown.is_cancelled(),
+            "busy worker must not be shut down"
+        );
+        assert!(
+            crate::daemon::registry::load(&workers_dir, &c_shared.session_id).is_some(),
+            "attached worker must survive the sweep"
+        );
+        assert!(!c_shared.shutdown.is_cancelled());
+
+        // A high threshold leaves even the idle survivors alone (idle_ms < threshold).
+        crate::daemon::server::sweep_idle_workers(&workers_dir, 60_000).await;
+        assert!(crate::daemon::registry::load(&workers_dir, &c_shared.session_id).is_some());
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn busy_send_is_refused_and_disconnect_does_not_kill_the_turn() {

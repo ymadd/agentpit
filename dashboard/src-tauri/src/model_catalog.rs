@@ -257,13 +257,17 @@ fn parse_line_models(raw: &str, require_provider_prefix: bool) -> Vec<ModelOptio
 /// prime-inference  anthropic/claude-opus-5   1M       128K     yes       yes
 /// ```
 ///
-/// The `--model` flag takes the id from column two, so that is the option VALUE; the provider is
-/// kept in the label because the same id can appear under more than one provider. The header row
-/// is dropped by name — a blank-line or index heuristic would break the moment the table gains a
-/// separator row.
+/// The option VALUE is the canonical `provider/model` selector. prime-agent resolves
+/// `--model` by splitting on the FIRST slash and treating a recognized prefix as a
+/// provider, so passing a bare Prime Inference id like `anthropic/claude-opus-5` would
+/// route to Anthropic directly — different credentials, billing and data destination.
+/// Deduplication is by the full selector, so the same id under two providers stays
+/// selectable under both. Only rows after the `provider  model …` header are parsed:
+/// diagnostic prose ("No models available…") can never become a selectable model.
 fn parse_prime_agent_models(raw: &str) -> Vec<ModelOption> {
     let clean = clean_text(raw);
     let mut seen = HashSet::new();
+    let mut in_table = false;
     clean
         .lines()
         .map(str::trim)
@@ -272,13 +276,17 @@ fn parse_prime_agent_models(raw: &str) -> Vec<ModelOption> {
             let mut fields = line.split_whitespace();
             let provider = fields.next()?;
             let model = fields.next()?;
-            (provider != "provider").then(|| (provider.to_string(), model.to_string()))
+            if provider == "provider" && model == "model" {
+                in_table = true;
+                return None;
+            }
+            in_table.then(|| (provider.to_string(), model.to_string()))
         })
-        .filter(|(_, model)| seen.insert(model.clone()))
+        .filter(|(provider, model)| seen.insert(format!("{provider}/{model}")))
         .take(MAX_MODELS)
         .map(|(provider, model)| ModelOption {
             label: format!("{model} ({provider})"),
-            value: model,
+            value: format!("{provider}/{model}"),
         })
         .collect()
 }
@@ -325,20 +333,29 @@ mod tests {
     );
 
     #[test]
-    fn prime_agent_table_yields_ids_not_header_or_columns() {
+    fn prime_agent_table_yields_canonical_selectors() {
         let models = parse_prime_agent_models(PRIME_AGENT_TABLE);
         assert_eq!(
             models.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(),
             [
-                "claude-opus-5",
                 "anthropic/claude-opus-5",
-                "deepseek/deepseek-v4-pro"
+                "prime-inference/anthropic/claude-opus-5",
+                "prime-inference/deepseek/deepseek-v4-pro"
             ],
-            "the header row must never become a selectable model"
+            "values must keep the provider: a bare `anthropic/claude-opus-5` would be \
+             resolved by prime-agent as the Anthropic provider, not Prime Inference"
         );
-        // The provider disambiguates ids that repeat across providers, so it stays in the label.
+        // The label still shows the raw id plus provider, as before.
         assert_eq!(models[1].label, "anthropic/claude-opus-5 (prime-inference)");
         assert!(parse_prime_agent_models("").is_empty());
+    }
+
+    #[test]
+    fn prime_agent_prose_and_headerless_output_yield_no_models() {
+        // A successful invocation with no models prints prose, not a table; two words on a
+        // line must not become a bogus model entry.
+        let prose = "No models available to display.\nUse /login to sign in first.";
+        assert!(parse_prime_agent_models(prose).is_empty());
     }
 
     #[test]

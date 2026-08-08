@@ -231,6 +231,18 @@ impl App {
                                 return Ok(());
                             }
                         }
+                        // Re-clamp the scroll offset on resize (M7): a wider terminal
+                        // rewraps to fewer rows, so a stale large offset would compute an
+                        // empty window and blank the transcript.
+                        Some(Ok(TermEvent::Resize(w, h))) => {
+                            let height = (h.saturating_sub(5)) as usize;
+                            self.scroll_offset = scroll::clamp_offset(
+                                &self.transcript,
+                                w as usize,
+                                height,
+                                self.scroll_offset,
+                            );
+                        }
                         Some(Ok(_)) => {}
                         Some(Err(_)) | None => return Ok(()),
                     }
@@ -284,6 +296,29 @@ impl App {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Send a request and wait for its response, routing EVERY other frame that arrives
+    /// meanwhile through `on_frame` (H2). Using `Conn::request` here instead would discard
+    /// the in-flight turn's Chunk/TurnFinished events and even the pending send's own
+    /// Response — leaving `busy` stuck true and the spinner running forever.
+    async fn request_data(&mut self, body: RequestBody) -> Result<ResponseData> {
+        let want = self.conn.send_request(body).await?;
+        loop {
+            let frame = self.conn.recv_frame().await?;
+            match frame {
+                Frame::Response(resp) if resp.id == want => {
+                    return if resp.ok {
+                        Ok(resp.data.unwrap_or(ResponseData::Unit))
+                    } else {
+                        Err(anyhow::anyhow!(resp.error.unwrap_or_default()))
+                    };
+                }
+                // Turn events and the pending send's Response keep flowing to on_frame,
+                // so busy state and the transcript stay correct during the round-trip.
+                other => self.on_frame(other),
             }
         }
     }
@@ -355,7 +390,7 @@ impl App {
                 let line = self.input.submit();
                 if line.is_empty() {
                 } else if line == "/tree" {
-                    let lines = match self.conn.request(RequestBody::Tree).await {
+                    let lines = match self.request_data(RequestBody::Tree).await {
                         Ok(ResponseData::Lines { lines }) => lines,
                         _ => return Ok(false),
                     };
@@ -440,8 +475,7 @@ impl App {
                     }
                     (OverlayKind::Tree, Some(target)) if !target.is_empty() => {
                         match self
-                            .conn
-                            .request(RequestBody::Branch {
+                            .request_data(RequestBody::Branch {
                                 target: target.clone(),
                                 summary: None,
                             })
@@ -463,7 +497,7 @@ impl App {
                 let picked = overlay.keys.get(overlay.cursor.index).cloned();
                 self.mode = Mode::Chat;
                 if let Some(at) = picked.filter(|a| !a.is_empty()) {
-                    match self.conn.request(RequestBody::Fork { at: Some(at) }).await {
+                    match self.request_data(RequestBody::Fork { at: Some(at) }).await {
                         Ok(ResponseData::Forked { session_id }) => {
                             let tail = crate::cli::guidance::short_id(&session_id).to_string();
                             self.push_text(
@@ -486,7 +520,15 @@ impl App {
             return Ok(());
         };
         let input_text = self.input.text().to_string();
-        let cursor = self.input.cursor() as u16;
+        // Cursor x in display CELLS, not char count (M8): a CJK char before the cursor
+        // occupies two columns, so a char-index cursor lands left of the true position.
+        let cursor: u16 = self
+            .input
+            .text()
+            .chars()
+            .take(self.input.cursor())
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum();
         let live = self.assembler.tail().to_string();
         let short = crate::cli::guidance::short_id(&self.session_id).to_string();
         let elapsed = self.turn_started.elapsed().as_secs();

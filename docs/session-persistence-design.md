@@ -9,9 +9,14 @@
 > ことは変わらない。
 > 追記（§11）: Q5 を反転し、**TUI フロントエンド（ratatui）をスコープ内**とした
 > （2026-08-08 決定）。agentpit を「スキル経由の道具」から人間の主役フロントエンドへ。
-> ステータス: **承認済み（Q1〜Q8 すべて提案どおり、2026-08-08）/ P1 実装完了**。
-> P1 = セッションログ核（コミット4本: スキーマ+リース / fork+一覧 / ref抽出+継続 /
-> REPL統合+sessions CLI）。次: P2（デーモン + attach/detach）。
+> ステータス: **全フェーズ実装完了（2026-08-08）**。P1（ログ核4コミット）→ P2（デーモン
+> +worker+attach/detach+クラッシュ回復）→ P3（idle eviction+3状態roster）→ P4/A群（guidance/
+> Ctrl+C二段階/スピナー/誘導）→ B群（B1〜B7、doctor 含む）→ R1〜R3（Deno サイドカーの
+> orchestration REPL、`enable_repl` で workflow 統合）→ T1〜T3（ratatui インライン TUI +
+> Agents/Tree オーバーレイ、素の `agentpit` は TTY で TUI 既定）。
+> 実装中に設計へ入った実測修正: UDS の SUN_LEN 制限（長い XDG_RUNTIME_DIR は /tmp へ
+> フォールバック）、ゾンビ pid の生存誤判定（reaper + ps stat 検出）、REPL セルは eval でなく
+> モジュール import（TS 型注釈が実行時に通るため）、stale daemon owner の live-probe 乗っ取り。
 > 根拠: agentpit 現状調査 + prime-agent 実装調査（2026-08-08、prime-agent は
 > TypeScript monorepo `packages/coding-agent` を直接読解）。
 

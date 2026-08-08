@@ -46,13 +46,53 @@ jobs:
       - name: Test
         run: cargo test --workspace --exclude agentpit-dashboard --locked
 
-      # The similarity feature (fastembed/ONNX) is off by default, so without this it would
-      # never be linted or tested in CI. Tests never download the model — the embedder is
-      # gated behind `agentpit similarity init` — so this stays network-free.
-      - name: Clippy + Test (similarity feature)
+  # The similarity feature (fastembed/ONNX) is off by default, so without this it would
+  # never be linted or tested in CI. Tests never download the model — the embedder is
+  # gated behind `agentpit similarity init` — so this stays network-free.
+  #
+  # Runs as its own job: building it on top of the workspace job's target/ starved the
+  # hosted runner ("lost communication with the server" after ~49 min) whenever the
+  # Cargo.lock cache missed. A separate runner gives it a full disk, and debuginfo=0
+  # keeps the ONNX-heavy build within the runner's memory and disk budget.
+  similarity:
+    name: clippy · test (similarity feature)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
         run: |
-          cargo clippy -p agentpit --features similarity --all-targets --locked -- -D warnings
-          cargo test -p agentpit --features similarity --locked
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-sim-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-sim-
+
+      - name: Clippy (similarity)
+        run: cargo clippy -p agentpit --features similarity --all-targets --locked -- -D warnings
+
+      - name: Test (similarity)
+        run: cargo test -p agentpit --features similarity --locked
+
+      - name: Disk usage
+        if: always()
+        run: |
+          df -h /
+          du -sh target 2>/dev/null || true
 
   dashboard:
     name: frontend · fmt · clippy · test (dashboard)

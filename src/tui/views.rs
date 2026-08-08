@@ -38,13 +38,6 @@ impl ListCursor {
             self.index = (self.index + 1).min(len - 1);
         }
     }
-    pub fn clamp(&mut self, len: usize) {
-        if len == 0 {
-            self.index = 0;
-        } else {
-            self.index = self.index.min(len - 1);
-        }
-    }
 }
 
 /// Extract the entry id from a `/tree` display line
@@ -73,6 +66,10 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
         "Tree View: branches; Enter moves the leaf, f forks at the cursor",
     ),
     ("↑ / ↓", "input history (from an empty line)"),
+    (
+        "PageUp / PageDown",
+        "scroll the transcript; End follows the newest",
+    ),
     ("Ctrl-C", "cancel the running turn; twice within 2s exits"),
     (
         "Ctrl-D (empty line)",
@@ -121,8 +118,6 @@ mod tests {
         c.down(3);
         c.down(3);
         assert_eq!(c.index, 2, "stops at the end");
-        c.clamp(1);
-        assert_eq!(c.index, 0);
     }
 
     #[test]

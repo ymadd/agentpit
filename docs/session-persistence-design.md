@@ -611,14 +611,20 @@ diagnose の LLM 補助層・arena judge・compose 要約（§4.3）・リキャ
 
 - Q5 当初判断の根拠「prime の自前差分レンダラを Rust で再実装する工数」は、
   ratatui への委譲で消える。
-- prime の TUI の最良の性質 = **インラインモード**（トランスクリプトはターミナルの
-  スクロールバックへ流し、下部のエディタ + ステータス行だけ固定描画）は、ratatui の
-  Inline viewport + `insert_before` パターンで同型に組める（codex CLI の Rust 版が
-  同スタックで同型 UI を実証済み）。
-- Agents View / Tree View のときだけ一時的に alternate screen（フルスクリーン）へ —
-  prime の二面併用を踏襲。
-- エディタは ratatui エコシステムの定番（tui-textarea 等）を実装時に選定。
-  `console`/`cliclack` はワンショット経路（rescue 等）にそのまま残す。
+- **改訂（2026-08-08、ユーザー決定）: 全状況でフルスクリーン**。当初はインライン
+  （スクロールバック保持）を既定にしたが、実装後のレビューで常時フルスクリーンへ変更。
+  prime の fullscreen レイアウトを採用: エディタ + ステータスを最下部にドックし、
+  トランスクリプトが**内部スクロール**（PageUp/PageDown、End で最新追従）。折返しは
+  unicode-width による CJK 幅正確な自前実装（スクロール計算と描画行の一致が必須のため
+  ウィジェットの word-wrap には委ねない）。オーバーレイ（Agents/Tree/Help）は同一
+  alternate screen 内の描画（Mode enum）となり、入れ子の画面切替が消えた。
+  トレードオフとして端末スクロールバックには履歴が残らない — 永続履歴はセッション
+  JSONL と `sessions show/export` が担う。
+- テーマは `src/tui/theme.rs` に一元化（prime の dark テーマ実測値をパレットに、
+  パレット→セマンティック→コンポーネントの2層構造。userMsgBg カード・working pulse
+  ◇◈◆◈・Hint ローテータ・一回きりヘッダーを prime から、角丸入力ボックスを
+  opencode から輸入）。
+- `console`/`cliclack` はワンショット経路（rescue 等）にそのまま残す。
 
 ### 11.3 画面構成
 

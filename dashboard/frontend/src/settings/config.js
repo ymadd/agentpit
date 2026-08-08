@@ -1,4 +1,4 @@
-export const FALLBACK_BACKENDS = ["antigravity", "claude", "codex", "opencode"];
+export const FALLBACK_BACKENDS = ["antigravity", "claude", "codex", "opencode", "prime-agent"];
 
 export const ENSEMBLE_KEYS = [
   "default",

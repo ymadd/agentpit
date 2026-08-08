@@ -65,6 +65,14 @@ const CLIS: &[CliDefinition] = &[
         update_args: Some(&["upgrade"]),
         update_help_marker: None,
     },
+    CliDefinition {
+        id: "prime-agent",
+        label: "Prime Agent",
+        command: "prime-agent",
+        version_args: &["--version"],
+        update_args: Some(&["update"]),
+        update_help_marker: None,
+    },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,7 +313,14 @@ mod tests {
         let ids: Vec<_> = inventory.iter().map(|cli| cli.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["claude", "codex", "gemini", "antigravity", "opencode"]
+            vec![
+                "claude",
+                "codex",
+                "gemini",
+                "antigravity",
+                "opencode",
+                "prime-agent"
+            ]
         );
     }
 

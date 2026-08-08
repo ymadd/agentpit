@@ -98,10 +98,13 @@ jobs:
       - name: Build tests (similarity)
         run: cargo test -p agentpit --features similarity --locked -j 2 --no-run
 
-      # Serial test threads so a hang names its culprit: the guilty test is the one
-      # after the last name printed in the log.
+      # DEBUG (this branch only): run just the hanging test, alone, with full output.
+      # Reproduces → the test alone is the culprit; passes → prior-test state leak.
       - name: Test (similarity)
-        run: cargo test -p agentpit --features similarity --locked -j 2 -- --test-threads=1
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          timeout 300 cargo test -p agentpit --features similarity --locked -j 2 -- --test-threads=1 --nocapture mcp::tools::tests::ask_human_times_out_to_sentinel_as_success || echo "EXIT CODE $? (124 = hung for 5 min)"
 
       - name: Disk usage
         if: always()

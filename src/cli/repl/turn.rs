@@ -1,4 +1,7 @@
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
+use console::style;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -14,18 +17,28 @@ pub enum LoopControl {
     Exit,
 }
 
+/// Two-stage Ctrl-C at the prompt (§7.2 A2): the second press within this window exits.
+const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
+
 /// Drive one full turn: show status line → readline (blocking, off tokio threads) →
 /// route to slash or free-text dispatch → return updated state, editor, and
 /// loop-control decision.
 ///
-/// Returns `Ok((state, editor, LoopControl::Exit))` on Ctrl-D or `/quit`.
-/// Returns `Ok((state, editor, LoopControl::Continue))` in all other cases, including
-/// Ctrl-C during readline, cancelled dispatch, and dispatch errors.
-/// Returns `Err` only on an unrecoverable runtime error (e.g. `spawn_blocking` panic).
+/// `last_interrupt` threads the two-stage Ctrl-C state through the loop: a first Ctrl-C
+/// at the prompt prints a hint and arms the window; a second within it exits.
+///
+/// Returns `Ok((state, editor, control, last_interrupt))`; `Exit` on Ctrl-D, `/quit`, or
+/// a double Ctrl-C. Returns `Err` only on an unrecoverable runtime error.
 pub async fn run_one_turn(
     state: SessionState,
     editor: Box<DefaultEditor>,
-) -> Result<(SessionState, Box<DefaultEditor>, LoopControl)> {
+    last_interrupt: Option<Instant>,
+) -> Result<(
+    SessionState,
+    Box<DefaultEditor>,
+    LoopControl,
+    Option<Instant>,
+)> {
     // Print the per-turn status line to stderr before the prompt.
     print_status_line(&state);
 
@@ -47,41 +60,50 @@ pub async fn run_one_turn(
 
             if trimmed.is_empty() {
                 // Blank line — re-prompt without dispatch.
-                return Ok((state, editor, LoopControl::Continue));
+                return Ok((state, editor, LoopControl::Continue, None));
             }
 
             // Check for slash command.
             if let Some(cmd) = parse_slash(trimmed) {
                 let (new_state, control) = handle_slash(cmd, state).await?;
-                return Ok((new_state, editor, control));
+                return Ok((new_state, editor, control, None));
             }
 
             // Free-text turn: parse optional @backend modifier then dispatch.
             match parse_at_modifier(trimmed) {
                 None => {
                     // Invalid @backend — error already printed; re-prompt.
-                    Ok((state, editor, LoopControl::Continue))
+                    Ok((state, editor, LoopControl::Continue, None))
                 }
                 Some((explicit_backend, task)) => {
                     if task.is_empty() {
                         // e.g. user typed just `@claude` with no prompt text.
                         eprintln!("No task text after backend modifier — please type a task.");
-                        Ok((state, editor, LoopControl::Continue))
+                        Ok((state, editor, LoopControl::Continue, None))
                     } else {
                         let new_state = dispatch_free_text(state, explicit_backend, task).await?;
-                        Ok((new_state, editor, LoopControl::Continue))
+                        Ok((new_state, editor, LoopControl::Continue, None))
                     }
                 }
             }
         }
 
-        // Ctrl-C during readline: re-prompt.
-        Err(ReadlineError::Interrupted) => Ok((state, editor, LoopControl::Continue)),
+        // Ctrl-C at the prompt: two-stage (A2). First press arms a 2s window with a
+        // visible hint; a second press inside it exits cleanly.
+        Err(ReadlineError::Interrupted) => {
+            if let Some(prev) = last_interrupt
+                && prev.elapsed() <= CTRL_C_EXIT_WINDOW
+            {
+                return Ok((state, editor, LoopControl::Exit, None));
+            }
+            eprintln!("{}", style("(press Ctrl-C again within 2s to exit)").dim());
+            Ok((state, editor, LoopControl::Continue, Some(Instant::now())))
+        }
 
         // Ctrl-D or piped/closed stdin: clean exit.
         Err(ReadlineError::Eof) => {
             eprintln!("[no TTY or stdin closed — exiting]");
-            Ok((state, editor, LoopControl::Exit))
+            Ok((state, editor, LoopControl::Exit, None))
         }
 
         // Propagate unexpected readline errors.

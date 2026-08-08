@@ -96,10 +96,20 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "clone" => SlashCommand::CloneSession,
         "compact" => SlashCommand::Compact,
         _ => {
+            // A4: unknown commands never dispatch as tasks (a typo must not become a
+            // billable LLM call); they get a concrete pointer instead.
+            const KNOWN: &[&str] = &[
+                "help", "backend", "status", "config", "menu", "ensemble", "review", "workflow",
+                "login", "cwd", "clear", "quit", "exit", "session", "tree", "branch", "fork",
+                "clone", "compact",
+            ];
+            let suggestion = crate::cli::guidance::suggest_slash(&cmd_lower, KNOWN)
+                .map(|s| format!(" {s}"))
+                .unwrap_or_default();
             eprintln!(
                 "{}",
                 style(format!(
-                    "Unknown command /{cmd}. Type /help for available commands."
+                    "Unknown command /{cmd}.{suggestion} Type /help for available commands."
                 ))
                 .yellow()
             );

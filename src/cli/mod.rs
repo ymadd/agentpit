@@ -16,6 +16,7 @@ pub mod dashboard;
 pub mod diagnose;
 pub mod ensemble;
 pub mod explain;
+pub mod guidance;
 pub mod init;
 pub mod learning;
 pub mod login;

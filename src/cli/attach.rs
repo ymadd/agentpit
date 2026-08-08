@@ -151,7 +151,8 @@ pub async fn run(session: Option<String>) -> Result<()> {
     eprintln!(
         "{}",
         style(format!(
-            "[detached — session {short} keeps running; return with `agentpit attach {short}`]"
+            "[detached — {}]",
+            crate::cli::guidance::detach_hint(short)
         ))
         .dim()
     );

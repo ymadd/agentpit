@@ -55,14 +55,16 @@ pub async fn dispatch_free_text(
     let auth = check_auth(backend_id).await;
     if !auth.ok {
         eprintln!(
-            "{} [{backend_id}] not authenticated. Run `{}` or use /login {backend_id}.",
+            "{} {}",
             style("auth:").yellow(),
-            auth.login_command
+            crate::cli::guidance::auth_hint(backend_id, &auth.login_command)
         );
         return Ok(state);
     }
 
-    // Working indicator: "working… Xs" on stderr until the first chunk arrives.
+    // Working indicator (§7.2 A3): a braille spinner + elapsed seconds on stderr until
+    // the first chunk arrives (after that, the stream itself is the progress display).
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let started = Instant::now();
     let first_chunk_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let indicator_cancel = CancellationToken::new();
@@ -70,8 +72,9 @@ pub async fn dispatch_free_text(
         let stop = indicator_cancel.clone();
         let seen = Arc::clone(&first_chunk_seen);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut interval = tokio::time::interval(Duration::from_millis(80));
             interval.tick().await;
+            let mut frame = 0usize;
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -79,10 +82,12 @@ pub async fn dispatch_free_text(
                             let elapsed = started.elapsed().as_secs();
                             let _ = write!(
                                 std::io::stderr(),
-                                "\r{}",
-                                style(format!("working… {elapsed}s")).dim()
+                                "\r{} {}",
+                                style(FRAMES[frame % FRAMES.len()]).cyan(),
+                                style(format!("{elapsed}s")).dim()
                             );
                             let _ = std::io::stderr().flush();
+                            frame += 1;
                         }
                     }
                     _ = stop.cancelled() => break,

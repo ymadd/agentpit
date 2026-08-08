@@ -64,11 +64,14 @@ pub async fn run_repl(resume: Option<String>) -> Result<()> {
 
     // Main REPL loop.
     let mut current_state = state;
+    let mut last_interrupt: Option<std::time::Instant> = None;
     loop {
         let history_file = current_state.history_file.clone();
-        let (new_state, new_editor, control) = run_one_turn(current_state, editor).await?;
+        let (new_state, new_editor, control, interrupt) =
+            run_one_turn(current_state, editor, last_interrupt).await?;
         current_state = new_state;
         editor = new_editor;
+        last_interrupt = interrupt;
 
         if control == LoopControl::Exit {
             let _ = editor.save_history(&history_file);
@@ -78,8 +81,8 @@ pub async fn run_repl(resume: Option<String>) -> Result<()> {
                 eprintln!(
                     "{}",
                     style(format!(
-                        "[session saved — resume with `agentpit repl --resume {}`]",
-                        rec.short_id()
+                        "[session saved — {}]",
+                        crate::cli::guidance::resume_hint(&rec.short_id())
                     ))
                     .dim()
                 );

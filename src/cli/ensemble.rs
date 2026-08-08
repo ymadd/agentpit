@@ -424,6 +424,20 @@ pub async fn run(
     .await
 }
 
+/// The task category a `RunKind` already tells us, if any. Kinds whose category is definite
+/// from the command alone (review/security_review/adversarial_review/refactor) map directly;
+/// kinds that don't pin down a category (plain `ensemble`, `rescue`, `workflow`, ...) return
+/// `None` so the diagnose back-fill in `cli/profile.rs::labels_from_log` still handles them.
+fn category_for_kind(kind: RunKind) -> Option<TaskCategory> {
+    match kind {
+        RunKind::Review => Some(TaskCategory::Review),
+        RunKind::SecurityReview => Some(TaskCategory::SecurityReview),
+        RunKind::AdversarialReview => Some(TaskCategory::AdversarialReview),
+        RunKind::Refactor => Some(TaskCategory::Refactor),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_resolved(
     ctx: Context,
@@ -463,6 +477,12 @@ pub async fn run_resolved(
     // its task_hash (re-run detection, kNN) and names the aggregator — else the first member —
     // as "the" backend. "ensemble_routed" marks that `--routed` picked the members from the
     // capability profiles, so profile-driven selection is verifiable in the event log.
+    //
+    // The run kind already tells us the category for review/security_review/refactor — no need
+    // to make the diagnose back-fill (`labels_from_log` in `cli/profile.rs`) guess at those.
+    // Kinds without a definite category (plain `ensemble`, etc.) stay `None` so that back-fill
+    // still runs for them.
+    let category = category_for_kind(kind);
     if let Some(primary) = aggregator.or_else(|| members.first().copied()) {
         logger.route_decided(
             primary,
@@ -471,7 +491,7 @@ pub async fn run_resolved(
             } else {
                 "ensemble"
             },
-            None,
+            category.as_ref().map(TaskCategory::as_str),
             None,
             None,
             model.as_deref(),
@@ -976,6 +996,150 @@ More prose.
         assert!(graded[0].contains("\"backend\":\"codex\"") && graded[0].contains("\"grade\":88"));
         assert!(
             graded[1].contains("\"backend\":\"opencode\"") && graded[1].contains("\"grade\":35")
+        );
+
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    fn test_context() -> Context {
+        Context {
+            loaded: crate::config::LoadedConfig {
+                config: crate::config::HubConfig::default(),
+                source: crate::config::ConfigSource::Defaults,
+                path: std::path::PathBuf::new(),
+            },
+            // Empty registries: preflight finds no runnable members and `run_resolved` errors
+            // out right after logging `route_decided`, which is all these tests need to happen.
+            regs: Registries::empty(),
+        }
+    }
+
+    /// A review-kind ensemble run (`agentpit review`, routed through `run_resolved`) already
+    /// knows its category from the command itself — the emitted `route_decided` line must carry
+    /// it, not leave it for the diagnose back-fill to guess. Fails against the pre-change code,
+    /// which always logged `category: None` from this call site.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn review_kind_run_logs_its_category() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+
+        let res = run_resolved(
+            test_context(),
+            RunKind::Review,
+            "review this diff".into(),
+            vec![BackendId::Codex],
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "no registered members must error out");
+
+        let log =
+            std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap_or_default();
+        let routed = log
+            .lines()
+            .find(|l| l.contains("route_decided"))
+            .expect("a route_decided line was written");
+        assert!(routed.contains("\"category\":\"review\""), "got: {routed}");
+
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    /// A plain ensemble run has no definite category from the command alone — `route_decided`
+    /// must keep omitting the field so `labels_from_log`'s diagnose back-fill still runs for it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensemble_kind_run_leaves_category_unset() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+
+        let res = run_resolved(
+            test_context(),
+            RunKind::Ensemble,
+            "do something".into(),
+            vec![BackendId::Codex],
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "no registered members must error out");
+
+        let log =
+            std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap_or_default();
+        let routed = log
+            .lines()
+            .find(|l| l.contains("route_decided"))
+            .expect("a route_decided line was written");
+        assert!(!routed.contains("\"category\""), "got: {routed}");
+
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    /// `agentpit adversarial-review` routes through `run_resolved` with `RunKind::AdversarialReview`
+    /// — its category is just as definite as review/security_review/refactor's, since
+    /// `cli/adversarial_review.rs` already uses `TaskCategory::AdversarialReview` directly at the
+    /// same call site to pick `--routed` members. Fails against the pre-change `category_for_kind`,
+    /// which fell through to `None` for this kind.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn adversarial_review_kind_run_logs_its_category() {
+        let _g = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded under STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+
+        let res = run_resolved(
+            test_context(),
+            RunKind::AdversarialReview,
+            "adversarially review this diff".into(),
+            vec![BackendId::Codex],
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "no registered members must error out");
+
+        let log =
+            std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap_or_default();
+        let routed = log
+            .lines()
+            .find(|l| l.contains("route_decided"))
+            .expect("a route_decided line was written");
+        assert!(
+            routed.contains("\"category\":\"adversarialreview\""),
+            "got: {routed}"
         );
 
         unsafe {

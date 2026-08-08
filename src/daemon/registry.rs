@@ -21,7 +21,9 @@ pub struct WorkerRecord {
 }
 
 impl WorkerRecord {
-    /// True when the recorded pid is alive AND is still the same incarnation.
+    /// True when the recorded pid is alive AND is still the same incarnation. Fails OPEN
+    /// on identity uncertainty (empty stored/current start id) — right for sweeping and
+    /// display, where wrongly declaring a live worker dead is the worse error.
     pub fn alive(&self) -> bool {
         if !pid_alive(self.pid) {
             return false;
@@ -31,6 +33,18 @@ impl WorkerRecord {
         }
         let current = process_start_id(self.pid);
         current.is_empty() || current == self.start_id
+    }
+
+    /// Strict identity for destructive actions: true only when the process is PROVABLY the
+    /// incarnation this record described. Fails CLOSED on uncertainty — after pid reuse or
+    /// a transient start-id read failure, a SIGKILL aimed at a long-dead worker must not
+    /// land on whatever unrelated process wears its pid now.
+    pub fn same_incarnation(&self) -> bool {
+        if !pid_alive(self.pid) || self.start_id.is_empty() {
+            return false;
+        }
+        let current = process_start_id(self.pid);
+        !current.is_empty() && current == self.start_id
     }
 }
 
@@ -119,13 +133,21 @@ impl OwnerRecord {
     }
 
     pub fn alive(&self) -> bool {
+        self.as_worker_record().alive()
+    }
+
+    /// See [`WorkerRecord::same_incarnation`]: the strict check gating any kill.
+    pub fn same_incarnation(&self) -> bool {
+        self.as_worker_record().same_incarnation()
+    }
+
+    fn as_worker_record(&self) -> WorkerRecord {
         WorkerRecord {
             session_id: String::new(),
             pid: self.pid,
             start_id: self.start_id.clone(),
             socket: String::new(),
         }
-        .alive()
     }
 }
 

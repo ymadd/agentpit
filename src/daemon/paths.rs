@@ -46,13 +46,30 @@ unsafe fn libc_uid() -> u32 {
 }
 
 /// Create the runtime dir with owner-only permissions and return it.
+///
+/// The `/tmp/agentpit-<uid>` fallback path is predictable, so on unix the directory must
+/// actually BE ours and private before any socket lives in it: a directory another local
+/// user pre-created there would let them unlink or replace our sockets. `$XDG_RUNTIME_DIR`
+/// gets the same check — it is cheap, and a wrong owner there is just as fatal.
 pub fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
     let dir = runtime_dir();
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(&dir)?;
+        let uid = unsafe { libc_uid() };
+        if meta.uid() != uid {
+            return Err(std::io::Error::other(format!(
+                "runtime dir {} is owned by uid {}, not us (uid {uid}) — refusing to \
+                 place sockets in a directory another user controls",
+                dir.display(),
+                meta.uid(),
+            )));
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     Ok(dir)
 }

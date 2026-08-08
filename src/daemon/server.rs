@@ -43,7 +43,11 @@ pub async fn run_daemon() -> Result<()> {
                 existing.pid
             ));
         }
-        let _ = kill_pid(existing.pid);
+        // Kill only a PROVEN incarnation: after pid reuse the recorded pid may belong to
+        // an unrelated process, which merely being unreachable-as-a-daemon cannot condemn.
+        if existing.same_incarnation() {
+            let _ = kill_pid(existing.pid);
+        }
     }
     ensure_runtime_dir()?;
     let socket = daemon_socket_path();
@@ -268,15 +272,14 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
                     Response::ok(id, ResponseData::Unit)
                 }
                 Ok(resp) if force => {
-                    let _ = kill_pid(record.pid);
+                    let note = force_kill_worker(&record);
                     registry::remove(&workers, &resolved);
                     Response::ok(
                         id,
                         ResponseData::Lines {
                             lines: vec![format!(
-                                "worker refused graceful stop ({}); killed pid {}",
+                                "worker refused graceful stop ({}); {note}",
                                 resp.error.unwrap_or_default(),
-                                record.pid
                             )],
                         },
                     )
@@ -287,9 +290,9 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
                         .unwrap_or_else(|| "worker refused to stop".into()),
                 ),
                 Err(_) if force => {
-                    let _ = kill_pid(record.pid);
+                    let note = force_kill_worker(&record);
                     registry::remove(&workers, &resolved);
-                    Response::ok(id, ResponseData::Unit)
+                    Response::ok(id, ResponseData::Lines { lines: vec![note] })
                 }
                 Err(e) => {
                     Response::err(id, format!("worker unreachable: {e:#}. Retry with force."))
@@ -466,6 +469,22 @@ async fn probe_worker_state(record: &WorkerRecord) -> Option<&'static str> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Kill a worker's pid only when its recorded identity still checks out, and say which
+/// path was taken. `--force` must not SIGKILL whatever unrelated process wears a reused
+/// pid — the record is removed either way, which is the actual goal of a forced stop.
+fn force_kill_worker(record: &registry::WorkerRecord) -> String {
+    if record.same_incarnation() {
+        let _ = kill_pid(record.pid);
+        format!("killed pid {}", record.pid)
+    } else {
+        format!(
+            "pid {} no longer matches the recorded worker (reused or already gone); \
+             removed its record without killing",
+            record.pid
+        )
     }
 }
 

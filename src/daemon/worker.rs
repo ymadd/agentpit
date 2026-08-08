@@ -15,7 +15,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::protocol::{Event, PROTO_VERSION, Request, RequestBody, Response, ResponseData};
@@ -168,10 +168,12 @@ async fn handle_connection(shared: Arc<WorkerShared>, stream: UnixStream, conn_i
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Err(e) => Response::err(0, format!("bad request: {e}")),
+            Err(e) => Some(Response::err(0, format!("bad request: {e}"))),
             Ok(req) => handle_request(&shared, req, conn_id, &out_tx).await,
         };
-        if let Ok(resp_line) = serde_json::to_string(&response)
+        // `None` = the handler replies through `out_tx` itself later (a running turn).
+        if let Some(response) = response
+            && let Ok(resp_line) = serde_json::to_string(&response)
             && out_tx.send(resp_line).is_err()
         {
             break;
@@ -186,7 +188,148 @@ async fn handle_connection(shared: Arc<WorkerShared>, stream: UnixStream, conn_i
     let _ = writer.await;
 }
 
+/// Route one request. `None` means the handler owns the reply and will write it to
+/// `out_tx` itself — only `Send` does that: its turn runs on a separate task so this
+/// connection's read loop stays free to process a `Cancel` for the very turn it started
+/// (awaiting the turn here made same-connection cancellation queue behind it, i.e. no-op).
 async fn handle_request(
+    shared: &Arc<WorkerShared>,
+    req: Request,
+    conn_id: u64,
+    out_tx: &mpsc::UnboundedSender<String>,
+) -> Option<Response> {
+    if let RequestBody::Send { text, backend } = req.body {
+        return handle_send(shared, req.id, text, backend, out_tx);
+    }
+    Some(handle_sync_request(shared, req, conn_id, out_tx).await)
+}
+
+/// Start a turn and reply asynchronously. `Some` only for immediate rejections (unknown
+/// backend, busy); otherwise the spawned turn task writes this request's Response itself.
+fn handle_send(
+    shared: &Arc<WorkerShared>,
+    id: u64,
+    text: String,
+    backend: Option<String>,
+    out_tx: &mpsc::UnboundedSender<String>,
+) -> Option<Response> {
+    let explicit = match backend.as_deref().map(str::parse::<BackendId>) {
+        None => None,
+        Some(Ok(b)) => Some(b),
+        Some(Err(e)) => return Some(Response::err(id, format!("unknown backend: {e}"))),
+    };
+    if shared
+        .busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Some(Response::err(
+            id,
+            "busy: a turn is already running. Attach to watch it, or `cancel` it first.",
+        ));
+    }
+    shared.touch();
+
+    let cancel = CancellationToken::new();
+    if let Ok(mut slot) = shared.cancel_current.lock() {
+        *slot = Some(cancel.clone());
+    }
+    let active = shared.active_backend.lock().ok().and_then(|b| *b);
+    let turn_shared = Arc::clone(shared);
+    let reply_tx = out_tx.clone();
+    // The turn runs on its OWN task: the requesting connection may die mid-turn and the
+    // exchange still completes and lands in the log (§5.3). Just as important, this
+    // connection's read loop stays free — a Cancel sent on the SAME connection reaches
+    // the token while the turn runs, instead of queueing behind it.
+    tokio::spawn(async move {
+        // A drop guard clears the busy flag and cancel slot even if run_turn PANICS
+        // (M1) — otherwise a panicked turn leaves busy=true forever, which also makes
+        // Shutdown refuse and wedges the whole worker. `finished` suppresses the
+        // guard's fallback TurnFinished on the normal path (which sends a richer one).
+        struct TurnGuard {
+            shared: Arc<WorkerShared>,
+            finished: bool,
+        }
+        impl Drop for TurnGuard {
+            fn drop(&mut self) {
+                if let Ok(mut slot) = self.shared.cancel_current.lock() {
+                    *slot = None;
+                }
+                self.shared.busy.store(false, Ordering::SeqCst);
+                self.shared.touch();
+                if !self.finished {
+                    self.shared.broadcast(&Event::TurnFinished {
+                        status: "error".into(),
+                    });
+                }
+            }
+        }
+        let mut guard = TurnGuard {
+            shared: Arc::clone(&turn_shared),
+            finished: false,
+        };
+
+        let sink_shared = Arc::clone(&turn_shared);
+        let on_event: Arc<dyn Fn(EngineEvent) + Send + Sync> = Arc::new(move |ev| match ev {
+            EngineEvent::Route { backend, .. } => sink_shared.broadcast(&Event::TurnStarted {
+                backend: backend.to_string(),
+            }),
+            EngineEvent::Chunk { text } => sink_shared.broadcast(&Event::Chunk { text }),
+            EngineEvent::Notice { text } => sink_shared.broadcast(&Event::Notice { text }),
+        });
+        let outcome = turn_shared
+            .engine
+            .run_turn(
+                Some(&turn_shared.recorder),
+                active,
+                explicit,
+                &text,
+                cancel,
+                on_event,
+            )
+            .await;
+        let status = match &outcome {
+            TurnOutcome::Completed { status, .. } => serde_json::to_value(status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "ok".into()),
+            TurnOutcome::Unavailable { .. } => "unavailable".into(),
+        };
+        turn_shared.broadcast(&Event::TurnFinished { status });
+        guard.finished = true; // richer TurnFinished sent; suppress the guard's fallback
+        drop(guard); // clears cancel slot + busy before the response goes out
+
+        let response = match outcome {
+            TurnOutcome::Unavailable { backend, available } => Response::err(
+                id,
+                format!(
+                    "backend {backend} unavailable (available: {})",
+                    available
+                        .iter()
+                        .map(|b| b.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            TurnOutcome::Completed { status, answer, .. } => Response::ok(
+                id,
+                ResponseData::Turn {
+                    status: serde_json::to_value(status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "ok".into()),
+                    answer,
+                },
+            ),
+        };
+        if let Ok(line) = serde_json::to_string(&response) {
+            let _ = reply_tx.send(line);
+        }
+    });
+    None
+}
+
+async fn handle_sync_request(
     shared: &Arc<WorkerShared>,
     req: Request,
     conn_id: u64,
@@ -254,124 +397,7 @@ async fn handle_request(
             Response::ok(id, ResponseData::Unit)
         }
 
-        RequestBody::Send { text, backend } => {
-            let explicit = match backend.as_deref().map(str::parse::<BackendId>) {
-                None => None,
-                Some(Ok(b)) => Some(b),
-                Some(Err(e)) => return Response::err(id, format!("unknown backend: {e}")),
-            };
-            if shared
-                .busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return Response::err(
-                    id,
-                    "busy: a turn is already running. Attach to watch it, or `cancel` it first.",
-                );
-            }
-            shared.touch();
-
-            let cancel = CancellationToken::new();
-            if let Ok(mut slot) = shared.cancel_current.lock() {
-                *slot = Some(cancel.clone());
-            }
-            let active = shared.active_backend.lock().ok().and_then(|b| *b);
-            let (done_tx, done_rx) = oneshot::channel::<TurnOutcome>();
-            let turn_shared = Arc::clone(shared);
-            let text_clone = text.clone();
-            // The turn runs on its OWN task: the requesting connection may die mid-turn
-            // and the exchange still completes and lands in the log (§5.3).
-            tokio::spawn(async move {
-                // A drop guard clears the busy flag and cancel slot even if run_turn PANICS
-                // (M1) — otherwise a panicked turn leaves busy=true forever, which also makes
-                // Shutdown refuse and wedges the whole worker. `finished` suppresses the
-                // guard's fallback TurnFinished on the normal path (which sends a richer one).
-                struct TurnGuard {
-                    shared: Arc<WorkerShared>,
-                    finished: bool,
-                }
-                impl Drop for TurnGuard {
-                    fn drop(&mut self) {
-                        if let Ok(mut slot) = self.shared.cancel_current.lock() {
-                            *slot = None;
-                        }
-                        self.shared.busy.store(false, Ordering::SeqCst);
-                        self.shared.touch();
-                        if !self.finished {
-                            self.shared.broadcast(&Event::TurnFinished {
-                                status: "error".into(),
-                            });
-                        }
-                    }
-                }
-                let mut guard = TurnGuard {
-                    shared: Arc::clone(&turn_shared),
-                    finished: false,
-                };
-
-                let sink_shared = Arc::clone(&turn_shared);
-                let on_event: Arc<dyn Fn(EngineEvent) + Send + Sync> =
-                    Arc::new(move |ev| match ev {
-                        EngineEvent::Route { backend, .. } => {
-                            sink_shared.broadcast(&Event::TurnStarted {
-                                backend: backend.to_string(),
-                            })
-                        }
-                        EngineEvent::Chunk { text } => {
-                            sink_shared.broadcast(&Event::Chunk { text })
-                        }
-                    });
-                let outcome = turn_shared
-                    .engine
-                    .run_turn(
-                        Some(&turn_shared.recorder),
-                        active,
-                        explicit,
-                        &text_clone,
-                        cancel,
-                        on_event,
-                    )
-                    .await;
-                let status = match &outcome {
-                    TurnOutcome::Completed { status, .. } => serde_json::to_value(status)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_string))
-                        .unwrap_or_else(|| "ok".into()),
-                    TurnOutcome::Unavailable { .. } => "unavailable".into(),
-                };
-                turn_shared.broadcast(&Event::TurnFinished { status });
-                guard.finished = true; // richer TurnFinished sent; suppress the guard's fallback
-                drop(guard); // clears cancel slot + busy before handing back the outcome
-                let _ = done_tx.send(outcome);
-            });
-
-            match done_rx.await {
-                Err(_) => Response::err(id, "turn task dropped unexpectedly"),
-                Ok(TurnOutcome::Unavailable { backend, available }) => Response::err(
-                    id,
-                    format!(
-                        "backend {backend} unavailable (available: {})",
-                        available
-                            .iter()
-                            .map(|b| b.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                ),
-                Ok(TurnOutcome::Completed { status, answer, .. }) => Response::ok(
-                    id,
-                    ResponseData::Turn {
-                        status: serde_json::to_value(status)
-                            .ok()
-                            .and_then(|v| v.as_str().map(str::to_string))
-                            .unwrap_or_else(|| "ok".into()),
-                        answer,
-                    },
-                ),
-            }
-        }
-
+        RequestBody::Send { .. } => Response::err(id, "internal: Send is handled on its own task"),
         RequestBody::Cancel => {
             let cancelled = shared
                 .cancel_current
@@ -403,6 +429,15 @@ async fn handle_request(
         }
 
         RequestBody::Branch { target, summary } => {
+            // A running turn's result lands on the CURRENT leaf when it completes — a
+            // branch taken mid-turn would be silently undone by that append. Refuse.
+            if shared.busy.load(Ordering::SeqCst) {
+                return Response::err(
+                    id,
+                    "busy: a turn is running and its result would undo the branch. \
+                     Cancel it or wait for it to finish.",
+                );
+            }
             let Ok(mut rec) = shared.recorder.lock() else {
                 return Response::err(id, "session recorder unavailable");
             };
@@ -413,6 +448,14 @@ async fn handle_request(
         }
 
         RequestBody::Fork { at } => {
+            // Forking mid-turn would copy a half-written exchange (no result yet) and the
+            // fork would forever look crash-interrupted. Refuse while busy.
+            if shared.busy.load(Ordering::SeqCst) {
+                return Response::err(
+                    id,
+                    "busy: a turn is running; fork when it finishes so the copy is complete.",
+                );
+            }
             let Ok(rec) = shared.recorder.lock() else {
                 return Response::err(id, "session recorder unavailable");
             };
@@ -423,6 +466,24 @@ async fn handle_request(
         }
 
         RequestBody::Compact => {
+            // Compaction reads the context AND runs its own backend leg: claim the turn
+            // slot so a concurrent Send cannot interleave (its result would land after a
+            // summary built from stale context). The guard restores busy on every path.
+            if shared
+                .busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Response::err(id, "busy: a turn is running; compact when it finishes.");
+            }
+            struct BusyGuard(Arc<WorkerShared>);
+            impl Drop for BusyGuard {
+                fn drop(&mut self) {
+                    self.0.busy.store(false, Ordering::SeqCst);
+                    self.0.touch();
+                }
+            }
+            let _busy = BusyGuard(Arc::clone(shared));
             // Summarize via the engine's own dispatch path (active/default backend).
             let items = {
                 let Ok(rec) = shared.recorder.lock() else {
@@ -714,13 +775,17 @@ mod tests {
     }
 
     fn test_shared(tmp: &std::path::Path) -> Arc<WorkerShared> {
+        test_shared_with(tmp, Box::new(EchoExec))
+    }
+
+    fn test_shared_with(tmp: &std::path::Path, exec: Box<dyn ExecAdapter>) -> Arc<WorkerShared> {
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp) };
         let log = SessionLog::create(&tmp.join("sessions"), "/w", None, None).unwrap();
         let lease = SessionLease::acquire_at(&tmp.join("leases"), log.path()).unwrap();
         let sid = log.session_id().to_string();
         let recorder = SessionRecorder::from_parts(log, lease);
         let mut regs = Registries::empty();
-        regs.execs.insert(BackendId::Opencode, Box::new(EchoExec));
+        regs.execs.insert(BackendId::Opencode, exec);
         let mut config = crate::config::HubConfig::default();
         config.default.backend = BackendId::Opencode;
         let engine = TurnEngine {
@@ -752,6 +817,91 @@ mod tests {
         let mut line = String::new();
         r.read_line(&mut line).await.unwrap();
         line
+    }
+
+    struct SlowExec;
+    impl ExecAdapter for SlowExec {
+        fn id(&self) -> BackendId {
+            BackendId::Opencode
+        }
+        fn build_spec(
+            &self,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<crate::effort::Effort>,
+        ) -> ExecSpec {
+            ExecSpec {
+                command: "sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                env: vec![],
+                stdin_input: None,
+            }
+        }
+    }
+
+    /// H: a Cancel sent on the SAME connection must stop the running turn. The old
+    /// handler awaited the turn inside the request loop, so the Cancel queued behind the
+    /// very turn it was cancelling and the remote Ctrl-C was a no-op.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cancel_on_the_same_connection_stops_a_running_turn() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = test_shared_with(tmp.path(), Box::new(SlowExec));
+        let sock = tmp.path().join("w.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let serve_shared = Arc::clone(&shared);
+        let server = tokio::spawn(async move { serve(serve_shared, listener).await });
+
+        let (mut r, mut w) = client(&sock).await;
+        send_req(&mut w, 1, RequestBody::Attach { tail: 0 }).await;
+        let _attach_resp = recv_line(&mut r).await;
+        send_req(
+            &mut w,
+            2,
+            RequestBody::Send {
+                text: "long task".into(),
+                backend: None,
+            },
+        )
+        .await;
+        // Wait until the turn actually runs, then cancel it from THIS connection.
+        loop {
+            let line = recv_line(&mut r).await;
+            if line.contains("turn_started") {
+                break;
+            }
+        }
+        send_req(&mut w, 3, RequestBody::Cancel).await;
+
+        // Both the Cancel ack and the Send's own (cancelled) response must arrive far
+        // sooner than the 30 s child would have taken.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (mut cancel_ok, mut send_done) = (false, false);
+            while !(cancel_ok && send_done) {
+                let line = recv_line(&mut r).await;
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                match v.get("id").and_then(serde_json::Value::as_u64) {
+                    Some(3) => {
+                        assert_eq!(
+                            v.get("ok").and_then(serde_json::Value::as_bool),
+                            Some(true),
+                            "cancel must be accepted while the turn runs: {line}"
+                        );
+                        cancel_ok = true;
+                    }
+                    Some(2) => send_done = true,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "cancel and turn completion must beat the 30 s child"
+        );
+        shared.shutdown.cancel();
+        let _ = server.await;
     }
 
     /// Full protocol pass over a real unix socket with a fake backend: hello → attach →

@@ -31,6 +31,9 @@ pub enum EngineEvent {
     },
     /// A streamed output chunk (already decoded — display text, not raw JSONL).
     Chunk { text: String },
+    /// An out-of-band warning the user must see (e.g. a session-journal write failed:
+    /// the answer is real but resume will not know about this turn). Never answer text.
+    Notice { text: String },
 }
 
 /// How the turn ended. `Completed` covers every dispatched outcome (ok/error/cancelled/
@@ -172,24 +175,47 @@ impl TurnEngine {
                 task,
                 self.config.session.compose_window,
             );
-            let _ = rec.record_user(task);
-            let _ = rec.record_route("rescue", None, None, backend_id, decision.reason.as_str());
+            // Journal failures must be SEEN (H: silently ignoring them meant a full disk
+            // produced answers that resume knew nothing about, re-running side effects).
+            // The turn still proceeds — the answer is worth more than the journal entry —
+            // but the user is told the durable story is now incomplete.
+            if let Err(e) = rec.record_user(task) {
+                on_event(EngineEvent::Notice {
+                    text: format!("session journal: user entry not recorded: {e:#}"),
+                });
+            }
+            if let Err(e) =
+                rec.record_route("rescue", None, None, backend_id, decision.reason.as_str())
+            {
+                on_event(EngineEvent::Notice {
+                    text: format!("session journal: route entry not recorded: {e:#}"),
+                });
+            }
             let (prompt_sent, continue_from) = match &plan {
                 TurnPlan::Fresh => (task, None),
                 TurnPlan::Native { continue_from } => (task, Some(continue_from.as_str())),
                 TurnPlan::Composed { prompt } => (prompt.as_str(), None),
             };
-            exchange_id = rec
-                .record_exchange(NewExchange {
-                    backend: backend_id.as_str(),
-                    transport,
-                    run_id: logger.run_id(),
-                    model: effective_model.as_deref(),
-                    effort: effective_effort.map(|e| e.as_str()),
-                    prompt: prompt_sent,
-                    continue_from,
-                })
-                .ok();
+            exchange_id = match rec.record_exchange(NewExchange {
+                backend: backend_id.as_str(),
+                transport,
+                run_id: logger.run_id(),
+                model: effective_model.as_deref(),
+                effort: effective_effort.map(|e| e.as_str()),
+                prompt: prompt_sent,
+                continue_from,
+            }) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    on_event(EngineEvent::Notice {
+                        text: format!(
+                            "session journal: exchange not recorded: {e:#} — resume will \
+                             not see this turn"
+                        ),
+                    });
+                    None
+                }
+            };
         }
         let (task_to_send, continue_from): (String, Option<String>) = match &plan {
             TurnPlan::Fresh => (task.to_string(), None),
@@ -244,8 +270,7 @@ impl TurnEngine {
 
         if let (Some(recorder), Some(exchange_id)) = (recorder, &exchange_id)
             && let Ok(mut rec) = recorder.lock()
-        {
-            let _ = rec.record_result(
+            && let Err(e) = rec.record_result(
                 exchange_id,
                 NewResult {
                     status,
@@ -255,7 +280,14 @@ impl TurnEngine {
                     backend_session_ref: backend_ref.as_deref(),
                     raw_ref: Some(&raw_ref),
                 },
-            );
+            )
+        {
+            on_event(EngineEvent::Notice {
+                text: format!(
+                    "session journal: result not recorded: {e:#} — on resume this turn \
+                     will look interrupted and could be repeated"
+                ),
+            });
         }
 
         // Run-event bookkeeping mirrors the recorded status.

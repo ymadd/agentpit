@@ -116,6 +116,9 @@ pub async fn dispatch_free_text(
             }
             to_stdout(&text);
         }
+        EngineEvent::Notice { text } => {
+            eprintln!("{}", style(format!("[!] {text}")).yellow());
+        }
     });
 
     // Ctrl-C cancels the token; the engine then records the turn as cancelled and returns

@@ -34,6 +34,11 @@ pub enum BackendId {
     Codex,
     Antigravity,
     Opencode,
+    /// Prime Agent (`prime-agent`) — Prime Intellect's RLM-native coding/research harness.
+    /// The wire form is the hyphenated CLI name, so the serde default (`primeagent`) is
+    /// overridden: the event log, `config.toml`, and the CLI all spell it `prime-agent`.
+    #[serde(rename = "prime-agent", alias = "prime_agent", alias = "primeagent")]
+    PrimeAgent,
     Goose,
     Copilot,
 }
@@ -44,6 +49,7 @@ impl BackendId {
         BackendId::Codex,
         BackendId::Antigravity,
         BackendId::Opencode,
+        BackendId::PrimeAgent,
         BackendId::Goose,
         BackendId::Copilot,
     ];
@@ -54,6 +60,7 @@ impl BackendId {
             BackendId::Codex => "codex",
             BackendId::Antigravity => "antigravity",
             BackendId::Opencode => "opencode",
+            BackendId::PrimeAgent => "prime-agent",
             BackendId::Goose => "goose",
             BackendId::Copilot => "copilot",
         }
@@ -75,6 +82,11 @@ impl FromStr for BackendId {
             "codex" => Ok(BackendId::Codex),
             "antigravity" | "agy" => Ok(BackendId::Antigravity),
             "opencode" => Ok(BackendId::Opencode),
+            // `prime` / `pa` are the short forms a human types; `prime_agent` and `primeagent`
+            // catch the underscore/serde-default spellings so a hand-edited config still parses.
+            "prime-agent" | "prime_agent" | "primeagent" | "prime" | "pa" => {
+                Ok(BackendId::PrimeAgent)
+            }
             "goose" => Ok(BackendId::Goose),
             "copilot" => Ok(BackendId::Copilot),
             other => Err(format!("unknown backend: {other}")),
@@ -934,6 +946,39 @@ mod tests {
             BackendId::Opencode
         );
         assert_eq!("AGY".parse::<BackendId>().unwrap(), BackendId::Antigravity);
+        // prime-agent's canonical spelling plus every alias a human or an old config may use.
+        for spelling in [
+            "prime-agent",
+            "PRIME-AGENT",
+            "prime_agent",
+            "primeagent",
+            "prime",
+            "pa",
+        ] {
+            assert_eq!(
+                spelling.parse::<BackendId>().unwrap(),
+                BackendId::PrimeAgent,
+                "{spelling}"
+            );
+        }
+    }
+
+    /// The event log is read by the dashboard, so a backend's wire spelling is a contract.
+    /// `rename_all = "lowercase"` would have written `primeagent`; this pins the hyphen and
+    /// keeps the old spelling readable so logs written before the rename still parse.
+    #[test]
+    fn prime_agent_serializes_with_a_hyphen_and_still_reads_the_legacy_spelling() {
+        assert_eq!(
+            serde_json::to_string(&BackendId::PrimeAgent).unwrap(),
+            r#""prime-agent""#
+        );
+        for wire in [r#""prime-agent""#, r#""prime_agent""#, r#""primeagent""#] {
+            assert_eq!(
+                serde_json::from_str::<BackendId>(wire).unwrap(),
+                BackendId::PrimeAgent,
+                "{wire}"
+            );
+        }
     }
 
     #[test]

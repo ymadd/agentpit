@@ -98,15 +98,15 @@ jobs:
       - name: Build tests (similarity)
         run: cargo test -p agentpit --features similarity --locked -j 2 --no-run
 
-      # DEBUG round 3 (this branch only): the modules round 2 missed that still precede
-      # mcp:: in serial order (ask auth config daemon dispatch), plus the hanging test.
+      # DEBUG round 4 (this branch only): the last 58 uncovered tests that precede mcp::
+      # in serial order (acp/arena/availability/diagnose/effort), plus the hanging test.
       - name: Test (similarity)
         env:
           RUST_BACKTRACE: "1"
         run: |
           (while true; do echo "[mem] $(free -m | awk '/Mem:/ {print "used="$3"M avail="$7"M"} /Swap:/ {print "swap_used="$3"M"}' | tr '\n' ' ')"; sleep 15; done) &
           MONPID=$!
-          timeout 600 cargo test -p agentpit --features similarity --locked -j 2 -- --test-threads=1 ask:: auth:: config:: daemon:: dispatch:: mcp::tools::tests::ask_human_times_out_to_sentinel_as_success || echo "EXIT CODE $? (124 = hung for 10 min)"
+          timeout 600 cargo test -p agentpit --features similarity --locked -j 2 -- --test-threads=1 acp:: arena:: availability:: diagnose:: effort:: mcp::tools::tests::ask_human_times_out_to_sentinel_as_success || echo "EXIT CODE $? (124 = hung for 10 min)"
           kill $MONPID 2>/dev/null || true
 
       - name: Disk usage

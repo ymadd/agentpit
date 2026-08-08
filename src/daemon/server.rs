@@ -30,10 +30,20 @@ pub async fn run_daemon() -> Result<()> {
     if let Some(existing) = registry::load_owner(&owner_path)
         && existing.alive()
     {
-        return Err(anyhow!(
-            "a daemon is already running (pid {}). Use `agentpit daemon status` to inspect it.",
-            existing.pid
-        ));
+        // Live-probe the RECORDED socket, never trust the pid alone: a daemon whose
+        // runtime dir was wiped or whose $XDG_RUNTIME_DIR changed is alive but
+        // unreachable, and refusing to start here would leave the user daemon-less
+        // forever (found live 2026-08-08). An unreachable owner is killed and replaced.
+        if crate::daemon::client::Conn::connect(Path::new(&existing.socket))
+            .await
+            .is_ok()
+        {
+            return Err(anyhow!(
+                "a daemon is already running (pid {}). Use `agentpit daemon status` to inspect it.",
+                existing.pid
+            ));
+        }
+        let _ = kill_pid(existing.pid);
     }
     ensure_runtime_dir()?;
     let socket = daemon_socket_path();

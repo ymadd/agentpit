@@ -635,8 +635,15 @@ async fn run_repl_cell(
                 .await
             }
         })
-        .await?;
-    Ok(outcome)
+        .await;
+    // A sidecar I/O error (broken pipe = deno died) means the heap is gone; drop the
+    // handle so the NEXT cell respawns a fresh REPL rather than reusing a dead process
+    // (H3 — the error text promised this, but nothing reset the guard). A RuntimeError
+    // is a cell exception with the sidecar still alive, so it keeps its handle.
+    if outcome.is_err() {
+        *guard = None;
+    }
+    outcome
 }
 
 #[cfg(test)]

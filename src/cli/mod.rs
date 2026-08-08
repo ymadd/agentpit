@@ -41,7 +41,7 @@ pub(crate) use common::{install_ctrlc_cancel, load_context, resolve_cwd, stdout_
 #[command(
     name = "agentpit",
     version,
-    about = "Multi-agent hub CLI: route work to Antigravity (agy) / Claude / Codex / OpenCode."
+    about = "Multi-agent hub CLI: route work to Antigravity (agy) / Claude / Codex / OpenCode / Prime Agent."
 )]
 pub struct Cli {
     /// Run a subcommand. Omit to launch the interactive menu.

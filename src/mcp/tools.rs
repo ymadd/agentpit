@@ -44,7 +44,7 @@ use crate::types::BackendId;
 /// Parameters for the `dispatch_task` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DispatchTaskRequest {
-    /// Backend id to run (claude | codex | codex | antigravity | opencode). At most one of
+    /// Backend id to run (claude | codex | antigravity | opencode | prime-agent). At most one of
     /// `backend` or `role`; omit both to let the learned router pick per task.
     #[serde(default)]
     pub backend: Option<String>,

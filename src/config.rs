@@ -634,7 +634,8 @@ pub fn load_config(override_path: Option<&Path>) -> Result<LoadedConfig> {
 }
 
 pub const DEFAULT_CONFIG_TOML: &str = r#"# agentpit config
-# Backends currently available: antigravity (agy), claude, codex (paid plan), opencode
+# Backends currently available: antigravity (agy), claude, codex (paid plan), opencode,
+# prime-agent (Prime Agent — subscription OAuth or any provider API key)
 
 [default]
 backend = "claude"
@@ -727,6 +728,11 @@ review_members = ["antigravity", "opencode"]
 # model     = "gemini-3-pro"   # default model for this backend (lowest precedence; --model / role.model win)
 # effort    = "high"           # default reasoning effort: low|medium|high|xhigh|max (same precedence as model;
 #                              # rungs the backend cannot express are clamped down — agy stops at high, codex at xhigh)
+
+# [backends.prime-agent]
+# model     = "anthropic/claude-opus-5"  # any id from `prime-agent model list`, passed through verbatim
+#                                        # (prime-inference ids contain slashes — never split them)
+# effort    = "xhigh"                    # prime-agent maps effort to `--thinking` and accepts the whole ladder
 "#;
 
 #[cfg(test)]
@@ -771,6 +777,59 @@ review_members = ["claude", "opencode"]
         assert_eq!(
             loaded.config.ensemble.review_members,
             vec![BackendId::Claude, BackendId::Opencode]
+        );
+    }
+
+    /// The hyphen in `prime-agent` is the wire spelling everywhere a backend is named: a
+    /// `[routes]` pin, an ensemble member list, and a `[backends.<id>]` table key. serde would
+    /// otherwise have derived `primeagent` from `rename_all = "lowercase"`, so this pins the
+    /// override — a config written against the README must load.
+    #[test]
+    fn prime_agent_is_spelled_with_a_hyphen_everywhere_a_backend_is_named() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("prime-agent.toml");
+        fs::write(
+            &path,
+            r#"
+[default]
+backend = "prime-agent"
+
+[routes]
+rescue = "prime-agent"
+
+[ensemble]
+review_members = ["prime-agent", "codex"]
+
+[backends.prime-agent]
+model = "anthropic/claude-opus-5"
+effort = "xhigh"
+"#,
+        )
+        .unwrap();
+        let loaded = load_config(Some(&path)).unwrap();
+        assert_eq!(loaded.config.default.backend, BackendId::PrimeAgent);
+        assert_eq!(
+            loaded.config.routes.get(&RouteKey::Rescue),
+            Some(&BackendId::PrimeAgent)
+        );
+        assert_eq!(
+            loaded.config.ensemble.review_members,
+            vec![BackendId::PrimeAgent, BackendId::Codex]
+        );
+        let backend = loaded.config.backends.get(&BackendId::PrimeAgent).unwrap();
+        // A prime-inference id keeps its slash: agentpit must never split a provider off.
+        assert_eq!(backend.model.as_deref(), Some("anthropic/claude-opus-5"));
+        assert_eq!(backend.effort, Some(crate::effort::Effort::XHigh));
+
+        // And it survives a save/load round trip, so the settings UI cannot rename it.
+        let out = dir.path().join("saved.toml");
+        save_config_at(&loaded.config, &out).unwrap();
+        let raw = fs::read_to_string(&out).unwrap();
+        assert!(raw.contains("prime-agent"), "{raw}");
+        assert!(!raw.contains("primeagent"), "{raw}");
+        assert_eq!(
+            load_config(Some(&out)).unwrap().config.default.backend,
+            BackendId::PrimeAgent
         );
     }
 
@@ -1046,6 +1105,33 @@ prompt = "Research only."
             vec!["reviewer".to_string(), "security".to_string()]
         );
         assert_eq!(review.manager_backend, Some(BackendId::Claude));
+    }
+
+    /// The `[backends.prime-agent]` example must stay valid TOML when uncommented — it is the
+    /// one sample block whose table key contains a hyphen, so a serde rename regression would
+    /// surface here as an unknown-backend parse error rather than at someone's first dispatch.
+    #[test]
+    fn sample_config_prime_agent_backend_example_parses_when_uncommented() {
+        let block: String = DEFAULT_CONFIG_TOML
+            .lines()
+            .skip_while(|l| !l.starts_with("# [backends.prime-agent]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .or_else(|| l.strip_prefix("#"))
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !block.is_empty(),
+            "prime-agent backend example not found in sample config"
+        );
+        let parsed: HubConfig =
+            toml::from_str(&block).expect("uncommented prime-agent example parses");
+        let backend = parsed.backends.get(&BackendId::PrimeAgent).expect("entry");
+        assert_eq!(backend.model.as_deref(), Some("anthropic/claude-opus-5"));
+        assert_eq!(backend.effort, Some(crate::effort::Effort::XHigh));
     }
 
     #[test]

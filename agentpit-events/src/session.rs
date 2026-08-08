@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -746,6 +746,128 @@ impl SessionLog {
             .collect()
     }
 
+    /// Fork the chain root→`up_to_id` into a NEW session file under `dest_dir` (§3.2).
+    /// Entry ids and timestamps are preserved (they stay unique — the copy is a subset of
+    /// one file), only the first copied entry is re-parented onto the new header, and
+    /// `parent_session` records the source path. Cloning = forking at the current leaf.
+    pub fn fork(&self, up_to_id: &str, dest_dir: &Path) -> std::io::Result<SessionLog> {
+        if !self.index.contains_key(up_to_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("no entry {up_to_id} in this session"),
+            ));
+        }
+        // Chain root→target, minus the source header (the fork gets its own).
+        let mut chain: Vec<&LoadedEntry> = Vec::new();
+        let mut cursor: Option<&str> = Some(up_to_id);
+        let mut hops = 0usize;
+        while let Some(id) = cursor {
+            if hops > self.entries.len() {
+                break;
+            }
+            hops += 1;
+            let Some(entry) = self.entry(id) else { break };
+            if !matches!(entry, LoadedEntry::Known(SessionEntry::Session { .. })) {
+                chain.push(entry);
+            }
+            cursor = self.effective_parent(id);
+        }
+        chain.reverse();
+
+        fs::create_dir_all(dest_dir)?;
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let path = dest_dir.join(format!("{session_id}.jsonl"));
+        // The header id must not collide with any preserved entry id.
+        let copied_ids: HashMap<String, usize> = chain
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.id().map(|id| (id.to_string(), i)))
+            .collect();
+        let header_id = random_entry_id(&copied_ids);
+        let (cwd, title) = (self.cwd().to_string(), self.title().map(str::to_string));
+        let header = SessionEntry::Session {
+            id: header_id.clone(),
+            ts: now_rfc3339(),
+            v: SESSION_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            cwd,
+            title,
+            parent_session: Some(self.path.display().to_string()),
+        };
+        let mut forked = SessionLog {
+            path,
+            entries: Vec::new(),
+            index: HashMap::new(),
+            repaired_parents: HashMap::new(),
+            leaf_id: header_id.clone(),
+            session_id,
+            warnings: Vec::new(),
+        };
+        forked.write_line(&header, false)?;
+        forked.push_known(header);
+
+        for (i, entry) in chain.iter().enumerate() {
+            match entry {
+                LoadedEntry::Known(e) => {
+                    let mut copy = (*e).clone();
+                    if i == 0 {
+                        set_parent(&mut copy, &header_id);
+                    }
+                    forked.write_line(&copy, false)?;
+                    forked.push_known(copy);
+                }
+                LoadedEntry::Unknown(v) => {
+                    let mut copy = v.clone();
+                    if i == 0 {
+                        if let Some(obj) = copy.as_object_mut() {
+                            obj.insert(
+                                "parent_id".to_string(),
+                                serde_json::Value::String(header_id.clone()),
+                            );
+                        }
+                    }
+                    let line = serde_json::to_string(&copy).map_err(std::io::Error::other)?;
+                    forked.write_raw_line(&line, false)?;
+                    let id = copy
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .expect("chain entries have ids")
+                        .to_string();
+                    forked.entries.push(LoadedEntry::Unknown(copy));
+                    forked.index.insert(id.clone(), forked.entries.len() - 1);
+                    forked.leaf_id = id;
+                }
+            }
+        }
+        // Durability checkpoint: a fork that vanishes on power loss would surprise more
+        // than a lost turn.
+        forked.sync()?;
+        Ok(forked)
+    }
+
+    /// The header's working directory.
+    pub fn cwd(&self) -> &str {
+        match self.entries.first() {
+            Some(LoadedEntry::Known(SessionEntry::Session { cwd, .. })) => cwd,
+            _ => "",
+        }
+    }
+
+    /// The header's title, when one was set at creation/fork time.
+    pub fn title(&self) -> Option<&str> {
+        match self.entries.first() {
+            Some(LoadedEntry::Known(SessionEntry::Session { title, .. })) => title.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .and_then(|f| f.sync_all())
+    }
+
     fn envelope(&self) -> (String, String, String) {
         (
             random_entry_id(&self.index),
@@ -767,22 +889,134 @@ impl SessionLog {
         self.leaf_id = id;
     }
 
+    fn write_line(&self, entry: &SessionEntry, durable: bool) -> std::io::Result<()> {
+        let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+        self.write_raw_line(&line, durable)
+    }
+
     /// One line = one `write_all` on an append-mode handle: effectively atomic for normal
     /// line sizes, and a torn tail on crash is tolerated by [`SessionLog::open`]. `durable`
     /// adds an fsync (results and summaries — the checkpoints worth surviving power loss).
-    fn write_line(&self, entry: &SessionEntry, durable: bool) -> std::io::Result<()> {
-        let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
-        line.push('\n');
+    fn write_raw_line(&self, line: &str, durable: bool) -> std::io::Result<()> {
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
         f.write_all(line.as_bytes())?;
+        f.write_all(b"\n")?;
         f.flush()?;
         if durable {
             f.sync_all()?;
         }
         Ok(())
+    }
+}
+
+/// Rewrite `entry`'s parent pointer (used when re-rooting the first forked entry).
+fn set_parent(entry: &mut SessionEntry, new_parent: &str) {
+    match entry {
+        SessionEntry::Session { .. } => {}
+        SessionEntry::User { parent_id, .. }
+        | SessionEntry::Route { parent_id, .. }
+        | SessionEntry::Exchange { parent_id, .. }
+        | SessionEntry::ExchangeResult { parent_id, .. }
+        | SessionEntry::Switch { parent_id, .. }
+        | SessionEntry::Summary { parent_id, .. }
+        | SessionEntry::State { parent_id, .. }
+        | SessionEntry::Label { parent_id, .. }
+        | SessionEntry::Ext { parent_id, .. } => *parent_id = new_parent.to_string(),
+    }
+}
+
+/// A session file's identity, read from its header line only (cheap listing).
+#[derive(Debug, Clone)]
+pub struct SessionMeta {
+    pub session_id: String,
+    pub path: PathBuf,
+    pub title: Option<String>,
+    pub cwd: String,
+    /// File mtime — "last activity" for listings.
+    pub updated_at: SystemTime,
+    pub size_bytes: u64,
+}
+
+/// List sessions under `dir`, newest first. Files without a readable header are skipped.
+pub fn list_sessions(dir: &Path) -> Vec<SessionMeta> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SessionMeta> = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(meta) = read_meta(&path) else {
+            continue;
+        };
+        out.push(meta);
+    }
+    out.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
+    out
+}
+
+fn read_meta(path: &Path) -> Option<SessionMeta> {
+    use std::io::BufRead;
+    let f = fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(f).read_line(&mut first).ok()?;
+    let SessionEntry::Session {
+        session_id,
+        cwd,
+        title,
+        ..
+    } = serde_json::from_str::<SessionEntry>(&first).ok()?
+    else {
+        return None;
+    };
+    let md = fs::metadata(path).ok()?;
+    Some(SessionMeta {
+        session_id,
+        path: path.to_path_buf(),
+        title,
+        cwd,
+        updated_at: md.modified().unwrap_or(UNIX_EPOCH),
+        size_bytes: md.len(),
+    })
+}
+
+#[derive(Debug)]
+pub enum ResolveError {
+    NotFound,
+    /// Multiple candidates — never silently pick one (prime's discipline).
+    Ambiguous(Vec<SessionMeta>),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::NotFound => write!(f, "no session matches"),
+            ResolveError::Ambiguous(c) => write!(f, "{} sessions match", c.len()),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+/// Resolve a user-supplied session reference: exact id first, then unique prefix/suffix.
+pub fn resolve_session(dir: &Path, needle: &str) -> Result<SessionMeta, ResolveError> {
+    let all = list_sessions(dir);
+    if let Some(exact) = all.iter().find(|m| m.session_id == needle) {
+        return Ok(exact.clone());
+    }
+    let partial: Vec<SessionMeta> = all
+        .into_iter()
+        .filter(|m| m.session_id.starts_with(needle) || m.session_id.ends_with(needle))
+        .collect();
+    match partial.len() {
+        0 => Err(ResolveError::NotFound),
+        1 => Ok(partial.into_iter().next().expect("len checked")),
+        _ => Err(ResolveError::Ambiguous(partial)),
     }
 }
 
@@ -1084,6 +1318,92 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn fork_copies_only_the_chain_and_rerooots_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = seed(tmp.path());
+        let u1 = log.append_user("keep me").unwrap();
+        let (_e1, r1) = run_turn(&mut log, "keep q", "keep a");
+        // A second branch that must NOT be copied.
+        log.branch(&u1).unwrap();
+        log.append_user("abandoned branch").unwrap();
+
+        let dest = tmp.path().join("forks");
+        let forked = log.fork(&r1, &dest).unwrap();
+        assert_ne!(forked.session_id(), log.session_id());
+        assert_eq!(forked.title(), Some("t"));
+        assert_eq!(forked.cwd(), "/work");
+
+        let raw = std::fs::read_to_string(forked.path()).unwrap();
+        assert!(raw.contains("keep q"));
+        assert!(raw.contains("\"parent_session\""));
+        assert!(!raw.contains("abandoned branch"));
+
+        // The fork replays exactly the copied conversation and stays appendable.
+        let mut reopened = SessionLog::open(forked.path()).unwrap();
+        assert!(reopened.warnings().is_empty(), "{:?}", reopened.warnings());
+        assert_eq!(
+            reopened.context(),
+            vec![
+                ContextItem::User("keep me"),
+                ContextItem::User("keep q"),
+                ContextItem::Answer {
+                    backend: "codex",
+                    text: "keep a"
+                },
+            ]
+        );
+        reopened.append_user("continue in fork").unwrap();
+        assert_eq!(reopened.context().len(), 4);
+        // Continuation refs survive the copy.
+        assert_eq!(reopened.last_backend_ref("codex"), Some("thread-1"));
+    }
+
+    #[test]
+    fn fork_of_unknown_id_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = seed(tmp.path());
+        assert!(log.fork("nope0000", tmp.path()).is_err());
+    }
+
+    #[test]
+    fn list_and_resolve_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = SessionLog::create(tmp.path(), "/a", Some("first"), None).unwrap();
+        let b = SessionLog::create(tmp.path(), "/b", None, None).unwrap();
+        // Junk that must be skipped, not crash the listing.
+        std::fs::write(tmp.path().join("junk.jsonl"), "not json\n").unwrap();
+        std::fs::write(tmp.path().join("readme.txt"), "ignore").unwrap();
+
+        let listed = list_sessions(tmp.path());
+        assert_eq!(listed.len(), 2);
+        let ids: Vec<_> = listed.iter().map(|m| m.session_id.as_str()).collect();
+        assert!(ids.contains(&a.session_id()));
+        assert!(ids.contains(&b.session_id()));
+
+        // Exact match wins.
+        let hit = resolve_session(tmp.path(), a.session_id()).unwrap();
+        assert_eq!(hit.session_id, a.session_id());
+        // Unique suffix resolves (uuidv7 tails differ).
+        let tail = &b.session_id()[b.session_id().len() - 12..];
+        let hit = resolve_session(tmp.path(), tail).unwrap();
+        assert_eq!(hit.session_id, b.session_id());
+        // A shared prefix is ambiguous, not a silent pick: uuidv7 ids created in the same
+        // millisecond share a long prefix, so probe with a 4-char prefix common to both if
+        // it exists, else assert NotFound behavior on garbage.
+        let p4a = &a.session_id()[..4];
+        if b.session_id().starts_with(p4a) {
+            assert!(matches!(
+                resolve_session(tmp.path(), p4a),
+                Err(ResolveError::Ambiguous(_))
+            ));
+        }
+        assert!(matches!(
+            resolve_session(tmp.path(), "zzzz-not-a-session"),
+            Err(ResolveError::NotFound)
+        ));
     }
 
     #[test]

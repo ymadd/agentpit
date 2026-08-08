@@ -534,8 +534,9 @@ mod tests {
         decoder.decode_line(
             r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"ok"}}"#,
         );
-        let torn = decoder
-            .decode_line(r#"{"type":"tool_execution_start","toolName":"ipython","args":{"code":"secret"#);
+        let torn = decoder.decode_line(
+            r#"{"type":"tool_execution_start","toolName":"ipython","args":{"code":"secret"#,
+        );
         assert_eq!(torn.answer, None);
         assert!(torn.display.unwrap().contains("unparsed"));
     }

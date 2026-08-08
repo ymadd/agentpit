@@ -270,12 +270,9 @@ fn interrupt_child(child: &tokio::process::Child) {
         let _ = std::process::Command::new("kill")
             .args(["-INT", &pid.to_string()])
             .status();
-        return;
     }
     #[cfg(not(unix))]
-    {
-        let _ = child;
-    }
+    let _ = child;
 }
 
 /// Read and throw away the rest of an oversized line, returning how many bytes went.

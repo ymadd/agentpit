@@ -174,7 +174,9 @@ async fn check_prime_agent() -> AuthStatus {
         .find_map(|var| std::env::var(var).ok().filter(|dir| !dir.trim().is_empty()))
         .map(|dir| std::path::PathBuf::from(dir).join("auth.json"))
         .unwrap_or_else(|| home_join(&[".prime", "agent", "auth.json"]));
-    let auth_file = tokio::fs::read_to_string(auth_path).await.unwrap_or_default();
+    let auth_file = tokio::fs::read_to_string(auth_path)
+        .await
+        .unwrap_or_default();
     let env_provider = PRIME_AGENT_PROVIDERS
         .iter()
         .find(|(_, var)| {

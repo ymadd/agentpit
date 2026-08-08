@@ -98,17 +98,17 @@ jobs:
       - name: Build tests (similarity)
         run: cargo test -p agentpit --features similarity --locked -j 2 --no-run
 
-      # DEBUG round 5 (this branch only): ALL 282 tests up to and including ask_human in
-      # one process. Rounds 2-4 covered the same tests split three ways and all passed;
-      # reproducing here = cumulative/combination effect, passing here = the real hang
-      # point is later than ask_human.
+      # DEBUG round 6 (this branch only): the FULL suite. Rounds 1-5 proved everything up
+      # to ask_human passes together (3.95 s), so the hang lives in the remaining 206
+      # tests. timeout -k kills only the test process, so the runner survives to upload
+      # the log — the last printed test name fingers the culprit.
       - name: Test (similarity)
         env:
           RUST_BACKTRACE: "1"
         run: |
           (while true; do echo "[mem] $(free -m | awk '/Mem:/ {print "used="$3"M avail="$7"M"} /Swap:/ {print "swap_used="$3"M"}' | tr '\n' ' ')"; sleep 15; done) &
           MONPID=$!
-          timeout 600 cargo test -p agentpit --features similarity --locked -j 2 -- --test-threads=1 acp:: arena:: ask:: auth:: availability:: cli:: config:: daemon:: diagnose:: dispatch:: effort:: exec:: mcp::tools::tests::ask_human_times_out_to_sentinel_as_success || echo "EXIT CODE $? (124 = hung for 10 min)"
+          timeout -k 30 600 cargo test -p agentpit --features similarity --locked -j 2 -- --test-threads=1 || echo "EXIT CODE $? (124 = hung for 10 min)"
           kill $MONPID 2>/dev/null || true
 
       - name: Disk usage

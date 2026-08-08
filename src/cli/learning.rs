@@ -220,8 +220,8 @@ fn render(status: &LearningStatus) -> String {
     let mix = status.label_mix;
     let _ = writeln!(
         out,
-        "evidence  outcome {} · relative {} · grade {} · rerun {} · exit {}  (gate: {} labels per cell)",
-        mix.outcome, mix.relative, mix.grade, mix.rerun, mix.exit, status.min_samples
+        "evidence  outcome {} · grade {} · rerun {} · exit {}  (gate: {} labels per cell)",
+        mix.outcome, mix.grade, mix.rerun, mix.exit, status.min_samples
     );
 
     // Cells with telemetry behind them, strongest evidence first — the actual "in progress".
@@ -368,7 +368,6 @@ mod tests {
                         bad: 1,
                         mix: SourceMix {
                             outcome: 1,
-                            relative: 0,
                             grade: 1,
                             rerun: 0,
                             exit: 1,
@@ -383,7 +382,6 @@ mod tests {
             }],
             label_mix: SourceMix {
                 outcome: 2,
-                relative: 2,
                 grade: 3,
                 rerun: 1,
                 exit: 1,

@@ -40,6 +40,27 @@ pub trait ExecAdapter: Send + Sync {
     fn autonomy(&self) -> AutonomyLevel {
         AutonomyLevel::FullAutonomy
     }
+
+    /// Whether this backend can natively continue a previous session from a
+    /// `backend_session_ref`. Callers use this to decide BEFORE dispatch whether to send
+    /// the raw task (native resume) or a composed context (design §4.3, Q3: claude/codex).
+    fn supports_resume(&self) -> bool {
+        false
+    }
+
+    /// Build a spec that natively continues the backend session identified by
+    /// `backend_ref` (opaque — captured from a prior run's stream). `None` = no native
+    /// continuation; the caller falls back to a fresh [`ExecAdapter::build_spec`].
+    fn build_continuation_spec(
+        &self,
+        task: &str,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        backend_ref: &str,
+    ) -> Option<ExecSpec> {
+        let _ = (task, model, effort, backend_ref);
+        None
+    }
 }
 
 pub async fn run<A: ExecAdapter + ?Sized>(
@@ -47,6 +68,12 @@ pub async fn run<A: ExecAdapter + ?Sized>(
     task: &str,
     options: ExecRunOptions,
 ) -> Result<ExecOutcome> {
-    let spec = adapter.build_spec(task, options.model.as_deref(), options.effort);
+    let spec = options
+        .continue_from
+        .as_deref()
+        .and_then(|r| {
+            adapter.build_continuation_spec(task, options.model.as_deref(), options.effort, r)
+        })
+        .unwrap_or_else(|| adapter.build_spec(task, options.model.as_deref(), options.effort));
     run_spec(adapter.id(), spec, options, adapter.stream_format()).await
 }

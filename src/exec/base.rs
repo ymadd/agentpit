@@ -49,11 +49,18 @@ pub struct ExecRunOptions {
     /// (no effort flag emitted). Threaded to `build_spec`, which clamps it to what the backend
     /// can express.
     pub effort: Option<crate::effort::Effort>,
+    /// Opaque backend session ref to natively continue from (design §4.3). `Some` routes the
+    /// spec build through `build_continuation_spec`; adapters without native resume fall back
+    /// to a fresh `build_spec` (the caller composes context in that case).
+    pub continue_from: Option<String>,
 }
 
 pub struct ExecOutcome {
     pub output: String,
     pub exit_code: Option<i32>,
+    /// The backend's own session/thread id captured from the stream (see
+    /// [`StreamDecoder::backend_session_ref`]). `None` for Text streams and failed runs.
+    pub backend_session_ref: Option<String>,
 }
 
 pub async fn run_spec(
@@ -187,7 +194,12 @@ pub async fn run_spec(
             }
             consume_decoded(decoder.finish(), &on_stdout, &mut collected, &mut truncated);
         }
-        Ok::<(String, Option<String>), std::io::Error>((collected, decoder.take_backend_error()))
+        let session_ref = decoder.backend_session_ref().map(str::to_string);
+        Ok::<(String, Option<String>, Option<String>), std::io::Error>((
+            collected,
+            decoder.take_backend_error(),
+            session_ref,
+        ))
     });
 
     let stderr_task = tokio::spawn(async move {
@@ -230,7 +242,7 @@ pub async fn run_spec(
         }
     };
 
-    let (stdout_text, backend_error) = stdout_task.await??;
+    let (stdout_text, backend_error, backend_session_ref) = stdout_task.await??;
     let stderr_text = stderr_task.await??;
 
     let code = exit_status.code();
@@ -259,6 +271,7 @@ pub async fn run_spec(
     Ok(ExecOutcome {
         output: stdout_text,
         exit_code: code,
+        backend_session_ref,
     })
 }
 
@@ -417,6 +430,7 @@ mod tests {
                 on_stdout: None,
                 model: None,
                 effort: None,
+                continue_from: None,
             },
             StreamFormat::Text,
         )
@@ -478,6 +492,7 @@ mod tests {
                 on_stdout: None,
                 model: None,
                 effort: None,
+                continue_from: None,
             },
             StreamFormat::CodexJsonl,
         )
@@ -520,6 +535,7 @@ mod tests {
                 on_stdout: None,
                 model: None,
                 effort: None,
+                continue_from: None,
             },
             StreamFormat::CodexJsonl,
         )

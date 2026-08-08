@@ -57,6 +57,52 @@ impl ExecAdapter for CodexExec {
         // without an approval TTY, so it carries the same full-autonomy posture.
         AutonomyLevel::FullAutonomy
     }
+
+    fn supports_resume(&self) -> bool {
+        true
+    }
+
+    fn build_continuation_spec(
+        &self,
+        task: &str,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        backend_ref: &str,
+    ) -> Option<ExecSpec> {
+        // `codex exec resume <thread_id> …` continues the thread and re-emits the same
+        // thread_id on `thread.started` (verified against the real CLI 2026-08-08). The
+        // resume subcommand has no `--sandbox`/`--model` flags, so both ride the documented
+        // `-c` config overrides (raw-literal TOML values); the sandbox override keeps the
+        // adapter's declared [`AutonomyLevel::FullAutonomy`] honest rather than trusting
+        // whatever the original session ran with.
+        let mut args = vec![
+            "exec".into(),
+            "resume".into(),
+            backend_ref.to_string(),
+            "--skip-git-repo-check".into(),
+            "--json".into(),
+            "-c".into(),
+            "sandbox_mode=workspace-write".into(),
+        ];
+        if let Some(m) = model {
+            args.push("-c".into());
+            args.push(format!("model={m}"));
+        }
+        if let Some(e) = effort {
+            args.push("-c".into());
+            args.push(format!(
+                "model_reasoning_effort={}",
+                e.clamp_for(BackendId::Codex)
+            ));
+        }
+        args.push("-".into()); // read the prompt from stdin
+        Some(ExecSpec {
+            command: "codex".into(),
+            args,
+            env: Vec::new(),
+            stdin_input: Some(task.to_string()),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +174,35 @@ mod tests {
         assert_eq!(spec.args[i + 1], "workspace-write");
         // Full shell access stays reserved for the workflow manager.
         assert!(!spec.args.iter().any(|a| a == "danger-full-access"));
+    }
+
+    /// `codex exec resume` has no `--sandbox`/`--model` flags (verified 2026-08-08), so the
+    /// continuation spec must carry both as `-c` config overrides, keep the thread id as the
+    /// positional right after `resume`, and still read the prompt from stdin.
+    #[test]
+    fn continuation_spec_uses_resume_subcommand_with_config_overrides() {
+        assert!(CodexExec.supports_resume());
+        let spec = CodexExec
+            .build_continuation_spec(
+                "follow up",
+                Some("gpt-5-codex"),
+                Some(Effort::High),
+                "019fe072-tid",
+            )
+            .unwrap();
+        assert_eq!(spec.args[0], "exec");
+        assert_eq!(spec.args[1], "resume");
+        assert_eq!(spec.args[2], "019fe072-tid");
+        assert!(spec.args.iter().any(|a| a == "--json"));
+        assert!(!spec.args.iter().any(|a| a == "--sandbox"));
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a == "sandbox_mode=workspace-write")
+        );
+        assert!(spec.args.iter().any(|a| a == "model=gpt-5-codex"));
+        assert!(spec.args.iter().any(|a| a == "model_reasoning_effort=high"));
+        assert_eq!(spec.args.last().unwrap(), "-");
+        assert_eq!(spec.stdin_input.as_deref(), Some("follow up"));
     }
 }

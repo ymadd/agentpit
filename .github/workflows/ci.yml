@@ -51,9 +51,10 @@ jobs:
   # gated behind `agentpit similarity init` — so this stays network-free.
   #
   # Runs as its own job: building it on top of the workspace job's target/ starved the
-  # hosted runner ("lost communication with the server" after ~49 min) whenever the
-  # Cargo.lock cache missed. A separate runner gives it a full disk, and debuginfo=0
-  # keeps the ONNX-heavy build within the runner's memory and disk budget.
+  # hosted runner ("lost communication with the server") whenever the Cargo.lock cache
+  # missed. Clippy alone is light (no codegen/link), but linking the ONNX-heavy test
+  # binaries in parallel exhausts the runner's RAM — hence the swap file, -j 2, and the
+  # build/run split so a future failure points at the guilty phase.
   similarity:
     name: clippy · test (similarity feature)
     runs-on: ubuntu-latest
@@ -62,10 +63,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Free disk space
+      - name: Free disk space, add swap
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
           df -h /
+          free -h
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.93.0
@@ -85,8 +91,11 @@ jobs:
       - name: Clippy (similarity)
         run: cargo clippy -p agentpit --features similarity --all-targets --locked -- -D warnings
 
+      - name: Build tests (similarity)
+        run: cargo test -p agentpit --features similarity --locked -j 2 --no-run
+
       - name: Test (similarity)
-        run: cargo test -p agentpit --features similarity --locked
+        run: cargo test -p agentpit --features similarity --locked -j 2
 
       - name: Disk usage
         if: always()

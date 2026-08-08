@@ -187,11 +187,15 @@ function CoverageCard({ t, status }) {
   );
 }
 
-const MIX_KEYS = ["outcome", "grade", "rerun", "exit"];
-// Evidence strength, mirroring the fold's own weights (outcome 3 · grade 2 · rerun 1 · exit ½).
+const MIX_KEYS = ["outcome", "relative", "grade", "rerun", "exit"];
+// Evidence strength, mirroring the fold's own weights
+// (outcome 3 · relative 2 · grade 2 · rerun 1 · exit ½).
 const MIX_COLOR = {
   outcome: "var(--ok)",
-  grade: "var(--ac)",
+  relative: "var(--ac)",
+  // Same channel as `relative`, weaker case (a lone grade with nothing to compare against),
+  // so it reads as a lighter sibling of the same accent rather than a separate colour.
+  grade: "var(--ac-bd)",
   rerun: "#8a7fd0",
   exit: "var(--line-3)",
 };

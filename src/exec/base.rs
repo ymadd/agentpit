@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -186,7 +187,7 @@ pub async fn run_spec(
             }
             consume_decoded(decoder.finish(), &on_stdout, &mut collected, &mut truncated);
         }
-        Ok::<String, std::io::Error>(collected)
+        Ok::<(String, Option<String>), std::io::Error>((collected, decoder.take_backend_error()))
     });
 
     let stderr_task = tokio::spawn(async move {
@@ -213,12 +214,23 @@ pub async fn run_spec(
     let exit_status = tokio::select! {
         status = child.wait() => status?,
         _ = cancel.cancelled() => {
-            let _ = child.start_kill();
-            child.wait().await?
+            // Interrupt first so the backend can run its own cleanup — prime-agent's
+            // headless sessions live in a daemon worker that keeps executing for a grace
+            // period unless the frontend shuts down in order; an immediate SIGKILL leaves
+            // that worker acting for ~30 s after we reported "cancelled". Escalate only if
+            // the process ignores the interrupt.
+            interrupt_child(&child);
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(status) => status?,
+                Err(_) => {
+                    let _ = child.start_kill();
+                    child.wait().await?
+                }
+            }
         }
     };
 
-    let stdout_text = stdout_task.await??;
+    let (stdout_text, backend_error) = stdout_task.await??;
     let stderr_text = stderr_task.await??;
 
     let code = exit_status.code();
@@ -238,10 +250,32 @@ pub async fn run_spec(
         ));
     }
 
+    // The process exited 0 but reported a failure in-stream (prime-agent's JSON mode never
+    // sets a nonzero exit for a failed turn). Surface it as the dispatch error it is.
+    if let Some(be) = backend_error {
+        return Err(anyhow!("{id} reported an in-stream error: {be}"));
+    }
+
     Ok(ExecOutcome {
         output: stdout_text,
         exit_code: code,
     })
+}
+
+/// Send SIGINT so the child can clean up (Unix); on other platforms fall back to the
+/// immediate kill. `tokio::process` has no graceful-signal API, so shell out to `kill`.
+fn interrupt_child(child: &tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status();
+        return;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+    }
 }
 
 /// Read and throw away the rest of an oversized line, returning how many bytes went.

@@ -31,6 +31,8 @@ pub struct StreamDecoder {
     answer_ends_with_newline: bool,
     display_ends_with_newline: bool,
     fallback_answer: Option<String>,
+    seen_structured: bool,
+    backend_error: Option<String>,
 }
 
 impl StreamDecoder {
@@ -41,7 +43,16 @@ impl StreamDecoder {
             answer_ends_with_newline: false,
             display_ends_with_newline: true,
             fallback_answer: None,
+            seen_structured: false,
+            backend_error: None,
         }
+    }
+
+    /// A failure the backend reported in-stream while still exiting 0 (prime-agent's JSON
+    /// mode does this for provider errors). The caller must turn it into a dispatch error —
+    /// otherwise an auth failure or quota error masquerades as a successful answer.
+    pub fn take_backend_error(&mut self) -> Option<String> {
+        self.backend_error.take()
     }
 
     pub fn decode_line(&mut self, line: &str) -> DecodedChunk {
@@ -50,10 +61,16 @@ impl StreamDecoder {
         }
 
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-            // Preserve compatibility with older CLIs and startup warnings that may still write
-            // plain text to stdout even when a structured format was requested.
+            // Before any structured event: compatibility with older CLIs and startup warnings
+            // that write plain text even when a structured format was requested. After one: a
+            // malformed line is a torn/corrupt event — surface it, but never as answer text
+            // (a partially written tool_execution record could leak the redacted `args.code`).
+            if self.seen_structured {
+                return self.progress("unparsed", line);
+            }
             return self.answer(line.to_string());
         };
+        self.seen_structured = true;
 
         match self.format {
             StreamFormat::Text => unreachable!("handled above"),
@@ -221,9 +238,23 @@ impl StreamDecoder {
                 if message.get("role").and_then(Value::as_str) != Some("assistant") {
                     return DecodedChunk::default();
                 }
+                // prime-agent's JSON mode exits 0 even for a failed turn (stop-reason
+                // handling lives in its text mode only), so the in-stream error is the ONLY
+                // failure signal. Record it as an error, never as answer text — otherwise a
+                // 401 or quota message becomes a "successful" answer that cascades and
+                // capability learning would score as a win.
+                let stop_reason = message.get("stopReason").and_then(Value::as_str);
+                let failed = matches!(stop_reason, Some("error") | Some("aborted"));
                 if let Some(error) = message.get("errorMessage").and_then(Value::as_str) {
-                    self.fallback_answer = Some(error.to_string());
-                } else if let Some(text) = prime_agent_message_text(message) {
+                    self.backend_error = Some(error.to_string());
+                    return self.progress("error", error);
+                }
+                if failed {
+                    let reason = format!("request {}", stop_reason.unwrap_or("failed"));
+                    self.backend_error = Some(reason.clone());
+                    return self.progress("error", &reason);
+                }
+                if let Some(text) = prime_agent_message_text(message) {
                     self.fallback_answer = Some(text);
                 }
                 DecodedChunk::default()
@@ -456,21 +487,57 @@ mod tests {
         let final_chunk = decoder.finish();
         assert_eq!(final_chunk.answer.as_deref(), Some("fallback\n"));
 
+        // A provider failure surfaces in the display stream and as a backend error for the
+        // dispatcher — never as answer text: prime-agent's JSON mode exits 0 for a failed
+        // turn, so this in-stream signal is the only thing standing between a 401 and a
+        // "successful" answer that cascades would consume and learning would score as a win.
         let mut failed = StreamDecoder::new(StreamFormat::PrimeAgentJsonl);
-        failed.decode_line(
+        let chunk = failed.decode_line(
             r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"401 Unauthorized"}}"#,
         );
+        assert!(chunk.display.unwrap().contains("401 Unauthorized"));
+        assert_eq!(failed.finish().answer, None);
         assert_eq!(
-            failed.finish().answer.as_deref(),
-            Some("401 Unauthorized\n")
+            failed.take_backend_error().as_deref(),
+            Some("401 Unauthorized")
+        );
+    }
+
+    #[test]
+    fn prime_agent_failure_after_partial_text_is_still_an_error() {
+        // Deltas arrived, then the stream failed: the truncated text must not be promoted
+        // to a successful answer just because something was emitted first.
+        let mut decoder = StreamDecoder::new(StreamFormat::PrimeAgentJsonl);
+        decoder.decode_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"partial"}}"#,
+        );
+        decoder.decode_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"partial"}],"stopReason":"aborted"}}"#,
+        );
+        decoder.finish();
+        assert_eq!(
+            decoder.take_backend_error().as_deref(),
+            Some("request aborted")
         );
     }
 
     #[test]
     fn malformed_structured_lines_are_not_lost() {
+        // Before any structured event: plain text is the answer (older CLIs, wrapper noise).
         let mut decoder = StreamDecoder::new(StreamFormat::CodexJsonl);
         let chunk = decoder.decode_line("warning from wrapper\n");
         assert_eq!(chunk.answer.as_deref(), Some("warning from wrapper\n"));
+
+        // After one: a malformed line is displayed but never joins the answer — a torn
+        // tool_execution record would otherwise leak its redacted args into the transcript.
+        let mut decoder = StreamDecoder::new(StreamFormat::PrimeAgentJsonl);
+        decoder.decode_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"ok"}}"#,
+        );
+        let torn = decoder
+            .decode_line(r#"{"type":"tool_execution_start","toolName":"ipython","args":{"code":"secret"#);
+        assert_eq!(torn.answer, None);
+        assert!(torn.display.unwrap().contains("unparsed"));
     }
 
     #[test]

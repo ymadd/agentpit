@@ -275,6 +275,10 @@ pub enum ContextItem<'a> {
 /// discovered on load; carrying `data.exchange_id`. Written once per interrupted exchange.
 pub const RECOVERY_EXT_TYPE: &str = "agentpit.recovery";
 
+/// `ext` type journaling a `/cwd` change, so the working directory survives resume and
+/// daemon attach instead of silently reverting to the header's original directory.
+pub const CWD_EXT_TYPE: &str = "agentpit.cwd_change";
+
 /// One session file held open for appending. The single-writer discipline is enforced one
 /// level up by [`crate::session_lease`]; this type itself assumes it is the only writer.
 pub struct SessionLog {
@@ -291,6 +295,10 @@ pub struct SessionLog {
     leaf_id: String,
     session_id: String,
     warnings: Vec<String>,
+    /// True when the file's last line has no trailing newline (a torn tail from a crash).
+    /// The next append writes a `\n` first — otherwise it would CONCATENATE onto the torn
+    /// bytes, producing one unparsable line and losing the new entry on the next open too.
+    pending_newline_repair: bool,
 }
 
 fn now_rfc3339() -> String {
@@ -327,6 +335,7 @@ impl SessionLog {
             leaf_id: header_id,
             session_id,
             warnings: Vec::new(),
+            pending_newline_repair: false,
         };
         log.write_line(&header, false)?;
         log.push_known(header);
@@ -336,7 +345,13 @@ impl SessionLog {
     /// Load an existing session file. Unparsable lines are skipped with a warning
     /// (torn-line tolerance); the file itself is never modified by loading.
     pub fn open(path: &Path) -> std::io::Result<SessionLog> {
-        let content = fs::read_to_string(path)?;
+        // Decode lossily: a crash can tear the file mid-multibyte-character, and
+        // `read_to_string` would reject the WHOLE log before line recovery ever ran. The
+        // replacement characters land inside the torn line, which parses as garbage and is
+        // skipped like any other torn tail.
+        let bytes = fs::read(path)?;
+        let ends_with_newline = bytes.is_empty() || bytes.ends_with(b"\n");
+        let content = String::from_utf8_lossy(&bytes).into_owned();
         let mut entries: Vec<LoadedEntry> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
         for (lineno, line) in content.lines().enumerate() {
@@ -420,6 +435,7 @@ impl SessionLog {
             leaf_id,
             session_id,
             warnings,
+            pending_newline_repair: !ends_with_newline,
         })
     }
 
@@ -700,25 +716,42 @@ impl SessionLog {
         items
     }
 
-    /// The most recent `backend_session_ref` on the current branch for `backend`, for
-    /// native continuation. A `switch` does not reset it — refs are per-backend.
-    pub fn last_backend_ref(&self, backend: &str) -> Option<&str> {
-        let path = self.path_from_root();
-        path.iter().rev().find_map(|e| match e {
-            LoadedEntry::Known(SessionEntry::ExchangeResult {
-                parent_id,
-                backend_session_ref: Some(r),
-                ..
-            }) => match self.entry(parent_id) {
-                Some(LoadedEntry::Known(SessionEntry::Exchange { backend: b, .. }))
-                    if b == backend =>
-                {
-                    Some(r.as_str())
-                }
-                _ => None,
-            },
+    /// The id of the LAST `user` entry on the current branch, if any — the natural keep
+    /// boundary for compaction: keeping only the leaf (normally the assistant's result)
+    /// would strand an answer without the question that produced it.
+    pub fn last_user_id(&self) -> Option<String> {
+        self.path_from_root().iter().rev().find_map(|e| match e {
+            LoadedEntry::Known(SessionEntry::User { id, .. }) => Some(id.clone()),
             _ => None,
         })
+    }
+
+    /// The `backend_session_ref` of the MOST RECENT completed exchange on the current
+    /// branch for `backend`, for native continuation. A `switch` does not reset it — refs
+    /// are per-backend. The newest result decides alone: if it carries no ref (a composed
+    /// fallback, or a run whose stream never yielded one), the answer is `None` — reaching
+    /// past it to an older ref would resume a native session that never saw that newer
+    /// turn, silently dropping conversation from the backend's view.
+    pub fn last_backend_ref(&self, backend: &str) -> Option<&str> {
+        let path = self.path_from_root();
+        path.iter()
+            .rev()
+            .find_map(|e| match e {
+                LoadedEntry::Known(SessionEntry::ExchangeResult {
+                    parent_id,
+                    backend_session_ref,
+                    ..
+                }) => match self.entry(parent_id) {
+                    Some(LoadedEntry::Known(SessionEntry::Exchange { backend: b, .. }))
+                        if b == backend =>
+                    {
+                        Some(backend_session_ref.as_deref())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .flatten()
     }
 
     /// True when the most recent exchange for `backend` on the current branch resumed
@@ -838,6 +871,7 @@ impl SessionLog {
             leaf_id: header_id.clone(),
             session_id,
             warnings: Vec::new(),
+            pending_newline_repair: false,
         };
         forked.write_line(&header, false)?;
         forked.push_known(header);
@@ -889,6 +923,25 @@ impl SessionLog {
         }
     }
 
+    /// The session's CURRENT working directory: the most recent [`CWD_EXT_TYPE`] entry on
+    /// the active branch wins, falling back to the header. This is what makes `/cwd`
+    /// durable — resume and daemon attach land where the user last moved, not where the
+    /// session happened to start.
+    pub fn effective_cwd(&self) -> &str {
+        self.path_from_root()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                LoadedEntry::Known(SessionEntry::Ext { ext_type, data, .. })
+                    if ext_type == CWD_EXT_TYPE =>
+                {
+                    data.get("cwd").and_then(|v| v.as_str())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| self.cwd())
+    }
+
     /// The header's title, when one was set at creation/fork time.
     pub fn title(&self) -> Option<&str> {
         match self.entries.first() {
@@ -925,7 +978,7 @@ impl SessionLog {
         self.leaf_id = id;
     }
 
-    fn write_line(&self, entry: &SessionEntry, durable: bool) -> std::io::Result<()> {
+    fn write_line(&mut self, entry: &SessionEntry, durable: bool) -> std::io::Result<()> {
         let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
         self.write_raw_line(&line, durable)
     }
@@ -933,11 +986,17 @@ impl SessionLog {
     /// One line = one `write_all` on an append-mode handle: effectively atomic for normal
     /// line sizes, and a torn tail on crash is tolerated by [`SessionLog::open`]. `durable`
     /// adds an fsync (results and summaries — the checkpoints worth surviving power loss).
-    fn write_raw_line(&self, line: &str, durable: bool) -> std::io::Result<()> {
+    fn write_raw_line(&mut self, line: &str, durable: bool) -> std::io::Result<()> {
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
+        // Seal a torn tail before the first append so the new line starts fresh instead of
+        // concatenating onto the crash residue (which would corrupt this entry as well).
+        if self.pending_newline_repair {
+            f.write_all(b"\n")?;
+            self.pending_newline_repair = false;
+        }
         f.write_all(line.as_bytes())?;
         f.write_all(b"\n")?;
         f.flush()?;
@@ -1155,6 +1214,103 @@ mod tests {
             !log.last_native_failed("codex"),
             "a later success clears the stale-ref flag"
         );
+    }
+
+    #[test]
+    fn open_survives_a_tail_torn_mid_multibyte_character() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = seed(tmp.path());
+        run_turn(&mut log, "こんにちは", "日本語の答え");
+        let path = log.path().to_path_buf();
+
+        // Tear the file inside a multibyte character: cut just before the last UTF-8
+        // continuation byte, leaving a dangling sequence at EOF. `read_to_string` would
+        // reject the whole log here, before torn-line recovery ever ran.
+        let bytes = fs::read(&path).unwrap();
+        let cut = bytes
+            .iter()
+            .rposition(|b| (0x80..0xC0).contains(b))
+            .unwrap();
+        fs::write(&path, &bytes[..cut]).unwrap();
+
+        let reopened = SessionLog::open(&path).unwrap();
+        assert!(
+            reopened.warnings().iter().any(|w| w.contains("unparsable")),
+            "the torn tail must be skipped with a warning, not fail the open: {:?}",
+            reopened.warnings()
+        );
+    }
+
+    #[test]
+    fn append_after_a_torn_tail_starts_a_fresh_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = seed(tmp.path());
+        run_turn(&mut log, "q1", "a1");
+        let path = log.path().to_path_buf();
+
+        // Simulate a crash mid-append: a torn, newline-less JSON fragment at EOF.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(br#"{"type":"res"#);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reopened = SessionLog::open(&path).unwrap();
+        let user_id = reopened.append_user("after the crash").unwrap();
+
+        // The new entry must survive the NEXT open: without sealing the torn tail with a
+        // newline first, it would be glued onto the fragment and lost as one unparsable
+        // line — losing every post-crash append forever.
+        let third = SessionLog::open(&path).unwrap();
+        assert!(
+            third.entry(&user_id).is_some(),
+            "the appended entry must parse on reopen; warnings: {:?}",
+            third.warnings()
+        );
+        assert_eq!(
+            third
+                .warnings()
+                .iter()
+                .filter(|w| w.contains("unparsable"))
+                .count(),
+            1,
+            "only the original torn fragment stays unparsable"
+        );
+    }
+
+    #[test]
+    fn a_ref_less_newest_result_blocks_older_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = seed(tmp.path());
+        run_turn(&mut log, "q1", "a1"); // records backend_session_ref "thread-1"
+        assert_eq!(log.last_backend_ref("codex"), Some("thread-1"));
+
+        // A newer completed exchange without a ref (composed fallback, or a stream that
+        // never yielded one): resuming "thread-1" now would show the backend a session
+        // that never saw this turn, so the ref must be gone.
+        log.append_user("q2").unwrap();
+        let e = log
+            .append_exchange(NewExchange {
+                backend: "codex",
+                transport: "exec",
+                run_id: "r2",
+                model: None,
+                effort: None,
+                prompt: "q2",
+                continue_from: None,
+            })
+            .unwrap();
+        log.append_result(
+            &e,
+            NewResult {
+                status: ExchangeStatus::Ok,
+                answer: "a2",
+                exit_code: Some(0),
+                duration_ms: 1,
+                backend_session_ref: None,
+                raw_ref: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(log.last_backend_ref("codex"), None);
     }
 
     #[test]

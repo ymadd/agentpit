@@ -17,7 +17,8 @@ use agentpit_events::session::{
 use agentpit_events::session_lease::{LeaseError, SessionLease};
 
 pub use agentpit_events::session::{
-    ExchangeStatus, NewExchange, NewResult, RECOVERY_EXT_TYPE, SessionMeta, SummaryReason,
+    CWD_EXT_TYPE, ExchangeStatus, NewExchange, NewResult, RECOVERY_EXT_TYPE, SessionMeta,
+    SummaryReason,
 };
 
 /// `ext_type` recording a summary of a branch that was just left (B5). Transparent to the
@@ -104,9 +105,18 @@ impl SessionRecorder {
         self.log.path()
     }
 
-    /// The session's working directory, from the header entry.
+    /// The session's CURRENT working directory: the latest journaled `/cwd` change on the
+    /// active branch, falling back to the header entry.
     pub fn cwd_string(&self) -> String {
-        self.log.cwd().to_string()
+        self.log.effective_cwd().to_string()
+    }
+
+    /// Journal a `/cwd` change (an `ext` entry — transparent to replay) so resume and
+    /// daemon attach land in the directory the user last chose, not the original one.
+    pub fn record_cwd_change(&mut self, cwd: &str) -> Result<()> {
+        self.log
+            .append_ext(CWD_EXT_TYPE, serde_json::json!({ "cwd": cwd }))?;
+        Ok(())
     }
 
     /// Mark exchanges that never got a result (a previous writer died mid-dispatch) and
@@ -212,10 +222,15 @@ impl SessionRecorder {
         Ok(())
     }
 
-    /// Compact: fold everything up to (excluding) the current leaf into `summary_text`.
-    /// Replay afterwards = summary + the leaf entry onward.
+    /// Compact: fold history into `summary_text`, keeping the last complete exchange.
+    /// Replay afterwards = summary + the latest user turn onward — anchoring at the raw
+    /// leaf (normally the assistant's result) would strand that answer without the
+    /// question that produced it.
     pub fn record_summary(&mut self, summary_text: &str, reason: SummaryReason) -> Result<()> {
-        let first_kept = self.log.leaf_id().to_string();
+        let first_kept = self
+            .log
+            .last_user_id()
+            .unwrap_or_else(|| self.log.leaf_id().to_string());
         self.log.append_summary(summary_text, &first_kept, reason)?;
         Ok(())
     }
@@ -570,7 +585,29 @@ mod tests {
         let items = rec.context_items();
         assert_eq!(items[0].0, "summary");
         assert!(items.iter().any(|(_, t)| t == "recent answer"));
+        assert!(
+            items.iter().any(|(_, t)| t == "recent"),
+            "the kept answer must keep its QUESTION too — an orphan assistant answer \
+             reads as context noise: {items:?}"
+        );
         assert!(!items.iter().any(|(_, t)| t == "old answer"));
+    }
+
+    #[test]
+    fn cwd_changes_are_journaled_and_survive_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rec = recorder_in(tmp.path());
+        assert_eq!(rec.cwd_string(), "/w");
+        rec.record_cwd_change("/elsewhere").unwrap();
+        assert_eq!(rec.cwd_string(), "/elsewhere");
+
+        // A fresh open (what resume and daemon attach do) sees the journaled directory.
+        let path = rec.path().to_path_buf();
+        drop(rec); // releases the lease
+        let log = SessionLog::open(&path).unwrap();
+        let lease = SessionLease::acquire_at(&tmp.path().join("leases"), &path).unwrap();
+        let reopened = SessionRecorder::from_parts(log, lease);
+        assert_eq!(reopened.cwd_string(), "/elsewhere");
     }
 
     #[test]

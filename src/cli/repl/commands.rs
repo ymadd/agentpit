@@ -245,6 +245,21 @@ pub async fn handle_slash(
                 }
                 Some(path) => match crate::cli::resolve_cwd(Some(path)) {
                     Ok(new_cwd) => {
+                        // Journal the change: without it, resume/attach silently reverts
+                        // to the directory the session STARTED in.
+                        if let Some(rec) = &state.recorder
+                            && let Ok(mut rec) = rec.lock()
+                            && let Err(e) = rec.record_cwd_change(&new_cwd.display().to_string())
+                        {
+                            eprintln!(
+                                "{}",
+                                style(format!(
+                                    "session: cwd change not journaled ({e:#}); resume will \
+                                     use the previous directory"
+                                ))
+                                .yellow()
+                            );
+                        }
                         println!("cwd set to {}", new_cwd.display());
                         return Ok((state.with_cwd(new_cwd), LoopControl::Continue));
                     }

@@ -30,6 +30,17 @@ pub async fn run_repl(resume: Option<String>) -> Result<()> {
             for note in recorder.mark_interrupted() {
                 eprintln!("{} {note}", style("session:").yellow());
             }
+            // Return to the session's own working directory (its journaled `/cwd`, or the
+            // header). The shell's location is where the user typed the command, not where
+            // the session's work lives — "edit this file" must not land in another repo.
+            let session_cwd = std::path::PathBuf::from(recorder.cwd_string());
+            if session_cwd != state.cwd && session_cwd.is_dir() {
+                eprintln!(
+                    "{}",
+                    style(format!("[cwd: {}]", session_cwd.display())).dim()
+                );
+                state.cwd = session_cwd;
+            }
             let n_turns = recorder.context_items().len();
             eprintln!(
                 "{}",

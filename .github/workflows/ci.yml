@@ -58,6 +58,9 @@ jobs:
   similarity:
     name: clippy · test (similarity feature)
     runs-on: ubuntu-latest
+    # The workflow-level timeout (not runner starvation) is what preserves logs when the
+    # test phase wedges: these tests run in 11 s locally, so 20 min means "hung, kill it".
+    timeout-minutes: 20
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
@@ -95,8 +98,10 @@ jobs:
       - name: Build tests (similarity)
         run: cargo test -p agentpit --features similarity --locked -j 2 --no-run
 
+      # Serial test threads so a hang names its culprit: the guilty test is the one
+      # after the last name printed in the log.
       - name: Test (similarity)
-        run: cargo test -p agentpit --features similarity --locked -j 2
+        run: cargo test -p agentpit --features similarity --locked -j 2 -- --test-threads=1
 
       - name: Disk usage
         if: always()

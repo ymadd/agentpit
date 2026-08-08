@@ -220,6 +220,12 @@ impl SessionRecorder {
         Ok(())
     }
 
+    /// Whether `id` names an entry in this session — a cheap pre-check so callers can
+    /// validate a `/branch` target BEFORE paying for a summarization LLM call (L4).
+    pub fn has_entry(&self, id: &str) -> bool {
+        self.log.entry(id).is_some()
+    }
+
     /// Move the leaf to `target_id`, optionally leaving a summary of the abandoned branch
     /// (B5). The summary is an `ext` on the NEW path — transparent to replay, folded into
     /// composed prompts as "notes".

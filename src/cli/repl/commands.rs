@@ -299,6 +299,21 @@ pub async fn handle_slash(
                 warn_no_session();
                 return Ok((state, LoopControl::Continue));
             }
+            // Validate the target BEFORE the summary prompt/LLM call (L4): a typo must not
+            // burn a summarization dispatch. Compute the check and drop the lock before any
+            // path that moves `state`.
+            let known = state
+                .recorder
+                .as_ref()
+                .and_then(|r| r.lock().ok().map(|rec| rec.has_entry(&target)))
+                .unwrap_or(true);
+            if !known {
+                eprintln!(
+                    "{} no entry {target} in this session. Pick an id from /tree.",
+                    style("error:").red()
+                );
+                return Ok((state, LoopControl::Continue));
+            }
             // B5: leaving a branch offers a summary of what is being left behind —
             // prime's three choices: none / auto / custom instructions.
             let choice = cliclack::select("Leaving this branch — keep a summary of it?")

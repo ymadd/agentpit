@@ -87,7 +87,9 @@ impl Conn {
         Ok(())
     }
 
-    /// Next frame (response OR event). `Err` on EOF/parse failure = connection over.
+    /// Next frame (response OR event). `Err` only on EOF (connection over). A single
+    /// unparsable line is skipped rather than killing the whole connection (L7): one
+    /// stray non-JSON line must not drop an attach mid-stream.
     pub async fn recv_frame(&mut self) -> Result<Frame> {
         let mut line = String::new();
         loop {
@@ -99,8 +101,10 @@ impl Conn {
             if line.trim().is_empty() {
                 continue;
             }
-            return serde_json::from_str::<Frame>(&line)
-                .with_context(|| format!("bad frame: {}", line.trim()));
+            match serde_json::from_str::<Frame>(&line) {
+                Ok(frame) => return Ok(frame),
+                Err(_) => continue, // skip a torn/foreign line, keep the connection alive
+            }
         }
     }
 }

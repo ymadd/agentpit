@@ -17,6 +17,7 @@ pub mod profile;
 pub mod router;
 pub mod session;
 pub mod similarity;
+pub mod tui;
 pub mod types;
 pub mod update;
 pub mod workflow;

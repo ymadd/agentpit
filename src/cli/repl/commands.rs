@@ -299,7 +299,8 @@ pub async fn handle_slash(
                 warn_no_session();
                 return Ok((state, LoopControl::Continue));
             }
-            // B5: leaving a branch offers a summary of what is being left behind.
+            // B5: leaving a branch offers a summary of what is being left behind —
+            // prime's three choices: none / auto / custom instructions.
             let choice = cliclack::select("Leaving this branch — keep a summary of it?")
                 .item("no", "No summary", "")
                 .item(
@@ -307,16 +308,26 @@ pub async fn handle_slash(
                     "Summarize the branch being left",
                     "uses the active backend",
                 )
+                .item(
+                    "custom",
+                    "Summarize with custom instructions",
+                    "you steer what the summary keeps",
+                )
                 .item("cancel", "Cancel", "")
                 .interact()
                 .unwrap_or("cancel");
             if choice == "cancel" {
                 return Ok((state, LoopControl::Continue));
             }
-            let summary = if choice == "summarize" {
-                summarize_context(&state).await
-            } else {
-                None
+            let summary = match choice {
+                "summarize" => summarize_context(&state, None).await,
+                "custom" => {
+                    let instructions: String = cliclack::input("What should the summary focus on?")
+                        .interact()
+                        .unwrap_or_default();
+                    summarize_context(&state, Some(&instructions)).await
+                }
+                _ => None,
             };
             if let Some(recorder) = &state.recorder
                 && let Ok(mut rec) = recorder.lock()
@@ -374,7 +385,7 @@ pub async fn handle_slash(
                 warn_no_session();
                 return Ok((state, LoopControl::Continue));
             }
-            match summarize_context(&state).await {
+            match summarize_context(&state, None).await {
                 Some(text) => {
                     if let Some(recorder) = &state.recorder
                         && let Ok(mut rec) = recorder.lock()
@@ -419,7 +430,7 @@ fn lock_recorder(
 
 /// Summarize the current branch's conversation via the active backend. Returns `None` on
 /// any failure — callers degrade gracefully (branch without summary / no compaction).
-async fn summarize_context(state: &SessionState) -> Option<String> {
+async fn summarize_context(state: &SessionState, focus: Option<&str>) -> Option<String> {
     let items = {
         let rec = state.recorder.as_ref()?.lock().ok()?;
         rec.context_items()
@@ -431,10 +442,14 @@ async fn summarize_context(state: &SessionState) -> Option<String> {
     for (who, text) in &items {
         convo.push_str(&format!("{who}: {text}\n"));
     }
+    let steer = focus
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| format!(" Focus especially on: {f}."))
+        .unwrap_or_default();
     let prompt = format!(
         "Summarize this conversation for future context. Cover: the goal, decisions made, \
-         current progress, and open next steps. Be concise (under 300 words). Output only \
-         the summary.\n\n{convo}"
+         current progress, and open next steps.{steer} Be concise (under 300 words). Output \
+         only the summary.\n\n{convo}"
     );
     let backend = state.active_backend.unwrap_or(state.config.default.backend);
     eprintln!("{}", style(format!("[summarizing via {backend}…]")).dim());

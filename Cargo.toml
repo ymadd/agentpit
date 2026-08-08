@@ -31,6 +31,10 @@ futures-util = "0.3"
 # kNN similarity routing (feature `similarity`): local ONNX embeddings. Optional so the
 # default single-binary build carries no ONNX runtime.
 fastembed = { version = "5", optional = true }
+# TUI front end (design §11): inline-viewport conversation + fullscreen roster/tree.
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+ratatui = "0.30"
 regex = "1"
 rmcp = { version = "=1.7.0", features = ["server", "macros", "transport-io"] }
 rustyline = "18"

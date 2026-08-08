@@ -14,6 +14,7 @@ pub mod config;
 pub mod daemon_cmd;
 pub mod dashboard;
 pub mod diagnose;
+pub mod doctor;
 pub mod ensemble;
 pub mod explain;
 pub mod guidance;
@@ -334,6 +335,21 @@ pub enum Command {
         action: daemon_cmd::Action,
     },
 
+    /// Scan daemon/worker/lease/socket hygiene. --fix removes provably-dead debris only.
+    Doctor {
+        /// Remove stale records, orphan sockets, and dead leases (never touches anything alive).
+        #[arg(long)]
+        fix: bool,
+    },
+
+    /// Open the TUI (inline conversation + Agents/Tree overlays; the default when no
+    /// subcommand is given on a terminal).
+    Tui {
+        /// Session id (unique prefix/suffix). Omit to start a fresh session.
+        #[arg(long)]
+        session: Option<String>,
+    },
+
     /// Drive a session's orchestration REPL: TypeScript cells in a sandboxed Deno
     /// sidecar, with dispatch()/store/session as the only exits (needs deno).
     Orchestrate {
@@ -429,7 +445,16 @@ pub enum Command {
 pub async fn run(cli: Cli) -> Result<()> {
     let command = match cli.command {
         Some(c) => c,
-        None => return repl::run_repl(None).await,
+        // Bare `agentpit` (Q8, §11.4 T3): the TUI on a real terminal, the line REPL when
+        // piped (CI, scripts) — the TUI needs raw mode, which a pipe cannot give.
+        None => {
+            use std::io::IsTerminal;
+            return if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                crate::tui::run(None).await
+            } else {
+                repl::run_repl(None).await
+            };
+        }
     };
     match command {
         Command::Rescue {
@@ -599,6 +624,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Attach { session } => attach::run(session).await,
 
         Command::Daemon { action } => daemon_cmd::run(action).await,
+
+        Command::Doctor { fix } => doctor::run(fix).await,
+
+        Command::Tui { session } => crate::tui::run(session).await,
 
         Command::Orchestrate { session, cell } => orchestrate_cmd::run(session, cell).await,
 

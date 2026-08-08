@@ -19,6 +19,9 @@ pub struct SessionState {
     pub cwd: PathBuf,
     /// rustyline history file path.
     pub history_file: PathBuf,
+    /// The durable session log (always recording, Q2). `None` only when creation failed at
+    /// startup — the REPL still works, it just doesn't persist (warned once).
+    pub recorder: Option<crate::session::SharedRecorder>,
 }
 
 impl SessionState {
@@ -31,6 +34,7 @@ impl SessionState {
             active_backend: None,
             cwd,
             history_file,
+            recorder: None,
         }
     }
 

@@ -429,6 +429,29 @@ pub struct HubConfig {
     pub cascade: CascadeSection,
     #[serde(default)]
     pub arena: ArenaSection,
+    #[serde(default)]
+    pub session: SessionSection,
+}
+
+/// Session-persistence knobs (design: docs/session-persistence-design.md §4.3/§7).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct SessionSection {
+    /// How many recent user↔answer turns a composed continuation includes for backends
+    /// without native resume. Bounds prompt growth (and file growth) to O(window).
+    #[serde(default = "default_compose_window")]
+    pub compose_window: usize,
+}
+
+fn default_compose_window() -> usize {
+    4
+}
+
+impl Default for SessionSection {
+    fn default() -> Self {
+        SessionSection {
+            compose_window: default_compose_window(),
+        }
+    }
 }
 
 /// Used for both `default.backend` and `auto_route.long_context_backend`. Claude since
@@ -721,6 +744,11 @@ review_members = ["antigravity", "opencode"]
 # [arena]
 # verify = "cargo test"   # run in each contender's worktree; shown beside its diff, never an
 #                         # automatic disqualification — the verdict stays yours
+
+# REPL session persistence (append-only JSONL under the state dir; `agentpit sessions`).
+# [session]
+# compose_window = 4      # recent turns included when continuing a backend without native
+#                         # resume (claude/codex resume natively; others get composed context)
 
 # Per-backend transport + default model / effort override.
 # [backends.antigravity]
@@ -1074,6 +1102,30 @@ prompt = "Research only."
         // A minimal type may set just a brief; roles omitted = all worker roles.
         assert!(wf.types["research"].roles.is_empty());
         assert!(wf.types["research"].manager_backend.is_none());
+    }
+
+    #[test]
+    fn sample_config_session_example_parses_when_uncommented() {
+        // The commented [session] example must stay valid TOML when uncommented, and its
+        // value must equal the coded default (the example documents the default, §7).
+        let block: String = DEFAULT_CONFIG_TOML
+            .lines()
+            .skip_while(|l| !l.starts_with("# [session]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .or_else(|| l.strip_prefix("#"))
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !block.is_empty(),
+            "session example block not found in sample config"
+        );
+        let parsed: HubConfig = toml::from_str(&block).expect("uncommented session example parses");
+        assert_eq!(parsed.session.compose_window, 4);
+        assert_eq!(parsed.session, SessionSection::default());
     }
 
     #[test]

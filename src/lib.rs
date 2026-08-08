@@ -13,6 +13,7 @@ pub mod exec;
 pub mod mcp;
 pub mod profile;
 pub mod router;
+pub mod session;
 pub mod similarity;
 pub mod types;
 pub mod update;

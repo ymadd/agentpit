@@ -29,6 +29,7 @@ pub mod repl;
 pub mod rescue;
 pub mod review;
 pub mod security_review;
+pub mod sessions;
 #[cfg(feature = "similarity")]
 pub mod similarity_cmd;
 pub mod status;
@@ -305,7 +306,17 @@ pub enum Command {
     },
 
     /// Launch the persistent conversational REPL (the default when no subcommand is given).
-    Repl,
+    Repl {
+        /// Resume a saved session by id (unique prefix/suffix accepted; see `agentpit sessions`).
+        #[arg(long)]
+        resume: Option<String>,
+    },
+
+    /// List, inspect, or export saved REPL sessions (append-only JSONL under the state dir).
+    Sessions {
+        #[command(subcommand)]
+        action: Option<sessions::Action>,
+    },
 
     /// Ask the supervising human a question and block for an answer (the CLI back-channel a
     /// shell-out workflow manager uses; prints the answer or HUMAN_UNAVAILABLE to stdout).
@@ -391,7 +402,7 @@ pub enum Command {
 pub async fn run(cli: Cli) -> Result<()> {
     let command = match cli.command {
         Some(c) => c,
-        None => return repl::run_repl().await,
+        None => return repl::run_repl(None).await,
     };
     match command {
         Command::Rescue {
@@ -554,7 +565,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Command::Mcp { action } => mcp_cmd::run(action).await,
 
-        Command::Repl => repl::run_repl().await,
+        Command::Repl { resume } => repl::run_repl(resume).await,
+
+        Command::Sessions { action } => sessions::run(action).await,
 
         Command::Ask {
             prompt,

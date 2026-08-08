@@ -9,9 +9,12 @@ use tokio_util::sync::CancellationToken;
 use super::state::SessionState;
 use crate::auth::check_auth;
 use crate::config::RouteKey;
-use crate::dispatch::{DispatchResult, dispatch, resolve_transport};
+use crate::dispatch::{
+    DispatchResult, dispatch_continuing, resolve_transport, supports_native_continuation,
+};
 use crate::events::{LegStatus, RunKind, RunLogger, output_streamer};
 use crate::router::{RouteRequest, Router};
+use crate::session::{ExchangeStatus, NewExchange, NewResult, TurnPlan};
 use crate::types::BackendId;
 
 /// Parse an optional inline `@backend` modifier from the start of a free-text turn.
@@ -135,6 +138,46 @@ pub async fn dispatch_free_text(
     );
     let started = Instant::now();
 
+    // Session recording: user + route entries, then plan how this turn travels (§4.3) and
+    // append the exchange BEFORE dispatching — a missing result marks a crash. Lock per
+    // operation, never across the await below.
+    let native_ok = supports_native_continuation(backend_id, &state.regs);
+    let mut plan = TurnPlan::Fresh;
+    let mut exchange_id: Option<String> = None;
+    if let Some(recorder) = &state.recorder
+        && let Ok(mut rec) = recorder.lock()
+    {
+        let _ = rec.record_user(&task);
+        let _ = rec.record_route("rescue", None, None, backend_id, decision.reason.as_str());
+        plan = rec.plan_turn(
+            backend_id,
+            native_ok,
+            &task,
+            state.config.session.compose_window,
+        );
+        let (prompt_sent, continue_from) = match &plan {
+            TurnPlan::Fresh => (task.as_str(), None),
+            TurnPlan::Native { continue_from } => (task.as_str(), Some(continue_from.as_str())),
+            TurnPlan::Composed { prompt } => (prompt.as_str(), None),
+        };
+        exchange_id = rec
+            .record_exchange(NewExchange {
+                backend: backend_id.as_str(),
+                transport,
+                run_id: logger.run_id(),
+                model: effective_model.as_deref(),
+                effort: effective_effort.map(|e| e.as_str()),
+                prompt: prompt_sent,
+                continue_from,
+            })
+            .ok();
+    }
+    let (task_to_send, continue_from): (String, Option<String>) = match &plan {
+        TurnPlan::Fresh => (task.clone(), None),
+        TurnPlan::Native { continue_from } => (task.clone(), Some(continue_from.clone())),
+        TurnPlan::Composed { prompt } => (prompt.clone(), None),
+    };
+
     // Tee output to terminal and to dashboard's capture file.
     // The first chunk arriving clears the working indicator so output starts clean.
     let first_chunk_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -187,7 +230,7 @@ pub async fn dispatch_free_text(
     let cwd = state.cwd.clone();
 
     let result = tokio::select! {
-        res = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &regs_ref, effective_model.as_deref(), effective_effort) => {
+        res = dispatch_continuing(backend_id, &task_to_send, &cwd, cancel, on_chunk, &regs_ref, effective_model.as_deref(), effective_effort, continue_from.as_deref()) => {
             indicator_cancel.cancel();
             // Erase indicator if no streaming output has arrived.
             if !first_chunk_seen.load(std::sync::atomic::Ordering::Relaxed) {
@@ -200,14 +243,80 @@ pub async fn dispatch_free_text(
             cancel_sig.cancel();
             let _ = std::io::stderr().write_all(b"\r\x1b[K");
             eprintln!("{}", style("[cancelled]").yellow());
+            record_session_result(&state, &exchange_id, ExchangeStatus::Cancelled, "", None, started, backend_id, logger.run_id());
             // Return a synthetic "cancelled" outcome so the loop continues.
             return Ok(state);
         }
     };
 
+    // Record the session result before the run bookkeeping consumes `result`.
+    match &result {
+        Ok(res) if res.auth_failed => record_session_result(
+            &state,
+            &exchange_id,
+            ExchangeStatus::Auth,
+            &res.output,
+            res.backend_session_ref.as_deref(),
+            started,
+            backend_id,
+            logger.run_id(),
+        ),
+        Ok(res) => record_session_result(
+            &state,
+            &exchange_id,
+            ExchangeStatus::Ok,
+            &res.output,
+            res.backend_session_ref.as_deref(),
+            started,
+            backend_id,
+            logger.run_id(),
+        ),
+        Err(e) => record_session_result(
+            &state,
+            &exchange_id,
+            ExchangeStatus::Error,
+            &format!("{e:#}"),
+            None,
+            started,
+            backend_id,
+            logger.run_id(),
+        ),
+    }
+
     handle_dispatch_result(result, &logger, backend_id, &auth.login_command, started);
 
     Ok(state)
+}
+
+/// Append the `result` entry for this turn's exchange (best-effort — session recording
+/// must never break a dispatch, same contract as telemetry).
+#[allow(clippy::too_many_arguments)]
+fn record_session_result(
+    state: &SessionState,
+    exchange_id: &Option<String>,
+    status: ExchangeStatus,
+    answer: &str,
+    backend_session_ref: Option<&str>,
+    started: Instant,
+    backend_id: BackendId,
+    run_id: &str,
+) {
+    let (Some(recorder), Some(exchange_id)) = (&state.recorder, exchange_id) else {
+        return;
+    };
+    let Ok(mut rec) = recorder.lock() else { return };
+    let raw_ref = format!("runs/{run_id}/{backend_id}.log");
+    let _ = rec.record_result(
+        exchange_id,
+        NewResult {
+            status,
+            answer,
+            exit_code: None,
+            duration_ms: started.elapsed().as_millis() as u64,
+            backend_session_ref,
+            raw_ref: Some(&raw_ref),
+        },
+    );
 }
 
 /// Handle a `Result<DispatchResult>` from `dispatch`. Prints errors/auth hints and

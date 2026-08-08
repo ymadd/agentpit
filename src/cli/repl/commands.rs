@@ -21,6 +21,12 @@ pub enum SlashCommand {
     Cwd(Option<String>),
     Clear,
     Quit,
+    SessionInfo,
+    Tree,
+    Branch(String),
+    Fork(Option<String>),
+    CloneSession,
+    Compact,
 }
 
 /// Parse a line that starts with `/` into a `SlashCommand`, returning `None` if
@@ -68,6 +74,27 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         }
         "clear" => SlashCommand::Clear,
         "quit" | "exit" => SlashCommand::Quit,
+        "session" => SlashCommand::SessionInfo,
+        "tree" => SlashCommand::Tree,
+        "branch" => {
+            if rest.is_empty() {
+                eprintln!(
+                    "{}",
+                    style("usage: /branch <entry-id> — pick an id from /tree").yellow()
+                );
+                return None;
+            }
+            SlashCommand::Branch(rest.to_string())
+        }
+        "fork" => {
+            if rest.is_empty() {
+                SlashCommand::Fork(None)
+            } else {
+                SlashCommand::Fork(Some(rest.to_string()))
+            }
+        }
+        "clone" => SlashCommand::CloneSession,
+        "compact" => SlashCommand::Compact,
         _ => {
             eprintln!(
                 "{}",
@@ -103,6 +130,13 @@ pub async fn handle_slash(
 
         SlashCommand::BackendSet(id_str) => match id_str.parse::<BackendId>() {
             Ok(id) => {
+                let from = state.active_backend.unwrap_or(state.config.default.backend);
+                if from != id
+                    && let Some(recorder) = &state.recorder
+                    && let Ok(mut rec) = recorder.lock()
+                {
+                    let _ = rec.record_switch(from, id);
+                }
                 println!("backend set to {id}");
                 Ok((state.with_backend(Some(id)), LoopControl::Continue))
             }
@@ -221,6 +255,197 @@ pub async fn handle_slash(
         }
 
         SlashCommand::Quit => Ok((state, LoopControl::Exit)),
+
+        SlashCommand::SessionInfo => {
+            match &state.recorder {
+                None => println!("no session log (creation failed at startup — not resumable)"),
+                Some(recorder) => {
+                    if let Ok(rec) = recorder.lock() {
+                        println!("session:  {}", rec.session_id());
+                        println!("file:     {}", rec.path().display());
+                        println!("context:  {} entries", rec.context_items().len());
+                        println!("resume:   agentpit repl --resume {}", rec.short_id());
+                    }
+                }
+            }
+            Ok((state, LoopControl::Continue))
+        }
+
+        SlashCommand::Tree => {
+            if let Some(rec) = lock_recorder(&state) {
+                for line in rec.tree_lines() {
+                    println!("{line}");
+                }
+                println!(
+                    "{}",
+                    style("← = current position, • = current path. /branch <id> to move.").dim()
+                );
+            }
+            Ok((state, LoopControl::Continue))
+        }
+
+        SlashCommand::Branch(target) => {
+            if state.recorder.is_none() {
+                warn_no_session();
+                return Ok((state, LoopControl::Continue));
+            }
+            // B5: leaving a branch offers a summary of what is being left behind.
+            let choice = cliclack::select("Leaving this branch — keep a summary of it?")
+                .item("no", "No summary", "")
+                .item(
+                    "summarize",
+                    "Summarize the branch being left",
+                    "uses the active backend",
+                )
+                .item("cancel", "Cancel", "")
+                .interact()
+                .unwrap_or("cancel");
+            if choice == "cancel" {
+                return Ok((state, LoopControl::Continue));
+            }
+            let summary = if choice == "summarize" {
+                summarize_context(&state).await
+            } else {
+                None
+            };
+            if let Some(recorder) = &state.recorder
+                && let Ok(mut rec) = recorder.lock()
+            {
+                match rec.branch(&target, summary.as_deref()) {
+                    Ok(()) => println!(
+                        "moved to {target}. The next turn continues from there{}",
+                        if summary.is_some() {
+                            " (branch summary kept)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Err(e) => eprintln!("{} {e}. Pick an id from /tree.", style("error:").red()),
+                }
+            }
+            Ok((state, LoopControl::Continue))
+        }
+
+        SlashCommand::Fork(target) => {
+            if let Some(rec) = lock_recorder(&state) {
+                match rec.fork(target.as_deref()) {
+                    Ok(new_id) => {
+                        let tail = &new_id[new_id.len().saturating_sub(12)..];
+                        println!(
+                            "forked into a new session. Open it with: agentpit repl --resume {tail}"
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "{} {e:#}. Pick an id from /tree, or /fork with no id to fork at the current position.",
+                        style("error:").red()
+                    ),
+                }
+            }
+            Ok((state, LoopControl::Continue))
+        }
+
+        SlashCommand::CloneSession => {
+            if let Some(rec) = lock_recorder(&state) {
+                match rec.fork(None) {
+                    Ok(new_id) => {
+                        let tail = &new_id[new_id.len().saturating_sub(12)..];
+                        println!(
+                            "cloned the current position into a new session. Open it with: agentpit repl --resume {tail}"
+                        );
+                    }
+                    Err(e) => eprintln!("{} {e:#}", style("error:").red()),
+                }
+            }
+            Ok((state, LoopControl::Continue))
+        }
+
+        SlashCommand::Compact => {
+            if state.recorder.is_none() {
+                warn_no_session();
+                return Ok((state, LoopControl::Continue));
+            }
+            match summarize_context(&state).await {
+                Some(text) => {
+                    if let Some(recorder) = &state.recorder
+                        && let Ok(mut rec) = recorder.lock()
+                    {
+                        match rec.record_summary(&text, crate::session::SummaryReason::Manual) {
+                            Ok(()) => {
+                                println!("context compacted — future turns replay from the summary")
+                            }
+                            Err(e) => eprintln!("{} {e:#}", style("error:").red()),
+                        }
+                    }
+                }
+                None => eprintln!(
+                    "{} summarization failed; nothing was compacted. Try again or switch backends with /backend.",
+                    style("error:").red()
+                ),
+            }
+            Ok((state, LoopControl::Continue))
+        }
+    }
+}
+
+fn warn_no_session() {
+    eprintln!(
+        "{}",
+        style("no session log for this REPL (creation failed at startup)").yellow()
+    );
+}
+
+/// Lock the recorder for a short read-only-ish operation, warning when absent.
+fn lock_recorder(
+    state: &SessionState,
+) -> Option<std::sync::MutexGuard<'_, crate::session::SessionRecorder>> {
+    match &state.recorder {
+        None => {
+            warn_no_session();
+            None
+        }
+        Some(recorder) => recorder.lock().ok(),
+    }
+}
+
+/// Summarize the current branch's conversation via the active backend. Returns `None` on
+/// any failure — callers degrade gracefully (branch without summary / no compaction).
+async fn summarize_context(state: &SessionState) -> Option<String> {
+    let items = {
+        let rec = state.recorder.as_ref()?.lock().ok()?;
+        rec.context_items()
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let mut convo = String::new();
+    for (who, text) in &items {
+        convo.push_str(&format!("{who}: {text}\n"));
+    }
+    let prompt = format!(
+        "Summarize this conversation for future context. Cover: the goal, decisions made, \
+         current progress, and open next steps. Be concise (under 300 words). Output only \
+         the summary.\n\n{convo}"
+    );
+    let backend = state.active_backend.unwrap_or(state.config.default.backend);
+    eprintln!("{}", style(format!("[summarizing via {backend}…]")).dim());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let quiet: std::sync::Arc<dyn Fn(&str) + Send + Sync> = std::sync::Arc::new(|_c: &str| {});
+    match crate::dispatch::dispatch(
+        backend,
+        &prompt,
+        &state.cwd,
+        cancel,
+        quiet,
+        &state.regs,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(res) if !res.auth_failed && !res.output.trim().is_empty() => {
+            Some(res.output.trim().to_string())
+        }
+        _ => None,
     }
 }
 
@@ -249,8 +474,14 @@ fn print_help() {
          \n  /login [backend]       Launch login flow (defaults to active backend)\
          \n  /cwd                   Show current working directory\
          \n  /cwd <path>            Change working directory for this session\
+         \n  /session               Show this session's id, file, and resume command\
+         \n  /tree                  Show the session tree (branches included)\
+         \n  /branch <id>           Move to a node from /tree; the next turn continues there\
+         \n  /fork [id]             Copy the path up to a node (default: here) into a new session\
+         \n  /clone                 Copy the current path into a new session\
+         \n  /compact               Summarize history; future turns replay from the summary\
          \n  /clear                 Clear the terminal screen\
-         \n  /quit  or  /exit       Exit the REPL\
+         \n  /quit  or  /exit       Exit the REPL (the session stays resumable)\
          \n\nFree text turns are routed to the active backend (or auto-routed) and streamed inline.\
          \nPrefix with @<backend> to route a single turn to that backend without changing the default.\
          \n  e.g.  @claude explain this file\

@@ -1,18 +1,58 @@
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
+use console::style;
 use rustyline::DefaultEditor;
 
 use super::banner::{flush_stderr, print_banner};
 use super::state::SessionState;
 use super::turn::{LoopControl, run_one_turn};
+use crate::session::SessionRecorder;
 
 /// Launch the persistent conversational REPL.
 ///
 /// Called both when `agentpit` is run with no arguments and via `agentpit repl`.
-pub async fn run_repl() -> Result<()> {
+/// `resume` reopens an existing session by (partial) id instead of creating a new one.
+pub async fn run_repl(resume: Option<String>) -> Result<()> {
     // Load config + build registries once at session start.
     let ctx = crate::cli::load_context()?;
     let cwd = crate::cli::resolve_cwd(None)?;
-    let state = SessionState::new(ctx.loaded, ctx.regs, cwd);
+    let mut state = SessionState::new(ctx.loaded, ctx.regs, cwd.clone());
+
+    // Open the durable session log. A resume failure is a hard error (the user asked for
+    // that session); a CREATE failure only degrades to a non-persisted REPL (Q2).
+    match &resume {
+        Some(needle) => {
+            let mut recorder = SessionRecorder::resume(needle)?;
+            for w in recorder.warnings() {
+                eprintln!("{} {w}", style("session:").yellow());
+            }
+            for note in recorder.mark_interrupted() {
+                eprintln!("{} {note}", style("session:").yellow());
+            }
+            let n_turns = recorder.context_items().len();
+            eprintln!(
+                "{}",
+                style(format!(
+                    "[resumed session {} — {n_turns} context entries]",
+                    recorder.short_id()
+                ))
+                .dim()
+            );
+            state.recorder = Some(Arc::new(Mutex::new(recorder)));
+        }
+        None => match SessionRecorder::create(&cwd) {
+            Ok(recorder) => {
+                state.recorder = Some(Arc::new(Mutex::new(recorder)));
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} could not create the session log ({e:#}); this REPL will not be resumable",
+                    style("session:").yellow()
+                );
+            }
+        },
+    }
 
     // Initialise rustyline with history.
     let mut editor = Box::new(DefaultEditor::new()?);
@@ -32,6 +72,18 @@ pub async fn run_repl() -> Result<()> {
 
         if control == LoopControl::Exit {
             let _ = editor.save_history(&history_file);
+            if let Some(recorder) = &current_state.recorder
+                && let Ok(rec) = recorder.lock()
+            {
+                eprintln!(
+                    "{}",
+                    style(format!(
+                        "[session saved — resume with `agentpit repl --resume {}`]",
+                        rec.short_id()
+                    ))
+                    .dim()
+                );
+            }
             break;
         }
     }

@@ -242,8 +242,26 @@ pub async fn run_spec(
         }
     };
 
-    let (stdout_text, backend_error, backend_session_ref) = stdout_task.await??;
-    let stderr_text = stderr_task.await??;
+    // On cancellation, bound the pipe drain: killing the direct child does not kill its
+    // orphaned children (dash's `sh -c sleep` being the canonical case), and an orphan
+    // holding the pipe's write end postpones EOF — without the timeout a cancelled turn
+    // silently waited out the grandchild's whole lifetime before reporting "cancelled".
+    let (stdout_text, backend_error, backend_session_ref) = if cancel.is_cancelled() {
+        match tokio::time::timeout(Duration::from_secs(2), stdout_task).await {
+            Ok(joined) => joined??,
+            Err(_) => (String::new(), None, None),
+        }
+    } else {
+        stdout_task.await??
+    };
+    let stderr_text = if cancel.is_cancelled() {
+        match tokio::time::timeout(Duration::from_secs(2), stderr_task).await {
+            Ok(joined) => joined??,
+            Err(_) => String::new(),
+        }
+    } else {
+        stderr_task.await??
+    };
 
     let code = exit_status.code();
     if !exit_status.success() {

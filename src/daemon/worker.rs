@@ -831,8 +831,12 @@ mod tests {
             _effort: Option<crate::effort::Effort>,
         ) -> ExecSpec {
             ExecSpec {
-                command: "sh".into(),
-                args: vec!["-c".into(), "sleep 30".into()],
+                // Spawn sleep DIRECTLY — via `sh -c` the interrupt kills only the shell
+                // (dash does not forward it), and the orphaned sleep keeps the stdout pipe
+                // open; the cancel path's bounded drain covers that, but the test's subject
+                // is cancel latency, not orphan handling.
+                command: "sleep".into(),
+                args: vec!["30".into()],
                 env: vec![],
                 stdin_input: None,
             }

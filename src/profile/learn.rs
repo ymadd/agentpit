@@ -9,7 +9,9 @@
 //!
 //! Label sources, strongest first — the first available source decides a run's label:
 //! 1. `OutcomeNoted` — the human's explicit verdict (single-backend runs).
-//! 2. `MemberGraded` — the aggregator's structured grades (per member; ≥70 pass, <40 fail).
+//! 2. `MemberGraded` — read *within the run*: the best-graded member wins and the worst loses,
+//!    provided the run separated them at all. A lone graded member has nobody to compare
+//!    against and falls back to the absolute reading (≥70 pass, <40 fail).
 //! 3. Re-dispatch — the same task re-run on a different backend shortly after counts the
 //!    earlier attempt as a failure.
 //! 4. `RunFinished` — exit status, discounted (exit ok ≠ quality ok).
@@ -37,10 +39,18 @@ const CONFIDENCE_CAP: f32 = 0.85;
 /// Label weights by source (design: outcome strongest, exit status weakest).
 const WEIGHT_OUTCOME: f32 = 3.0;
 const WEIGHT_GRADE: f32 = 2.0;
+/// A within-run comparison is *cleaner* evidence than an absolute grade — both members saw the
+/// same task and the same judge, so the judge's scale bias and the task's difficulty cancel —
+/// yet it is still one judge's opinion about one task, never a statement that the winning work
+/// was good, so it stays well below the human's own verdict. It is deliberately not raised
+/// above [`WEIGHT_GRADE`] either: relative reading already emits ~2 labels where the absolute
+/// rule emitted ~1, so the channel's total mass rose on its own, and paying more per label on
+/// top of that would let a fan-out-heavy week drown out the `OutcomeNoted` verdicts.
+const WEIGHT_RELATIVE: f32 = 2.0;
 const WEIGHT_RERUN: f32 = 1.0;
 const WEIGHT_EXIT: f32 = 0.5;
 
-/// Which of the four evidence sources produced a label. Carried on the label rather than
+/// Which evidence source produced a label. Carried on the label rather than
 /// inferred back from its weight, so anything reporting the *quality* of the evidence
 /// (`agentpit learning`) reads the fact instead of reverse-engineering a float.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -48,7 +58,11 @@ const WEIGHT_EXIT: f32 = 0.5;
 pub enum LabelSource {
     /// The human's explicit verdict (`OutcomeNoted`).
     Outcome,
-    /// An aggregator grade (`MemberGraded`).
+    /// A within-run comparison of `MemberGraded` grades: this member came out top (or bottom)
+    /// of a run that actually separated its members.
+    Relative,
+    /// An absolute aggregator grade (`MemberGraded`), used only when the run graded exactly one
+    /// member, so there was nothing to compare it against.
     Grade,
     /// The task was re-dispatched elsewhere shortly after, failing this attempt.
     Rerun,
@@ -61,6 +75,7 @@ impl LabelSource {
     pub fn weight(&self) -> f32 {
         match self {
             LabelSource::Outcome => WEIGHT_OUTCOME,
+            LabelSource::Relative => WEIGHT_RELATIVE,
             LabelSource::Grade => WEIGHT_GRADE,
             LabelSource::Rerun => WEIGHT_RERUN,
             LabelSource::Exit => WEIGHT_EXIT,
@@ -70,6 +85,7 @@ impl LabelSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             LabelSource::Outcome => "outcome",
+            LabelSource::Relative => "relative",
             LabelSource::Grade => "grade",
             LabelSource::Rerun => "rerun",
             LabelSource::Exit => "exit",
@@ -77,9 +93,16 @@ impl LabelSource {
     }
 }
 
-/// Aggregator grade thresholds: ≥ pass succeeds, < fail fails, in between is ignored.
+/// Absolute grade thresholds, the fallback for a run that graded exactly one member:
+/// ≥ pass succeeds, < fail fails, in between is ignored.
 const GRADE_PASS: u8 = 70;
 const GRADE_FAIL: u8 = 40;
+
+/// How far apart the best and worst grade of a run must be before the run counts as having
+/// separated its members. Judges score coarsely and inconsistently at the margin, so a few
+/// points is a rounding difference, not a finding: under this gap the run is flat and says
+/// nothing about anybody. This is what keeps "80 vs 78" from manufacturing a loser.
+const RELATIVE_MARGIN: u8 = 10;
 
 /// Everything the fold needs about one run, assembled from its event lines.
 #[derive(Debug, Clone, Default)]
@@ -103,6 +126,11 @@ pub struct RunRecord {
     member_variants: BTreeMap<BackendId, (Option<String>, Option<Effort>)>,
     pub grades: Vec<(BackendId, u8)>,
     pub outcome: Option<OutcomeLabel>,
+    /// The backend that ran as aggregator (`MemberStarted{aggregator:true}`), when the log says
+    /// so. `None` covers both "no aggregator in this run" and "old log, the line predates the
+    /// field" — either way there is nothing to exclude, so grading falls back to trusting every
+    /// grade line as before.
+    pub aggregator: Option<BackendId>,
 }
 
 impl RunRecord {
@@ -209,14 +237,18 @@ pub fn parse_runs(log: &str) -> Vec<RunRecord> {
             Event::MemberStarted {
                 run_id,
                 backend,
-                aggregator: false,
+                aggregator,
                 model,
                 effort,
                 ..
             } => {
-                record(&mut order, &mut runs, &run_id)
-                    .member_variants
-                    .insert(backend, (model, effort.and_then(|e| e.parse().ok())));
+                let r = record(&mut order, &mut runs, &run_id);
+                if aggregator {
+                    r.aggregator = Some(backend);
+                } else {
+                    r.member_variants
+                        .insert(backend, (model, effort.and_then(|e| e.parse().ok())));
+                }
             }
             Event::MemberGraded {
                 run_id,
@@ -251,6 +283,91 @@ pub fn resolve_categories(runs: &mut [RunRecord], resolve: impl Fn(&str) -> Opti
             && let Some(hash) = run.task_hash.as_deref()
         {
             run.category = resolve(hash);
+        }
+    }
+}
+
+/// Turn one run's `MemberGraded` lines into labels, reading each grade *against the others in
+/// the same run* rather than against a fixed bar.
+///
+/// An absolute threshold cannot work here. The graders are language models (and, in the arena,
+/// one person) scoring free-form work: their scales drift between runs, and a hard task drags
+/// every member's number down without saying anything about the backends. The old ≥70/<40 rule
+/// turned that into a dead band that swallowed the most common real result — the observed
+/// `82 vs 66` ensemble scored a win for the leader and *nothing* for the member that plainly
+/// lost, so the loser's row never learned anything and the fold only ever moved upward.
+///
+/// Within one run those distortions cancel: the members answered the same task and were read by
+/// the same judge, so the ordering is the part worth believing. The best-graded member wins, the
+/// worst loses, and anyone in between is left alone — being neither best nor worst is not a
+/// finding. Two guards keep the rule from inventing evidence:
+///
+/// * a run whose grades span less than [`RELATIVE_MARGIN`] did not separate anybody, so it
+///   yields nothing (this is the `80 vs 78` case);
+/// * a run that graded a single member has no comparison at all, so it falls back to the
+///   absolute reading — the only reading available — with its conservative dead band intact.
+///
+/// The emitter (`parse_member_grades`) already validates range and duplicates, but the log is
+/// plain text on disk, so re-verify here: out-of-range grades drop and duplicates keep the first
+/// entry (defense in depth against hand-edited or corrupted lines).
+///
+/// One more exclusion, unrelated to range/duplicates: every `MemberGraded` line in a run was
+/// written by that run's aggregator, so a grade whose *subject* is the aggregator itself is not
+/// a judgment at all — it is the aggregator grading its own work, with every incentive to score
+/// itself well and no independent judge to catch it. Real telemetry (run `70658`) shows exactly
+/// this: `claude` was dispatched as both a fan-out member and the aggregator, and duly graded
+/// itself 86 with rank 1. Dropped here, before best/worst is computed, so it can neither win a
+/// label for itself nor drag a peer's grade down into a false "loss" by comparison against an
+/// inflated self-score. The peer's own grade is untouched and still scores normally — as a
+/// lone grade (absolute fallback) if it was the aggregator's only other subject, or relative to
+/// other peers otherwise. Old logs without a `MemberStarted{aggregator:true}` line leave
+/// `run.aggregator` at `None`, so this filter is a no-op for them — behavior is unchanged.
+fn grade_labels(run: &RunRecord, category: TaskCategory) -> Vec<Label> {
+    let mut seen: std::collections::HashSet<BackendId> = Default::default();
+    let graded: Vec<(BackendId, u8)> = run
+        .grades
+        .iter()
+        .copied()
+        .filter(|(backend, grade)| {
+            *grade <= 100 && seen.insert(*backend) && Some(*backend) != run.aggregator
+        })
+        .collect();
+
+    let label = |backend: BackendId, success: bool, source: LabelSource| {
+        let (model, effort) = run.member_variant(backend);
+        Label {
+            backend,
+            model,
+            effort,
+            category,
+            success,
+            source,
+            task_hash: run.task_hash.clone(),
+            ts: run.route_ts,
+        }
+    };
+
+    match graded.as_slice() {
+        [] => Vec::new(),
+        [(backend, grade)] => match *grade {
+            g if g >= GRADE_PASS => vec![label(*backend, true, LabelSource::Grade)],
+            g if g < GRADE_FAIL => vec![label(*backend, false, LabelSource::Grade)],
+            _ => Vec::new(), // middling lone grade: no signal
+        },
+        members => {
+            let best = members.iter().map(|(_, g)| *g).max().unwrap_or_default();
+            let worst = members.iter().map(|(_, g)| *g).min().unwrap_or_default();
+            if best.saturating_sub(worst) < RELATIVE_MARGIN {
+                return Vec::new(); // flat run: the judge did not separate them
+            }
+            members
+                .iter()
+                .filter_map(|(backend, grade)| match *grade {
+                    g if g == best => Some(label(*backend, true, LabelSource::Relative)),
+                    g if g == worst => Some(label(*backend, false, LabelSource::Relative)),
+                    _ => None, // neither best nor worst: no finding
+                })
+                .collect()
         }
     }
 }
@@ -301,33 +418,11 @@ pub fn derive_labels(runs: &[RunRecord], rerun_window_ms: u64) -> Vec<Label> {
             continue;
         }
 
-        // Source 2: aggregator grades — one label per decisively-graded member. The emitter
-        // (`parse_member_grades`) already validates range/duplicates, but the log is plain
-        // text on disk, so re-verify here: out-of-range grades drop, duplicates keep the
-        // first entry (defense in depth against hand-edited or corrupted lines).
+        // Source 2: aggregator grades, read relative to the rest of the run (see
+        // `grade_labels`). A graded run never falls through to the weaker sources, even when
+        // the comparison came out flat — "the judge could not separate them" is an answer.
         if !run.grades.is_empty() {
-            let mut graded_backends: std::collections::HashSet<BackendId> = Default::default();
-            for (backend, grade) in &run.grades {
-                if *grade > 100 || !graded_backends.insert(*backend) {
-                    continue;
-                }
-                let success = match *grade {
-                    g if g >= GRADE_PASS => true,
-                    g if g < GRADE_FAIL => false,
-                    _ => continue, // middling grade: no signal
-                };
-                let (model, effort) = run.member_variant(*backend);
-                labels.push(Label {
-                    backend: *backend,
-                    model,
-                    effort,
-                    category,
-                    success,
-                    source: LabelSource::Grade,
-                    task_hash: run.task_hash.clone(),
-                    ts: run.route_ts,
-                });
-            }
+            labels.extend(grade_labels(run, category));
             continue;
         }
 
@@ -483,7 +578,7 @@ mod tests {
             route("r-1", "claude", Some("coding"), "aa", 5),
             finished("r-1", "ok"),
             r#"{"event":"outcome_noted","ts":10,"run_id":"r-1","outcome":"bad"}"#.into(),
-            // r-2: graded ensemble — decisive grades label members; the middling one is silent.
+            // r-2: graded ensemble — best and worst are labelled; the one in between is silent.
             started("r-2", "review", &["claude", "codex", "opencode"]),
             route("r-2", "claude", Some("review"), "bb", 6),
             r#"{"event":"member_graded","ts":11,"run_id":"r-2","backend":"claude","grade":90}"#
@@ -515,7 +610,7 @@ mod tests {
                     effort: None,
                     category: TaskCategory::Review,
                     success: true,
-                    source: LabelSource::Grade,
+                    source: LabelSource::Relative,
                     task_hash: Some("bb".into()),
                     ts: 6,
                 },
@@ -525,11 +620,176 @@ mod tests {
                     effort: None,
                     category: TaskCategory::Review,
                     success: false,
-                    source: LabelSource::Grade,
+                    source: LabelSource::Relative,
                     task_hash: Some("bb".into()),
                     ts: 6,
                 },
             ]
+        );
+    }
+
+    fn graded(run: &str, backend: &str, grade: u8) -> String {
+        format!(
+            r#"{{"event":"member_graded","ts":11,"run_id":"{run}","backend":"{backend}","grade":{grade}}}"#
+        )
+    }
+
+    /// The case that motivated relative labelling, taken from the real telemetry: an ensemble
+    /// judge scored 82 against 66. The old absolute rule banked a win for the leader and said
+    /// nothing at all about the member that plainly lost — every such run pushed the fold
+    /// upward and nobody ever accrued a failure. The run separated them, so both are labelled.
+    #[test]
+    fn a_run_that_separated_its_members_labels_the_winner_and_the_loser() {
+        let log = [
+            started("r-1", "review", &["claude", "codex"]),
+            route("r-1", "claude", Some("review"), "aa", 5),
+            graded("r-1", "claude", 82),
+            graded("r-1", "codex", 66),
+            finished("r-1", "ok"),
+        ]
+        .join("\n");
+
+        let labels = derive_labels(&parse_runs(&log), DEFAULT_RERUN_WINDOW_MS);
+        assert_eq!(labels.len(), 2, "both members are labelled: {labels:?}");
+        assert_eq!(
+            (labels[0].backend, labels[0].success, labels[0].source),
+            (BackendId::Claude, true, LabelSource::Relative),
+        );
+        assert_eq!(
+            (labels[1].backend, labels[1].success, labels[1].source),
+            (BackendId::Codex, false, LabelSource::Relative),
+            "66 lost the run and must record a loss, not silence",
+        );
+        // A comparison is one judge's opinion about one task: heavier than an exit code, never
+        // heavier than the human's own verdict.
+        assert_eq!(labels[0].weight(), WEIGHT_RELATIVE);
+        const { assert!(WEIGHT_RELATIVE < WEIGHT_OUTCOME) };
+    }
+
+    /// The other half of the same rule: a run whose grades sit on top of each other did not
+    /// separate anybody, so it must invent neither a winner nor a loser.
+    #[test]
+    fn a_flat_run_labels_nobody() {
+        let log = [
+            started("r-1", "review", &["claude", "codex"]),
+            route("r-1", "claude", Some("review"), "aa", 5),
+            graded("r-1", "claude", 80),
+            graded("r-1", "codex", 78),
+            finished("r-1", "ok"),
+        ]
+        .join("\n");
+        assert!(
+            derive_labels(&parse_runs(&log), DEFAULT_RERUN_WINDOW_MS).is_empty(),
+            "a 2-point spread is judge rounding, not a finding",
+        );
+
+        // Nor does a flat run fall through to its exit status: it was graded, and "the judge
+        // could not separate them" is the answer, not an absence of evidence.
+        let unanimous = [
+            started("r-2", "review", &["claude", "codex", "opencode"]),
+            route("r-2", "claude", Some("review"), "bb", 5),
+            graded("r-2", "claude", 90),
+            graded("r-2", "codex", 90),
+            graded("r-2", "opencode", 90),
+            finished("r-2", "ok"),
+        ]
+        .join("\n");
+        assert!(
+            derive_labels(&parse_runs(&unanimous), DEFAULT_RERUN_WINDOW_MS).is_empty(),
+            "three identical grades separate nobody",
+        );
+    }
+
+    /// A run that graded exactly one member has nothing to compare against, so it keeps the
+    /// absolute reading — and that reading stays conservative: only a decisive grade speaks.
+    #[test]
+    fn a_lone_grade_keeps_the_absolute_reading() {
+        let lone = |grade: u8| {
+            let log = [
+                started("r-1", "rescue", &["claude"]),
+                route("r-1", "claude", Some("coding"), "aa", 5),
+                graded("r-1", "claude", grade),
+            ]
+            .join("\n");
+            derive_labels(&parse_runs(&log), DEFAULT_RERUN_WINDOW_MS)
+        };
+
+        let pass = lone(82);
+        assert_eq!(pass.len(), 1);
+        assert_eq!(
+            (pass[0].success, pass[0].source),
+            (true, LabelSource::Grade)
+        );
+        let fail = lone(20);
+        assert_eq!(
+            (fail[0].success, fail[0].source),
+            (false, LabelSource::Grade)
+        );
+        assert!(lone(55).is_empty(), "a middling lone grade says nothing");
+    }
+
+    /// The arena feeds its human head-to-head votes through this same channel as Bradley–Terry
+    /// scores (`cli::arena::emit_grades`), so they land as relative labels — and deliberately at
+    /// the same weight as a model judge's, since the log cannot tell the two apart and the arena
+    /// is designed to move the learned scores rather than outrank them.
+    #[test]
+    fn arena_votes_land_as_relative_labels_at_the_judge_weight() {
+        let log = [
+            started("r-1", "arena", &["claude", "codex"]),
+            route("r-1", "claude", Some("coding"), "aa", 5),
+            r#"{"event":"member_graded","ts":11,"run_id":"r-1","backend":"claude","grade":73,"rank":1}"#.into(),
+            r#"{"event":"member_graded","ts":11,"run_id":"r-1","backend":"codex","grade":27,"rank":2}"#.into(),
+        ]
+        .join("\n");
+        let labels = derive_labels(&parse_runs(&log), DEFAULT_RERUN_WINDOW_MS);
+        assert_eq!(
+            labels
+                .iter()
+                .map(|l| (l.backend, l.success, l.source, l.weight()))
+                .collect::<Vec<_>>(),
+            vec![
+                (BackendId::Claude, true, LabelSource::Relative, 2.0),
+                (BackendId::Codex, false, LabelSource::Relative, 2.0),
+            ],
+        );
+
+        // A round with a single contender has no head-to-head; Bradley–Terry scores it 50, which
+        // the absolute fallback correctly refuses to read as anything.
+        let alone = [
+            started("r-2", "arena", &["claude"]),
+            route("r-2", "claude", Some("coding"), "bb", 5),
+            r#"{"event":"member_graded","ts":11,"run_id":"r-2","backend":"claude","grade":50,"rank":1}"#.into(),
+        ]
+        .join("\n");
+        assert!(derive_labels(&parse_runs(&alone), DEFAULT_RERUN_WINDOW_MS).is_empty());
+    }
+
+    /// Precedence is unchanged: a graded run reads its grades even when it also exited ok and
+    /// was re-dispatched elsewhere inside the window.
+    #[test]
+    fn grades_still_outrank_rerun_and_exit_status() {
+        let log = [
+            started("r-1", "rescue", &["claude"]),
+            route("r-1", "claude", Some("coding"), "aa", 1_000),
+            graded("r-1", "claude", 85),
+            finished("r-1", "ok"),
+            // Same task, different backend, one second later: r-1 would otherwise be superseded.
+            started("r-2", "rescue", &["codex"]),
+            route("r-2", "codex", Some("coding"), "aa", 2_000),
+            finished("r-2", "ok"),
+        ]
+        .join("\n");
+        let labels = derive_labels(&parse_runs(&log), DEFAULT_RERUN_WINDOW_MS);
+        assert_eq!(
+            labels
+                .iter()
+                .map(|l| (l.backend, l.success, l.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (BackendId::Claude, true, LabelSource::Grade),
+                (BackendId::Codex, true, LabelSource::Exit),
+            ],
+            "the grade wins over both rerun and exit for r-1",
         );
     }
 
@@ -559,6 +819,63 @@ mod tests {
         assert!(scores.contains_key(&codex_high));
         assert!(!scores.contains_key(&ProfileKey::unpinned(BackendId::Claude)));
         assert!(!scores.contains_key(&ProfileKey::unpinned(BackendId::Codex)));
+    }
+
+    /// The case that motivated this exclusion, taken from real telemetry: run `70658` dispatched
+    /// `claude` as both a fan-out member and the aggregator, and `claude` graded itself 86/rank1
+    /// — a self-grade is not evidence for the grader. The peer it also graded must still land.
+    #[test]
+    fn an_aggregator_grading_itself_produces_no_evidence_for_itself() {
+        let log = [
+            started("r-1", "review", &["claude", "codex"]),
+            route("r-1", "claude", Some("review"), "aa", 5),
+            r#"{"event":"member_started","ts":6,"run_id":"r-1","backend":"claude","aggregator":true}"#.into(),
+            graded("r-1", "claude", 86),
+            graded("r-1", "codex", 20),
+            finished("r-1", "ok"),
+        ]
+        .join("\n");
+
+        let labels = derive_labels(&parse_runs(&log), DEFAULT_RERUN_WINDOW_MS);
+        assert_eq!(
+            labels
+                .iter()
+                .map(|l| (l.backend, l.success, l.source))
+                .collect::<Vec<_>>(),
+            vec![(BackendId::Codex, false, LabelSource::Grade)],
+            "the self-grade must vanish and the peer's grade must land as a lone (absolute) reading: {labels:?}",
+        );
+    }
+
+    /// Same shape, but with a second peer: the aggregator's self-grade must not enter the
+    /// best/worst comparison either, so it cannot manufacture a loser out of a peer that only
+    /// looks bad next to the aggregator's inflated score of itself.
+    #[test]
+    fn an_aggregators_self_grade_is_excluded_from_the_relative_comparison_too() {
+        let log = [
+            started("r-1", "review", &["claude", "codex", "opencode"]),
+            route("r-1", "claude", Some("review"), "aa", 5),
+            r#"{"event":"member_started","ts":6,"run_id":"r-1","backend":"claude","aggregator":true}"#.into(),
+            graded("r-1", "claude", 99), // self-grade: would otherwise dominate as "best"
+            graded("r-1", "codex", 80),
+            graded("r-1", "opencode", 60),
+            finished("r-1", "ok"),
+        ]
+        .join("\n");
+
+        let labels = derive_labels(&parse_runs(&log), DEFAULT_RERUN_WINDOW_MS);
+        assert_eq!(
+            labels
+                .iter()
+                .map(|l| (l.backend, l.success, l.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (BackendId::Codex, true, LabelSource::Relative),
+                (BackendId::Opencode, false, LabelSource::Relative),
+            ],
+            "claude never appears; codex (80) and opencode (60) are compared against each \
+             other, not against claude's excluded self-grade of 99: {labels:?}",
+        );
     }
 
     #[test]

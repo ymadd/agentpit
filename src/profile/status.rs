@@ -34,10 +34,11 @@ pub struct Coverage {
 }
 
 /// Label counts split by evidence source. Named fields rather than a map so the frontend
-/// reads a fixed shape and the four sources always render, including at zero.
+/// reads a fixed shape and every source always renders, including at zero.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SourceMix {
     pub outcome: u16,
+    pub relative: u16,
     pub grade: u16,
     pub rerun: u16,
     pub exit: u16,
@@ -47,6 +48,7 @@ impl SourceMix {
     fn add(&mut self, source: LabelSource) {
         let slot = match source {
             LabelSource::Outcome => &mut self.outcome,
+            LabelSource::Relative => &mut self.relative,
             LabelSource::Grade => &mut self.grade,
             LabelSource::Rerun => &mut self.rerun,
             LabelSource::Exit => &mut self.exit,
@@ -421,6 +423,7 @@ mod tests {
             cell.mix,
             SourceMix {
                 outcome: 1,
+                relative: 0,
                 grade: 1,
                 rerun: 0,
                 exit: 1

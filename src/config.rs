@@ -416,6 +416,63 @@ pub struct ArenaSection {
     pub verify: Option<String>,
 }
 
+/// `[mcp]`: agentpit as a *client* of other MCP servers.
+///
+/// Nothing here is launched by a plain startup. A definition is only a recipe; a server is
+/// spawned exactly when the user runs `agentpit mcp refresh` (or `/mcp refresh`), and the
+/// prompts it advertises are read from the on-disk cache everywhere else.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpSection {
+    /// Server definitions, keyed by the name their prompts are namespaced under
+    /// (`/<server>:<prompt>`). The project's own `.mcp.json` is read as a second source and
+    /// never overrides a name defined here.
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
+    /// Seconds one `refresh` may spend on a single server — the handshake and the prompt
+    /// listing are bounded separately by this. 0 falls back to the default.
+    #[serde(default = "default_mcp_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+}
+
+/// Derived `Default` would give `connect_timeout_secs = 0` and disagree with the serde
+/// default the same field carries — and a config file with no `[mcp]` section takes THIS
+/// path, not serde's. Written out so the two cannot drift.
+impl Default for McpSection {
+    fn default() -> Self {
+        Self {
+            servers: BTreeMap::new(),
+            connect_timeout_secs: default_mcp_connect_timeout_secs(),
+        }
+    }
+}
+
+fn default_mcp_connect_timeout_secs() -> u64 {
+    15
+}
+
+/// One stdio MCP server: the command agentpit would run to talk to it.
+///
+/// Only the stdio transport is expressible. A remote server (`url`) is a different security
+/// story — outbound network from a refresh — and is deliberately not part of this section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpServerConfig {
+    /// Executable to run. Resolved on `$PATH` by the OS, like any other spawn.
+    pub command: String,
+    /// Arguments, passed verbatim.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment for the child, merged onto agentpit's own. `${VAR}` in a value is
+    /// expanded from agentpit's environment when the config is loaded, like anywhere else.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Working directory for the child. Empty = agentpit's cwd.
+    #[serde(default)]
+    pub cwd: String,
+    /// Set false to keep the definition but stop offering (and refreshing) it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HubConfig {
     #[serde(default)]
@@ -442,6 +499,8 @@ pub struct HubConfig {
     pub session: SessionSection,
     #[serde(default)]
     pub repl: ReplSection,
+    #[serde(default)]
+    pub mcp: McpSection,
 }
 
 /// Orchestration-REPL knobs (design §10.9).
@@ -833,6 +892,21 @@ review_members = ["antigravity", "opencode"]
 # deno_path   = ""        # explicit deno binary; empty = $PATH
 # cell_idle_timeout_secs = 120  # kill a cell that emits no frame this long (runaway loop); 0 = off
 
+# MCP servers agentpit is a CLIENT of: their prompts become `/<server>:<prompt>` on the
+# interactive surfaces. STDIO only. Nothing here is spawned by a plain startup — the slash
+# surfaces read a cache, and only `agentpit mcp refresh` launches anything. The project's
+# own .mcp.json is read as a second source and never overrides a name defined here; copy a
+# Claude Code setup in once with `agentpit mcp import`.
+# [mcp]
+# connect_timeout_secs = 15   # per-server budget for one refresh (handshake, then listing)
+#
+# [mcp.servers.context7]
+# command = "npx"
+# args    = ["-y", "@upstash/context7-mcp"]
+# env     = { CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}" }  # ${VAR} expands from the environment
+# cwd     = ""                # empty = agentpit's working directory
+# enabled = true              # false keeps the definition but stops offering/refreshing it
+
 # Per-backend transport + default model / effort override.
 # [backends.antigravity]
 # transport = "acp"
@@ -1209,6 +1283,131 @@ prompt = "Research only."
         let parsed: HubConfig = toml::from_str(&block).expect("uncommented session example parses");
         assert_eq!(parsed.session.compose_window, 4);
         assert_eq!(parsed.session, SessionSection::default());
+    }
+
+    /// The commented `[mcp]` example must stay valid TOML when uncommented, and must
+    /// document the coded default for the one knob it names.
+    #[test]
+    fn sample_config_mcp_example_parses_when_uncommented() {
+        let block: String = DEFAULT_CONFIG_TOML
+            .lines()
+            .skip_while(|l| !l.starts_with("# [mcp]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .or_else(|| l.strip_prefix("#"))
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !block.is_empty(),
+            "mcp example block not found in sample config"
+        );
+        let parsed: HubConfig = toml::from_str(&block).expect("uncommented mcp example parses");
+        assert_eq!(
+            parsed.mcp.connect_timeout_secs,
+            default_mcp_connect_timeout_secs()
+        );
+        let server = parsed.mcp.servers.get("context7").expect("server present");
+        assert_eq!(server.command, "npx");
+        assert_eq!(server.args, vec!["-y", "@upstash/context7-mcp"]);
+        assert!(server.enabled);
+    }
+
+    /// `[mcp.servers.*]` accepts the documented shape, fills its own defaults, and the
+    /// section as a whole is optional.
+    #[test]
+    fn mcp_servers_section_parses_and_defaults() {
+        let dir = tempdir().unwrap();
+
+        // Absent section: no servers, coded default timeout.
+        let bare = dir.path().join("bare.toml");
+        fs::write(&bare, "[default]\nbackend = \"claude\"\n").unwrap();
+        let loaded = load_config(Some(&bare)).unwrap();
+        assert!(loaded.config.mcp.servers.is_empty());
+        assert_eq!(loaded.config.mcp.connect_timeout_secs, 15);
+
+        let path = dir.path().join("mcp.toml");
+        fs::write(
+            &path,
+            r#"
+[mcp]
+connect_timeout_secs = 30
+
+[mcp.servers.minimal]
+command = "./server"
+
+[mcp.servers.full]
+command = "npx"
+args = ["-y", "pkg"]
+env = { TOKEN = "t" }
+cwd = "/tmp"
+enabled = false
+"#,
+        )
+        .unwrap();
+        let loaded = load_config(Some(&path)).unwrap();
+        assert_eq!(loaded.config.mcp.connect_timeout_secs, 30);
+        let minimal = &loaded.config.mcp.servers["minimal"];
+        assert_eq!(minimal.command, "./server");
+        assert!(minimal.args.is_empty() && minimal.env.is_empty());
+        assert!(
+            minimal.enabled,
+            "a server is enabled unless it says otherwise"
+        );
+        let full = &loaded.config.mcp.servers["full"];
+        assert_eq!(full.env["TOKEN"], "t");
+        assert_eq!(full.cwd, "/tmp");
+        assert!(!full.enabled);
+
+        // Round trip: the settings surface cannot lose a server.
+        let out = dir.path().join("saved.toml");
+        save_config_at(&loaded.config, &out).unwrap();
+        assert_eq!(
+            load_config(Some(&out)).unwrap().config.mcp,
+            loaded.config.mcp
+        );
+    }
+
+    /// A `[mcp.servers.*]` block with a wrong-typed field is a load error, not a panic and
+    /// not a silently half-read server.
+    #[test]
+    fn junk_in_mcp_servers_is_an_error_not_a_panic() {
+        let dir = tempdir().unwrap();
+        for junk in [
+            "[mcp.servers.x]\ncommand = 42\n",
+            "[mcp.servers.x]\ncommand = \"ok\"\nargs = \"not-a-list\"\n",
+            "[mcp.servers.x]\ncommand = \"ok\"\nenabled = \"yes\"\n",
+            "[mcp]\nservers = \"not-a-table\"\n",
+            // `command` is required: a server with nothing to run is not a server.
+            "[mcp.servers.x]\nargs = []\n",
+        ] {
+            let path = dir.path().join("junk.toml");
+            fs::write(&path, junk).unwrap();
+            assert!(load_config(Some(&path)).is_err(), "accepted junk: {junk}");
+        }
+    }
+
+    /// `${VAR}` expansion reaches a server's env, so a token lives in the environment
+    /// rather than in the config file.
+    #[test]
+    fn mcp_server_env_expands_environment_references() {
+        unsafe {
+            env::set_var("AGENTPIT_TEST_MCP_TOKEN", "from-env");
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("env.toml");
+        fs::write(
+            &path,
+            "[mcp.servers.x]\ncommand = \"./s\"\nenv = { TOKEN = \"${AGENTPIT_TEST_MCP_TOKEN}\" }\n",
+        )
+        .unwrap();
+        let loaded = load_config(Some(&path)).unwrap();
+        assert_eq!(loaded.config.mcp.servers["x"].env["TOKEN"], "from-env");
+        unsafe {
+            env::remove_var("AGENTPIT_TEST_MCP_TOKEN");
+        }
     }
 
     #[test]

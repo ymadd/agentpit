@@ -24,6 +24,9 @@
 //! - **Status bar**: `idle` (session id + key hints, muted) / `busy` (working pulse
 //!   ◇◈◆◈ + elapsed + backend + cancel hint) / `busy+hint` (after ~15s a rotating
 //!   "Hint:" line, prime's rotator).
+//! - **Command dropdown**: the slash menu anchored above the input box — rounded
+//!   BORDER_MUTED frame, label in ACCENT, description in DIM, highlighted row in
+//!   `style_selected` (the same selection vocabulary as the overlays).
 //! - **Transcript line**: `user` (USER_BG card, "› " lead) / `backend-turn-start`
 //!   (dim "◈ backend" marker) / `answer` (plain text) / `progress` (DIM, "◈" lead) /
 //!   `notice` (YELLOW) / `error` (RED) / `summary` (ACCENT rule).
@@ -219,9 +222,30 @@ pub fn roster_line(glyph: &str, state: &str, rest: &str) -> Line<'static> {
     ])
 }
 
+/// One row of the slash-command dropdown: the label in the label colour, its description
+/// muted behind it. Column width is fixed so the descriptions line up (the widest label
+/// the registry offers is `/login [backend]`).
+pub fn menu_row(label: &str, description: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:MENU_LABEL_WIDTH$}"), style_accent()),
+        Span::styled(description.to_string(), style_dim()),
+    ])
+}
+
+/// Column width for [`menu_row`]'s label.
+pub const MENU_LABEL_WIDTH: usize = 18;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_rows_align_their_descriptions() {
+        let row = menu_row("/tree", "Show the session tree");
+        assert_eq!(row.spans[0].content.chars().count(), MENU_LABEL_WIDTH);
+        assert_eq!(row.spans[0].style.fg, Some(ACCENT));
+        assert_eq!(row.spans[1].style.fg, Some(DIM));
+    }
 
     #[test]
     fn header_carries_identity_once() {

@@ -120,6 +120,30 @@ pub enum Action {
     },
 }
 
+/// `/arena …` on an interactive surface, parsed with this subcommand's own clap grammar.
+///
+/// The slash surfaces hand over raw argv words rather than a second, hand-rolled parser, so
+/// `/arena vote --round r7` means exactly what `agentpit arena vote --round r7` means, and a
+/// bad argument (or `--help`) gets clap's own message instead of a bespoke one.
+#[derive(clap::Parser, Debug)]
+#[command(name = "/arena", no_binary_name = true)]
+struct Words {
+    #[command(subcommand)]
+    action: Action,
+}
+
+/// Run `/arena <words>`. A rejected argument prints clap's usage and is not an error: the
+/// surface keeps its prompt rather than treating a typo as a failure.
+pub async fn run_words(words: Vec<String>) -> Result<()> {
+    match <Words as clap::Parser>::try_parse_from(words) {
+        Ok(parsed) => run(parsed.action).await,
+        Err(e) => {
+            let _ = e.print();
+            Ok(())
+        }
+    }
+}
+
 pub async fn run(action: Action) -> Result<()> {
     match action {
         Action::Run {
@@ -994,6 +1018,26 @@ mod tests {
         assert!(err.contains("arena templates"), "{err}");
         let err = format!("{:#}", resolve_task(None, None, None).unwrap_err());
         assert!(err.contains("--template"), "{err}");
+    }
+
+    #[test]
+    fn slash_words_carry_the_sub_action_with_no_binary_name_in_front() {
+        // `/arena vote --round r7` hands over the words only. If `no_binary_name` were
+        // missing, clap would swallow `vote` as argv[0] and reject the rest — a failure
+        // that only shows up when a human types the command, never at compile time.
+        let parsed = Words::try_parse_from(["vote", "--round", "r7"]).unwrap();
+        let Action::Vote { round, .. } = parsed.action else {
+            panic!("expected arena vote")
+        };
+        assert_eq!(round.as_deref(), Some("r7"));
+        // A quoted multi-word task arrives as one word, the way `split_words` produces it.
+        let parsed = Words::try_parse_from(["run", "add a login form"]).unwrap();
+        let Action::Run { task, .. } = parsed.action else {
+            panic!("expected arena run")
+        };
+        assert_eq!(task.as_deref(), Some("add a login form"));
+        // A required sub-action is still required.
+        assert!(Words::try_parse_from(Vec::<String>::new()).is_err());
     }
 
     #[test]

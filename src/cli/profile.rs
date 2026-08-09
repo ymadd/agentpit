@@ -99,6 +99,26 @@ pub enum Action {
     },
 }
 
+/// `/profile …` on an interactive surface, parsed with this subcommand's own clap grammar
+/// (see `arena::run_words` for why the slash surfaces reuse clap instead of re-parsing).
+#[derive(clap::Parser, Debug)]
+#[command(name = "/profile", no_binary_name = true)]
+struct Words {
+    #[command(subcommand)]
+    action: Option<Action>,
+}
+
+/// Run `/profile <words>`; no words is a bare `/profile`, i.e. `show`.
+pub async fn run_words(words: Vec<String>) -> Result<()> {
+    match <Words as clap::Parser>::try_parse_from(words) {
+        Ok(parsed) => run(parsed.action).await,
+        Err(e) => {
+            let _ = e.print();
+            Ok(())
+        }
+    }
+}
+
 /// Entry point. A bare `agentpit profile` (no sub-action) defaults to `show`.
 pub async fn run(action: Option<Action>) -> Result<()> {
     match action.unwrap_or(Action::Show) {
@@ -1075,6 +1095,23 @@ mod tests {
     use crate::profile::{CapabilityProfile, ProfileSource, Score, TaskCategory, load_profiles};
     use crate::types::BackendId;
     use tempfile::tempdir;
+
+    #[test]
+    fn slash_words_carry_the_sub_action_with_no_binary_name_in_front() {
+        use clap::Parser;
+        // A bare `/profile` is the CLI's bare `agentpit profile`: no sub-action, i.e. show.
+        assert!(
+            Words::try_parse_from(Vec::<String>::new())
+                .unwrap()
+                .action
+                .is_none()
+        );
+        let parsed = Words::try_parse_from(["learn", "--dry-run"]).unwrap();
+        assert!(matches!(
+            parsed.action,
+            Some(Action::Learn { dry_run: true, .. })
+        ));
+    }
 
     #[test]
     fn render_show_includes_source_and_scores() {

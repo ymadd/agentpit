@@ -37,11 +37,29 @@ pub mod security_review;
 pub mod sessions;
 #[cfg(feature = "similarity")]
 pub mod similarity_cmd;
+pub mod skills;
+pub mod slash;
 pub mod status;
 pub mod update;
 pub mod workflow;
 
 pub(crate) use common::{install_ctrlc_cancel, load_context, resolve_cwd, stdout_streamer};
+
+/// Everything the slash registry's second layer holds for a session rooted at `cwd`:
+/// `SKILL.md` files on disk, then the MCP prompts a `mcp refresh` cached.
+///
+/// One function so the REPL and the TUI cannot end up with different vocabularies, and one
+/// place to state the property both entry points depend on: **neither source starts a
+/// process.** `skills` reads two directories; `mcp::prompts` reads the config, the project's
+/// `.mcp.json`, and the prompt cache. A server is spawned only by `agentpit mcp refresh`.
+///
+/// Skills come first, so a project's own skill wins a name an MCP prompt also claims
+/// (`crate::cli::slash::Registry::resolve` keeps the first entry to claim a name).
+pub fn runtime_slash_entries(cwd: &std::path::Path) -> Vec<slash::SlashSpec> {
+    let mut entries = skills::discover(cwd);
+    entries.extend(crate::mcp::prompts::discover(cwd));
+    entries
+}
 
 #[derive(Parser, Debug)]
 #[command(

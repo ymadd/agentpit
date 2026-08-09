@@ -9,11 +9,14 @@
 //! the transcript.
 
 mod chunks;
+mod completion;
 mod input;
 mod scroll;
+mod slash;
 pub mod theme;
 mod views;
 
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -28,9 +31,12 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListSt
 
 use crate::daemon::client::{Conn, connect_daemon, create_session, open_session};
 use crate::daemon::protocol::{Event, Frame, RequestBody, ResponseData};
+use crate::types::BackendId;
 use chunks::{LineAssembler, is_progress_line};
+use completion::{Edit, SlashMenu};
 use input::InputState;
 use scroll::{clamp_offset, tail_window};
+use slash::{Local, Protocol, Route, Suspend, route};
 use views::{ListCursor, RosterRow, help_lines, tree_line_id};
 
 /// Transcript memory cap: beyond this many lines the oldest are dropped (the session
@@ -39,6 +45,10 @@ const TRANSCRIPT_CAP: usize = 5000;
 
 pub async fn run(session: Option<String>) -> Result<()> {
     let cwd = crate::cli::resolve_cwd(None)?;
+    // Fill the slash registry's second layer before the popup or the router reads it: the
+    // project scope is relative to this cwd. Both sources read files and nothing else — no
+    // MCP server is started by opening the TUI.
+    crate::cli::slash::install(crate::cli::runtime_slash_entries(&cwd));
     let (session_id, conn) = match &session {
         Some(id) => open_session(id, true).await?,
         None => create_session(&cwd, true).await?,
@@ -67,10 +77,48 @@ fn leave_screen() -> std::io::Result<()> {
     crossterm::terminal::disable_raw_mode()
 }
 
+/// Hold the normal screen until the user has read a suspended subcommand's output.
+///
+/// Raw mode is enabled only for the length of the read, and disabled again on every path
+/// — including a read error — so a terminal that dies here is left cooked, not raw. If raw
+/// mode cannot be entered at all (no tty behind the suspend), fall back to a line read so
+/// the pause still exists instead of flashing past.
+fn wait_for_key() {
+    eprint!("[press any key to return to the TUI]");
+    let _ = std::io::stderr().flush();
+    tokio::task::block_in_place(|| {
+        if crossterm::terminal::enable_raw_mode().is_ok() {
+            loop {
+                match crossterm::event::read() {
+                    Ok(TermEvent::Key(_)) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+            let _ = crossterm::terminal::disable_raw_mode();
+        } else {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        }
+    });
+    eprintln!();
+}
+
 /// Which surface owns the keys right now.
 enum Mode {
     Chat,
     Overlay(Overlay),
+}
+
+/// What the main loop must do after a key was handled.
+enum KeyOutcome {
+    /// Keep looping.
+    Continue,
+    /// Leave the TUI (Ctrl-D, /quit, /exit, /detach).
+    Exit,
+    /// Hand the terminal back and run a CLI subcommand (D2 SUSPEND). Performed by the
+    /// main loop, not here: it owns the crossterm `EventStream`, whose reader thread must
+    /// let go of stdin before an interactive subcommand can read it.
+    Suspend(Suspend),
 }
 
 /// A fullscreen list overlay (Agents / Tree / Help) drawn over the conversation.
@@ -99,6 +147,9 @@ struct App {
     /// Rows from the bottom the view is scrolled up by; 0 = follow the newest.
     scroll_offset: usize,
     input: InputState,
+    /// The slash-command dropdown (D4) — pure state; this loop only feeds it keys and
+    /// draws it above the input line.
+    menu: SlashMenu,
     assembler: LineAssembler,
     busy: bool,
     turn_started: Instant,
@@ -106,6 +157,8 @@ struct App {
     /// Request id of OUR in-flight send (its response ends the busy state).
     pending_send: Option<u64>,
     backend_line: String,
+    /// Backend of the most recent turn — what `/login` with no argument means here.
+    active_backend: Option<String>,
     /// 100ms app-timer count driving the working pulse.
     tick: usize,
     /// Shown in the header; the session's cwd.
@@ -122,12 +175,14 @@ impl App {
             transcript: Vec::new(),
             scroll_offset: 0,
             input: InputState::default(),
+            menu: SlashMenu::default(),
             assembler: LineAssembler::default(),
             busy: false,
             turn_started: Instant::now(),
             last_ctrl_c: None,
             pending_send: None,
             backend_line: String::new(),
+            active_backend: None,
             tick: 0,
             cwd_label: String::new(),
         }
@@ -204,10 +259,19 @@ impl App {
 
     async fn main_loop(&mut self) -> Result<()> {
         self.attach().await?;
-        let mut events = EventStream::new();
+        // `Option` so the stream can be DROPPED for the duration of a suspended
+        // subcommand: crossterm's EventStream parks a thread inside `poll_internal`,
+        // which consumes stdin into its own buffer, so a live stream would swallow every
+        // keystroke an interactive subcommand (e.g. `/login`) is waiting for. Dropping it
+        // wakes that thread and hands stdin back; a fresh stream is built on return.
+        let mut events = Some(EventStream::new());
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         loop {
             self.draw()?;
+            let mut suspend: Option<Suspend> = None;
+            let stream = events
+                .as_mut()
+                .expect("event stream is restored before the next iteration");
             tokio::select! {
                 frame = self.conn.recv_frame() => {
                     match frame {
@@ -224,11 +288,13 @@ impl App {
                         Ok(frame) => { self.on_frame(frame); }
                     }
                 }
-                ev = events.next() => {
+                ev = stream.next() => {
                     match ev {
                         Some(Ok(TermEvent::Key(key))) => {
-                            if self.on_key(key).await? {
-                                return Ok(());
+                            match self.on_key(key).await? {
+                                KeyOutcome::Continue => {}
+                                KeyOutcome::Exit => return Ok(()),
+                                KeyOutcome::Suspend(cmd) => suspend = Some(cmd),
                             }
                         }
                         // Re-clamp the scroll offset on resize (M7): a wider terminal
@@ -251,7 +317,98 @@ impl App {
                     self.tick = self.tick.wrapping_add(1);
                 }
             }
+            if let Some(cmd) = suspend {
+                drop(events.take()); // hands stdin back to the subcommand
+                if !self.suspend_and_run(cmd).await {
+                    return Ok(()); // terminal lost — do not start another reader on it
+                }
+                events = Some(EventStream::new());
+            }
         }
+    }
+
+    /// Run a CLI subcommand with the real terminal handed back to it (D2 SUSPEND), then
+    /// come back to the conversation. `false` = the alternate screen could not be
+    /// re-entered, so the caller must stop instead of drawing into a dead terminal.
+    ///
+    /// Order matters for safety: the screen is restored to its normal, cooked-mode state
+    /// FIRST and re-entered LAST, so a subcommand that panics or a terminal that dies
+    /// mid-command leaves the user in a usable shell rather than in raw mode.
+    async fn suspend_and_run(&mut self, cmd: Suspend) -> bool {
+        let label = cmd.label();
+        self.leave_terminal();
+        eprintln!("── {label} ──");
+        if let Err(e) = self.run_suspended(&cmd).await {
+            eprintln!("error: {e:#}");
+        }
+        wait_for_key();
+        match self.enter_terminal() {
+            Ok(()) => {
+                // The transcript and `scroll_offset` are untouched by the round trip, so
+                // the redraw comes back to exactly the rows the reader was looking at.
+                self.push_text(
+                    &format!("[{label} ran on the normal screen]"),
+                    theme::style_dim(),
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "cannot return to the TUI ({e:#}) — reopen with `agentpit tui --session {}`",
+                    crate::cli::guidance::short_id(&self.session_id)
+                );
+                false
+            }
+        }
+    }
+
+    /// The CLI implementation behind a suspended command — the same code the subcommand
+    /// runs, so the TUI cannot drift from `agentpit status` / `agentpit login`.
+    async fn run_suspended(&self, cmd: &Suspend) -> Result<()> {
+        match cmd {
+            Suspend::Status => crate::cli::status::run(None).await,
+            Suspend::Login(requested) => {
+                let backend = self.login_target(requested.as_deref())?;
+                crate::cli::login::run(backend, false).await
+            }
+            Suspend::Learning => crate::cli::learning::run(false),
+            Suspend::Arena(words) => crate::cli::arena::run_words(words.clone()).await,
+            Suspend::Profile(words) => crate::cli::profile::run_words(words.clone()).await,
+            #[cfg(feature = "similarity")]
+            Suspend::Similarity(words) => {
+                crate::cli::similarity_cmd::run_words(words.clone()).await
+            }
+            Suspend::Outcome { verdict, run_id } => {
+                crate::cli::outcome::run(verdict.clone(), run_id.clone()).await
+            }
+            Suspend::Doctor { fix } => crate::cli::doctor::run(*fix).await,
+            Suspend::Diagnose(task) => crate::cli::diagnose::run(task.clone(), false).await,
+            Suspend::Sessions(words) => crate::cli::sessions::run_words(words.clone()).await,
+            Suspend::Mcp(words) => crate::cli::mcp_cmd::run_words(words.clone()).await,
+        }
+    }
+
+    /// Which backend `/login` means: the one named, else the one that ran the last turn,
+    /// else the configured default.
+    fn login_target(&self, requested: Option<&str>) -> Result<BackendId> {
+        if let Some(id) = requested {
+            return id.parse::<BackendId>().map_err(|e| {
+                anyhow::anyhow!(
+                    "{e}. Valid backends: {}",
+                    BackendId::ALL
+                        .iter()
+                        .map(|b| b.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+        }
+        if let Some(active) = self.active_backend.as_deref()
+            && let Ok(id) = active.parse::<BackendId>()
+        {
+            return Ok(id);
+        }
+        Ok(crate::config::load_config(None)?.config.default.backend)
     }
 
     fn on_frame(&mut self, frame: Frame) {
@@ -260,6 +417,7 @@ impl App {
                 self.busy = true;
                 self.turn_started = Instant::now();
                 self.push_line(theme::turn_start_line(&backend));
+                self.active_backend = Some(backend.clone());
                 self.backend_line = backend;
             }
             Frame::Event(Event::Chunk { text }) => {
@@ -323,11 +481,11 @@ impl App {
         }
     }
 
-    /// Handle a key; `true` = exit the TUI.
-    async fn on_key(&mut self, key: KeyEvent) -> Result<bool> {
+    /// Handle a key, telling the main loop what to do next.
+    async fn on_key(&mut self, key: KeyEvent) -> Result<KeyOutcome> {
         if let Mode::Overlay(_) = self.mode {
             self.on_overlay_key(key).await?;
-            return Ok(false);
+            return Ok(KeyOutcome::Continue);
         }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -339,28 +497,19 @@ impl App {
                     .map(|t| t.elapsed() <= Duration::from_secs(2))
                     .unwrap_or(false)
                 {
-                    return Ok(true);
+                    return Ok(KeyOutcome::Exit);
                 } else {
                     self.last_ctrl_c = Some(Instant::now());
                     self.push_text("(press Ctrl-C again within 2s to exit)", theme::style_dim());
                 }
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) if self.input.is_empty() => {
-                return Ok(true);
+                return Ok(KeyOutcome::Exit);
             }
             (KeyCode::PageUp, _) => self.scroll_by(1),
             (KeyCode::PageDown, _) => self.scroll_by(-1),
             (KeyCode::End, _) if self.input.is_empty() => self.scroll_offset = 0,
-            (KeyCode::Char('?'), _) if self.input.is_empty() => {
-                let lines = help_lines();
-                self.mode = Mode::Overlay(Overlay {
-                    kind: OverlayKind::Help,
-                    title: "Keys — Esc returns",
-                    keys: vec![String::new(); lines.len()],
-                    items: lines.into_iter().map(Line::raw).collect(),
-                    cursor: ListCursor::default(),
-                });
-            }
+            (KeyCode::Char('?'), _) if self.input.is_empty() => self.open_help(),
             (KeyCode::Left, _) if self.input.is_empty() => {
                 let rows = fetch_roster().await;
                 let items: Vec<Line<'static>> = rows
@@ -386,54 +535,143 @@ impl App {
                     cursor: ListCursor::default(),
                 });
             }
-            (KeyCode::Enter, _) => {
-                let line = self.input.submit();
-                if line.is_empty() {
-                } else if line == "/tree" {
-                    let lines = match self.request_data(RequestBody::Tree).await {
-                        Ok(ResponseData::Lines { lines }) => lines,
-                        _ => return Ok(false),
-                    };
-                    self.mode = Mode::Overlay(Overlay {
-                        kind: OverlayKind::Tree,
-                        title: "Tree — Enter moves the leaf, f forks at the cursor, Esc returns",
-                        keys: lines
-                            .iter()
-                            .map(|l| tree_line_id(l).unwrap_or("").to_string())
-                            .collect(),
-                        items: lines.into_iter().map(Line::raw).collect(),
-                        cursor: ListCursor::default(),
-                    });
-                } else if matches!(line.as_str(), "/quit" | "/exit" | "/detach") {
-                    return Ok(true);
-                } else {
-                    self.push_line(theme::user_line(&line));
-                    self.scroll_offset = 0; // sending re-follows the bottom
-                    let id = self
-                        .conn
-                        .send_request(RequestBody::Send {
-                            text: line,
-                            backend: None,
-                        })
-                        .await?;
-                    self.pending_send = Some(id);
-                    self.busy = true;
-                    self.turn_started = Instant::now();
+            // Everything else belongs to the editor: the input line and the slash menu
+            // that shares its keys. `completion::handle_key` owns that split (D4) — this
+            // loop only learns whether a line is ready to route.
+            _ => {
+                if completion::handle_key(&mut self.input, &mut self.menu, key) == Edit::Submit {
+                    // Registry-driven (D2): only `Route::FreeText` may become a Send, so
+                    // an unknown /word is refused in-screen instead of billing a turn.
+                    match route(&self.input.submit()) {
+                        Route::Ignore => {}
+                        Route::Local(Local::Exit) => return Ok(KeyOutcome::Exit),
+                        Route::Local(Local::Help) => self.open_help(),
+                        Route::Protocol(cmd) => self.run_protocol(cmd).await?,
+                        Route::Suspend(cmd) => return Ok(KeyOutcome::Suspend(cmd)),
+                        Route::Unknown(message) => self.notify(&message, theme::style_notice()),
+                        Route::FreeText(text) => self.send_turn(text.clone(), text).await?,
+                        // A skill's turn is sent exactly like a typed one; only what the
+                        // transcript shows differs — the provenance line and the command,
+                        // rather than the composed body. The note goes in before the send
+                        // so the size and the source file are on screen by the time the
+                        // turn starts, not after it.
+                        Route::Compose {
+                            provenance,
+                            label,
+                            text,
+                        } => {
+                            self.push_text(&provenance, theme::style_dim());
+                            self.send_turn(label, text).await?;
+                        }
+                        // An MCP prompt is the same turn one step later: its body is on the
+                        // server, so it is fetched here and only then sent. A server that
+                        // cannot be reached prints its refusal into the transcript and sends
+                        // nothing — a failed fetch is never a turn.
+                        Route::McpPrompt(invocation) => {
+                            match crate::mcp::prompts::invoke(&invocation).await {
+                                Ok(composed) => {
+                                    self.push_text(&composed.provenance, theme::style_dim());
+                                    self.send_turn(format!("/{}", invocation.name), composed.turn)
+                                        .await?;
+                                }
+                                Err(e) => {
+                                    self.notify(&format!("error: {e:#}"), theme::style_error())
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            (KeyCode::Backspace, _) => self.input.backspace(),
-            (KeyCode::Left, _) => self.input.left(),
-            (KeyCode::Right, _) => self.input.right(),
-            (KeyCode::Home, _) => self.input.home(),
-            (KeyCode::End, _) => self.input.end(),
-            (KeyCode::Up, _) => self.input.history_prev(),
-            (KeyCode::Down, _) => self.input.history_next(),
-            (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                self.input.insert(c);
-            }
-            _ => {}
         }
-        Ok(false)
+        Ok(KeyOutcome::Continue)
+    }
+
+    /// Start one turn: echo `shown` into the transcript and send `text` to the worker.
+    ///
+    /// The two are the same string for a line the user typed, and differ for a composed
+    /// turn (a skill), where `text` is the whole skill body.
+    async fn send_turn(&mut self, shown: String, text: String) -> Result<()> {
+        self.push_line(theme::user_line(&shown));
+        self.scroll_offset = 0; // sending re-follows the bottom
+        let id = self
+            .conn
+            .send_request(RequestBody::Send {
+                text,
+                backend: None,
+            })
+            .await?;
+        self.pending_send = Some(id);
+        self.busy = true;
+        self.turn_started = Instant::now();
+        Ok(())
+    }
+
+    /// Print a result line and re-follow the bottom, so the reader sees it even when
+    /// scrolled up.
+    fn notify(&mut self, text: &str, style: Style) {
+        self.push_text(text, style);
+        self.scroll_offset = 0;
+    }
+
+    /// The `?` / `/help` overlay: keys and the commands this screen serves.
+    fn open_help(&mut self) {
+        let lines = help_lines();
+        self.mode = Mode::Overlay(Overlay {
+            kind: OverlayKind::Help,
+            title: "Keys & commands — Esc returns",
+            keys: vec![String::new(); lines.len()],
+            items: lines.into_iter().map(Line::raw).collect(),
+            cursor: ListCursor::default(),
+        });
+    }
+
+    /// Run a worker-served command and render its result in-screen.
+    async fn run_protocol(&mut self, cmd: Protocol) -> Result<()> {
+        let request = cmd.request();
+        match cmd {
+            Protocol::Tree => {
+                let lines = match self.request_data(request).await {
+                    Ok(ResponseData::Lines { lines }) => lines,
+                    _ => return Ok(()),
+                };
+                self.mode = Mode::Overlay(Overlay {
+                    kind: OverlayKind::Tree,
+                    title: "Tree — Enter moves the leaf, f forks at the cursor, Esc returns",
+                    keys: lines
+                        .iter()
+                        .map(|l| tree_line_id(l).unwrap_or("").to_string())
+                        .collect(),
+                    items: lines.into_iter().map(Line::raw).collect(),
+                    cursor: ListCursor::default(),
+                });
+            }
+            Protocol::Branch(target) => match self.request_data(request).await {
+                Ok(_) => self.notify(
+                    &format!("moved to {target} — the next turn continues from there"),
+                    theme::style_accent(),
+                ),
+                Err(e) => self.notify(&format!("error: {e:#}"), theme::style_error()),
+            },
+            Protocol::Fork(_) => match self.request_data(request).await {
+                Ok(ResponseData::Forked { session_id }) => {
+                    let tail = crate::cli::guidance::short_id(&session_id).to_string();
+                    self.notify(
+                        &format!("forked — open it with `agentpit tui --session {tail}`"),
+                        theme::style_accent(),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => self.notify(&format!("error: {e:#}"), theme::style_error()),
+            },
+            Protocol::Compact => match self.request_data(request).await {
+                Ok(_) => self.notify(
+                    "compacted — future turns replay from the summary",
+                    theme::style_accent(),
+                ),
+                Err(e) => self.notify(&format!("error: {e:#}"), theme::style_error()),
+            },
+        }
+        Ok(())
     }
 
     /// Scroll by half a screen; +1 = up (older), -1 = down (newer).
@@ -473,22 +711,9 @@ impl App {
                     (OverlayKind::Agents, Some(session)) if !session.is_empty() => {
                         self.switch_session(session).await?;
                     }
+                    // Same command as `/branch <id>`, same rendering — one path.
                     (OverlayKind::Tree, Some(target)) if !target.is_empty() => {
-                        match self
-                            .request_data(RequestBody::Branch {
-                                target: target.clone(),
-                                summary: None,
-                            })
-                            .await
-                        {
-                            Ok(_) => self.push_text(
-                                &format!("moved to {target} — the next turn continues from there"),
-                                theme::style_accent(),
-                            ),
-                            Err(e) => {
-                                self.push_text(&format!("error: {e:#}"), theme::style_error())
-                            }
-                        }
+                        self.run_protocol(Protocol::Branch(target)).await?;
                     }
                     _ => {}
                 }
@@ -497,17 +722,8 @@ impl App {
                 let picked = overlay.keys.get(overlay.cursor.index).cloned();
                 self.mode = Mode::Chat;
                 if let Some(at) = picked.filter(|a| !a.is_empty()) {
-                    match self.request_data(RequestBody::Fork { at: Some(at) }).await {
-                        Ok(ResponseData::Forked { session_id }) => {
-                            let tail = crate::cli::guidance::short_id(&session_id).to_string();
-                            self.push_text(
-                                &format!("forked — open it with `agentpit tui --session {tail}`"),
-                                theme::style_accent(),
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => self.push_text(&format!("error: {e:#}"), theme::style_error()),
-                    }
+                    // Same command as `/fork <id>`, same rendering — one path.
+                    self.run_protocol(Protocol::Fork(Some(at))).await?;
                 }
             }
             _ => {}
@@ -559,6 +775,7 @@ impl App {
             Mode::Overlay(o) => Some(o),
             Mode::Chat => None,
         };
+        let menu = &self.menu;
         terminal.draw(|f| {
             let [transcript_area, live_area, box_area, status_area] = Layout::vertical([
                 Constraint::Min(1),
@@ -614,6 +831,32 @@ impl App {
                 f.render_stateful_widget(list, area, &mut state);
             } else {
                 f.set_cursor_position((inner.x + 2 + cursor, inner.y));
+                // The slash dropdown (D4): anchored to the input box's top edge and no
+                // taller than the room above it, so the conversation stays on screen —
+                // only the rows the popup actually needs are covered.
+                if let Some(area) = completion::popup_area(box_area, menu.matches().len()) {
+                    f.render_widget(Clear, area);
+                    let mut state = ListState::default();
+                    state.select(Some(menu.index()));
+                    let rows = menu
+                        .matches()
+                        .iter()
+                        .map(|c| ListItem::new(theme::menu_row(&c.label, c.description)));
+                    let list = List::new(rows)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(theme::BORDER_MUTED))
+                                .title(Span::styled(
+                                    " commands — Tab completes · Esc dismisses ",
+                                    theme::style_dim(),
+                                )),
+                        )
+                        .highlight_style(theme::style_selected())
+                        .highlight_symbol("› ");
+                    f.render_stateful_widget(list, area, &mut state);
+                }
             }
         })?;
         Ok(())

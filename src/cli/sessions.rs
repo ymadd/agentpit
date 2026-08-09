@@ -28,6 +28,26 @@ pub enum Action {
     },
 }
 
+/// `/sessions …` on an interactive surface, parsed with this subcommand's own clap grammar
+/// (see `arena::run_words` for why the slash surfaces reuse clap instead of re-parsing).
+#[derive(clap::Parser, Debug)]
+#[command(name = "/sessions", no_binary_name = true)]
+struct Words {
+    #[command(subcommand)]
+    action: Option<Action>,
+}
+
+/// Run `/sessions <words>`; no words is a bare `/sessions`, i.e. `list`.
+pub async fn run_words(words: Vec<String>) -> Result<()> {
+    match <Words as clap::Parser>::try_parse_from(words) {
+        Ok(parsed) => run(parsed.action).await,
+        Err(e) => {
+            let _ = e.print();
+            Ok(())
+        }
+    }
+}
+
 pub async fn run(action: Option<Action>) -> Result<()> {
     match action.unwrap_or(Action::List { json: false }) {
         Action::List { json } => list(json).await,
@@ -167,5 +187,27 @@ fn format_age(elapsed: std::time::Duration) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn slash_words_carry_the_sub_action_with_no_binary_name_in_front() {
+        // A bare `/sessions` means the CLI's bare `agentpit sessions`, i.e. list.
+        assert!(
+            Words::try_parse_from(Vec::<String>::new())
+                .unwrap()
+                .action
+                .is_none()
+        );
+        let parsed = Words::try_parse_from(["show", "a1b2c3d4"]).unwrap();
+        let Some(Action::Show { id }) = parsed.action else {
+            panic!("expected sessions show")
+        };
+        assert_eq!(id, "a1b2c3d4");
     }
 }

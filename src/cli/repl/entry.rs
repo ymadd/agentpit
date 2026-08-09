@@ -2,12 +2,18 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use console::style;
-use rustyline::DefaultEditor;
+use rustyline::Editor;
+use rustyline::history::DefaultHistory;
 
 use super::banner::{flush_stderr, print_banner};
+use super::completion::ReplHelper;
 use super::state::SessionState;
 use super::turn::{LoopControl, run_one_turn};
 use crate::session::SessionRecorder;
+
+/// The REPL's rustyline editor: [`ReplHelper`] drives Tab completion and inline hints
+/// from the shared slash registry (`crate::cli::slash`).
+pub type ReplEditor = Editor<ReplHelper, DefaultHistory>;
 
 /// Launch the persistent conversational REPL.
 ///
@@ -65,8 +71,14 @@ pub async fn run_repl(resume: Option<String>) -> Result<()> {
         },
     }
 
-    // Initialise rustyline with history.
-    let mut editor = Box::new(DefaultEditor::new()?);
+    // Fill the slash registry's second layer before anything reads it: the project scope
+    // is relative to the session's cwd, which a resume above may just have moved. Both
+    // sources read files and nothing else — no MCP server is started by opening a REPL.
+    crate::cli::slash::install(crate::cli::runtime_slash_entries(&state.cwd));
+
+    // Initialise rustyline with history and the registry-driven completion/hint helper.
+    let mut editor = Box::new(ReplEditor::new()?);
+    editor.set_helper(Some(ReplHelper::default()));
     let _ = std::fs::create_dir_all(state.history_file.parent().unwrap_or(&state.history_file));
     let _ = editor.load_history(&state.history_file); // best-effort; missing file is ok
 

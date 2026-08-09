@@ -8,6 +8,7 @@ pub mod autonomy;
 mod base;
 pub mod claude;
 pub mod codex;
+pub mod prime_agent;
 mod stream;
 pub mod workflow_manager;
 

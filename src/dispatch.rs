@@ -11,7 +11,8 @@ use crate::acp::{AcpAdapter, opencode::OpencodeAdapter};
 use crate::auth::is_auth_failure_outcome;
 use crate::config::HubConfig;
 use crate::exec::{
-    ExecAdapter, ExecRunOptions, antigravity::AntigravityExec, claude::ClaudeExec, codex::CodexExec,
+    ExecAdapter, ExecRunOptions, antigravity::AntigravityExec, claude::ClaudeExec,
+    codex::CodexExec, prime_agent::PrimeAgentExec,
 };
 use crate::types::{BackendId, Transport};
 
@@ -20,6 +21,7 @@ const DEFAULT_TRANSPORTS: &[(BackendId, Transport)] = &[
     (BackendId::Claude, Transport::Exec),
     (BackendId::Codex, Transport::Exec),
     (BackendId::Opencode, Transport::Acp),
+    (BackendId::PrimeAgent, Transport::Exec),
 ];
 
 pub struct Registries {
@@ -70,7 +72,12 @@ pub fn build_registries(config: &HubConfig) -> Registries {
             (BackendId::Opencode, Transport::Acp) => {
                 acps.insert(BackendId::Opencode, Box::new(OpencodeAdapter));
             }
-            // For now ACP transport is wired only for opencode; exec for the other three.
+            (BackendId::PrimeAgent, Transport::Exec) => {
+                execs.insert(BackendId::PrimeAgent, Box::new(PrimeAgentExec));
+            }
+            // For now ACP transport is wired only for opencode; exec for everyone else.
+            // prime-agent also speaks ACP (`prime-agent --mode acp`), but its JSON event stream
+            // is the mode its docs recommend for batch runs, so that is what is wired here.
             _ => {}
         }
     }

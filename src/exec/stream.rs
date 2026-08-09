@@ -9,6 +9,8 @@ pub enum StreamFormat {
     ClaudeJsonl,
     /// Codex `exec --json` events.
     CodexJsonl,
+    /// Prime Agent `--mode json` session events.
+    PrimeAgentJsonl,
 }
 
 /// A decoded stdout event has two independent consumers:
@@ -57,6 +59,7 @@ impl StreamDecoder {
             StreamFormat::Text => unreachable!("handled above"),
             StreamFormat::ClaudeJsonl => self.decode_claude(&value),
             StreamFormat::CodexJsonl => self.decode_codex(&value),
+            StreamFormat::PrimeAgentJsonl => self.decode_prime_agent(&value),
         }
     }
 
@@ -178,6 +181,57 @@ impl StreamDecoder {
         }
     }
 
+    /// Prime Agent `--mode json`: one `AgentSessionEvent` per line.
+    ///
+    /// Assistant text arrives as `message_update` events whose `assistantMessageEvent` carries a
+    /// `text_delta`. The enclosing `message.content` is CUMULATIVE (each update repeats the whole
+    /// text so far), so the delta — not the message — is what streams, or every chunk would be
+    /// re-emitted and the answer would grow quadratically.
+    ///
+    /// Reasoning (`thinking_delta`) is deliberately dropped from the answer: it is the model's
+    /// scratchpad, and an aggregator must synthesize the response, not the deliberation.
+    fn decode_prime_agent(&mut self, value: &Value) -> DecodedChunk {
+        match value.get("type").and_then(Value::as_str) {
+            Some("message_update") => {
+                let event = &value["assistantMessageEvent"];
+                match event.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => event
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .map(|text| self.answer(text.to_string()))
+                        .unwrap_or_default(),
+                    _ => DecodedChunk::default(),
+                }
+            }
+            // The tool NAME is progress; its `args` are not logged. prime-agent's one
+            // model-facing tool is an IPython kernel, so `args.code` is generated Python/shell
+            // that can carry credentials — the same reason codex's command arguments are elided.
+            Some("tool_execution_start") => {
+                let tool = value
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                self.progress("tool", tool)
+            }
+            // A completed assistant message repeats the full text. Kept only as a fallback for
+            // the case where no delta was seen (a non-streaming provider, or a run that failed
+            // before the first delta), so the final answer is never duplicated.
+            Some("message_end") => {
+                let message = &value["message"];
+                if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                    return DecodedChunk::default();
+                }
+                if let Some(error) = message.get("errorMessage").and_then(Value::as_str) {
+                    self.fallback_answer = Some(error.to_string());
+                } else if let Some(text) = prime_agent_message_text(message) {
+                    self.fallback_answer = Some(text);
+                }
+                DecodedChunk::default()
+            }
+            _ => DecodedChunk::default(),
+        }
+    }
+
     fn answer(&mut self, text: String) -> DecodedChunk {
         if text.is_empty() {
             return DecodedChunk::default();
@@ -217,6 +271,18 @@ impl StreamDecoder {
 
 fn claude_message_text(value: &Value) -> Option<String> {
     let content = value.get("message")?.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The plain text of a finished prime-agent assistant message: `text` blocks only, so a
+/// `thinking` block never leaks into the answer an aggregator reads.
+fn prime_agent_message_text(message: &Value) -> Option<String> {
+    let content = message.get("content")?.as_array()?;
     let text = content
         .iter()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
@@ -324,6 +390,80 @@ mod tests {
         );
         assert_eq!(first.answer.as_deref(), Some("First"));
         assert_eq!(second.answer.as_deref(), Some("\nSecond"));
+    }
+
+    /// Captured from `prime-agent --mode json` (0.7.1, 2026-08-08). `message.content` is
+    /// cumulative across updates, so only the delta may stream — asserting on it here is the
+    /// regression guard against re-emitting the whole answer on every event.
+    #[test]
+    fn prime_agent_streams_deltas_not_the_cumulative_message() {
+        let mut decoder = StreamDecoder::new(StreamFormat::PrimeAgentJsonl);
+        let start = decoder.decode_line(
+            r#"{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"","index":0}]},"assistantMessageEvent":{"type":"text_start","contentIndex":0}}"#,
+        );
+        let first = decoder.decode_line(
+            r#"{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"H","index":0}]},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"H"}}"#,
+        );
+        let second = decoder.decode_line(
+            r#"{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"HELLO","index":0}]},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"ELLO"}}"#,
+        );
+        let end = decoder.decode_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"HELLO"}],"stopReason":"stop"}}"#,
+        );
+
+        assert_eq!(start, DecodedChunk::default());
+        assert_eq!(first.answer.as_deref(), Some("H"));
+        assert_eq!(second.answer.as_deref(), Some("ELLO"));
+        // The completed message must NOT be replayed once deltas already carried it.
+        assert_eq!(end, DecodedChunk::default());
+        assert_eq!(decoder.finish().answer.as_deref(), Some("\n"));
+    }
+
+    /// Reasoning and tool arguments are progress or scratchpad, never answer: `thinking_delta`
+    /// is dropped entirely and a tool call contributes only its name.
+    #[test]
+    fn prime_agent_keeps_thinking_and_tool_args_out_of_the_answer() {
+        let mut decoder = StreamDecoder::new(StreamFormat::PrimeAgentJsonl);
+        let thinking = decoder.decode_line(
+            r#"{"type":"message_update","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"}]},"assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"plan"}}"#,
+        );
+        let tool = decoder.decode_line(
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"ipython","args":{"code":"export TOKEN=sekrit"}}"#,
+        );
+        let text = decoder.decode_line(
+            r#"{"type":"message_update","message":{"role":"assistant","content":[]},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Done"}}"#,
+        );
+
+        assert_eq!(thinking, DecodedChunk::default());
+        assert_eq!(tool.display.as_deref(), Some("[tool] ipython\n"));
+        assert_eq!(tool.answer, None);
+        let shown = tool.display.unwrap();
+        assert!(!shown.contains("sekrit"), "tool args must not be logged");
+        assert_eq!(text.answer.as_deref(), Some("Done"));
+    }
+
+    /// No delta ever arrived (non-streaming provider, or a failed turn): the completed message
+    /// — or its error — is the fallback, and `thinking` blocks stay out of it.
+    #[test]
+    fn prime_agent_falls_back_to_the_completed_message() {
+        let mut decoder = StreamDecoder::new(StreamFormat::PrimeAgentJsonl);
+        decoder.decode_line(
+            r#"{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"ignored"}]}}"#,
+        );
+        decoder.decode_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"scratch"},{"type":"text","text":"fallback"}],"stopReason":"stop"}}"#,
+        );
+        let final_chunk = decoder.finish();
+        assert_eq!(final_chunk.answer.as_deref(), Some("fallback\n"));
+
+        let mut failed = StreamDecoder::new(StreamFormat::PrimeAgentJsonl);
+        failed.decode_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"401 Unauthorized"}}"#,
+        );
+        assert_eq!(
+            failed.finish().answer.as_deref(),
+            Some("401 Unauthorized\n")
+        );
     }
 
     #[test]

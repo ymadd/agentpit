@@ -43,6 +43,14 @@ impl InputState {
         self.cursor -= 1;
     }
 
+    /// Replace the whole line, cursor at the end — what the slash menu's accept does
+    /// (`super::completion`). Ends any history browse: the line is a fresh edit now.
+    pub fn set_line(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.cursor = self.char_len();
+        self.browse = None;
+    }
+
     pub fn left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }

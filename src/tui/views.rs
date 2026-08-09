@@ -65,7 +65,11 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
         "/tree",
         "Tree View: branches; Enter moves the leaf, f forks at the cursor",
     ),
-    ("↑ / ↓", "input history (from an empty line)"),
+    (
+        "/ (line start)",
+        "command menu: type to filter, ↑↓ select, Tab completes, Esc dismisses",
+    ),
+    ("↑ / ↓", "input history (from an empty line, menu closed)"),
     (
         "PageUp / PageDown",
         "scroll the transcript; End follows the newest",
@@ -79,17 +83,51 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
     ("Esc", "leave an overlay"),
 ];
 
-/// Render the help overlay's lines from [`KEYBINDINGS`].
+/// Render the help overlay: the keys from [`KEYBINDINGS`], then the slash commands this
+/// screen serves, read from the shared registry (design D2) so a row added there shows up
+/// here — and only here — without a second list to keep in sync.
 pub fn help_lines() -> Vec<String> {
-    let width = KEYBINDINGS
+    use crate::cli::slash::{Surface, form_label, help_order};
+
+    let key_width = KEYBINDINGS
         .iter()
         .map(|(k, _)| k.chars().count())
         .max()
         .unwrap_or(0);
-    KEYBINDINGS
+    let commands: Vec<(String, &'static str)> = help_order(Surface::Tui)
         .iter()
-        .map(|(key, what)| format!("  {key:width$}  {what}"))
-        .collect()
+        .flat_map(|spec| {
+            spec.forms
+                .iter()
+                .enumerate()
+                .map(move |(i, form)| (form_label(spec, i), form.description.as_ref()))
+        })
+        .collect();
+    let label_width = commands
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines: Vec<String> = KEYBINDINGS
+        .iter()
+        .map(|(key, what)| format!("  {key:key_width$}  {what}"))
+        .collect();
+    lines.push(String::new());
+    lines.push("  Commands".to_string());
+    lines.extend(
+        commands
+            .iter()
+            .map(|(label, what)| format!("  {label:label_width$}  {what}")),
+    );
+    // What discovery refused, on the same terms the REPL's `/help` states it. A skill that
+    // failed to load is invisible by construction — there is no row for a command that does
+    // not exist — so the only place the user can learn their file was passed over is here.
+    if let Some(note) = crate::cli::skills::skipped_note(crate::cli::skills::skipped()) {
+        lines.push(String::new());
+        lines.push(format!("  {note}"));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -137,8 +175,32 @@ mod tests {
     #[test]
     fn help_is_generated_from_the_keybinding_table() {
         let lines = help_lines();
-        assert_eq!(lines.len(), KEYBINDINGS.len());
         assert!(lines.iter().any(|l| l.contains("Agents View")));
         assert!(lines.iter().any(|l| l.contains("twice within 2s")));
+        for (key, _) in KEYBINDINGS {
+            assert!(
+                lines.iter().any(|l| l.contains(key)),
+                "the {key} binding is missing from /help"
+            );
+        }
+    }
+
+    #[test]
+    fn help_lists_every_command_the_tui_claims() {
+        use crate::cli::slash::{Surface, form_label, help_order};
+
+        let lines = help_lines();
+        assert!(lines.iter().any(|l| l == "  Commands"));
+        for spec in help_order(Surface::Tui) {
+            for i in 0..spec.forms.len() {
+                let label = form_label(spec, i);
+                assert!(
+                    lines.iter().any(|l| l.contains(&label)),
+                    "/help does not mention {label}"
+                );
+            }
+        }
+        // …and nothing the TUI cannot run: /menu is REPL-only.
+        assert!(!lines.iter().any(|l| l.contains("/menu")));
     }
 }

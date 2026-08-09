@@ -354,6 +354,7 @@ mod tests {
             arena: Default::default(),
             session: Default::default(),
             repl: Default::default(),
+            mcp: Default::default(),
         }
     }
 

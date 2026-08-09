@@ -38,7 +38,17 @@ ratatui = "0.30"
 # Cell-accurate wrapping for the transcript's internal scroll (CJK-safe).
 unicode-width = "0.2"
 regex = "1"
-rmcp = { version = "=1.7.0", features = ["server", "macros", "transport-io"] }
+# Both halves of MCP on one pinned crate: `server`/`transport-io` back `agentpit mcp serve`
+# (agentpit AS a server), `client`/`transport-child-process` back `agentpit mcp refresh`
+# (agentpit as a CLIENT of other servers, spawned over stdio). The `=` pin is deliberate —
+# rmcp's client API moves between minors.
+rmcp = { version = "=1.7.0", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "client",
+    "transport-child-process",
+] }
 rustyline = "18"
 # Direct dep on the reqwest self_update already brings in (blocking client): the latest-tag
 # probe needs redirects DISABLED to read the Location header, which self_update's own

@@ -47,18 +47,19 @@ jobs:
         run: cargo test --workspace --exclude agentpit-dashboard --locked
 
   # The similarity feature (fastembed/ONNX) is off by default, so without this it would
-  # never be linted or tested in CI. Tests never download the model — the embedder is
+  # never be linted or built in CI. Tests never download the model — the embedder is
   # gated behind `agentpit similarity init` — so this stays network-free.
   #
-  # Runs as its own job with defense-in-depth timeouts. History: on 2026-08-08 seven
-  # consecutive runs of this suite died with "runner lost communication" and zero logs;
-  # a six-round bisect (see closed PR #11) showed no test or combination reproduces it —
-  # the same full suite passes in 27 s — so it was an Actions-infrastructure incident.
-  # The job split (own cache/disk), debuginfo=0, -j 2, serial tests, and the two-level
-  # timeout stay: they make the suite fast, and any recurrence dies WITH logs instead of
-  # starving the runner for 49 minutes.
+  # LINT + BUILD ONLY, deliberately. Running this suite on hosted runners starved the
+  # runner to death ("lost communication", zero logs, even `timeout(1)` never fired)
+  # 8 times on 2026-08-08 — yet a six-round bisect (closed PR #11) passed the identical
+  # full suite in 27 s, and locally it runs in 11 s. Nondeterministic, environmental,
+  # and expensive to keep chasing: the feature-gated tests themselves are six pure
+  # arithmetic tests, so execution stays a local-gate concern. If this is revisited,
+  # prefer cargo-nextest (per-test process isolation + per-test timeouts) so a hang
+  # names its culprit instead of taking the runner down.
   similarity:
-    name: clippy · test (similarity feature)
+    name: clippy · build tests (similarity feature)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -97,11 +98,6 @@ jobs:
 
       - name: Build tests (similarity)
         run: cargo test -p agentpit --features similarity --locked -j 2 --no-run
-
-      # Serial test threads so a hang names its culprit (the test after the last printed
-      # name), and a process-level timeout so the runner survives to upload the log.
-      - name: Test (similarity)
-        run: timeout -k 30 600 cargo test -p agentpit --features similarity --locked -j 2 -- --test-threads=1
 
       - name: Disk usage
         if: always()

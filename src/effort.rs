@@ -1,9 +1,9 @@
 //! Central declaration of the reasoning-effort ladder every backend is dispatched at.
 //!
 //! Each backend CLI exposes reasoning effort under its own name and its own vocabulary
-//! (`claude --effort`, `codex -c model_reasoning_effort=`, `agy --effort`, opencode's model
-//! *variant*), and the rungs do not line up: agy stops at `high`, codex's top rung is `xhigh`,
-//! claude goes one further to `max`. Rather than leave that mismatch to each adapter's flag
+//! (`claude --effort`, `codex -c model_reasoning_effort=`, `agy --effort`, `prime-agent
+//! --thinking`, opencode's model *variant*), and the rungs do not line up: agy stops at `high`,
+//! codex's top rung is `xhigh`, claude goes one further to `max`. Rather than leave that mismatch to each adapter's flag
 //! building — the same reasoning [`autonomy`](crate::exec::autonomy) centralises for permission
 //! posture — agentpit defines ONE canonical ladder here and declares, in a single auditable
 //! table, what each rung becomes on each backend.
@@ -57,11 +57,16 @@ impl Effort {
     /// The rung `self` becomes on `backend`, clamped to the highest rung that backend's CLI
     /// accepts. Verified against the locally installed CLIs (2026-07-31):
     ///
-    /// | canonical | claude 2.1 `--effort` | codex 0.146 `model_reasoning_effort` | agy 1.1 `--effort` | opencode 1.18 variant |
-    /// |---|---|---|---|---|
-    /// | low / medium / high | same | same | same | same |
-    /// | xhigh | `xhigh` | `xhigh` | **`high`** | `xhigh` |
-    /// | max | `max` | **`xhigh`** | **`high`** | `max` |
+    /// | canonical | claude 2.1 `--effort` | codex 0.146 `model_reasoning_effort` | agy 1.1 `--effort` | opencode 1.18 variant | prime-agent 0.7 `--thinking` |
+    /// |---|---|---|---|---|---|
+    /// | low / medium / high | same | same | same | same | same |
+    /// | xhigh | `xhigh` | `xhigh` | **`high`** | `xhigh` | `xhigh` |
+    /// | max | `max` | **`xhigh`** | **`high`** | `max` | `max` |
+    ///
+    /// prime-agent's ladder is a superset (it also offers `off` and `minimal`, below the
+    /// canonical floor), so nothing clamps there either. It only WARNS on an unknown value
+    /// rather than failing, which is precisely why the value handed to it comes from this
+    /// table instead of free text.
     ///
     /// opencode's variant is provider-specific by definition (`--variant` documents itself as
     /// "provider-specific reasoning effort"), so the rung passes through unclamped and the
@@ -77,9 +82,13 @@ impl Effort {
             BackendId::Antigravity => Effort::High,
             // codex tops out at xhigh (and only on models that offer it).
             BackendId::Codex => Effort::XHigh,
-            BackendId::Claude | BackendId::Opencode | BackendId::Goose | BackendId::Copilot => {
-                Effort::Max
-            }
+            // prime-agent's `--thinking` ladder (off|minimal|low|medium|high|xhigh|max) is a
+            // superset of the canonical one, so nothing clamps.
+            BackendId::Claude
+            | BackendId::Opencode
+            | BackendId::PrimeAgent
+            | BackendId::Goose
+            | BackendId::Copilot => Effort::Max,
         };
         self.min(ceiling)
     }
@@ -154,8 +163,9 @@ mod tests {
         // codex stops at xhigh.
         assert_eq!(Effort::Max.clamp_for(BackendId::Codex), Effort::XHigh);
         assert_eq!(Effort::XHigh.clamp_for(BackendId::Codex), Effort::XHigh);
-        // claude carries the whole ladder.
+        // claude carries the whole ladder, and so does prime-agent's `--thinking`.
         assert_eq!(Effort::Max.clamp_for(BackendId::Claude), Effort::Max);
+        assert_eq!(Effort::Max.clamp_for(BackendId::PrimeAgent), Effort::Max);
         // Clamping never raises a rung.
         for backend in BackendId::ALL {
             for e in Effort::ALL {

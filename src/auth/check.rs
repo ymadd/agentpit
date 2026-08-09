@@ -100,6 +100,10 @@ fn claude_status_from_exit(exit: i32) -> AuthStatus {
 /// `docs/providers.md`; a provider missing here only means agentpit cannot *see* that credential,
 /// never that a dispatch would fail.
 const PRIME_AGENT_PROVIDERS: &[(&str, &str)] = &[
+    // Subscription logins (`/login` with ChatGPT or GitHub Copilot): auth.json only, no
+    // environment fallback — the empty var name never matches an env lookup.
+    ("openai-codex", ""),
+    ("github-copilot", ""),
     ("anthropic", "ANTHROPIC_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
     ("prime-inference", "PRIME_API_KEY"),
@@ -163,12 +167,21 @@ fn prime_agent_status(auth_file: &str, env_provider: Option<&str>) -> AuthStatus
 }
 
 async fn check_prime_agent() -> AuthStatus {
-    let auth_file = tokio::fs::read_to_string(home_join(&[".prime", "agent", "auth.json"]))
+    // prime-agent honors <PREFIX>_CODING_AGENT_DIR (PRIME_AGENT_ for the branded build,
+    // PI_ for the base one) as its agent directory; the default is ~/.prime/agent.
+    let auth_path = ["PRIME_AGENT_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|dir| !dir.trim().is_empty()))
+        .map(|dir| std::path::PathBuf::from(dir).join("auth.json"))
+        .unwrap_or_else(|| home_join(&[".prime", "agent", "auth.json"]));
+    let auth_file = tokio::fs::read_to_string(auth_path)
         .await
         .unwrap_or_default();
     let env_provider = PRIME_AGENT_PROVIDERS
         .iter()
-        .find(|(_, var)| std::env::var(var).is_ok_and(|value| !value.trim().is_empty()))
+        .find(|(_, var)| {
+            !var.is_empty() && std::env::var(var).is_ok_and(|value| !value.trim().is_empty())
+        })
         .map(|(provider, _)| *provider);
     prime_agent_status(&auth_file, env_provider)
 }

@@ -357,6 +357,7 @@ const MODEL = {
   gemini: { mono: "G", color: "#6f8fd9" },
   antigravity: { mono: "ag", color: "#c9a227" },
   opencode: { mono: "oc", color: "#7c5cff" },
+  "prime-agent": { mono: "pa", color: "#4f8ef7" },
   goose: { mono: "go", color: "#a7adba" },
   copilot: { mono: "cp", color: "#7d8595" },
 };
@@ -1029,7 +1030,7 @@ function persistSavedSteps() {
 // Wire/transport per backend — the CLI inventory has no transport field, so pin the known shapes
 // (matches how each backend is actually launched: exec for the CLIs, ACP for opencode).
 const CLI_TRANSPORT = { claude: "exec", codex: "exec", antigravity: "exec", gemini: "exec", opencode: "acp" };
-const CLI_NAME = { claude: "Claude Code", codex: "Codex", antigravity: "Antigravity", gemini: "Gemini CLI", opencode: "OpenCode" };
+const CLI_NAME = { claude: "Claude Code", codex: "Codex", antigravity: "Antigravity", gemini: "Gemini CLI", opencode: "OpenCode", "prime-agent": "Prime Agent" };
 
 let settingsDirty = false; // unsaved CONFIG edits (roles/workflow/types/backend models) — not the blueprint
 let studio = null; // local studio/blueprint view state (see newStudio)

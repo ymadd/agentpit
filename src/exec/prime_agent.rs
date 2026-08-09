@@ -21,11 +21,12 @@ impl ExecAdapter for PrimeAgentExec {
     fn build_spec(&self, task: &str, model: Option<&str>, effort: Option<Effort>) -> ExecSpec {
         let mut args = vec!["--mode".into(), "json".into()];
         if let Some(m) = model {
-            // prime-agent: `--model <id>` as listed by `prime-agent model list`. The id is
-            // passed through verbatim — prime-inference ids contain slashes
-            // ("anthropic/claude-opus-5"), so agentpit must not try to split a provider off.
-            // Pin the provider explicitly with `[backends.prime-agent]` + `--provider` only if
-            // an id is ambiguous across providers.
+            // prime-agent: `--model` takes either a bare id or the canonical
+            // `provider/model` selector, resolved by splitting on the FIRST slash. The
+            // dashboard catalog stores the canonical form (a bare Prime Inference id like
+            // "anthropic/claude-opus-5" would route to the Anthropic provider instead), and
+            // agentpit passes whatever it was given through verbatim — never splitting or
+            // reassembling it here.
             args.push("--model".into());
             args.push(m.to_string());
         }

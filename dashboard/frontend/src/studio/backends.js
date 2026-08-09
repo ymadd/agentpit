@@ -6,6 +6,7 @@ export const MODEL = {
   codex: { mono: "co", color: "#56b89a" },
   antigravity: { mono: "ag", color: "#c9a227" },
   opencode: { mono: "oc", color: "#7c5cff" },
+  "prime-agent": { mono: "pa", color: "#4f8ef7" },
   goose: { mono: "go", color: "#a7adba" },
   copilot: { mono: "cp", color: "#7d8595" },
 };
@@ -15,6 +16,7 @@ export const CLI_NAME = {
   codex: "Codex",
   antigravity: "Antigravity",
   opencode: "OpenCode",
+  "prime-agent": "Prime Agent",
 };
 
 export function metaFor(id) {

@@ -40,13 +40,14 @@ pub struct ModelCatalog {
 pub async fn list(refresh: bool) -> Vec<ModelCatalog> {
     // These probes are independent and can each involve network/auth checks. Running them
     // concurrently keeps opening Settings bounded by the slowest CLI instead of their sum.
-    let (codex, antigravity, opencode) = tokio::join!(
+    let (codex, antigravity, opencode, prime_agent) = tokio::join!(
         codex_catalog(),
         antigravity_catalog(),
-        opencode_catalog(refresh)
+        opencode_catalog(refresh),
+        prime_agent_catalog()
     );
 
-    vec![claude_catalog(), codex, antigravity, opencode]
+    vec![claude_catalog(), codex, antigravity, opencode, prime_agent]
 }
 
 fn claude_catalog() -> ModelCatalog {
@@ -121,6 +122,21 @@ async fn opencode_catalog(refresh: bool) -> ModelCatalog {
             }
         }
         Err(error) => failure("opencode", source, error),
+    }
+}
+
+async fn prime_agent_catalog() -> ModelCatalog {
+    let source = "prime-agent model list";
+    match run_cli("prime-agent", &["model", "list"]).await {
+        Ok(stdout) => {
+            let models = parse_prime_agent_models(&stdout);
+            if models.is_empty() {
+                failure("prime-agent", source, "Prime Agent returned no models")
+            } else {
+                success("prime-agent", source, models)
+            }
+        }
+        Err(error) => failure("prime-agent", source, error),
     }
 }
 
@@ -233,6 +249,48 @@ fn parse_line_models(raw: &str, require_provider_prefix: bool) -> Vec<ModelOptio
         .collect()
 }
 
+/// `prime-agent model list` prints a padded table, not one id per line:
+///
+/// ```text
+/// provider         model                     context  max-out  thinking  images
+/// anthropic        claude-opus-5             1M       128K     yes       yes
+/// prime-inference  anthropic/claude-opus-5   1M       128K     yes       yes
+/// ```
+///
+/// The option VALUE is the canonical `provider/model` selector. prime-agent resolves
+/// `--model` by splitting on the FIRST slash and treating a recognized prefix as a
+/// provider, so passing a bare Prime Inference id like `anthropic/claude-opus-5` would
+/// route to Anthropic directly — different credentials, billing and data destination.
+/// Deduplication is by the full selector, so the same id under two providers stays
+/// selectable under both. Only rows after the `provider  model …` header are parsed:
+/// diagnostic prose ("No models available…") can never become a selectable model.
+fn parse_prime_agent_models(raw: &str) -> Vec<ModelOption> {
+    let clean = clean_text(raw);
+    let mut seen = HashSet::new();
+    let mut in_table = false;
+    clean
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let provider = fields.next()?;
+            let model = fields.next()?;
+            if provider == "provider" && model == "model" {
+                in_table = true;
+                return None;
+            }
+            in_table.then(|| (provider.to_string(), model.to_string()))
+        })
+        .filter(|(provider, model)| seen.insert(format!("{provider}/{model}")))
+        .take(MAX_MODELS)
+        .map(|(provider, model)| ModelOption {
+            label: format!("{model} ({provider})"),
+            value: format!("{provider}/{model}"),
+        })
+        .collect()
+}
+
 fn clean_text(raw: &str) -> String {
     // Strip ANSI CSI sequences emitted by some CLIs while keeping Unicode model names intact.
     let mut clean = String::with_capacity(raw.len());
@@ -265,6 +323,40 @@ fn truncate_chars(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Captured from `prime-agent model list` (0.7.1, 2026-08-08), padding and all.
+    const PRIME_AGENT_TABLE: &str = concat!(
+        "provider         model                       context  max-out  thinking  images\n",
+        "anthropic        claude-opus-5               1M       128K     yes       yes   \n",
+        "prime-inference  anthropic/claude-opus-5     1M       128K     yes       yes   \n",
+        "prime-inference  deepseek/deepseek-v4-pro    1.0M     384K     yes       no    \n",
+    );
+
+    #[test]
+    fn prime_agent_table_yields_canonical_selectors() {
+        let models = parse_prime_agent_models(PRIME_AGENT_TABLE);
+        assert_eq!(
+            models.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(),
+            [
+                "anthropic/claude-opus-5",
+                "prime-inference/anthropic/claude-opus-5",
+                "prime-inference/deepseek/deepseek-v4-pro"
+            ],
+            "values must keep the provider: a bare `anthropic/claude-opus-5` would be \
+             resolved by prime-agent as the Anthropic provider, not Prime Inference"
+        );
+        // The label still shows the raw id plus provider, as before.
+        assert_eq!(models[1].label, "anthropic/claude-opus-5 (prime-inference)");
+        assert!(parse_prime_agent_models("").is_empty());
+    }
+
+    #[test]
+    fn prime_agent_prose_and_headerless_output_yield_no_models() {
+        // A successful invocation with no models prints prose, not a table; two words on a
+        // line must not become a bogus model entry.
+        let prose = "No models available to display.\nUse /login to sign in first.";
+        assert!(parse_prime_agent_models(prose).is_empty());
+    }
 
     #[test]
     fn claude_uses_documented_aliases_and_keeps_custom_input_possible_in_ui() {

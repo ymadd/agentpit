@@ -1,6 +1,6 @@
 # agentpit
 
-Single-binary CLI that routes coding tasks across **Antigravity (agy)**, **Claude Code**, **Codex**, and **OpenCode** — pick the best agent per task, fan out to several in parallel, or let `agentpit` choose for you.
+Single-binary CLI that routes coding tasks across **Antigravity (agy)**, **Claude Code**, **Codex**, **OpenCode**, and **Prime Agent** — pick the best agent per task, fan out to several in parallel, or let `agentpit` choose for you.
 
 ![agentpit Workflow Studio — cast each agent into a role and orchestrate a model-driven workflow](assets/dashboard-studio.png)
 
@@ -8,7 +8,7 @@ Single-binary CLI that routes coding tasks across **Antigravity (agy)**, **Claud
 
 ## Why
 
-Different coding agents are good at different things: long-context reads on Antigravity, refactors on Claude, adversarial review on Codex, free local models on OpenCode. `agentpit` is the dispatcher in front of them so you never have to remember which CLI to open.
+Different coding agents are good at different things: long-context reads on Antigravity, refactors on Claude, adversarial review on Codex, free local models on OpenCode, and any provider/model behind one IPython-backed harness on Prime Agent. `agentpit` is the dispatcher in front of them so you never have to remember which CLI to open.
 
 - **One binary, many backends** — Rust, no runtime
 - **One-shot dispatch** — `agentpit rescue "task"` picks a backend by your routing rules
@@ -76,12 +76,14 @@ agentpit init --scope user
 | `claude` | `claude` | exec | `~/.claude.json` |
 | `codex` | `codex` | exec | `codex login status` |
 | `opencode` | `~/.opencode/bin/opencode` | acp | binary present |
+| `prime-agent` (aliases `prime`, `pa`) | `prime-agent` | exec | `~/.prime/agent/auth.json` or a provider API-key env var |
 
 Each backend's transport (`exec` per-request or `acp` persistent session) can be overridden in `config.toml`.
 
 Backend output is streamed to the terminal and dashboard without exposing provider-specific
 framing. Claude Code (`stream-json` partial messages),
-and Codex (`exec --json`) are decoded into clean text plus live tool progress; OpenCode already
+Codex (`exec --json`), and Prime Agent (`--mode json` session events) are decoded into clean text
+plus live tool progress; OpenCode already
 streams text through ACP. Antigravity currently has no documented structured stream, so its
 `--print` stdout remains a best-effort byte stream. Aggregators receive only the decoded answer —
 never JSONL or progress lines.
@@ -92,6 +94,7 @@ never JSONL or progress lines.
 - **Claude Code** — install per [Anthropic docs](https://docs.claude.com/claude-code)
 - **Codex** — `npm i -g @openai/codex`
 - **OpenCode** — `curl -fsSL https://opencode.ai/install | bash`
+- **Prime Agent** — `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh`
 
 ## Usage
 
@@ -224,6 +227,42 @@ Notes:
 - If `agy`'s non-interactive flag changes, edit the same file.
 - ACP transport is **not yet wired** for `agy` — once Google publishes an `--acp` mode equivalent we'll add it.
 - Auth is OAuth on first run of `agy`. For headless boxes use `agy auth login`.
+
+## Prime Agent (`prime-agent`) — RLM/IPython harness
+
+[Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) is Prime Intellect's coding CLI:
+one model-facing tool (a persistent IPython kernel), recursive subagents, and a provider catalog
+that spans Anthropic, OpenAI, Google, DeepSeek, Prime Inference, and more. That makes it the one
+backend whose strength is chosen at dispatch time rather than baked in — pin the model and it
+becomes whichever agent you need.
+
+```bash
+agentpit rescue "port the parser to nom" --backend prime-agent
+agentpit rescue "..." --backend pa --model anthropic/claude-opus-5 --effort xhigh
+prime-agent model list                  # the ids --model accepts
+```
+
+Notes:
+
+- Exec spec is `prime-agent --mode json [--model <id>] [--thinking <rung>] -- <task>`. The JSON
+  event stream is what its own docs recommend for batch runs, and it is what lets agentpit show
+  live tool progress while keeping the collected answer free of JSONL. `--` guarantees a task
+  beginning with a dash is a message, not a flag.
+- `--effort` maps to `--thinking`, which accepts the whole canonical ladder — nothing clamps.
+- **Model ids are passed through verbatim.** Prime Inference ids contain slashes
+  (`anthropic/claude-opus-5`), so agentpit never splits a provider off the front. Set a default
+  with `[backends.prime-agent].model`.
+- **No approval gate exists to bypass**: prime-agent's IPython tool runs model-generated Python
+  and shell with your own OS permissions, and non-interactive modes have no UI to confirm
+  through. It is declared `FullAutonomy` for that reason. Use a sandboxed checkout for untrusted
+  work.
+- Auth is `~/.prime/agent/auth.json` (written by `/login` inside the TUI — Claude Pro/Max,
+  ChatGPT, or Copilot subscriptions, or a stored API key) or a provider env var such as
+  `ANTHROPIC_API_KEY`. `agentpit login prime-agent` opens the TUI so you can run `/login`; there
+  is no non-interactive login subcommand to shell out to.
+- It ships **no seeded capability profile** on purpose: a model-agnostic harness would be
+  mis-described by a fixed prior. Measure it instead — `agentpit profile run --backend
+  prime-agent` — and the benchmarked scores enter auto-routing like any other backend.
 
 ## How auto-routing works
 

@@ -4,7 +4,7 @@ argument-hint: [backend?] <task> [--model <m>]
 ---
 
 Parse `$ARGUMENTS`:
-- If the first whitespace-separated token is one of `claude`, `codex`, `antigravity` (or `agy`), `opencode`, treat it as the backend override; the rest is the task.
+- If the first whitespace-separated token is one of `claude`, `codex`, `antigravity` (or `agy`), `opencode`, `prime-agent` (or `prime` / `pa`), treat it as the backend override; the rest is the task.
 - Otherwise, the entire `$ARGUMENTS` is the task and agentpit auto-routes (`[routes]` pin → capability profile → similarity → long-context/keyword heuristics → default).
 
 Run the `agentpit` CLI via Bash:

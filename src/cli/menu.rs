@@ -459,6 +459,11 @@ fn pick_backend(label: &str) -> anyhow::Result<Option<BackendId>> {
             .item(BackendId::Claude, "claude", "")
             .item(BackendId::Codex, "codex", "")
             .item(BackendId::Opencode, "opencode", "")
+            .item(
+                BackendId::PrimeAgent,
+                "prime-agent",
+                "Prime Agent — RLM/IPython harness",
+            )
             .item(BackendId::Goose, "goose", "")
             .item(BackendId::Copilot, "copilot", "GitHub Copilot")
             .interact(),

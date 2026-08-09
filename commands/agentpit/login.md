@@ -1,6 +1,6 @@
 ---
 description: Check or trigger the login flow for a backend agent
-argument-hint: <claude|codex|antigravity|opencode> [--check]
+argument-hint: <claude|codex|antigravity|opencode|prime-agent> [--check]
 ---
 
 Parse `$ARGUMENTS`:

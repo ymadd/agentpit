@@ -52,8 +52,12 @@ fn seeded_profile(backend: BackendId, rows: &[(TaskCategory, u8)]) -> Capability
 /// - **antigravity** — long context / docs.
 /// - **opencode** — middling all-rounder (no standout column).
 ///
-/// Backends without a row here (goose, copilot) simply have no seeded scores and are picked
-/// up only once benchmarked.
+/// Backends without a row here (prime-agent, goose, copilot) simply have no seeded scores and
+/// are picked up only once benchmarked. For **prime-agent** that is deliberate rather than an
+/// omission: it is a model-agnostic harness driving whichever provider/model is selected, so a
+/// fixed prior would encode the harness instead of the model that actually runs. Measure it with
+/// `agentpit profile run --backend prime-agent` (optionally per `--model`) and the benchmarked
+/// scores supersede any guess.
 pub fn seeded_profiles() -> ProfileSet {
     use TaskCategory::*;
 

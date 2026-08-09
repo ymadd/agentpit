@@ -18,7 +18,7 @@ Use this skill to hand a one-shot task off to another coding agent without leavi
 Run the CLI:
 
 ```bash
-agentpit rescue "<task description>" [--backend claude|codex|antigravity|opencode]
+agentpit rescue "<task description>" [--backend claude|codex|antigravity|opencode|prime-agent]
 ```
 
 Omit `--backend` to let agentpit auto-route. The chain, first hit wins: a `[routes]` hard pin

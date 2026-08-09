@@ -102,6 +102,18 @@ pub struct DispatchResult {
     /// True when the backend's output looks like an auth failure. Detected once here so
     /// callers act on a typed flag instead of each re-running `is_auth_failure`.
     pub auth_failed: bool,
+    /// The backend's own session/thread id captured from the stream, for native
+    /// continuation via [`dispatch_continuing`]. `None` on Text streams and the ACP path.
+    pub backend_session_ref: Option<String>,
+}
+
+/// Whether `backend` can natively continue from a `backend_session_ref` — the caller's
+/// pre-dispatch signal for choosing the raw task (native) vs a composed context (§4.3).
+pub fn supports_native_continuation(backend: BackendId, regs: &Registries) -> bool {
+    regs.execs
+        .get(&backend)
+        .map(|e| e.supports_resume())
+        .unwrap_or(false)
 }
 
 /// Safety cap on a single backend dispatch. A wedged backend (produces no output and
@@ -154,6 +166,28 @@ pub async fn dispatch(
     model: Option<&str>,
     effort: Option<crate::effort::Effort>,
 ) -> Result<DispatchResult> {
+    dispatch_continuing(
+        backend, task, cwd, cancel, on_chunk, regs, model, effort, None,
+    )
+    .await
+}
+
+/// [`dispatch`] with native session continuation: `continue_from` is an opaque
+/// `backend_session_ref` from a prior result, translated into resume flags by the exec
+/// adapter (claude/codex today). Ignored on the ACP path and by adapters without
+/// [`ExecAdapter::supports_resume`] — callers pre-compose context in those cases (§4.3).
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_continuing(
+    backend: BackendId,
+    task: &str,
+    cwd: &Path,
+    cancel: CancellationToken,
+    on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
+    regs: &Registries,
+    model: Option<&str>,
+    effort: Option<crate::effort::Effort>,
+    continue_from: Option<&str>,
+) -> Result<DispatchResult> {
     // A child of the caller's token: the parent (Ctrl-C) still cancels every member, but a
     // per-member timeout cancels only this child, leaving concurrent siblings untouched.
     let child = cancel.child_token();
@@ -164,6 +198,7 @@ pub async fn dispatch(
             on_stdout: Some(on_chunk.clone()),
             model: model.map(str::to_string),
             effort,
+            continue_from: continue_from.map(str::to_string),
         };
         let fut = crate::exec::run(exec.as_ref(), task, options);
         let outcome = with_timeout(backend, &child, fut).await?;
@@ -175,6 +210,7 @@ pub async fn dispatch(
                 outcome.exit_code.map(|code| code == 0),
             ),
             output: outcome.output,
+            backend_session_ref: outcome.backend_session_ref,
         });
     }
     if let Some(acp) = regs.acps.get(&backend) {
@@ -198,6 +234,7 @@ pub async fn dispatch(
             // answer discarded. Protocol status classifies the run; answer text never does.
             auth_failed: is_auth_failure_outcome(&outcome.output, Some(true)),
             output: outcome.output,
+            backend_session_ref: None,
         });
     }
     Err(anyhow!("No transport registered for backend {backend}"))

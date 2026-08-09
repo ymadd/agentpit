@@ -25,6 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod session;
+pub mod session_lease;
+
 /// Backend agents agentpit can route to. Lives here so the event schema and the CLI
 /// share one definition. The CLI re-exports this as `crate::types::BackendId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -389,16 +392,22 @@ fn normalize_task(task: &str) -> String {
     task.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// FNV-1a 64-bit over the normalized task text, hex-encoded. Deterministic and dependency-free;
-/// at personal-use scale a 64-bit space makes collisions a non-issue. (std's DefaultHasher is
-/// explicitly not stable across releases, so it can't key on-disk state.)
-pub fn task_hash(task: &str) -> String {
+/// FNV-1a 64-bit, hex-encoded. Deterministic and dependency-free; at personal-use scale a
+/// 64-bit space makes collisions a non-issue. (std's DefaultHasher is explicitly not stable
+/// across releases, so it can't key on-disk state.) Keys `tasks/<hash>.txt` and the
+/// session-lease directories.
+pub(crate) fn fnv1a_64_hex(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in normalize_task(task).as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// FNV-1a 64-bit over the normalized task text, hex-encoded.
+pub fn task_hash(task: &str) -> String {
+    fnv1a_64_hex(normalize_task(task).as_bytes())
 }
 
 /// Save the normalized task text under `tasks/<hash>.txt` (truncated to 4KB on a char boundary)

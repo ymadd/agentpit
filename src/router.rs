@@ -352,6 +352,8 @@ mod tests {
             backends: BTreeMap::new(),
             cascade: Default::default(),
             arena: Default::default(),
+            session: Default::default(),
+            repl: Default::default(),
         }
     }
 

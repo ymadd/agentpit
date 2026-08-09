@@ -8,10 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::state::SessionState;
 use crate::auth::check_auth;
-use crate::config::RouteKey;
-use crate::dispatch::{DispatchResult, dispatch, resolve_transport};
-use crate::events::{LegStatus, RunKind, RunLogger, output_streamer};
-use crate::router::{RouteRequest, Router};
+use crate::session::ExchangeStatus;
+use crate::session::turn_engine::{EngineEvent, TurnEngine, TurnOutcome};
 use crate::types::BackendId;
 
 /// Parse an optional inline `@backend` modifier from the start of a free-text turn.
@@ -38,233 +36,157 @@ pub fn parse_at_modifier(input: &str) -> Option<(Option<BackendId>, String)> {
     }
 }
 
-/// Drive one free-text turn: route → auth → dispatch (with streaming + event tee).
-///
-/// Returns the (possibly unchanged) `SessionState`. Errors during dispatch are
-/// printed-and-continued rather than propagated, so the REPL loop always gets back
-/// a usable state for the next prompt.
+/// Drive one free-text turn through the shared [`TurnEngine`]: auth probe → engine
+/// (route/record/dispatch/record) → render the outcome. Errors are printed-and-continued
+/// so the REPL loop always gets back a usable state.
 pub async fn dispatch_free_text(
     state: SessionState,
     explicit_backend: Option<BackendId>,
     task: String,
 ) -> Result<SessionState> {
-    // Build router from current session state (clone is cheap; HubConfig: Clone).
-    let available = state.regs.available();
-    // Capability matrix for diagnostic routing; falls back to seeded priors (missing file)
-    // or the legacy heuristics (corrupt file) without breaking the turn.
-    let profiles = crate::profile::load_profiles(None).unwrap_or_default();
-    let router = Router::new(state.config.clone(), available.clone(), profiles)
-        .with_suspended(crate::availability::recently_suspended());
+    let engine = TurnEngine {
+        config: state.config.clone(),
+        regs: Arc::clone(&state.regs),
+        cwd: state.cwd.clone(),
+    };
 
-    // Honour both the session's active_backend AND any per-turn @modifier.
-    let effective_explicit = explicit_backend.or(state.active_backend);
-
-    let decision = router.resolve(&RouteRequest {
-        tool: RouteKey::Rescue,
-        explicit_backend: effective_explicit,
-        task: Some(&task),
-    });
-    let backend_id = decision.backend;
-
-    if !available.contains(&backend_id) {
-        let list: Vec<String> = available.iter().map(|b| b.to_string()).collect();
-        eprintln!(
-            "{} resolved backend {backend_id} is not available. Available: {}",
-            style("error:").red(),
-            list.join(", ")
-        );
-        return Ok(state);
-    }
-
-    // Auth check — print hint and re-prompt; never bail in the REPL.
+    // Pre-dispatch auth probe (the engine deliberately doesn't probe, §5.2).
+    let backend_id = engine.resolve_backend(state.active_backend, explicit_backend, &task);
     let auth = check_auth(backend_id).await;
     if !auth.ok {
         eprintln!(
-            "{} [{backend_id}] not authenticated. Run `{}` or use /login {backend_id}.",
+            "{} {}",
             style("auth:").yellow(),
-            auth.login_command
+            crate::cli::guidance::auth_hint(backend_id, &auth.login_command)
         );
         return Ok(state);
     }
 
-    // Print route-decision status line before dispatching.
-    let transport = resolve_transport(backend_id, &state.regs)
-        .map(|t| t.as_str())
-        .unwrap_or("none");
-    eprintln!(
-        "{}",
-        style(format!(
-            "[→ {backend_id} | {transport} | route={}]",
-            decision.reason.as_str()
-        ))
-        .dim()
-    );
-
-    // Effective model: the REPL has no --model or role, so the backend's configured default
-    // is the whole chain. It used to be skipped here entirely — a `[backends.claude]
-    // model = "opus"` applied to `rescue` but silently not to the same task typed in the
-    // REPL (HILLTE-269).
-    let effective_model = crate::workflow::roles::resolve_model(
-        None,
-        None,
-        state
-            .config
-            .backends
-            .get(&backend_id)
-            .and_then(|o| o.model.as_deref()),
-    );
-    // The REPL has no --effort of its own; the backend's configured default still applies.
-    let effective_effort = crate::effort::resolve_effort(
-        None,
-        None,
-        state
-            .config
-            .backends
-            .get(&backend_id)
-            .and_then(|o| o.effort),
-    )
-    .map(|e| e.clamp_for(backend_id));
-
-    let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &state.cwd);
-    decision.log(&logger, &task, effective_model.as_deref(), effective_effort);
-    logger.member_started(
-        backend_id,
-        false,
-        effective_model.as_deref(),
-        effective_effort.map(|e| e.as_str()),
-    );
+    // Working indicator (§7.2 A3): a braille spinner + elapsed seconds on stderr until
+    // the first chunk arrives (after that, the stream itself is the progress display).
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let started = Instant::now();
-
-    // Tee output to terminal and to dashboard's capture file.
-    // The first chunk arriving clears the working indicator so output starts clean.
     let first_chunk_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let first_chunk_flag = Arc::clone(&first_chunk_seen);
-    let to_stdout = crate::cli::stdout_streamer();
-    let to_file = output_streamer(logger.run_id(), backend_id, false);
-    let on_chunk: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |c: &str| {
-        // On first chunk, erase the working indicator from stderr before writing output.
-        if !first_chunk_flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let _ = std::io::stderr().write_all(b"\r\x1b[K");
-        }
-        to_stdout(c);
-        to_file(c);
-    });
-
-    // Fresh per-turn cancellation token; cancelled by the tokio::select! ctrl_c branch.
-    let cancel = CancellationToken::new();
-    let cancel_sig = cancel.clone();
-
-    // Working indicator: print "working… Xs" to stderr every second while dispatch runs.
-    // Cancelled when dispatch completes or is Ctrl-C'd.
     let indicator_cancel = CancellationToken::new();
-    let indicator_stop = indicator_cancel.clone();
-    let indicator_started = started;
-    let indicator_seen = Arc::clone(&first_chunk_seen);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.tick().await; // skip the immediate first tick
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Only show indicator if no output has started streaming yet.
-                    if !indicator_seen.load(std::sync::atomic::Ordering::Relaxed) {
-                        let elapsed = indicator_started.elapsed().as_secs();
-                        let _ = write!(
-                            std::io::stderr(),
-                            "\r{}",
-                            style(format!("working… {elapsed}s")).dim()
-                        );
-                        let _ = std::io::stderr().flush();
+    {
+        let stop = indicator_cancel.clone();
+        let seen = Arc::clone(&first_chunk_seen);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(80));
+            interval.tick().await;
+            let mut frame = 0usize;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if !seen.load(std::sync::atomic::Ordering::Relaxed) {
+                            let elapsed = started.elapsed().as_secs();
+                            let _ = write!(
+                                std::io::stderr(),
+                                "\r{} {}",
+                                style(FRAMES[frame % FRAMES.len()]).cyan(),
+                                style(format!("{elapsed}s")).dim()
+                            );
+                            let _ = std::io::stderr().flush();
+                            frame += 1;
+                        }
                     }
+                    _ = stop.cancelled() => break,
                 }
-                _ = indicator_stop.cancelled() => break,
             }
+        });
+    }
+
+    // Render engine events: the route line, then streamed chunks to stdout.
+    let to_stdout = crate::cli::stdout_streamer();
+    let first_chunk_flag = Arc::clone(&first_chunk_seen);
+    let on_event: Arc<dyn Fn(EngineEvent) + Send + Sync> = Arc::new(move |ev| match ev {
+        EngineEvent::Route {
+            backend,
+            transport,
+            reason,
+        } => {
+            eprintln!(
+                "{}",
+                style(format!("[→ {backend} | {transport} | route={reason}]")).dim()
+            );
         }
-    });
-
-    // Borrow Arc<Registries> without moving state.
-    let regs_ref = Arc::clone(&state.regs);
-    let cwd = state.cwd.clone();
-
-    let result = tokio::select! {
-        res = dispatch(backend_id, &task, &cwd, cancel, on_chunk, &regs_ref, effective_model.as_deref(), effective_effort) => {
-            indicator_cancel.cancel();
-            // Erase indicator if no streaming output has arrived.
-            if !first_chunk_seen.load(std::sync::atomic::Ordering::Relaxed) {
+        EngineEvent::Chunk { text } => {
+            if !first_chunk_flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let _ = std::io::stderr().write_all(b"\r\x1b[K");
             }
-            res
+            to_stdout(&text);
         }
-        _ = tokio::signal::ctrl_c() => {
-            indicator_cancel.cancel();
-            cancel_sig.cancel();
-            let _ = std::io::stderr().write_all(b"\r\x1b[K");
-            eprintln!("{}", style("[cancelled]").yellow());
-            // Return a synthetic "cancelled" outcome so the loop continues.
-            return Ok(state);
+        EngineEvent::Notice { text } => {
+            eprintln!("{}", style(format!("[!] {text}")).yellow());
         }
-    };
+    });
 
-    handle_dispatch_result(result, &logger, backend_id, &auth.login_command, started);
+    // Ctrl-C cancels the token; the engine then records the turn as cancelled and returns
+    // (the child is killed by the dispatch layer). Awaiting — rather than dropping — the
+    // engine future is what lets the cancelled result reach the session log.
+    let cancel = CancellationToken::new();
+    let ctrlc_cancel = cancel.clone();
+    let ctrlc_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            ctrlc_cancel.cancel();
+        }
+    });
 
+    let outcome = engine
+        .run_turn(
+            state.recorder.as_ref(),
+            state.active_backend,
+            explicit_backend,
+            &task,
+            cancel.clone(),
+            on_event,
+        )
+        .await;
+    ctrlc_task.abort();
+    indicator_cancel.cancel();
+    if !first_chunk_seen.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = std::io::stderr().write_all(b"\r\x1b[K");
+    }
+
+    render_outcome(&outcome, &auth.login_command);
     Ok(state)
 }
 
-/// Handle a `Result<DispatchResult>` from `dispatch`. Prints errors/auth hints and
-/// logs run bookkeeping. Always returns (never panics, never bails) so the REPL
-/// loop can always re-prompt after a turn.
-pub(crate) fn handle_dispatch_result(
-    result: Result<DispatchResult>,
-    logger: &RunLogger,
-    backend_id: BackendId,
-    auth_login_command: &str,
-    started: Instant,
-) {
-    match result {
-        Ok(res) if res.auth_failed => {
-            logger.member_finished(
-                backend_id,
-                false,
-                LegStatus::Error,
-                started.elapsed().as_millis() as u64,
-                None,
-                Some("auth failure during execution".into()),
-            );
-            logger.finished(LegStatus::Error);
+/// Print the turn's ending to the terminal (the engine itself never prints).
+fn render_outcome(outcome: &TurnOutcome, login_command: &str) {
+    match outcome {
+        TurnOutcome::Unavailable { backend, available } => {
+            let list: Vec<String> = available.iter().map(|b| b.to_string()).collect();
             eprintln!(
-                "\n{} [{backend_id}] auth failure. Run `{auth_login_command}` to re-authenticate,\n\
-                 then try again or use /login {backend_id}.",
-                style("auth:").yellow()
+                "{} resolved backend {backend} is not available. Available: {}",
+                style("error:").red(),
+                list.join(", ")
             );
-            // Re-prompt; do NOT bail.
         }
-        Ok(res) => {
-            logger.member_finished(
-                backend_id,
-                false,
-                LegStatus::Ok,
-                started.elapsed().as_millis() as u64,
-                Some(res.output.len()),
-                None,
-            );
-            logger.finished(LegStatus::Ok);
-            if !res.output.ends_with('\n') {
-                println!();
+        TurnOutcome::Completed {
+            backend,
+            status,
+            answer,
+        } => match status {
+            ExchangeStatus::Ok => {
+                if !answer.ends_with('\n') {
+                    println!();
+                }
             }
-        }
-        Err(e) => {
-            logger.member_finished(
-                backend_id,
-                false,
-                LegStatus::Error,
-                started.elapsed().as_millis() as u64,
-                None,
-                Some(format!("{e:#}")),
-            );
-            logger.finished(LegStatus::Error);
-            eprintln!("\n{} [{backend_id}] {e:#}", style("error:").red());
-            // Re-prompt; do NOT bail.
-        }
+            ExchangeStatus::Auth => {
+                eprintln!(
+                    "\n{} [{backend}] auth failure. Run `{login_command}` to re-authenticate,\n\
+                     then try again or use /login {backend}.",
+                    style("auth:").yellow()
+                );
+            }
+            ExchangeStatus::Cancelled => {
+                eprintln!("{}", style("[cancelled]").yellow());
+            }
+            ExchangeStatus::Error | ExchangeStatus::Timeout => {
+                eprintln!("\n{} [{backend}] {answer}", style("error:").red());
+            }
+        },
     }
 }
 

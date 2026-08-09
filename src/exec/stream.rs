@@ -33,6 +33,7 @@ pub struct StreamDecoder {
     fallback_answer: Option<String>,
     seen_structured: bool,
     backend_error: Option<String>,
+    backend_session_ref: Option<String>,
 }
 
 impl StreamDecoder {
@@ -45,6 +46,7 @@ impl StreamDecoder {
             fallback_answer: None,
             seen_structured: false,
             backend_error: None,
+            backend_session_ref: None,
         }
     }
 
@@ -53,6 +55,14 @@ impl StreamDecoder {
     /// otherwise an auth failure or quota error masquerades as a successful answer.
     pub fn take_backend_error(&mut self) -> Option<String> {
         self.backend_error.take()
+    }
+
+    /// The backend's own session/thread id captured from the stream, when the format carries
+    /// one (claude: top-level `session_id` on every event; codex: `thread.started`'s
+    /// `thread_id` — both verified against the real CLIs, 2026-08-08). Opaque: only the
+    /// owning adapter can turn it back into resume flags. `None` for Text streams.
+    pub fn backend_session_ref(&self) -> Option<&str> {
+        self.backend_session_ref.as_deref()
     }
 
     pub fn decode_line(&mut self, line: &str) -> DecodedChunk {
@@ -112,6 +122,11 @@ impl StreamDecoder {
     }
 
     fn decode_claude(&mut self, value: &Value) -> DecodedChunk {
+        if self.backend_session_ref.is_none()
+            && let Some(sid) = value.get("session_id").and_then(Value::as_str)
+        {
+            self.backend_session_ref = Some(sid.to_string());
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("stream_event") => {
                 let event = &value["event"];
@@ -158,6 +173,12 @@ impl StreamDecoder {
     }
 
     fn decode_codex(&mut self, value: &Value) -> DecodedChunk {
+        if self.backend_session_ref.is_none()
+            && value.get("type").and_then(Value::as_str) == Some("thread.started")
+            && let Some(tid) = value.get("thread_id").and_then(Value::as_str)
+        {
+            self.backend_session_ref = Some(tid.to_string());
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("item.completed")
                 if value["item"].get("type").and_then(Value::as_str) == Some("agent_message") =>
@@ -539,6 +560,49 @@ mod tests {
         );
         assert_eq!(torn.answer, None);
         assert!(torn.display.unwrap().contains("unparsed"));
+    }
+
+    #[test]
+    fn claude_captures_session_id_from_any_event() {
+        let mut decoder = StreamDecoder::new(StreamFormat::ClaudeJsonl);
+        assert_eq!(decoder.backend_session_ref(), None);
+        // Real shape (verified 2026-08-08): every claude event carries a top-level session_id.
+        decoder.decode_line(
+            r#"{"type":"system","subtype":"init","cwd":"/x","session_id":"0c1ff28e-83d8-488c-86f7-a7213d9bd050","tools":[]}"#,
+        );
+        assert_eq!(
+            decoder.backend_session_ref(),
+            Some("0c1ff28e-83d8-488c-86f7-a7213d9bd050")
+        );
+        // First capture wins; a later event with another id does not overwrite it.
+        decoder.decode_line(r#"{"type":"result","result":"ok","session_id":"other"}"#);
+        assert_eq!(
+            decoder.backend_session_ref(),
+            Some("0c1ff28e-83d8-488c-86f7-a7213d9bd050")
+        );
+    }
+
+    #[test]
+    fn codex_captures_thread_id_from_thread_started() {
+        let mut decoder = StreamDecoder::new(StreamFormat::CodexJsonl);
+        // Real shape (verified 2026-08-08).
+        decoder.decode_line(
+            r#"{"type":"thread.started","thread_id":"019fe072-b0bc-7922-9d64-3e20a01c2805"}"#,
+        );
+        decoder.decode_line(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#,
+        );
+        assert_eq!(
+            decoder.backend_session_ref(),
+            Some("019fe072-b0bc-7922-9d64-3e20a01c2805")
+        );
+    }
+
+    #[test]
+    fn text_stream_has_no_session_ref() {
+        let mut decoder = StreamDecoder::new(StreamFormat::Text);
+        decoder.decode_line("session_id: not-a-structured-stream\n");
+        assert_eq!(decoder.backend_session_ref(), None);
     }
 
     #[test]

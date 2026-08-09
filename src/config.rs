@@ -301,6 +301,9 @@ pub struct WorkflowType {
     pub use_mcp: Option<bool>,
     #[serde(default)]
     pub enable_ask_human: Option<bool>,
+    /// Per-type override for the orchestration-REPL block (design §10.9 R3).
+    #[serde(default)]
+    pub enable_repl: Option<bool>,
     /// A soft "suggested flow" for this type — the ordered step names the user sketched on the
     /// dashboard canvas (distilled from the drawn edges). Injected into the manager prompt as a
     /// non-binding hint ("you sketched this; adapt freely"); the manager still improvises. Unset =
@@ -340,6 +343,11 @@ pub struct WorkflowSection {
     /// it off the manager is never told to call a back-channel that would otherwise 404.
     #[serde(default)]
     pub enable_ask_human: bool,
+    /// Teach the manager the orchestration REPL (`agentpit orchestrate --cell`, design §10.9
+    /// R3): persistent TypeScript cells whose intermediate results stay out of the manager's
+    /// context. Default OFF: it needs deno installed, and with it off the prompt is unchanged.
+    #[serde(default)]
+    pub enable_repl: bool,
     /// A soft "suggested flow" for the BASE workflow — the ordered step names sketched on the
     /// dashboard canvas, injected as a non-binding hint (same treatment as a type's `flow`).
     /// A type without its own `flow` inherits this one. `None`/empty = no hint (the default).
@@ -362,6 +370,7 @@ impl Default for WorkflowSection {
             max_calls_per_manager: 8,
             use_mcp: false,
             enable_ask_human: false,
+            enable_repl: false,
             flow: None,
             steps: Vec::new(),
         }
@@ -429,6 +438,93 @@ pub struct HubConfig {
     pub cascade: CascadeSection,
     #[serde(default)]
     pub arena: ArenaSection,
+    #[serde(default)]
+    pub session: SessionSection,
+    #[serde(default)]
+    pub repl: ReplSection,
+}
+
+/// Orchestration-REPL knobs (design §10.9).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ReplSection {
+    /// Run `deno check` on every cell before execution (§10.5). Costs ~100s of ms per
+    /// cell; catching an API misuse before it runs is usually cheaper than the failed
+    /// round-trip it prevents.
+    #[serde(default = "default_repl_typecheck")]
+    pub typecheck: bool,
+    /// V8 heap cap for the sidecar (`--max-old-space-size`).
+    #[serde(default = "default_repl_max_heap_mb")]
+    pub max_heap_mb: u64,
+    /// Explicit deno binary path. Empty = find on $PATH.
+    #[serde(default)]
+    pub deno_path: String,
+    /// Seconds a cell may run without emitting a protocol frame before it is killed
+    /// (§10 M2). A `while(true){}` cell emits nothing, so this bounds it; a cell awaiting
+    /// a dispatch is not affected (the host is servicing the call, not reading). 0 = off.
+    #[serde(default = "default_repl_cell_idle_timeout_secs")]
+    pub cell_idle_timeout_secs: u64,
+}
+
+fn default_repl_typecheck() -> bool {
+    true
+}
+
+fn default_repl_max_heap_mb() -> u64 {
+    512
+}
+
+fn default_repl_cell_idle_timeout_secs() -> u64 {
+    120
+}
+
+impl Default for ReplSection {
+    fn default() -> Self {
+        ReplSection {
+            typecheck: default_repl_typecheck(),
+            max_heap_mb: default_repl_max_heap_mb(),
+            deno_path: String::new(),
+            cell_idle_timeout_secs: default_repl_cell_idle_timeout_secs(),
+        }
+    }
+}
+
+/// Session-persistence knobs (design: docs/session-persistence-design.md §4.3/§7).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct SessionSection {
+    /// How many recent user↔answer turns a composed continuation includes for backends
+    /// without native resume. Bounds prompt growth (and file growth) to O(window).
+    #[serde(default = "default_compose_window")]
+    pub compose_window: usize,
+    /// How many transcript entries an attach renders (§5.3: display only — the model's
+    /// context is always complete).
+    #[serde(default = "default_transcript_tail")]
+    pub transcript_tail: usize,
+    /// Minutes of inactivity before an idle worker is evicted from memory (§7.1).
+    /// 0 = never evict. The session file survives either way.
+    #[serde(default = "default_idle_evict_minutes")]
+    pub idle_evict_minutes: u64,
+}
+
+fn default_compose_window() -> usize {
+    4
+}
+
+fn default_transcript_tail() -> usize {
+    400
+}
+
+fn default_idle_evict_minutes() -> u64 {
+    30
+}
+
+impl Default for SessionSection {
+    fn default() -> Self {
+        SessionSection {
+            compose_window: default_compose_window(),
+            transcript_tail: default_transcript_tail(),
+            idle_evict_minutes: default_idle_evict_minutes(),
+        }
+    }
 }
 
 /// Used for both `default.backend` and `auto_route.long_context_backend`. Claude since
@@ -721,6 +817,21 @@ review_members = ["antigravity", "opencode"]
 # [arena]
 # verify = "cargo test"   # run in each contender's worktree; shown beside its diff, never an
 #                         # automatic disqualification — the verdict stays yours
+
+# REPL session persistence (append-only JSONL under the state dir; `agentpit sessions`).
+# [session]
+# compose_window = 4      # recent turns included when continuing a backend without native
+#                         # resume (claude/codex resume natively; others get composed context)
+# transcript_tail = 400   # entries rendered on attach (display only; context stays complete)
+# idle_evict_minutes = 30 # idle worker eviction (0 = never); the session file always survives
+
+# Orchestration REPL (`agentpit orchestrate`): TypeScript cells in a sandboxed Deno
+# sidecar; dispatch()/store/session are the only exits. Needs deno on $PATH.
+# [repl]
+# typecheck   = true      # deno-check every cell before running it
+# max_heap_mb = 512       # V8 heap cap for the sidecar
+# deno_path   = ""        # explicit deno binary; empty = $PATH
+# cell_idle_timeout_secs = 120  # kill a cell that emits no frame this long (runaway loop); 0 = off
 
 # Per-backend transport + default model / effort override.
 # [backends.antigravity]
@@ -1074,6 +1185,30 @@ prompt = "Research only."
         // A minimal type may set just a brief; roles omitted = all worker roles.
         assert!(wf.types["research"].roles.is_empty());
         assert!(wf.types["research"].manager_backend.is_none());
+    }
+
+    #[test]
+    fn sample_config_session_example_parses_when_uncommented() {
+        // The commented [session] example must stay valid TOML when uncommented, and its
+        // value must equal the coded default (the example documents the default, §7).
+        let block: String = DEFAULT_CONFIG_TOML
+            .lines()
+            .skip_while(|l| !l.starts_with("# [session]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .or_else(|| l.strip_prefix("#"))
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !block.is_empty(),
+            "session example block not found in sample config"
+        );
+        let parsed: HubConfig = toml::from_str(&block).expect("uncommented session example parses");
+        assert_eq!(parsed.session.compose_window, 4);
+        assert_eq!(parsed.session, SessionSection::default());
     }
 
     #[test]

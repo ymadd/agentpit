@@ -7,19 +7,24 @@ use crate::types::BackendId;
 pub mod adversarial_review;
 pub mod arena;
 pub mod ask;
+pub mod attach;
 pub(crate) mod cancel;
 mod common;
 pub mod config;
+pub mod daemon_cmd;
 pub mod dashboard;
 pub mod diagnose;
+pub mod doctor;
 pub mod ensemble;
 pub mod explain;
+pub mod guidance;
 pub mod init;
 pub mod learning;
 pub mod login;
 pub mod mcp_cmd;
 mod menu;
 pub mod note;
+pub mod orchestrate_cmd;
 pub mod outcome;
 pub mod profile;
 pub mod refactor;
@@ -29,6 +34,7 @@ pub mod repl;
 pub mod rescue;
 pub mod review;
 pub mod security_review;
+pub mod sessions;
 #[cfg(feature = "similarity")]
 pub mod similarity_cmd;
 pub mod status;
@@ -305,7 +311,55 @@ pub enum Command {
     },
 
     /// Launch the persistent conversational REPL (the default when no subcommand is given).
-    Repl,
+    Repl {
+        /// Resume a saved session by id (unique prefix/suffix accepted; see `agentpit sessions`).
+        #[arg(long)]
+        resume: Option<String>,
+    },
+
+    /// List, inspect, or export saved REPL sessions (append-only JSONL under the state dir).
+    Sessions {
+        #[command(subcommand)]
+        action: Option<sessions::Action>,
+    },
+
+    /// Attach to a session's worker (daemon-backed: survives closing the terminal).
+    Attach {
+        /// Session id (unique prefix/suffix accepted). Omit to start a fresh session.
+        session: Option<String>,
+    },
+
+    /// Manage the background daemon that keeps sessions running while detached.
+    Daemon {
+        #[command(subcommand)]
+        action: daemon_cmd::Action,
+    },
+
+    /// Scan daemon/worker/lease/socket hygiene. --fix removes provably-dead debris only.
+    Doctor {
+        /// Remove stale records, orphan sockets, and dead leases (never touches anything alive).
+        #[arg(long)]
+        fix: bool,
+    },
+
+    /// Open the TUI (inline conversation + Agents/Tree overlays; the default when no
+    /// subcommand is given on a terminal).
+    Tui {
+        /// Session id (unique prefix/suffix). Omit to start a fresh session.
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// Drive a session's orchestration REPL: TypeScript cells in a sandboxed Deno
+    /// sidecar, with dispatch()/store/session as the only exits (needs deno).
+    Orchestrate {
+        /// Session id (unique prefix/suffix). Omit to start a fresh session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Evaluate one cell and exit (state persists in the worker across invocations).
+        #[arg(long)]
+        cell: Option<String>,
+    },
 
     /// Ask the supervising human a question and block for an answer (the CLI back-channel a
     /// shell-out workflow manager uses; prints the answer or HUMAN_UNAVAILABLE to stdout).
@@ -391,7 +445,16 @@ pub enum Command {
 pub async fn run(cli: Cli) -> Result<()> {
     let command = match cli.command {
         Some(c) => c,
-        None => return repl::run_repl().await,
+        // Bare `agentpit` (Q8, §11.4 T3): the TUI on a real terminal, the line REPL when
+        // piped (CI, scripts) — the TUI needs raw mode, which a pipe cannot give.
+        None => {
+            use std::io::IsTerminal;
+            return if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                crate::tui::run(None).await
+            } else {
+                repl::run_repl(None).await
+            };
+        }
     };
     match command {
         Command::Rescue {
@@ -554,7 +617,19 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Command::Mcp { action } => mcp_cmd::run(action).await,
 
-        Command::Repl => repl::run_repl().await,
+        Command::Repl { resume } => repl::run_repl(resume).await,
+
+        Command::Sessions { action } => sessions::run(action).await,
+
+        Command::Attach { session } => attach::run(session).await,
+
+        Command::Daemon { action } => daemon_cmd::run(action).await,
+
+        Command::Doctor { fix } => doctor::run(fix).await,
+
+        Command::Tui { session } => crate::tui::run(session).await,
+
+        Command::Orchestrate { session, cell } => orchestrate_cmd::run(session, cell).await,
 
         Command::Ask {
             prompt,

@@ -49,11 +49,18 @@ pub struct ExecRunOptions {
     /// (no effort flag emitted). Threaded to `build_spec`, which clamps it to what the backend
     /// can express.
     pub effort: Option<crate::effort::Effort>,
+    /// Opaque backend session ref to natively continue from (design §4.3). `Some` routes the
+    /// spec build through `build_continuation_spec`; adapters without native resume fall back
+    /// to a fresh `build_spec` (the caller composes context in that case).
+    pub continue_from: Option<String>,
 }
 
 pub struct ExecOutcome {
     pub output: String,
     pub exit_code: Option<i32>,
+    /// The backend's own session/thread id captured from the stream (see
+    /// [`StreamDecoder::backend_session_ref`]). `None` for Text streams and failed runs.
+    pub backend_session_ref: Option<String>,
 }
 
 pub async fn run_spec(
@@ -187,7 +194,12 @@ pub async fn run_spec(
             }
             consume_decoded(decoder.finish(), &on_stdout, &mut collected, &mut truncated);
         }
-        Ok::<(String, Option<String>), std::io::Error>((collected, decoder.take_backend_error()))
+        let session_ref = decoder.backend_session_ref().map(str::to_string);
+        Ok::<(String, Option<String>, Option<String>), std::io::Error>((
+            collected,
+            decoder.take_backend_error(),
+            session_ref,
+        ))
     });
 
     let stderr_task = tokio::spawn(async move {
@@ -230,8 +242,26 @@ pub async fn run_spec(
         }
     };
 
-    let (stdout_text, backend_error) = stdout_task.await??;
-    let stderr_text = stderr_task.await??;
+    // On cancellation, bound the pipe drain: killing the direct child does not kill its
+    // orphaned children (dash's `sh -c sleep` being the canonical case), and an orphan
+    // holding the pipe's write end postpones EOF — without the timeout a cancelled turn
+    // silently waited out the grandchild's whole lifetime before reporting "cancelled".
+    let (stdout_text, backend_error, backend_session_ref) = if cancel.is_cancelled() {
+        match tokio::time::timeout(Duration::from_secs(2), stdout_task).await {
+            Ok(joined) => joined??,
+            Err(_) => (String::new(), None, None),
+        }
+    } else {
+        stdout_task.await??
+    };
+    let stderr_text = if cancel.is_cancelled() {
+        match tokio::time::timeout(Duration::from_secs(2), stderr_task).await {
+            Ok(joined) => joined??,
+            Err(_) => String::new(),
+        }
+    } else {
+        stderr_task.await??
+    };
 
     let code = exit_status.code();
     if !exit_status.success() {
@@ -259,6 +289,7 @@ pub async fn run_spec(
     Ok(ExecOutcome {
         output: stdout_text,
         exit_code: code,
+        backend_session_ref,
     })
 }
 
@@ -417,6 +448,7 @@ mod tests {
                 on_stdout: None,
                 model: None,
                 effort: None,
+                continue_from: None,
             },
             StreamFormat::Text,
         )
@@ -478,6 +510,7 @@ mod tests {
                 on_stdout: None,
                 model: None,
                 effort: None,
+                continue_from: None,
             },
             StreamFormat::CodexJsonl,
         )
@@ -520,6 +553,7 @@ mod tests {
                 on_stdout: None,
                 model: None,
                 effort: None,
+                continue_from: None,
             },
             StreamFormat::CodexJsonl,
         )

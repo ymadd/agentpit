@@ -47,6 +47,27 @@ impl ExecAdapter for ClaudeExec {
         // `--permission-mode acceptEdits` auto-accepts edits without prompting.
         AutonomyLevel::FullAutonomy
     }
+
+    fn supports_resume(&self) -> bool {
+        true
+    }
+
+    fn build_continuation_spec(
+        &self,
+        task: &str,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        backend_ref: &str,
+    ) -> Option<ExecSpec> {
+        // `claude --print --resume <session_id> <task>` continues the session in place and
+        // keeps the SAME session_id on the stream (verified against the real CLI 2026-08-08).
+        let mut spec = self.build_spec(task, model, effort);
+        let task_arg = spec.args.pop().expect("build_spec always pushes the task");
+        spec.args.push("--resume".into());
+        spec.args.push(backend_ref.to_string());
+        spec.args.push(task_arg);
+        Some(spec)
+    }
 }
 
 #[cfg(test)]
@@ -94,5 +115,21 @@ mod tests {
         assert_eq!(ClaudeExec.autonomy(), AutonomyLevel::FullAutonomy);
         let spec = ClaudeExec.build_spec("x", None, None);
         assert!(spec.args.iter().any(|a| a == "acceptEdits"));
+    }
+
+    #[test]
+    fn continuation_spec_inserts_resume_before_the_task() {
+        assert!(ClaudeExec.supports_resume());
+        let spec = ClaudeExec
+            .build_continuation_spec("follow up", Some("opus"), None, "0c1ff28e-sid")
+            .unwrap();
+        let i = spec.args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(spec.args[i + 1], "0c1ff28e-sid");
+        // The task stays the final positional argument, after every flag.
+        assert_eq!(spec.args.last().unwrap(), "follow up");
+        // Everything else matches the fresh spec (same output format, permission mode, model).
+        assert!(spec.args.iter().any(|a| a == "stream-json"));
+        assert!(spec.args.iter().any(|a| a == "acceptEdits"));
+        assert!(spec.args.iter().any(|a| a == "opus"));
     }
 }

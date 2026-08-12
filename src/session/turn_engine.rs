@@ -96,7 +96,7 @@ pub struct TurnEngine {
 
 impl TurnEngine {
     /// Run one turn. `recorder` = the session log (None = non-persisted REPL fallback);
-    /// `active_backend`/`explicit` mirror the REPL's `/backend` and `@backend` overrides.
+    /// `active_backend`/`explicit` mirror the REPL's `/backend` and `!backend` overrides.
     pub async fn run_turn(
         &self,
         recorder: Option<&SharedRecorder>,

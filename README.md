@@ -19,7 +19,7 @@ Different coding agents are good at different things: long-context reads on Anti
 - **Desktop-first app** — the decision cockpit, complete CLI settings, updates, and **Workflow Studio** in one install; the matching CLI ships inside it
 - **Auth-aware** — checks each backend's credentials before dispatching; `agentpit login <backend>` triggers the right login flow
 - **Self-updating** — the desktop app checks and installs paired app + CLI releases automatically; standalone CLI installs keep `agentpit update`
-- **Discoverable** — running `agentpit` with no args opens an interactive menu
+- **Discoverable** — running `agentpit` with no args opens the fullscreen TUI; `/` lists commands and `@` selects project files
 
 ## Install
 
@@ -99,7 +99,8 @@ never JSONL or progress lines.
 ## Usage
 
 ```bash
-agentpit                              # interactive menu
+agentpit                              # fullscreen TUI
+# In the TUI: / lists commands, @ selects files, and !codex routes one turn to Codex.
 
 agentpit rescue "list files in src/" # one-shot
 agentpit rescue "..." --backend agy   # force a backend

@@ -69,9 +69,17 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
         "/ (line start)",
         "command menu: type to filter, ↑↓ select, Tab completes, Esc dismisses",
     ),
+    (
+        "@ (token start)",
+        "project files: type a path, ↑↓ select, Tab/Enter inserts it",
+    ),
+    (
+        "!<backend>",
+        "route this turn to one backend, e.g. !codex review this",
+    ),
     ("↑ / ↓", "input history (from an empty line, menu closed)"),
     (
-        "PageUp / PageDown",
+        "PageUp / PageDown / wheel",
         "scroll the transcript; End follows the newest",
     ),
     ("Ctrl-C", "cancel the running turn; twice within 2s exits"),
@@ -200,7 +208,9 @@ mod tests {
                 );
             }
         }
-        // …and nothing the TUI cannot run: /menu is REPL-only.
+        // `/config` is available from the TUI; the broader top-level `/menu` remains
+        // REPL-only because opening it could recursively launch another TUI.
+        assert!(lines.iter().any(|l| l.contains("/config")));
         assert!(!lines.iter().any(|l| l.contains("/menu")));
     }
 }

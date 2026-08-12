@@ -51,6 +51,17 @@ impl InputState {
         self.browse = None;
     }
 
+    /// Replace a range expressed in character indices and leave the cursor after the
+    /// replacement. Completion menus use this instead of rebuilding the whole line so
+    /// text on either side of an inline token is preserved.
+    pub fn replace_range(&mut self, start: usize, end: usize, replacement: &str) {
+        let start_byte = self.byte_at(start);
+        let end_byte = self.byte_at(end);
+        self.text.replace_range(start_byte..end_byte, replacement);
+        self.cursor = start + replacement.chars().count();
+        self.browse = None;
+    }
+
     pub fn left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
@@ -145,6 +156,15 @@ mod tests {
         s.end();
         s.insert('!');
         assert_eq!(s.text(), "→日本ok!");
+    }
+
+    #[test]
+    fn replace_range_uses_character_indices_and_preserves_both_sides() {
+        let mut s = InputState::default();
+        s.set_line("前 @src/古.rs 後");
+        s.replace_range(2, 11, "@src/new.rs ");
+        assert_eq!(s.text(), "前 @src/new.rs  後");
+        assert_eq!(s.cursor(), "前 @src/new.rs ".chars().count());
     }
 
     #[test]

@@ -12,17 +12,17 @@ use crate::session::ExchangeStatus;
 use crate::session::turn_engine::{EngineEvent, TurnEngine, TurnOutcome};
 use crate::types::BackendId;
 
-/// Parse an optional inline `@backend` modifier from the start of a free-text turn.
+/// Parse an optional inline `!backend` modifier from the start of a free-text turn.
 ///
-/// Returns `(explicit_backend, task_text)`. If the modifier is present but the
-/// backend id is invalid, prints an error and returns `None` to signal the caller
-/// should re-prompt without dispatching.
-pub fn parse_at_modifier(input: &str) -> Option<(Option<BackendId>, String)> {
+/// `@` is reserved for project-file mentions. Returns `(explicit_backend, task_text)`.
+/// If the modifier is present but the backend id is invalid, prints an error and returns
+/// `None` to signal the caller should re-prompt without dispatching.
+pub fn parse_bang_modifier(input: &str) -> Option<(Option<BackendId>, String)> {
     let trimmed = input.trim_start();
-    if !trimmed.starts_with('@') {
+    if !trimmed.starts_with('!') {
         return Some((None, input.trim().to_string()));
     }
-    let rest = trimmed.trim_start_matches('@');
+    let rest = trimmed.trim_start_matches('!');
     let (word, remaining) = rest
         .split_once(char::is_whitespace)
         .map(|(w, r)| (w, r.trim_start()))
@@ -30,7 +30,7 @@ pub fn parse_at_modifier(input: &str) -> Option<(Option<BackendId>, String)> {
     match word.parse::<BackendId>() {
         Ok(id) => Some((Some(id), remaining.to_string())),
         Err(e) => {
-            eprintln!("{} unknown backend @{word}: {e}", style("error:").red());
+            eprintln!("{} unknown backend !{word}: {e}", style("error:").red());
             None
         }
     }
@@ -194,17 +194,17 @@ fn render_outcome(outcome: &TurnOutcome, login_command: &str) {
 mod tests {
     use super::*;
 
-    // ─── parse_at_modifier ────────────────────────────────────────────────────────
+    // ─── parse_bang_modifier ────────────────────────────────────────────────────────
 
     #[test]
     fn plain_text_has_no_modifier() {
-        let result = parse_at_modifier("explain this function");
+        let result = parse_bang_modifier("explain this function");
         assert!(matches!(result, Some((None, ref t)) if t == "explain this function"));
     }
 
     #[test]
-    fn at_prefix_with_valid_backend_parses() {
-        let result = parse_at_modifier("@claude fix the bug");
+    fn bang_prefix_with_valid_backend_parses() {
+        let result = parse_bang_modifier("!claude fix the bug");
         match result {
             Some((Some(BackendId::Claude), task)) => assert_eq!(task, "fix the bug"),
             other => panic!("expected Some((Some(Claude), text)), got {other:?}"),
@@ -212,8 +212,8 @@ mod tests {
     }
 
     #[test]
-    fn at_prefix_with_agy_alias_parses() {
-        let result = parse_at_modifier("@agy explain src/lib.rs");
+    fn bang_prefix_with_agy_alias_parses() {
+        let result = parse_bang_modifier("!agy explain src/lib.rs");
         match result {
             Some((Some(BackendId::Antigravity), task)) => assert_eq!(task, "explain src/lib.rs"),
             other => panic!("expected Some((Some(Antigravity), text)), got {other:?}"),
@@ -221,17 +221,17 @@ mod tests {
     }
 
     #[test]
-    fn at_prefix_with_unknown_backend_returns_none() {
-        // Unknown @backend: parse_at_modifier prints an error and returns None so the
+    fn bang_prefix_with_unknown_backend_returns_none() {
+        // Unknown !backend: parse_bang_modifier prints an error and returns None so the
         // caller can re-prompt without dispatching.
-        let result = parse_at_modifier("@nonexistent do the thing");
+        let result = parse_bang_modifier("!nonexistent do the thing");
         assert!(result.is_none());
     }
 
     #[test]
-    fn at_prefix_alone_no_task_text() {
-        // Just `@claude` with no trailing text → task is empty.
-        let result = parse_at_modifier("@claude");
+    fn bang_prefix_alone_no_task_text() {
+        // Just `!claude` with no trailing text → task is empty.
+        let result = parse_bang_modifier("!claude");
         match result {
             Some((Some(BackendId::Claude), task)) => assert!(task.is_empty()),
             other => panic!("expected Some((Some(Claude), \"\")), got {other:?}"),
@@ -239,9 +239,9 @@ mod tests {
     }
 
     #[test]
-    fn leading_whitespace_before_at_is_accepted() {
-        // trim_start is called before the `@` check.
-        let result = parse_at_modifier("  @codex refactor this");
+    fn leading_whitespace_before_bang_is_accepted() {
+        // trim_start is called before the `!` check.
+        let result = parse_bang_modifier("  !codex refactor this");
         match result {
             Some((Some(BackendId::Codex), task)) => assert_eq!(task, "refactor this"),
             other => panic!("expected Some((Some(Codex), text)), got {other:?}"),
@@ -249,12 +249,12 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_with_at_in_middle_is_not_treated_as_modifier() {
-        // An `@` that does NOT appear at the start is plain text, passed through as task.
-        let result = parse_at_modifier("email me@example.com");
-        match result {
-            Some((None, task)) => assert_eq!(task, "email me@example.com"),
-            other => panic!("expected Some((None, task)), got {other:?}"),
+    fn at_file_mentions_and_email_are_not_treated_as_modifiers() {
+        for text in ["@src/lib.rs explain this", "email me@example.com"] {
+            match parse_bang_modifier(text) {
+                Some((None, task)) => assert_eq!(task, text),
+                other => panic!("expected Some((None, task)), got {other:?}"),
+            }
         }
     }
 }

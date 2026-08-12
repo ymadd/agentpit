@@ -636,8 +636,8 @@ fn help_text_in(reg: &slash::Registry, skipped: &[crate::cli::skills::Skipped]) 
     format!(
         "\nAvailable REPL commands:\n{rows}\n{note}\
          \nFree text turns are routed to the active backend (or auto-routed) and streamed inline.\
-         \nPrefix with @<backend> to route a single turn to that backend without changing the default.\
-         \n  e.g.  @claude explain this file\
+         \nPrefix with !<backend> to route a single turn to that backend without changing the default.\
+         \n  e.g.  !claude explain this file\
          \nCtrl-C cancels the in-flight dispatch and returns to the prompt.\
          \nCtrl-D exits cleanly.\n"
     )
@@ -927,7 +927,7 @@ mod tests {
             );
         }
         assert!(!is_slash_line("hello world"));
-        assert!(!is_slash_line("@claude explain this"));
+        assert!(!is_slash_line("!claude explain this"));
     }
 
     #[test]
@@ -1053,7 +1053,7 @@ mod tests {
         assert!(help.ends_with("Ctrl-D exits cleanly.\n"));
     }
 
-    // ─── parse_at_modifier (dispatch_turn) ───────────────────────────────────────
+    // ─── parse_bang_modifier (dispatch_turn) ───────────────────────────────────────
     // Thin coverage here; heavier coverage lives in dispatch_turn tests.
 
     #[test]

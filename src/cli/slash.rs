@@ -339,7 +339,7 @@ pub static BUILTINS: &[SlashSpec] = &[
             description: cow("Open config menu"),
         }]),
         category: Category::Meta,
-        surfaces: Cow::Borrowed(&[Surface::Repl]),
+        surfaces: Cow::Borrowed(&[Surface::Repl, Surface::Tui]),
         exec: ExecKind::Local,
         parse: ParseRule::Fn(|_| Ok(SlashCommand::Config)),
     },
@@ -1398,9 +1398,9 @@ mod tests {
             names_for(Surface::Tui),
             expected_names(
                 vec![
-                    "help", "status", "learning", "arena", "profile", "outcome", "doctor", "mcp",
-                    "diagnose", "login", "quit", "exit", "detach", "sessions", "tree", "branch",
-                    "fork", "compact",
+                    "help", "status", "config", "learning", "arena", "profile", "outcome",
+                    "doctor", "mcp", "diagnose", "login", "quit", "exit", "detach", "sessions",
+                    "tree", "branch", "fork", "compact",
                 ],
                 "outcome",
                 "similarity",
@@ -1525,7 +1525,7 @@ mod tests {
         ));
         assert!(matches!(parse("", Surface::Repl), Parsed::NotSlash));
         assert!(matches!(
-            parse("@claude do a thing", Surface::Repl),
+            parse("!claude do a thing", Surface::Repl),
             Parsed::NotSlash
         ));
     }

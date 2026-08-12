@@ -1,10 +1,9 @@
-//! The slash-command dropdown (design D4) — Claude Code's popup, over agentpit's shared
-//! registry.
+//! The TUI completion popups: `/` commands from agentpit's shared registry and `@`
+//! project-file selection rooted at the attached session's working directory.
 //!
-//! Pure state, the way [`super::input`] and [`super::views`] are: the menu is a filtered
-//! view of the candidates [`crate::cli::slash`] declares for [`Surface::Tui`], plus a
-//! selection index. It never draws, never dispatches, and holds no terminal — the app
-//! loop feeds it keys and renders [`SlashMenu::matches`] above the input line.
+//! Pure state, the way [`super::input`] and [`super::views`] are: each menu is a filtered
+//! view plus a selection index. Neither draws, dispatches, nor holds a terminal — the app
+//! loop feeds them keys and renders the active menu above the input line.
 //!
 //! The popup is a *view of the text*: [`SlashMenu::refresh`] recomputes it from the line
 //! after every edit, so there is no second copy of "what is being typed" to drift. A line
@@ -23,6 +22,10 @@
 //!   since been edited leaves `InputState`'s browse cursor live, so an ↑ that also reached
 //!   the input would silently replace the line the user is completing.
 //! * popup CLOSED — ↑↓ browse history and Enter submits, exactly as before.
+
+use std::fs;
+use std::path::Path;
+use std::process::Command;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -162,6 +165,209 @@ impl SlashMenu {
     }
 }
 
+/// The `@token` immediately before the input cursor. `prefix` drives filtering while
+/// `start..end` identifies the whole token to replace, including any suffix after a cursor
+/// that was moved into the middle of the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtToken {
+    start: usize,
+    end: usize,
+    prefix: String,
+}
+
+fn at_token(text: &str, cursor: usize) -> Option<AtToken> {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let start = chars[..cursor]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map_or(0, |i| i + 1);
+    if start >= cursor || chars.get(start) != Some(&'@') {
+        return None;
+    }
+    let end = chars[cursor..]
+        .iter()
+        .position(|c| c.is_whitespace())
+        .map_or(chars.len(), |i| cursor + i);
+    Some(AtToken {
+        start,
+        end,
+        prefix: chars[start + 1..cursor].iter().collect(),
+    })
+}
+
+/// Project-file completion state. Paths are stored relative to the session cwd and use
+/// `/` separators even on platforms whose native separator differs.
+#[derive(Debug, Default)]
+pub struct FileMenu {
+    files: Vec<String>,
+    matches: Vec<String>,
+    cursor: ListCursor,
+    /// Esc suppresses the token at this character position until it disappears or the
+    /// cursor enters another token.
+    dismissed_at: Option<usize>,
+}
+
+impl FileMenu {
+    pub fn from_cwd(cwd: &Path) -> FileMenu {
+        FileMenu::with_files(project_files(cwd))
+    }
+
+    pub fn with_files(mut files: Vec<String>) -> FileMenu {
+        files.sort_by_key(|path| path.to_ascii_lowercase());
+        files.dedup();
+        FileMenu {
+            files,
+            ..FileMenu::default()
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        !self.matches.is_empty()
+    }
+
+    pub fn matches(&self) -> &[String] {
+        &self.matches
+    }
+
+    pub fn index(&self) -> usize {
+        self.cursor.index
+    }
+
+    fn selected(&self) -> Option<&str> {
+        self.matches.get(self.cursor.index).map(String::as_str)
+    }
+
+    fn refresh(&mut self, text: &str, cursor: usize) {
+        let Some(token) = at_token(text, cursor) else {
+            self.close();
+            self.dismissed_at = None;
+            return;
+        };
+        if self.dismissed_at.is_some_and(|start| start == token.start) {
+            self.close();
+            return;
+        }
+        self.dismissed_at = None;
+        let prefix = token.prefix.to_ascii_lowercase();
+        let mut ranked: Vec<(u8, String)> = self
+            .files
+            .iter()
+            .filter_map(|path| {
+                let lower = path.to_ascii_lowercase();
+                let rank = if prefix.is_empty() || lower.starts_with(&prefix) {
+                    0
+                } else if lower.split('/').any(|part| part.starts_with(&prefix)) {
+                    1
+                } else if lower.contains(&prefix) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((rank, path.clone()))
+            })
+            .collect();
+        ranked.sort_by(|(rank_a, path_a), (rank_b, path_b)| {
+            rank_a.cmp(rank_b).then_with(|| {
+                path_a
+                    .to_ascii_lowercase()
+                    .cmp(&path_b.to_ascii_lowercase())
+            })
+        });
+        self.matches = ranked.into_iter().map(|(_, path)| path).collect();
+        self.cursor.index = 0;
+    }
+
+    fn close(&mut self) {
+        self.matches.clear();
+        self.cursor.index = 0;
+    }
+
+    fn dismiss(&mut self, text: &str, cursor: usize) {
+        self.dismissed_at = at_token(text, cursor).map(|token| token.start);
+        self.close();
+    }
+
+    fn reset(&mut self) {
+        self.close();
+        self.dismissed_at = None;
+    }
+}
+
+/// Enumerate regular project files. Git repositories use tracked + non-ignored untracked
+/// files; elsewhere a recursive fallback prunes VCS metadata and common generated trees.
+/// An unreadable entry is skipped rather than making the TUI fail to start.
+pub fn project_files(cwd: &Path) -> Vec<String> {
+    // Git gives the best project view: tracked files plus non-ignored untracked files. Fall
+    // back to a dependency-free walk for non-Git directories or systems without Git.
+    if let Ok(output) = Command::new("git")
+        .args([
+            "-C",
+            cwd.to_string_lossy().as_ref(),
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+        && output.status.success()
+    {
+        let mut files: Vec<String> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| String::from_utf8_lossy(raw).replace('\\', "/"))
+            .filter(|relative| relative.chars().all(|c| !c.is_control()))
+            .filter(|relative| cwd.join(relative).is_file())
+            .collect();
+        files.sort_by_key(|path| path.to_ascii_lowercase());
+        files.dedup();
+        return files;
+    }
+
+    const PRUNED_DIRS: &[&str] = &[
+        ".git",
+        "target",
+        "node_modules",
+        ".next",
+        "dist",
+        "build",
+        "coverage",
+        ".idea",
+        ".vscode",
+    ];
+
+    fn visit(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if !PRUNED_DIRS.contains(&entry.file_name().to_string_lossy().as_ref()) {
+                    visit(root, &path, out);
+                }
+            } else if kind.is_file()
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if relative.chars().all(|c| !c.is_control()) {
+                    out.push(relative);
+                }
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(cwd, cwd, &mut files);
+    files.sort_by_key(|path| path.to_ascii_lowercase());
+    files
+}
+
 /// What the app loop must still do after the editor has seen a key.
 #[derive(Debug, PartialEq)]
 pub enum Edit {
@@ -176,9 +382,34 @@ pub enum Edit {
 /// Feed one key to the editor (input line + popup) and say what is left to do.
 ///
 /// This is the whole ↑↓ / Enter ownership rule; see the module docs.
-pub fn handle_key(input: &mut InputState, menu: &mut SlashMenu, key: KeyEvent) -> Edit {
+pub fn handle_key_with_files(
+    input: &mut InputState,
+    menu: &mut SlashMenu,
+    files: &mut FileMenu,
+    key: KeyEvent,
+) -> Edit {
     match (key.code, key.modifiers) {
-        // ── popup open: it owns the navigation keys ──────────────────────────
+        // The file popup has priority when open. In practice the two syntaxes are
+        // disjoint (`/` at line start versus an `@` token), but making the ownership
+        // explicit prevents a future slash argument completion from stealing these keys.
+        (KeyCode::Up, _) if files.is_open() => {
+            files.cursor.up();
+            Edit::Consumed
+        }
+        (KeyCode::Down, _) if files.is_open() => {
+            files.cursor.down(files.matches.len());
+            Edit::Consumed
+        }
+        (KeyCode::Tab | KeyCode::Enter, _) if files.is_open() => {
+            accept_file(input, files);
+            menu.refresh(input.text());
+            Edit::Consumed
+        }
+        (KeyCode::Esc, _) if files.is_open() => {
+            files.dismiss(input.text(), input.cursor());
+            Edit::Consumed
+        }
+        // ── slash popup open: it owns the navigation keys ────────────────────
         (KeyCode::Up, _) if menu.is_open() => {
             menu.cursor.up();
             Edit::Consumed
@@ -189,20 +420,20 @@ pub fn handle_key(input: &mut InputState, menu: &mut SlashMenu, key: KeyEvent) -
         }
         (KeyCode::Tab, _) if menu.is_open() => {
             accept(input, menu);
+            files.refresh(input.text(), input.cursor());
             Edit::Consumed
         }
         (KeyCode::Enter, _) if menu.is_open() => {
-            // Enter completes the row — unless there is nothing left to complete because
-            // the typed name already IS the highlighted row, in which case it runs the
-            // command. `/tree` + Enter must stay one keystroke, not two.
             let typed = typed_name(input.text())
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if menu.selected().is_some_and(|c| c.name == typed) {
                 menu.reset();
+                files.reset();
                 Edit::Submit
             } else {
                 accept(input, menu);
+                files.refresh(input.text(), input.cursor());
                 Edit::Consumed
             }
         }
@@ -213,45 +444,57 @@ pub fn handle_key(input: &mut InputState, menu: &mut SlashMenu, key: KeyEvent) -
         // ── popup closed: the input line behaves exactly as it always has ────
         (KeyCode::Enter, _) => {
             menu.reset();
+            files.reset();
             Edit::Submit
         }
         (KeyCode::Up, _) => {
             input.history_prev();
+            refresh(input, menu, files);
             Edit::Consumed
         }
         (KeyCode::Down, _) => {
             input.history_next();
+            refresh(input, menu, files);
             Edit::Consumed
         }
-        // ── edits and cursor motion (only edits can change what matches) ─────
+        // ── edits and cursor motion can both change the active @ prefix ──────
         (KeyCode::Backspace, _) => {
             input.backspace();
-            menu.refresh(input.text());
+            refresh(input, menu, files);
             Edit::Consumed
         }
         (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
             input.insert(c);
-            menu.refresh(input.text());
+            refresh(input, menu, files);
             Edit::Consumed
         }
         (KeyCode::Left, _) => {
             input.left();
+            refresh(input, menu, files);
             Edit::Consumed
         }
         (KeyCode::Right, _) => {
             input.right();
+            refresh(input, menu, files);
             Edit::Consumed
         }
         (KeyCode::Home, _) => {
             input.home();
+            refresh(input, menu, files);
             Edit::Consumed
         }
         (KeyCode::End, _) => {
             input.end();
+            refresh(input, menu, files);
             Edit::Consumed
         }
         _ => Edit::Passthrough,
     }
+}
+
+fn refresh(input: &InputState, menu: &mut SlashMenu, files: &mut FileMenu) {
+    menu.refresh(input.text());
+    files.refresh(input.text(), input.cursor());
 }
 
 /// Where the popup is drawn: directly above the input box, growing upward, capped at
@@ -286,6 +529,28 @@ fn accept(input: &mut InputState, menu: &mut SlashMenu) {
     menu.refresh(input.text());
 }
 
+fn accept_file(input: &mut InputState, menu: &mut FileMenu) {
+    let Some(path) = menu.selected().map(str::to_owned) else {
+        return;
+    };
+    if let Some(token) = at_token(input.text(), input.cursor()) {
+        // Consume one existing delimiter so accepting an inline token never creates a
+        // double space, and leave the cursor after the single inserted delimiter.
+        let replace_end = if input
+            .text()
+            .chars()
+            .nth(token.end)
+            .is_some_and(char::is_whitespace)
+        {
+            token.end + 1
+        } else {
+            token.end
+        };
+        input.replace_range(token.start, replace_end, &format!("@{path} "));
+    }
+    menu.refresh(input.text(), input.cursor());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +565,7 @@ mod tests {
     struct Editor {
         input: InputState,
         menu: SlashMenu,
+        files: FileMenu,
     }
 
     impl Editor {
@@ -308,10 +574,17 @@ mod tests {
             Editor {
                 input: InputState::default(),
                 menu: SlashMenu::over(reg),
+                files: FileMenu::default(),
+            }
+        }
+        fn with_files(files: &[&str]) -> Editor {
+            Editor {
+                files: FileMenu::with_files(files.iter().map(|s| (*s).to_string()).collect()),
+                ..Editor::default()
             }
         }
         fn press(&mut self, code: KeyCode) -> Edit {
-            handle_key(&mut self.input, &mut self.menu, key(code))
+            handle_key_with_files(&mut self.input, &mut self.menu, &mut self.files, key(code))
         }
         fn type_str(&mut self, s: &str) {
             for c in s.chars() {
@@ -375,6 +648,17 @@ mod tests {
         let mut alias = Editor::default();
         alias.type_str("/ex");
         assert_eq!(alias.names(), vec!["exit"]);
+    }
+
+    #[test]
+    fn doctor_and_config_are_visible_and_filterable_in_the_tui() {
+        let mut doctor = Editor::default();
+        doctor.type_str("/doc");
+        assert_eq!(doctor.names(), vec!["doctor"]);
+
+        let mut config = Editor::default();
+        config.type_str("/conf");
+        assert_eq!(config.names(), vec!["config"]);
     }
 
     #[test]
@@ -627,15 +911,114 @@ mod tests {
         assert_eq!(e.press(KeyCode::Esc), Edit::Passthrough);
         assert_eq!(e.press(KeyCode::Tab), Edit::Passthrough);
         assert_eq!(
-            handle_key(
+            handle_key_with_files(
                 &mut e.input,
                 &mut e.menu,
+                &mut e.files,
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             ),
             Edit::Passthrough,
             "Ctrl-C is the app loop's, not a character to insert"
         );
         assert_eq!(e.text(), "");
+    }
+
+    // ─── project-file completion ─────────────────────────────────────────────
+
+    #[test]
+    fn at_token_filters_relative_paths_and_accept_replaces_only_that_token() {
+        let mut e = Editor::with_files(&["README.md", "src/main.rs", "src/tui/mod.rs"]);
+        e.type_str("please inspect @src/m then");
+        // Move the cursor back to immediately after `@src/m`; filtering is based on the
+        // cursor prefix, while acceptance replaces the suffix too.
+        for _ in 0.." then".chars().count() {
+            e.press(KeyCode::Left);
+        }
+        assert_eq!(e.files.matches(), &["src/main.rs"]);
+        assert_eq!(e.press(KeyCode::Enter), Edit::Consumed);
+        assert_eq!(e.text(), "please inspect @src/main.rs then");
+        assert_eq!(
+            e.input.cursor(),
+            "please inspect @src/main.rs ".chars().count()
+        );
+    }
+
+    #[test]
+    fn file_filter_finds_a_path_by_component_or_substring() {
+        let mut e = Editor::with_files(&["docs/guide.md", "src/main.rs", "src/tui/mod.rs"]);
+        e.type_str("look at @main");
+        assert_eq!(e.files.matches(), &["src/main.rs"]);
+
+        let mut substring = Editor::with_files(&["docs/architecture.md", "src/lib.rs"]);
+        substring.type_str("look at @tect");
+        assert_eq!(substring.files.matches(), &["docs/architecture.md"]);
+    }
+
+    #[test]
+    fn file_menu_owns_arrows_tab_enter_and_esc_without_opening_slash_menu() {
+        let mut e = Editor::with_files(&["alpha.rs", "assets/logo.png"]);
+        e.type_str("see @a");
+        assert!(e.files.is_open());
+        assert!(!e.menu.is_open());
+        e.press(KeyCode::Down);
+        assert_eq!(e.files.index(), 1);
+        e.press(KeyCode::Tab);
+        assert_eq!(e.text(), "see @assets/logo.png ");
+
+        e.type_str("and @a");
+        assert!(e.files.is_open());
+        assert_eq!(e.press(KeyCode::Esc), Edit::Consumed);
+        assert!(!e.files.is_open());
+        assert_eq!(e.text(), "see @assets/logo.png and @a");
+        e.type_str("lpha");
+        assert!(!e.files.is_open(), "dismissal lasts for the current token");
+    }
+
+    #[test]
+    fn no_matching_file_and_bang_backend_leave_normal_input_keys_alone() {
+        let mut e = Editor::with_files(&["src/main.rs"]);
+        e.type_str("@definitely-not-a-file do work");
+        assert!(!e.files.is_open());
+        assert_eq!(e.press(KeyCode::Enter), Edit::Submit);
+
+        let mut backend = Editor::with_files(&["claude"]);
+        backend.type_str("!claude review this");
+        assert!(
+            !backend.files.is_open(),
+            "! is reserved for backend routing"
+        );
+    }
+
+    #[test]
+    fn at_is_exclusively_a_file_picker_even_for_a_backend_named_file() {
+        let mut e = Editor::with_files(&["claude"]);
+        e.type_str("@claude");
+        assert_eq!(e.files.matches(), &["claude"]);
+        assert_eq!(e.press(KeyCode::Tab), Edit::Consumed);
+        assert_eq!(e.text(), "@claude ");
+    }
+
+    #[test]
+    fn project_enumeration_prunes_metadata_and_generated_trees() {
+        let unique = format!(
+            "agentpit-file-menu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::write(dir.join("README.md"), "readme").unwrap();
+        fs::write(dir.join("src/lib.rs"), "lib").unwrap();
+        fs::write(dir.join(".git/config"), "git").unwrap();
+        fs::write(dir.join("target/debug/app"), "binary").unwrap();
+
+        assert_eq!(project_files(&dir), vec!["README.md", "src/lib.rs"]);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     // ─── geometry ────────────────────────────────────────────────────────────

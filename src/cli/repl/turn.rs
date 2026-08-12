@@ -6,7 +6,7 @@ use rustyline::error::ReadlineError;
 
 use super::banner::print_status_line;
 use super::commands::{SlashCommand, handle_slash, is_slash_line_in, parse_slash_in};
-use super::dispatch_turn::{dispatch_free_text, parse_at_modifier};
+use super::dispatch_turn::{dispatch_free_text, parse_bang_modifier};
 use super::entry::ReplEditor;
 use super::state::SessionState;
 use crate::types::BackendId;
@@ -36,9 +36,9 @@ enum LineRoute {
     /// §7.2 A4: this must re-prompt, never fall through to a backend dispatch — a typo
     /// is not a billable LLM call.
     RejectedSlash,
-    /// `@backend` modifier present but the backend id did not parse. Already reported.
-    InvalidAtModifier,
-    /// A bare `@backend` with no task text after it.
+    /// `!backend` modifier present but the backend id did not parse. Already reported.
+    InvalidBackendModifier,
+    /// A bare `!backend` with no task text after it.
     EmptyTask,
     /// Ordinary text (optionally routed to an explicit backend) to dispatch.
     FreeText {
@@ -48,7 +48,7 @@ enum LineRoute {
 }
 
 /// Decide what a trimmed input line means, in the same order `run_one_turn` used to
-/// inline: blank check → slash parse → rejected-slash guard → `@backend` modifier.
+/// inline: blank check → slash parse → rejected-slash guard → `!backend` modifier.
 fn route_line(trimmed: &str) -> LineRoute {
     route_line_in(crate::cli::slash::registry(), trimmed)
 }
@@ -72,8 +72,8 @@ fn route_line_in(reg: &crate::cli::slash::Registry, trimmed: &str) -> LineRoute 
     if is_slash_line_in(reg, trimmed) {
         return LineRoute::RejectedSlash;
     }
-    match parse_at_modifier(trimmed) {
-        None => LineRoute::InvalidAtModifier,
+    match parse_bang_modifier(trimmed) {
+        None => LineRoute::InvalidBackendModifier,
         Some((_, task)) if task.is_empty() => LineRoute::EmptyTask,
         Some((backend, task)) => LineRoute::FreeText { backend, task },
     }
@@ -121,11 +121,11 @@ pub async fn run_one_turn(
                     let (new_state, control) = handle_slash(cmd, state).await?;
                     Ok((new_state, editor, control, None))
                 }
-                LineRoute::RejectedSlash | LineRoute::InvalidAtModifier => {
+                LineRoute::RejectedSlash | LineRoute::InvalidBackendModifier => {
                     Ok((state, editor, LoopControl::Continue, None))
                 }
                 LineRoute::EmptyTask => {
-                    // e.g. user typed just `@claude` with no prompt text.
+                    // e.g. user typed just `!claude` with no prompt text.
                     eprintln!("No task text after backend modifier — please type a task.");
                     Ok((state, editor, LoopControl::Continue, None))
                 }
@@ -165,19 +165,19 @@ mod tests {
 
     // These tests call `route_line` — the exact function `run_one_turn`'s match arms
     // dispatch on above, not a re-derivation from `parse_slash`/`is_slash_line`/
-    // `parse_at_modifier` in isolation. Deleting the `is_slash_line` guard inside
+    // `parse_bang_modifier` in isolation. Deleting the `is_slash_line` guard inside
     // `route_line` (collapsing `RejectedSlash` into falling through to the
-    // `parse_at_modifier` branch) makes `a_rejected_slash_line_routes_away_from_free_text`
+    // `parse_bang_modifier` branch) makes `a_rejected_slash_line_routes_away_from_free_text`
     // fail: `/frobnicate` would route to `FreeText` instead of `RejectedSlash`, because
-    // `parse_at_modifier` treats any non-`@` line — including a rejected slash line — as
+    // `parse_bang_modifier` treats any non-`!` line — including a rejected slash line — as
     // plain task text (see the assertion on that raw behavior below).
 
     #[test]
     fn a_rejected_slash_line_routes_away_from_free_text() {
-        // Why the guard inside `route_line` exists: `parse_at_modifier` alone treats a
+        // Why the guard inside `route_line` exists: `parse_bang_modifier` alone treats a
         // rejected slash line as ordinary task text (§7.2 A4's failure mode)...
         assert_eq!(
-            parse_at_modifier("/frobnicate"),
+            parse_bang_modifier("/frobnicate"),
             Some((None, "/frobnicate".to_string()))
         );
         // ...so `route_line` must intercept it before that point is ever reached.
@@ -234,7 +234,7 @@ mod tests {
 
     /// The other half: nothing about a skill weakens §7.2 A4. A `/name` the registry does
     /// not carry — never written, or written and skipped at discovery — is refused, and in
-    /// particular is never handed to `parse_at_modifier` and dispatched as its own text.
+    /// particular is never handed to `parse_bang_modifier` and dispatched as its own text.
     #[test]
     fn a_skill_the_registry_does_not_carry_is_refused_rather_than_dispatched() {
         let reg = crate::cli::skills::test_registry_from_disk();
@@ -243,9 +243,9 @@ mod tests {
                 matches!(route_line_in(reg, line), LineRoute::RejectedSlash),
                 "{line:?} did not route to RejectedSlash"
             );
-            // Which is the point: `parse_at_modifier` would happily take it as task text.
+            // Which is the point: `parse_bang_modifier` would happily take it as task text.
             assert_eq!(
-                parse_at_modifier(line),
+                parse_bang_modifier(line),
                 Some((None, line.to_string())),
                 "the guard is what keeps {line:?} off the dispatch"
             );
@@ -272,16 +272,16 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_at_modifier_routes_to_invalid_at_modifier() {
+    fn an_invalid_bang_modifier_routes_to_invalid_bang_modifier() {
         assert!(matches!(
-            route_line("@nonexistent-backend hi"),
-            LineRoute::InvalidAtModifier
+            route_line("!nonexistent-backend hi"),
+            LineRoute::InvalidBackendModifier
         ));
     }
 
     #[test]
-    fn a_bare_at_modifier_with_no_task_text_routes_to_empty_task() {
-        assert!(matches!(route_line("@claude"), LineRoute::EmptyTask));
+    fn a_bare_bang_modifier_with_no_task_text_routes_to_empty_task() {
+        assert!(matches!(route_line("!claude"), LineRoute::EmptyTask));
     }
 
     #[test]
@@ -296,8 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn an_at_modifier_with_task_text_routes_to_free_text_with_that_backend() {
-        match route_line("@claude explain this") {
+    fn a_bang_modifier_with_task_text_routes_to_free_text_with_that_backend() {
+        match route_line("!claude explain this") {
             LineRoute::FreeText { backend, task } => {
                 assert_eq!(backend, Some(BackendId::Claude));
                 assert_eq!(task, "explain this");

@@ -65,7 +65,7 @@ pub const HINTS: &[&str] = &[
     "you can close this terminal — the session keeps running (agentpit attach brings it back)",
     "← on an empty line lists every session with its live state",
     "/tree shows branches; Enter moves the leaf, f forks at the cursor",
-    "@codex …  routes a single turn to codex without switching the default",
+    "!codex …  routes a single turn to codex without switching the default",
     "agentpit orchestrate runs TypeScript cells that fan work out to backends",
 ];
 
@@ -88,6 +88,28 @@ pub fn style_notice() -> Style {
 
 pub fn style_accent() -> Style {
     Style::default().fg(ACCENT)
+}
+
+// Markdown tokens (§11.3, prime-agent's rendered answers): headings in the accent,
+// code in green, quotes muted-italic — all drawn from the palette above.
+pub fn style_md_heading() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+pub fn style_md_code() -> Style {
+    Style::default().fg(GREEN)
+}
+
+pub fn style_md_quote() -> Style {
+    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC)
+}
+
+pub fn style_md_bold() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+pub fn style_md_italic() -> Style {
+    Style::default().add_modifier(Modifier::ITALIC)
 }
 
 /// Overlay selection row (SELECTED_BG + accent, prime's tree-selector cursor).

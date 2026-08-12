@@ -98,6 +98,8 @@ impl Protocol {
 /// `agentpit <name>` behind the protocol.
 #[derive(Debug, PartialEq)]
 pub enum Suspend {
+    /// The interactive `agentpit config` menu.
+    Config,
     /// `agentpit status`.
     Status,
     /// `agentpit login <backend>` — `None` means the session's active backend.
@@ -139,6 +141,7 @@ impl Suspend {
             }
         }
         match self {
+            Suspend::Config => "/config".to_string(),
             Suspend::Status => "/status".to_string(),
             Suspend::Login(None) => "/login".to_string(),
             Suspend::Login(Some(backend)) => format!("/login {backend}"),
@@ -193,6 +196,7 @@ fn command_route(command: SlashCommand) -> Route {
         SlashCommand::Branch(target) => Route::Protocol(Protocol::Branch(target)),
         SlashCommand::Fork(at) => Route::Protocol(Protocol::Fork(at)),
         SlashCommand::Compact => Route::Protocol(Protocol::Compact),
+        SlashCommand::Config => Route::Suspend(Suspend::Config),
         SlashCommand::Status => Route::Suspend(Suspend::Status),
         SlashCommand::Login(backend) => Route::Suspend(Suspend::Login(backend)),
         SlashCommand::Learning => Route::Suspend(Suspend::Learning),
@@ -396,9 +400,9 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
-        // Suggestions come from the TUI's own vocabulary, not the REPL's.
+        // Suggestions come from the TUI's own vocabulary, including its config screen.
         match route("/conf") {
-            Route::Unknown(msg) => assert!(!msg.contains("Did you mean"), "{msg}"),
+            Route::Unknown(msg) => assert!(msg.contains("Did you mean /config?"), "{msg}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
@@ -419,10 +423,10 @@ mod tests {
             route("explain this file"),
             Route::FreeText("explain this file".to_string())
         );
-        // The @backend modifier is free text too — the worker parses it.
+        // The !backend modifier reaches the TUI's send preparation as free text.
         assert_eq!(
-            route("  @claude explain this  "),
-            Route::FreeText("@claude explain this".to_string())
+            route("  !claude explain this  "),
+            Route::FreeText("!claude explain this".to_string())
         );
         assert_eq!(route(""), Route::Ignore);
         assert_eq!(route("   "), Route::Ignore);
@@ -467,6 +471,8 @@ mod tests {
 
     #[test]
     fn suspend_commands_carry_their_argument_and_a_label() {
+        assert_eq!(route("/config"), Route::Suspend(Suspend::Config));
+        assert_eq!(Suspend::Config.label(), "/config");
         assert_eq!(route("/status"), Route::Suspend(Suspend::Status));
         assert_eq!(route("/login"), Route::Suspend(Suspend::Login(None)));
         assert_eq!(

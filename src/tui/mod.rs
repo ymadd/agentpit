@@ -11,16 +11,21 @@
 mod chunks;
 mod completion;
 mod input;
+mod markdown;
 mod scroll;
 mod slash;
 pub mod theme;
 mod views;
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyCode, KeyEvent,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -33,8 +38,9 @@ use crate::daemon::client::{Conn, connect_daemon, create_session, open_session};
 use crate::daemon::protocol::{Event, Frame, RequestBody, ResponseData};
 use crate::types::BackendId;
 use chunks::{LineAssembler, is_progress_line};
-use completion::{Edit, SlashMenu};
+use completion::{Edit, FileMenu, SlashMenu};
 use input::InputState;
+use markdown::MdRenderer;
 use scroll::{clamp_offset, tail_window};
 use slash::{Local, Protocol, Route, Suspend, route};
 use views::{ListCursor, RosterRow, help_lines, tree_line_id};
@@ -54,8 +60,15 @@ pub async fn run(session: Option<String>) -> Result<()> {
         None => create_session(&cwd, true).await?,
     };
 
-    let mut app = App::new(session_id, conn);
-    app.cwd_label = cwd.display().to_string();
+    let picker_cwd = if session.is_some() {
+        session_cwd(&session_id)
+            .await
+            .unwrap_or_else(|| cwd.clone())
+    } else {
+        cwd.clone()
+    };
+    let mut app = App::new(session_id, conn, &picker_cwd);
+    app.cwd_label = picker_cwd.display().to_string();
     app.enter_terminal().map_err(|e| {
         let _ = leave_screen();
         anyhow::anyhow!(
@@ -73,7 +86,11 @@ pub async fn run(session: Option<String>) -> Result<()> {
 }
 
 fn leave_screen() -> std::io::Result<()> {
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        crossterm::terminal::LeaveAlternateScreen
+    )?;
     crossterm::terminal::disable_raw_mode()
 }
 
@@ -150,7 +167,11 @@ struct App {
     /// The slash-command dropdown (D4) — pure state; this loop only feeds it keys and
     /// draws it above the input line.
     menu: SlashMenu,
+    /// Project paths offered for the `@` token at the input cursor.
+    file_menu: FileMenu,
     assembler: LineAssembler,
+    /// Styles the backend's answer lines (headings, code fences, emphasis) as they land.
+    md: MdRenderer,
     busy: bool,
     turn_started: Instant,
     last_ctrl_c: Option<Instant>,
@@ -166,7 +187,7 @@ struct App {
 }
 
 impl App {
-    fn new(session_id: String, conn: Conn) -> App {
+    fn new(session_id: String, conn: Conn, cwd: &Path) -> App {
         App {
             session_id,
             conn,
@@ -176,7 +197,9 @@ impl App {
             scroll_offset: 0,
             input: InputState::default(),
             menu: SlashMenu::default(),
+            file_menu: FileMenu::from_cwd(cwd),
             assembler: LineAssembler::default(),
+            md: MdRenderer::default(),
             busy: false,
             turn_started: Instant::now(),
             last_ctrl_c: None,
@@ -190,7 +213,14 @@ impl App {
 
     fn enter_terminal(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        // Mouse capture is what makes the wheel scroll the transcript instead of the
+        // terminal's (empty) alternate-screen scrollback. Text selection still works via
+        // the terminal's usual override (Shift/Option-drag).
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            EnableMouseCapture
+        )?;
         let backend = CrosstermBackend::new(std::io::stdout());
         self.terminal = Some(Terminal::new(backend)?);
         Ok(())
@@ -233,9 +263,12 @@ impl App {
             ..
         } = data
         {
+            // One renderer for the whole snapshot so a fence stays open across its lines;
+            // the live turns' renderer (`self.md`) is untouched.
+            let mut md = MdRenderer::default();
             let lines: Vec<Line<'static>> = transcript
                 .iter()
-                .map(|(who, text)| transcript_line(who, text))
+                .map(|(who, text)| transcript_line(who, text, &mut md))
                 .collect();
             for line in lines {
                 self.push_line(line);
@@ -309,6 +342,7 @@ impl App {
                                 self.scroll_offset,
                             );
                         }
+                        Some(Ok(TermEvent::Mouse(m))) => self.on_mouse(m),
                         Some(Ok(_)) => {}
                         Some(Err(_)) | None => return Ok(()),
                     }
@@ -366,6 +400,7 @@ impl App {
     /// runs, so the TUI cannot drift from `agentpit status` / `agentpit login`.
     async fn run_suspended(&self, cmd: &Suspend) -> Result<()> {
         match cmd {
+            Suspend::Config => crate::cli::menu::run_config().await,
             Suspend::Status => crate::cli::status::run(None).await,
             Suspend::Login(requested) => {
                 let backend = self.login_target(requested.as_deref())?;
@@ -415,6 +450,7 @@ impl App {
         match frame {
             Frame::Event(Event::TurnStarted { backend }) => {
                 self.busy = true;
+                self.md.reset(); // a new turn is a new document — no fence carries over
                 self.turn_started = Instant::now();
                 self.push_line(theme::turn_start_line(&backend));
                 self.active_backend = Some(backend.clone());
@@ -426,13 +462,15 @@ impl App {
                     if is_progress_line(&line) {
                         self.push_line(theme::progress_line(&line));
                     } else {
-                        self.push_text(&line, Style::default());
+                        let rendered = self.md.render(&line);
+                        self.push_line(rendered);
                     }
                 }
             }
             Frame::Event(Event::TurnFinished { status }) => {
                 if let Some(rest) = self.assembler.finish() {
-                    self.push_text(&rest, Style::default());
+                    let rendered = self.md.render(&rest);
+                    self.push_line(rendered);
                 }
                 if status != "ok" {
                     self.push_text(&format!("[turn ended: {status}]"), theme::style_notice());
@@ -539,7 +577,13 @@ impl App {
             // that shares its keys. `completion::handle_key` owns that split (D4) — this
             // loop only learns whether a line is ready to route.
             _ => {
-                if completion::handle_key(&mut self.input, &mut self.menu, key) == Edit::Submit {
+                if completion::handle_key_with_files(
+                    &mut self.input,
+                    &mut self.menu,
+                    &mut self.file_menu,
+                    key,
+                ) == Edit::Submit
+                {
                     // Registry-driven (D2): only `Route::FreeText` may become a Send, so
                     // an unknown /word is refused in-screen instead of billing a turn.
                     match route(&self.input.submit()) {
@@ -549,7 +593,14 @@ impl App {
                         Route::Protocol(cmd) => self.run_protocol(cmd).await?,
                         Route::Suspend(cmd) => return Ok(KeyOutcome::Suspend(cmd)),
                         Route::Unknown(message) => self.notify(&message, theme::style_notice()),
-                        Route::FreeText(text) => self.send_turn(text.clone(), text).await?,
+                        Route::FreeText(text) => match split_backend_modifier(&text) {
+                            Ok((_, task)) if task.is_empty() => self.notify(
+                                "A backend override needs task text after it.",
+                                theme::style_notice(),
+                            ),
+                            Ok((backend, task)) => self.send_turn(text, task, backend).await?,
+                            Err(message) => self.notify(&message, theme::style_notice()),
+                        },
                         // A skill's turn is sent exactly like a typed one; only what the
                         // transcript shows differs — the provenance line and the command,
                         // rather than the composed body. The note goes in before the send
@@ -561,7 +612,7 @@ impl App {
                             text,
                         } => {
                             self.push_text(&provenance, theme::style_dim());
-                            self.send_turn(label, text).await?;
+                            self.send_turn(label, text, None).await?;
                         }
                         // An MCP prompt is the same turn one step later: its body is on the
                         // server, so it is fetched here and only then sent. A server that
@@ -571,8 +622,12 @@ impl App {
                             match crate::mcp::prompts::invoke(&invocation).await {
                                 Ok(composed) => {
                                     self.push_text(&composed.provenance, theme::style_dim());
-                                    self.send_turn(format!("/{}", invocation.name), composed.turn)
-                                        .await?;
+                                    self.send_turn(
+                                        format!("/{}", invocation.name),
+                                        composed.turn,
+                                        None,
+                                    )
+                                    .await?;
                                 }
                                 Err(e) => {
                                     self.notify(&format!("error: {e:#}"), theme::style_error())
@@ -590,15 +645,17 @@ impl App {
     ///
     /// The two are the same string for a line the user typed, and differ for a composed
     /// turn (a skill), where `text` is the whole skill body.
-    async fn send_turn(&mut self, shown: String, text: String) -> Result<()> {
+    async fn send_turn(
+        &mut self,
+        shown: String,
+        text: String,
+        backend: Option<String>,
+    ) -> Result<()> {
         self.push_line(theme::user_line(&shown));
         self.scroll_offset = 0; // sending re-follows the bottom
         let id = self
             .conn
-            .send_request(RequestBody::Send {
-                text,
-                backend: None,
-            })
+            .send_request(RequestBody::Send { text, backend })
             .await?;
         self.pending_send = Some(id);
         self.busy = true;
@@ -676,19 +733,43 @@ impl App {
 
     /// Scroll by half a screen; +1 = up (older), -1 = down (newer).
     fn scroll_by(&mut self, direction: i32) {
-        let (width, height) = self
-            .terminal
-            .as_ref()
-            .and_then(|t| t.size().ok())
-            .map(|s| (s.width as usize, s.height.saturating_sub(5) as usize))
-            .unwrap_or((80, 20));
-        let step = (height / 2).max(1);
+        let (_, height) = self.viewport();
+        self.scroll_rows(direction, (height / 2).max(1));
+    }
+
+    /// Scroll by `step` wrapped rows; +1 = up (older), -1 = down (newer).
+    fn scroll_rows(&mut self, direction: i32, step: usize) {
+        let (width, height) = self.viewport();
         let wanted = if direction > 0 {
             self.scroll_offset + step
         } else {
             self.scroll_offset.saturating_sub(step)
         };
         self.scroll_offset = clamp_offset(&self.transcript, width, height, wanted);
+    }
+
+    /// The transcript area's (width, height) in cells.
+    fn viewport(&self) -> (usize, usize) {
+        self.terminal
+            .as_ref()
+            .and_then(|t| t.size().ok())
+            .map(|s| (s.width as usize, s.height.saturating_sub(5) as usize))
+            .unwrap_or((80, 20))
+    }
+
+    /// The wheel scrolls whatever surface is up: the transcript, or an overlay's cursor.
+    fn on_mouse(&mut self, m: MouseEvent) {
+        const WHEEL_STEP: usize = 3;
+        match (m.kind, &mut self.mode) {
+            (MouseEventKind::ScrollUp, Mode::Overlay(o)) => o.cursor.up(),
+            (MouseEventKind::ScrollDown, Mode::Overlay(o)) => {
+                let len = o.items.len();
+                o.cursor.down(len);
+            }
+            (MouseEventKind::ScrollUp, Mode::Chat) => self.scroll_rows(1, WHEEL_STEP),
+            (MouseEventKind::ScrollDown, Mode::Chat) => self.scroll_rows(-1, WHEEL_STEP),
+            _ => {}
+        }
     }
 
     async fn on_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -776,6 +857,7 @@ impl App {
             Mode::Chat => None,
         };
         let menu = &self.menu;
+        let file_menu = &self.file_menu;
         terminal.draw(|f| {
             let [transcript_area, live_area, box_area, status_area] = Layout::vertical([
                 Constraint::Min(1),
@@ -831,10 +913,33 @@ impl App {
                 f.render_stateful_widget(list, area, &mut state);
             } else {
                 f.set_cursor_position((inner.x + 2 + cursor, inner.y));
-                // The slash dropdown (D4): anchored to the input box's top edge and no
-                // taller than the room above it, so the conversation stays on screen —
-                // only the rows the popup actually needs are covered.
-                if let Some(area) = completion::popup_area(box_area, menu.matches().len()) {
+                // Both completion popups share the same anchored geometry. The file picker
+                // has priority while an `@token` is active; otherwise `/` shows commands.
+                if file_menu.is_open() {
+                    if let Some(area) = completion::popup_area(box_area, file_menu.matches().len())
+                    {
+                        f.render_widget(Clear, area);
+                        let mut state = ListState::default();
+                        state.select(Some(file_menu.index()));
+                        let rows = file_menu.matches().iter().map(|path| {
+                            ListItem::new(theme::menu_row(&format!("@{path}"), "project file"))
+                        });
+                        let list = List::new(rows)
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_type(BorderType::Rounded)
+                                    .border_style(Style::default().fg(theme::BORDER_MUTED))
+                                    .title(Span::styled(
+                                        " files — Tab/Enter selects · Esc dismisses ",
+                                        theme::style_dim(),
+                                    )),
+                            )
+                            .highlight_style(theme::style_selected())
+                            .highlight_symbol("› ");
+                        f.render_stateful_widget(list, area, &mut state);
+                    }
+                } else if let Some(area) = completion::popup_area(box_area, menu.matches().len()) {
                     f.render_widget(Clear, area);
                     let mut state = ListState::default();
                     state.select(Some(menu.index()));
@@ -868,29 +973,69 @@ impl App {
         let (session_id, conn) = open_session(&session, true).await?;
         self.session_id = session_id;
         self.conn = conn;
+        if let Some(cwd) = session_cwd(&self.session_id).await {
+            self.cwd_label = cwd.display().to_string();
+            self.file_menu = FileMenu::from_cwd(&cwd);
+        } else {
+            // Never keep offering paths from the previously attached session.
+            self.file_menu = FileMenu::default();
+        }
         self.transcript.clear();
         self.scroll_offset = 0;
         self.attach().await
     }
 }
 
-/// One transcript line, styled by speaker via the theme (§11.3).
-fn transcript_line(who: &str, text: &str) -> Line<'static> {
+/// Split a leading, known `!backend` from an ordinary TUI turn.
+///
+/// `@` remains exclusively available to the project-file picker and is never interpreted
+/// here. Email addresses and mentions later in the line also remain untouched.
+fn split_backend_modifier(text: &str) -> Result<(Option<String>, String), String> {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix('!') else {
+        return Ok((None, trimmed.to_string()));
+    };
+    let (name, task) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    match name.parse::<BackendId>() {
+        Ok(backend) => Ok((Some(backend.to_string()), task.trim().to_string())),
+        Err(error) => Err(format!("Unknown backend !{name}: {error}")),
+    }
+}
+
+/// One transcript line, styled by speaker via the theme (§11.3). Backend lines pass
+/// through the markdown renderer, same as when they streamed in live.
+fn transcript_line(who: &str, text: &str, md: &mut MdRenderer) -> Line<'static> {
     match who {
-        "user" => theme::user_line(text),
+        "user" => {
+            md.reset(); // a user turn ends the previous answer's document
+            theme::user_line(text)
+        }
         "summary" => Line::from(vec![
             Span::styled("── summary ── ".to_string(), theme::style_accent()),
             Span::styled(text.to_string(), theme::style_muted()),
         ]),
-        backend => Line::from(vec![
-            Span::styled("◈ ".to_string(), theme::style_accent()),
-            Span::styled(
-                format!("{backend}  "),
-                theme::style_muted().add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            Span::raw(text.to_string()),
-        ]),
+        backend => {
+            let mut line = md.render(text);
+            line.spans.insert(
+                0,
+                Span::styled(
+                    format!("{backend}  "),
+                    theme::style_muted().add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            );
+            line.spans
+                .insert(0, Span::styled("◈ ".to_string(), theme::style_accent()));
+            line
+        }
     }
+}
+
+async fn session_cwd(session_id: &str) -> Option<PathBuf> {
+    fetch_roster()
+        .await
+        .into_iter()
+        .find(|row| row.session_id == session_id)
+        .map(|row| PathBuf::from(row.cwd))
 }
 
 async fn fetch_roster() -> Vec<RosterRow> {
@@ -908,5 +1053,35 @@ async fn fetch_roster() -> Vec<RosterRow> {
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_backend_modifier;
+
+    #[test]
+    fn known_leading_bang_backend_is_sent_out_of_band() {
+        assert_eq!(
+            split_backend_modifier("  !codex  review @src/lib.rs  "),
+            Ok((Some("codex".to_string()), "review @src/lib.rs".to_string()))
+        );
+        assert_eq!(
+            split_backend_modifier("!claude"),
+            Ok((Some("claude".to_string()), String::new()))
+        );
+        assert!(split_backend_modifier("!unknown task").is_err());
+    }
+
+    #[test]
+    fn file_mentions_and_email_are_not_backend_modifiers() {
+        assert_eq!(
+            split_backend_modifier("@src/lib.rs explain this"),
+            Ok((None, "@src/lib.rs explain this".to_string()))
+        );
+        assert_eq!(
+            split_backend_modifier("email me@example.com"),
+            Ok((None, "email me@example.com".to_string()))
+        );
     }
 }

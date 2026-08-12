@@ -22,7 +22,7 @@ pub mod init;
 pub mod learning;
 pub mod login;
 pub mod mcp_cmd;
-mod menu;
+pub mod menu;
 pub mod note;
 pub mod orchestrate_cmd;
 pub mod outcome;

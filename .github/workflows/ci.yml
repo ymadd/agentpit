@@ -27,15 +27,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v5
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-ci-
+          shared-key: ci-default
+          cache-on-failure: true
 
       - name: Format
         run: cargo fmt -p agentpit -p agentpit-events --check
@@ -83,15 +79,11 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v5
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-sim-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-sim-
+          shared-key: ci-similarity
+          cache-on-failure: true
 
       - name: Clippy (similarity)
         run: cargo clippy -p agentpit --features similarity --all-targets --locked -- -D warnings
@@ -127,15 +119,11 @@ jobs:
             libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev
 
-      - name: Cache cargo
-        uses: actions/cache@v5
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-dashboard-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-dashboard-
+          shared-key: ci-dashboard
+          cache-on-failure: true
 
       - name: Set up Node
         uses: actions/setup-node@v4

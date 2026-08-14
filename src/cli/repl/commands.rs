@@ -336,7 +336,7 @@ pub async fn handle_slash(
                 }
                 println!(
                     "{}",
-                    style("← = current position, • = current path. /branch <id> to move.").dim()
+                    style("← = current position, • = current path. /rewind <id> to move.").dim()
                 );
             }
             Ok((state, LoopControl::Continue))

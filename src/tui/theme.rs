@@ -161,6 +161,27 @@ pub fn user_line(text: &str) -> Line<'static> {
     ])
 }
 
+/// Render every hard line of a multiline prompt as its own terminal row. The first row
+/// carries the user glyph; continuation rows retain the card background and indentation.
+pub fn user_lines(text: &str) -> Vec<Line<'static>> {
+    text.split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                user_line(line)
+            } else {
+                Line::from(vec![
+                    Span::styled("   ".to_string(), Style::default().bg(USER_BG)),
+                    Span::styled(
+                        format!("{line} "),
+                        Style::default().bg(USER_BG).fg(Color::Reset),
+                    ),
+                ])
+            }
+        })
+        .collect()
+}
+
 /// The dim marker line opening a backend's turn (`◈ codex`).
 pub fn turn_start_line(backend: &str) -> Line<'static> {
     Line::from(vec![
@@ -171,9 +192,16 @@ pub fn turn_start_line(backend: &str) -> Line<'static> {
 
 /// A tool/progress line: dim with the pulse glyph lead (folded-tool de-emphasis).
 pub fn progress_line(text: &str) -> Line<'static> {
+    let detail_style = if text.contains('✓') {
+        Style::default().fg(GREEN)
+    } else if text.contains('✗') {
+        style_error()
+    } else {
+        style_dim()
+    };
     Line::from(vec![
         Span::styled("  ◈ ".to_string(), style_dim()),
-        Span::styled(text.to_string(), style_dim()),
+        Span::styled(text.to_string(), detail_style),
     ])
 }
 
@@ -182,7 +210,7 @@ pub fn status_idle(session_short: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(session_short.to_string(), style_accent()),
         Span::styled(
-            "  ← agents · /tree branches · ? keys · Ctrl-D detach".to_string(),
+            "  ← agents · Ctrl-R rewind · ? keys · Ctrl-D detach".to_string(),
             style_dim(),
         ),
     ])
@@ -212,7 +240,7 @@ pub fn status_busy(
             },
             style_accent(),
         ),
-        Span::styled(" · Ctrl-C cancels".to_string(), style_dim()),
+        Span::styled(" · Esc / Ctrl-C cancels".to_string(), style_dim()),
     ];
     if let Some(h) = hint {
         spans.push(Span::styled("   Hint: ".to_string(), style_notice()));
@@ -287,6 +315,33 @@ mod tests {
         let line = user_line("hello");
         assert!(line.spans.iter().all(|s| s.style.bg == Some(USER_BG)));
         assert!(line.spans.iter().any(|s| s.content.contains("hello")));
+
+        let lines = user_lines("first\n日本");
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("first")));
+        assert!(lines[1].spans.iter().any(|s| s.content.contains("日本")));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .all(|s| s.style.bg == Some(USER_BG))
+        );
+    }
+
+    #[test]
+    fn tool_completion_rows_show_success_and_failure_colors() {
+        assert_eq!(
+            progress_line("[tool] ✓ Bash — succeeded").spans[1].style.fg,
+            Some(GREEN)
+        );
+        assert_eq!(
+            progress_line("[tool] ✗ Bash — failed").spans[1].style.fg,
+            Some(RED)
+        );
+        assert_eq!(
+            progress_line("[tool] ▶ Bash — echo hi").spans[1].style.fg,
+            Some(DIM)
+        );
     }
 
     #[test]

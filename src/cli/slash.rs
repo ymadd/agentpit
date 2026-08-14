@@ -755,6 +755,24 @@ pub static BUILTINS: &[SlashSpec] = &[
         parse: ParseRule::Fn(|_| Ok(SlashCommand::Tree)),
     },
     SlashSpec {
+        name: cow("rewind"),
+        aliases: NO_ALIASES,
+        forms: Cow::Borrowed(&[Form {
+            args: cow("[id]"),
+            description: cow("Open the rewind picker, or move directly to an entry id"),
+        }]),
+        category: Category::Session,
+        surfaces: Cow::Borrowed(&[Surface::Repl, Surface::Tui]),
+        exec: ExecKind::Local,
+        parse: ParseRule::Fn(|rest| {
+            if rest.is_empty() {
+                Ok(SlashCommand::Tree)
+            } else {
+                Ok(SlashCommand::Branch(rest.to_string()))
+            }
+        }),
+    },
+    SlashSpec {
         name: cow("branch"),
         aliases: NO_ALIASES,
         forms: Cow::Borrowed(&[Form {
@@ -1390,7 +1408,7 @@ mod tests {
 
     #[test]
     fn the_tui_claims_worker_verbs_plus_the_subcommands_it_suspends_for() {
-        // /help is in-screen; /tree, /branch, /fork and /compact are worker verbs served
+        // /help is in-screen; /tree, /rewind, /branch, /fork and /compact use worker verbs
         // over the protocol; the rest run CLI code with the alternate screen handed back.
         // Anything else the REPL offers is NOT reachable in the TUI and must stay unknown
         // there rather than reaching a backend.
@@ -1400,7 +1418,7 @@ mod tests {
                 vec![
                     "help", "status", "config", "learning", "arena", "profile", "outcome",
                     "doctor", "mcp", "diagnose", "login", "quit", "exit", "detach", "sessions",
-                    "tree", "branch", "fork", "compact",
+                    "tree", "rewind", "branch", "fork", "compact",
                 ],
                 "outcome",
                 "similarity",
@@ -1457,6 +1475,7 @@ mod tests {
                     "session",
                     "sessions",
                     "tree",
+                    "rewind",
                     "branch",
                     "fork",
                     "clone",
@@ -1538,6 +1557,18 @@ mod tests {
             Parsed::Usage(u) => assert_eq!(u, "usage: /branch <entry-id> — pick an id from /tree"),
             other => panic!("expected Usage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewind_without_an_id_opens_tree_and_with_an_id_moves_there() {
+        assert!(matches!(
+            parse("/rewind", Surface::Tui),
+            Parsed::Command(SlashCommand::Tree)
+        ));
+        assert!(matches!(
+            parse("/rewind abc12345", Surface::Tui),
+            Parsed::Command(SlashCommand::Branch(target)) if target == "abc12345"
+        ));
     }
 
     // ─── the CLI subcommands, as slash commands ──────────────────────────────────

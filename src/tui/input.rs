@@ -1,5 +1,5 @@
-//! The TUI's single-line input editor (design §11.3) — deliberately small: insert,
-//! delete, cursor movement, history recall. Pure state + pure ops, fully unit-tested;
+//! The TUI input editor (design §11.3) — deliberately small: multiline insert/paste,
+//! delete, cursor movement, and history recall. Pure state + pure ops, fully unit-tested;
 //! the render layer draws `text` with a cursor at `cursor` (a char index).
 
 #[derive(Debug, Default)]
@@ -32,6 +32,42 @@ impl InputState {
         self.text.insert(byte, c);
         self.cursor += 1;
         self.browse = None;
+    }
+
+    /// Insert a paste as one edit. CRLF/bare CR are normalized so a paste copied from
+    /// another platform renders as the same multiline buffer instead of visible `\r`s.
+    /// Other control characters are dropped, except tab and newline which are meaningful
+    /// prompt text.
+    pub fn insert_paste(&mut self, pasted: &str) {
+        let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
+        let clean: String = normalized
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .collect();
+        if clean.is_empty() {
+            return;
+        }
+        let byte = self.byte_at(self.cursor);
+        let added = clean.chars().count();
+        self.text.insert_str(byte, &clean);
+        self.cursor += added;
+        self.browse = None;
+    }
+
+    /// (zero-based row, display-cell column) of the cursor in the multiline buffer.
+    pub fn cursor_row_col(&self) -> (usize, usize) {
+        let before: String = self.text.chars().take(self.cursor).collect();
+        let row = before.chars().filter(|&c| c == '\n').count();
+        let line = before.rsplit('\n').next().unwrap_or("");
+        let col = line
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        (row, col)
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.text.chars().filter(|&c| c == '\n').count() + 1
     }
 
     pub fn backspace(&mut self) {
@@ -209,5 +245,28 @@ mod tests {
         assert_eq!(s.text(), "two");
         s.history_next();
         assert_eq!(s.text(), "");
+    }
+
+    #[test]
+    fn multiline_paste_is_atomic_normalized_and_multibyte_safe() {
+        let mut s = InputState::default();
+        s.insert_paste("first\r\n日本\rthird\0");
+        assert_eq!(s.text(), "first\n日本\nthird");
+        assert_eq!(s.line_count(), 3);
+        assert_eq!(s.cursor_row_col(), (2, 5));
+
+        s.home();
+        s.right();
+        s.insert_paste("A\nB");
+        assert_eq!(s.text(), "fA\nBirst\n日本\nthird");
+        assert_eq!(s.cursor(), 4);
+        assert_eq!(s.cursor_row_col(), (1, 1));
+    }
+
+    #[test]
+    fn cursor_row_col_uses_terminal_cells_for_cjk() {
+        let mut s = InputState::default();
+        s.insert_paste("one\n日本");
+        assert_eq!(s.cursor_row_col(), (1, 4));
     }
 }

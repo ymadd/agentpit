@@ -389,6 +389,18 @@ pub fn handle_key_with_files(
     key: KeyEvent,
 ) -> Edit {
     match (key.code, key.modifiers) {
+        // Multiline editing. Shift+Enter is the documented binding; Alt+Enter and Ctrl-J
+        // are fallbacks for terminals that cannot encode Shift+Enter distinctly.
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) => {
+            input.insert('\n');
+            refresh(input, menu, files);
+            Edit::Consumed
+        }
+        (KeyCode::Char('j'), m) if m == KeyModifiers::CONTROL => {
+            input.insert('\n');
+            refresh(input, menu, files);
+            Edit::Consumed
+        }
         // The file popup has priority when open. In practice the two syntaxes are
         // disjoint (`/` at line start versus an `@` token), but making the ownership
         // explicit prevents a future slash argument completion from stealing these keys.
@@ -490,6 +502,17 @@ pub fn handle_key_with_files(
         }
         _ => Edit::Passthrough,
     }
+}
+
+/// Insert one bracketed-paste event without interpreting embedded newlines as Enter.
+pub fn handle_paste(
+    input: &mut InputState,
+    menu: &mut SlashMenu,
+    files: &mut FileMenu,
+    text: &str,
+) {
+    input.insert_paste(text);
+    refresh(input, menu, files);
 }
 
 fn refresh(input: &InputState, menu: &mut SlashMenu, files: &mut FileMenu) {
@@ -1048,6 +1071,40 @@ mod tests {
             None
         );
         assert_eq!(popup_area(input_box, 0), None);
+    }
+
+    // ─── multiline input and paste ───────────────────────────────────────────
+
+    #[test]
+    fn modified_enter_inserts_a_newline_and_plain_enter_submits() {
+        let mut e = Editor::default();
+        e.type_str("first");
+        assert_eq!(
+            handle_key_with_files(
+                &mut e.input,
+                &mut e.menu,
+                &mut e.files,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            ),
+            Edit::Consumed
+        );
+        e.type_str("second");
+        assert_eq!(e.text(), "first\nsecond");
+        assert_eq!(e.press(KeyCode::Enter), Edit::Submit);
+    }
+
+    #[test]
+    fn bracketed_paste_keeps_embedded_newlines_in_one_draft() {
+        let mut e = Editor::default();
+        handle_paste(
+            &mut e.input,
+            &mut e.menu,
+            &mut e.files,
+            "echo one\r\necho two",
+        );
+        assert_eq!(e.text(), "echo one\necho two");
+        // Paste itself never submits; only a later plain Enter does.
+        assert_eq!(e.press(KeyCode::Enter), Edit::Submit);
     }
 
     // ─── registry agreement ──────────────────────────────────────────────────

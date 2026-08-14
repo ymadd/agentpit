@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyCode, KeyEvent,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
 use ratatui::Terminal;
@@ -48,6 +48,9 @@ use views::{ListCursor, RosterRow, help_lines, tree_line_id};
 /// Transcript memory cap: beyond this many lines the oldest are dropped (the session
 /// JSONL remains the durable history; this is only the on-screen buffer).
 const TRANSCRIPT_CAP: usize = 5000;
+/// The editor grows with hard newlines, then scrolls internally so a large paste cannot
+/// consume the whole conversation viewport.
+const MAX_INPUT_ROWS: usize = 8;
 
 pub async fn run(session: Option<String>) -> Result<()> {
     let cwd = crate::cli::resolve_cwd(None)?;
@@ -89,6 +92,7 @@ fn leave_screen() -> std::io::Result<()> {
     crossterm::execute!(
         std::io::stdout(),
         DisableMouseCapture,
+        DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen
     )?;
     crossterm::terminal::disable_raw_mode()
@@ -177,6 +181,8 @@ struct App {
     last_ctrl_c: Option<Instant>,
     /// Request id of OUR in-flight send (its response ends the busy state).
     pending_send: Option<u64>,
+    /// Suppresses repeated Esc/Ctrl-C cancellation requests while the worker is settling.
+    cancelling: bool,
     backend_line: String,
     /// Backend of the most recent turn — what `/login` with no argument means here.
     active_backend: Option<String>,
@@ -204,6 +210,7 @@ impl App {
             turn_started: Instant::now(),
             last_ctrl_c: None,
             pending_send: None,
+            cancelling: false,
             backend_line: String::new(),
             active_backend: None,
             tick: 0,
@@ -219,7 +226,8 @@ impl App {
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
-            EnableMouseCapture
+            EnableMouseCapture,
+            EnableBracketedPaste
         )?;
         let backend = CrosstermBackend::new(std::io::stdout());
         self.terminal = Some(Terminal::new(backend)?);
@@ -268,7 +276,7 @@ impl App {
             let mut md = MdRenderer::default();
             let lines: Vec<Line<'static>> = transcript
                 .iter()
-                .map(|(who, text)| transcript_line(who, text, &mut md))
+                .flat_map(|(who, text)| transcript_lines(who, text, &mut md))
                 .collect();
             for line in lines {
                 self.push_line(line);
@@ -334,12 +342,22 @@ impl App {
                         // rewraps to fewer rows, so a stale large offset would compute an
                         // empty window and blank the transcript.
                         Some(Ok(TermEvent::Resize(w, h))) => {
-                            let height = (h.saturating_sub(5)) as usize;
+                            let height = h.saturating_sub(self.editor_box_height() + 2) as usize;
                             self.scroll_offset = scroll::clamp_offset(
                                 &self.transcript,
                                 w as usize,
                                 height,
                                 self.scroll_offset,
+                            );
+                        }
+                        // Bracketed paste is one atomic editor operation. Embedded newlines
+                        // stay in the draft and are never interpreted as a series of Sends.
+                        Some(Ok(TermEvent::Paste(text))) if matches!(&self.mode, Mode::Chat) => {
+                            completion::handle_paste(
+                                &mut self.input,
+                                &mut self.menu,
+                                &mut self.file_menu,
+                                &text,
                             );
                         }
                         Some(Ok(TermEvent::Mouse(m))) => self.on_mouse(m),
@@ -476,6 +494,7 @@ impl App {
                     self.push_text(&format!("[turn ended: {status}]"), theme::style_notice());
                 }
                 self.busy = false;
+                self.cancelling = false;
                 self.backend_line.clear();
             }
             Frame::Event(Event::Notice { text }) => {
@@ -485,6 +504,7 @@ impl App {
                 if Some(resp.id) == self.pending_send {
                     self.pending_send = None;
                     self.busy = false;
+                    self.cancelling = false;
                     if !resp.ok {
                         self.push_text(
                             &format!("error: {}", resp.error.unwrap_or_default()),
@@ -519,6 +539,22 @@ impl App {
         }
     }
 
+    /// Ask the worker to cancel and wait for its acknowledgement while continuing to
+    /// route turn events. Repeated keys are ignored until the turn settles.
+    async fn cancel_turn(&mut self) {
+        if self.cancelling || !self.busy {
+            return;
+        }
+        self.cancelling = true;
+        match self.request_data(RequestBody::Cancel).await {
+            Ok(_) => self.notify("[cancelling…]", theme::style_notice()),
+            Err(error) => {
+                self.cancelling = false;
+                self.notify(&format!("cancel failed: {error:#}"), theme::style_error());
+            }
+        }
+    }
+
     /// Handle a key, telling the main loop what to do next.
     async fn on_key(&mut self, key: KeyEvent) -> Result<KeyOutcome> {
         if let Mode::Overlay(_) = self.mode {
@@ -526,10 +562,14 @@ impl App {
             return Ok(KeyOutcome::Continue);
         }
         match (key.code, key.modifiers) {
+            // A popup owns Esc first; otherwise Esc and Ctrl-C are equivalent while a
+            // turn runs. Idle Esc stays a no-op so it can never detach or rewind by accident.
+            (KeyCode::Esc, _) if self.busy && !self.menu.is_open() && !self.file_menu.is_open() => {
+                self.cancel_turn().await;
+            }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 if self.busy {
-                    let _ = self.conn.send_request(RequestBody::Cancel).await;
-                    self.push_text("[cancelling…]", theme::style_notice());
+                    self.cancel_turn().await;
                 } else if self
                     .last_ctrl_c
                     .map(|t| t.elapsed() <= Duration::from_secs(2))
@@ -543,6 +583,9 @@ impl App {
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) if self.input.is_empty() => {
                 return Ok(KeyOutcome::Exit);
+            }
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) if self.input.is_empty() && !self.busy => {
+                self.run_protocol(Protocol::Tree).await?;
             }
             (KeyCode::PageUp, _) => self.scroll_by(1),
             (KeyCode::PageDown, _) => self.scroll_by(-1),
@@ -651,7 +694,9 @@ impl App {
         text: String,
         backend: Option<String>,
     ) -> Result<()> {
-        self.push_line(theme::user_line(&shown));
+        for line in theme::user_lines(&shown) {
+            self.push_line(line);
+        }
         self.scroll_offset = 0; // sending re-follows the bottom
         let id = self
             .conn
@@ -693,7 +738,7 @@ impl App {
                 };
                 self.mode = Mode::Overlay(Overlay {
                     kind: OverlayKind::Tree,
-                    title: "Tree — Enter moves the leaf, f forks at the cursor, Esc returns",
+                    title: "Rewind — Enter restores this point, f forks it, Esc returns",
                     keys: lines
                         .iter()
                         .map(|l| tree_line_id(l).unwrap_or("").to_string())
@@ -703,10 +748,17 @@ impl App {
                 });
             }
             Protocol::Branch(target) => match self.request_data(request).await {
-                Ok(_) => self.notify(
-                    &format!("moved to {target} — the next turn continues from there"),
-                    theme::style_accent(),
-                ),
+                Ok(_) => {
+                    // The visible conversation must follow the restored branch too; keeping
+                    // the abandoned tail on screen made a successful rewind look ineffective.
+                    self.transcript.clear();
+                    self.scroll_offset = 0;
+                    self.attach().await?;
+                    self.notify(
+                        &format!("rewound to {target} — the next turn continues from there"),
+                        theme::style_accent(),
+                    );
+                }
                 Err(e) => self.notify(&format!("error: {e:#}"), theme::style_error()),
             },
             Protocol::Fork(_) => match self.request_data(request).await {
@@ -748,12 +800,22 @@ impl App {
         self.scroll_offset = clamp_offset(&self.transcript, width, height, wanted);
     }
 
+    fn editor_box_height(&self) -> u16 {
+        (self.input.line_count().min(MAX_INPUT_ROWS) as u16) + 2
+    }
+
     /// The transcript area's (width, height) in cells.
     fn viewport(&self) -> (usize, usize) {
+        let editor_height = self.editor_box_height();
         self.terminal
             .as_ref()
             .and_then(|t| t.size().ok())
-            .map(|s| (s.width as usize, s.height.saturating_sub(5) as usize))
+            .map(|s| {
+                (
+                    s.width as usize,
+                    s.height.saturating_sub(editor_height + 2) as usize,
+                )
+            })
             .unwrap_or((80, 20))
     }
 
@@ -813,19 +875,15 @@ impl App {
     }
 
     fn draw(&mut self) -> Result<()> {
+        let editor_height = self.editor_box_height();
+        let visible_input_rows = editor_height.saturating_sub(2) as usize;
+        let (cursor_row, cursor_col) = self.input.cursor_row_col();
+        let input_scroll = cursor_row.saturating_sub(visible_input_rows.saturating_sub(1));
+        // Keep the prompt glyph aligned on the first row and indent continuation rows.
+        let input_text = format!("› {}", self.input.text().replace('\n', "\n  "));
         let Some(terminal) = &mut self.terminal else {
             return Ok(());
         };
-        let input_text = self.input.text().to_string();
-        // Cursor x in display CELLS, not char count (M8): a CJK char before the cursor
-        // occupies two columns, so a char-index cursor lands left of the true position.
-        let cursor: u16 = self
-            .input
-            .text()
-            .chars()
-            .take(self.input.cursor())
-            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16)
-            .sum();
         let live = self.assembler.tail().to_string();
         let short = crate::cli::guidance::short_id(&self.session_id).to_string();
         let elapsed = self.turn_started.elapsed().as_secs();
@@ -862,7 +920,7 @@ impl App {
             let [transcript_area, live_area, box_area, status_area] = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(editor_height),
                 Constraint::Length(1),
             ])
             .areas(f.area());
@@ -887,10 +945,7 @@ impl App {
             let inner = input_box.inner(box_area);
             f.render_widget(input_box, box_area);
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("› ", theme::style_accent()),
-                    Span::raw(input_text.as_str()),
-                ])),
+                Paragraph::new(input_text.as_str()).scroll((input_scroll as u16, 0)),
                 inner,
             );
             f.render_widget(Paragraph::new(status_line), status_area);
@@ -912,7 +967,12 @@ impl App {
                     .highlight_symbol("› ");
                 f.render_stateful_widget(list, area, &mut state);
             } else {
-                f.set_cursor_position((inner.x + 2 + cursor, inner.y));
+                let cursor_x = inner.x + 2 + cursor_col as u16;
+                let cursor_y = inner.y + cursor_row.saturating_sub(input_scroll) as u16;
+                f.set_cursor_position((
+                    cursor_x.min(inner.right().saturating_sub(1)),
+                    cursor_y.min(inner.bottom().saturating_sub(1)),
+                ));
                 // Both completion popups share the same anchored geometry. The file picker
                 // has priority while an `@token` is active; otherwise `/` shows commands.
                 if file_menu.is_open() {
@@ -1004,29 +1064,45 @@ fn split_backend_modifier(text: &str) -> Result<(Option<String>, String), String
 
 /// One transcript line, styled by speaker via the theme (§11.3). Backend lines pass
 /// through the markdown renderer, same as when they streamed in live.
-fn transcript_line(who: &str, text: &str, md: &mut MdRenderer) -> Line<'static> {
+fn transcript_lines(who: &str, text: &str, md: &mut MdRenderer) -> Vec<Line<'static>> {
     match who {
         "user" => {
             md.reset(); // a user turn ends the previous answer's document
-            theme::user_line(text)
+            theme::user_lines(text)
         }
-        "summary" => Line::from(vec![
-            Span::styled("── summary ── ".to_string(), theme::style_accent()),
-            Span::styled(text.to_string(), theme::style_muted()),
-        ]),
-        backend => {
-            let mut line = md.render(text);
-            line.spans.insert(
-                0,
-                Span::styled(
-                    format!("{backend}  "),
-                    theme::style_muted().add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-            );
-            line.spans
-                .insert(0, Span::styled("◈ ".to_string(), theme::style_accent()));
-            line
-        }
+        "summary" => text
+            .split('\n')
+            .enumerate()
+            .map(|(index, line)| {
+                Line::from(vec![
+                    Span::styled(
+                        if index == 0 {
+                            "── summary ── "
+                        } else {
+                            "              "
+                        },
+                        theme::style_accent(),
+                    ),
+                    Span::styled(line.to_string(), theme::style_muted()),
+                ])
+            })
+            .collect(),
+        backend => text
+            .split('\n')
+            .map(|text_line| {
+                let mut line = md.render(text_line);
+                line.spans.insert(
+                    0,
+                    Span::styled(
+                        format!("{backend}  "),
+                        theme::style_muted().add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                );
+                line.spans
+                    .insert(0, Span::styled("◈ ".to_string(), theme::style_accent()));
+                line
+            })
+            .collect(),
     }
 }
 

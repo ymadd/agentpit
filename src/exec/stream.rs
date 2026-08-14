@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde_json::Value;
 
 /// The stdout framing emitted by a non-interactive backend CLI.
@@ -34,6 +38,8 @@ pub struct StreamDecoder {
     seen_structured: bool,
     backend_error: Option<String>,
     backend_session_ref: Option<String>,
+    /// Claude reports tool results by id in a later `user` event.
+    claude_tools: HashMap<String, String>,
 }
 
 impl StreamDecoder {
@@ -47,6 +53,7 @@ impl StreamDecoder {
             seen_structured: false,
             backend_error: None,
             backend_session_ref: None,
+            claude_tools: HashMap::new(),
         }
     }
 
@@ -145,11 +152,16 @@ impl StreamDecoder {
                         if event["content_block"].get("type").and_then(Value::as_str)
                             == Some("tool_use") =>
                     {
-                        let name = event["content_block"]
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("tool");
-                        self.progress("tool", name)
+                        let block = &event["content_block"];
+                        if let (Some(id), Some(name)) = (
+                            block.get("id").and_then(Value::as_str),
+                            block.get("name").and_then(Value::as_str),
+                        ) {
+                            self.claude_tools.insert(id.to_string(), name.to_string());
+                        }
+                        // Claude's stream start carries `{input:{}}`; wait for the complete
+                        // assistant event so the first visible row can say what will run.
+                        DecodedChunk::default()
                     }
                     _ => DecodedChunk::default(),
                 }
@@ -160,7 +172,50 @@ impl StreamDecoder {
                 if let Some(text) = claude_message_text(value) {
                     self.fallback_answer = Some(text);
                 }
-                DecodedChunk::default()
+                let details: Vec<String> = value
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .map(|block| {
+                        let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        if let Some(id) = block.get("id").and_then(Value::as_str) {
+                            self.claude_tools.insert(id.to_string(), name.to_string());
+                        }
+                        tool_start_detail(name, &block["input"])
+                    })
+                    .collect();
+                self.progress_many("tool", details)
+            }
+            Some("user") => {
+                let details: Vec<String> = value
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| {
+                        block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+                    .map(|block| {
+                        let id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let name = self
+                            .claude_tools
+                            .remove(id)
+                            .unwrap_or_else(|| "tool".to_string());
+                        if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                            format!("✗ {name} — failed")
+                        } else {
+                            format!("✓ {name} — succeeded")
+                        }
+                    })
+                    .collect();
+                self.progress_many("tool", details)
             }
             Some("result") => {
                 if let Some(text) = value.get("result").and_then(Value::as_str) {
@@ -189,13 +244,48 @@ impl StreamDecoder {
                     .map(|text| self.discrete_answer(text))
                     .unwrap_or_default()
             }
+            Some("item.completed")
+                if value["item"].get("type").and_then(Value::as_str)
+                    == Some("command_execution") =>
+            {
+                let item = &value["item"];
+                let failed = item.get("status").and_then(Value::as_str) == Some("failed")
+                    || item
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|c| c != 0);
+                let (glyph, status) = if failed {
+                    ("✗", "failed")
+                } else {
+                    ("✓", "succeeded")
+                };
+                let exit = item
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .map(|code| format!(" (exit {code})"))
+                    .unwrap_or_default();
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(redact_secrets)
+                    .map(|c| format!(" — {}", single_line(&c)))
+                    .unwrap_or_default();
+                self.progress(
+                    "command",
+                    &format!("{glyph} shell — {status}{exit}{command}"),
+                )
+            }
             Some("item.started") => {
                 let item = &value["item"];
                 match item.get("type").and_then(Value::as_str) {
                     Some("command_execution") => {
-                        // Do not persist command arguments in the dashboard log: generated shell
-                        // commands can contain credentials or other sensitive values.
-                        self.progress("command", "running")
+                        let command = item
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .map(redact_secrets)
+                            .map(|c| format!(" — {}", single_line(&c)))
+                            .unwrap_or_default();
+                        self.progress("command", &format!("▶ shell{command}"))
                     }
                     Some("mcp_tool_call") => {
                         let tool = item
@@ -241,15 +331,22 @@ impl StreamDecoder {
                     _ => DecodedChunk::default(),
                 }
             }
-            // The tool NAME is progress; its `args` are not logged. prime-agent's one
-            // model-facing tool is an IPython kernel, so `args.code` is generated Python/shell
-            // that can carry credentials — the same reason codex's command arguments are elided.
-            Some("tool_execution_start") => {
+            // Show a bounded, credential-redacted summary of what is being executed.
+            // Opaque `[tool] Bash` rows made it impossible to audit a run; dumping raw args
+            // would swing too far the other way because generated commands may contain keys.
+            Some("tool_execution_start") => self.progress("tool", &prime_tool_start_detail(value)),
+            Some("tool_execution_end") => {
                 let tool = value
                     .get("toolName")
                     .and_then(Value::as_str)
                     .unwrap_or("tool");
-                self.progress("tool", tool)
+                let failed = value.get("isError").and_then(Value::as_bool) == Some(true);
+                let (glyph, status) = if failed {
+                    ("✗", "failed")
+                } else {
+                    ("✓", "succeeded")
+                };
+                self.progress("tool", &format!("{glyph} {tool} — {status}"))
             }
             // A completed assistant message repeats the full text. Kept only as a fallback for
             // the case where no delta was seen (a non-streaming provider, or a run that failed
@@ -306,6 +403,19 @@ impl StreamDecoder {
         self.answer(format!("{prefix}{text}"))
     }
 
+    fn progress_many(&mut self, kind: &str, details: Vec<String>) -> DecodedChunk {
+        let mut display = String::new();
+        for detail in details {
+            if let Some(text) = self.progress(kind, &detail).display {
+                display.push_str(&text);
+            }
+        }
+        DecodedChunk {
+            display: (!display.is_empty()).then_some(display),
+            answer: None,
+        }
+    }
+
     fn progress(&mut self, kind: &str, detail: &str) -> DecodedChunk {
         let prefix = if self.display_ends_with_newline {
             ""
@@ -319,6 +429,65 @@ impl StreamDecoder {
             answer: None,
         }
     }
+}
+
+fn prime_tool_start_detail(value: &Value) -> String {
+    let tool = value
+        .get("toolName")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    tool_start_detail(tool, &value["args"])
+}
+
+fn tool_start_detail(tool: &str, args: &Value) -> String {
+    let lower = tool.to_ascii_lowercase();
+
+    let detail = if matches!(lower.as_str(), "bash" | "shell" | "ipython" | "python") {
+        first_string_arg(args, &["command", "cmd", "code"]).map(|raw| {
+            let without_cell_magic = raw
+                .strip_prefix("%%bash")
+                .map(str::trim_start)
+                .unwrap_or(raw);
+            redact_secrets(without_cell_magic)
+        })
+    } else if matches!(lower.as_str(), "read" | "write" | "edit") {
+        first_string_arg(args, &["path", "file_path", "file", "filename"]).map(ToString::to_string)
+    } else if lower.contains("search") || lower == "grep" {
+        first_string_arg(args, &["query", "pattern", "path"]).map(ToString::to_string)
+    } else {
+        // Generic tools only expose known descriptive fields, never their full args object.
+        first_string_arg(args, &["path", "query", "url", "name"]).map(ToString::to_string)
+    };
+
+    match detail.filter(|s| !s.trim().is_empty()) {
+        Some(detail) => format!("▶ {tool} — {}", single_line(&detail)),
+        None => format!("▶ {tool}"),
+    }
+}
+
+fn first_string_arg<'a>(args: &'a Value, names: &[&str]) -> Option<&'a str> {
+    names
+        .iter()
+        .find_map(|name| args.get(*name).and_then(Value::as_str))
+}
+
+fn redact_secrets(text: &str) -> String {
+    // Covers environment assignments and common CLI options while leaving the command
+    // structure visible. The transcript is durable, so err on the side of redaction.
+    static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)\b(token|secret|password|passwd|api[_-]?key|authorization|cookie)\b(\s*=\s*)([^\s;]+)"#,
+        )
+        .expect("credential assignment regex")
+    });
+    static FLAG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)(--(?:token|secret|password|passwd|api[_-]?key|authorization|cookie)(?:=|\s+))([^\s;]+)"#,
+        )
+        .expect("credential flag regex")
+    });
+    let assigned = ASSIGNMENT.replace_all(text, "$1$2<redacted>");
+    FLAG.replace_all(&assigned, "$1<redacted>").into_owned()
 }
 
 fn claude_message_text(value: &Value) -> Option<String> {
@@ -416,17 +585,50 @@ mod tests {
     }
 
     #[test]
+    fn claude_shows_tool_detail_and_result_without_adding_it_to_the_answer() {
+        let mut decoder = StreamDecoder::new(StreamFormat::ClaudeJsonl);
+        decoder.decode_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}}"#,
+        );
+        let start = decoder.decode_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"printf hello"}}]}}"#,
+        );
+        let end = decoder.decode_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"hello"}]}}"#,
+        );
+
+        assert_eq!(
+            start.display.as_deref(),
+            Some("[tool] ▶ Bash — printf hello\n")
+        );
+        assert_eq!(start.answer, None);
+        assert_eq!(end.display.as_deref(), Some("[tool] ✓ Bash — succeeded\n"));
+        assert_eq!(end.answer, None);
+    }
+
+    #[test]
     fn codex_keeps_progress_out_of_the_collected_answer() {
         let mut decoder = StreamDecoder::new(StreamFormat::CodexJsonl);
         let command = decoder.decode_line(
             r#"{"type":"item.started","item":{"type":"command_execution","command":"bash -lc ls"}}"#,
         );
+        let completed = decoder.decode_line(
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"bash -lc ls","exit_code":0,"status":"completed"}}"#,
+        );
         let message = decoder.decode_line(
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}"#,
         );
 
-        assert_eq!(command.display.as_deref(), Some("[command] running\n"));
+        assert_eq!(
+            command.display.as_deref(),
+            Some("[command] ▶ shell — bash -lc ls\n")
+        );
         assert_eq!(command.answer, None);
+        assert_eq!(
+            completed.display.as_deref(),
+            Some("[command] ✓ shell — succeeded (exit 0) — bash -lc ls\n")
+        );
+        assert_eq!(completed.answer, None);
         assert_eq!(message.answer.as_deref(), Some("Done"));
         assert_eq!(decoder.finish().answer.as_deref(), Some("\n"));
     }
@@ -474,23 +676,38 @@ mod tests {
     /// Reasoning and tool arguments are progress or scratchpad, never answer: `thinking_delta`
     /// is dropped entirely and a tool call contributes only its name.
     #[test]
-    fn prime_agent_keeps_thinking_and_tool_args_out_of_the_answer() {
+    fn prime_agent_shows_redacted_tool_detail_and_completion_status() {
         let mut decoder = StreamDecoder::new(StreamFormat::PrimeAgentJsonl);
         let thinking = decoder.decode_line(
             r#"{"type":"message_update","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"}]},"assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"plan"}}"#,
         );
         let tool = decoder.decode_line(
-            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"ipython","args":{"code":"export TOKEN=sekrit"}}"#,
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"Bash","args":{"code":"%%bash\necho hello; export TOKEN=sekrit"}}"#,
+        );
+        let finished = decoder.decode_line(
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"Bash","result":{},"isError":false}"#,
         );
         let text = decoder.decode_line(
             r#"{"type":"message_update","message":{"role":"assistant","content":[]},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Done"}}"#,
         );
 
         assert_eq!(thinking, DecodedChunk::default());
-        assert_eq!(tool.display.as_deref(), Some("[tool] ipython\n"));
         assert_eq!(tool.answer, None);
         let shown = tool.display.unwrap();
-        assert!(!shown.contains("sekrit"), "tool args must not be logged");
+        assert!(
+            shown.contains("echo hello"),
+            "command summary is visible: {shown}"
+        );
+        assert!(
+            shown.contains("<redacted>"),
+            "credential value is redacted: {shown}"
+        );
+        assert!(!shown.contains("sekrit"), "credential must not be logged");
+        assert_eq!(
+            finished.display.as_deref(),
+            Some("[tool] ✓ Bash — succeeded\n")
+        );
+        assert_eq!(finished.answer, None);
         assert_eq!(text.answer.as_deref(), Some("Done"));
     }
 

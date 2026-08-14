@@ -24,6 +24,9 @@ pub use agentpit_events::session::{
 /// `ext_type` recording a summary of a branch that was just left (B5). Transparent to the
 /// events crate's replay; folded into composed prompts by [`compose_prompt`]'s caller.
 pub const BRANCH_SUMMARY_EXT_TYPE: &str = "agentpit.branch_summary";
+/// Durable no-op node appended after every leaf move. Without it a branch with no summary
+/// existed only in memory and reopening the session snapped back to the abandoned file tail.
+pub const BRANCH_MOVE_EXT_TYPE: &str = "agentpit.branch_move";
 
 /// A live, lease-held session. Shared through the REPL's cloneable state as
 /// `Arc<Mutex<SessionRecorder>>` — lock per operation, never across an await.
@@ -247,6 +250,12 @@ impl SessionRecorder {
     pub fn branch(&mut self, target_id: &str, left_branch_summary: Option<&str>) -> Result<()> {
         let from = self.log.leaf_id().to_string();
         self.log.branch(target_id).map_err(|e| anyhow!(e))?;
+        // Persist the selected path even when the user chooses "no summary". The marker is
+        // transparent to context replay but becomes the file tail, so reopen keeps this leaf.
+        self.log.append_ext(
+            BRANCH_MOVE_EXT_TYPE,
+            serde_json::json!({ "from": from, "target": target_id }),
+        )?;
         if let Some(text) = left_branch_summary {
             self.log.append_ext(
                 BRANCH_SUMMARY_EXT_TYPE,
@@ -305,13 +314,16 @@ impl SessionRecorder {
         for e in entries {
             children.push((e.parent_id(), e));
         }
-        let on_path: std::collections::HashSet<&str> = self
-            .log
-            .path_from_root()
+        let path = self.log.path_from_root();
+        let on_path: std::collections::HashSet<&str> = path.iter().filter_map(|e| e.id()).collect();
+        // The durable branch-move marker is deliberately hidden. Mark the latest visible
+        // ancestor as the current point so `/tree` still has one `←` after reopen.
+        let leaf = path
             .iter()
-            .filter_map(|e| e.id())
-            .collect();
-        let leaf = self.log.leaf_id();
+            .rev()
+            .find(|entry| describe(entry).is_some())
+            .and_then(|entry| entry.id())
+            .unwrap_or(self.log.leaf_id());
 
         let mut lines = Vec::new();
         fn walk(
@@ -571,6 +583,31 @@ mod tests {
         assert!(prompt.contains("approach A hit a dead end"));
         // The abandoned branch's content is NOT replayed as turns.
         assert!(!prompt.contains("A failed"));
+    }
+
+    #[test]
+    fn branch_without_summary_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rec = recorder_in(tmp.path());
+        let anchor = rec.record_user("base").unwrap();
+        turn(&mut rec, "abandoned", "codex", "old answer", None);
+        rec.branch(&anchor, None).unwrap();
+
+        let path = rec.path().to_path_buf();
+        drop(rec);
+        let log = SessionLog::open(&path).unwrap();
+        let lease = SessionLease::acquire_at(&tmp.path().join("leases"), &path).unwrap();
+        let reopened = SessionRecorder::from_parts(log, lease);
+        let context = reopened.context_items();
+        assert_eq!(context, vec![("user".to_string(), "base".to_string())]);
+        assert!(!context.iter().any(|(_, text)| text == "old answer"));
+        let leaves: Vec<_> = reopened
+            .tree_lines()
+            .into_iter()
+            .filter(|line| line.starts_with('←'))
+            .collect();
+        assert_eq!(leaves.len(), 1);
+        assert!(leaves[0].contains("base"));
     }
 
     #[test]

@@ -56,14 +56,15 @@ pub fn tree_line_id(line: &str) -> Option<&str> {
 /// The keybinding table — single source (§11.3): the `?` overlay renders THIS, so a
 /// rebind or addition can never leave the help stale.
 pub const KEYBINDINGS: &[(&str, &str)] = &[
-    ("Enter", "send the line as a turn"),
+    ("Enter", "send the draft as a turn"),
+    ("Shift/Alt-Enter · Ctrl-J", "insert a newline in the draft"),
     (
         "← (empty line)",
         "Agents View: every session, live state; Enter attaches",
     ),
     (
-        "/tree",
-        "Tree View: branches; Enter moves the leaf, f forks at the cursor",
+        "Ctrl-R · /rewind",
+        "Rewind picker: Enter moves to an earlier point; f forks there",
     ),
     (
         "/ (line start)",
@@ -82,13 +83,16 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
         "PageUp / PageDown / wheel",
         "scroll the transcript; End follows the newest",
     ),
-    ("Ctrl-C", "cancel the running turn; twice within 2s exits"),
+    (
+        "Esc / Ctrl-C",
+        "cancel the running turn; Ctrl-C twice within 2s exits",
+    ),
     (
         "Ctrl-D (empty line)",
         "detach and exit — the session keeps running",
     ),
     ("?", "this help"),
-    ("Esc", "leave an overlay"),
+    ("Esc (idle)", "dismiss a popup or leave an overlay"),
 ];
 
 /// Render the help overlay: the keys from [`KEYBINDINGS`], then the slash commands this

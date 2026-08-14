@@ -38,8 +38,10 @@ pub struct StreamDecoder {
     seen_structured: bool,
     backend_error: Option<String>,
     backend_session_ref: Option<String>,
-    /// Claude reports tool results by id in a later `user` event.
+    /// Claude/Prime report tool results by id after their start event. The value is the
+    /// already-redacted display label, so completion can identify the exact row safely.
     claude_tools: HashMap<String, String>,
+    prime_tools: HashMap<String, String>,
 }
 
 impl StreamDecoder {
@@ -54,6 +56,7 @@ impl StreamDecoder {
             backend_error: None,
             backend_session_ref: None,
             claude_tools: HashMap::new(),
+            prime_tools: HashMap::new(),
         }
     }
 
@@ -181,10 +184,12 @@ impl StreamDecoder {
                     .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
                     .map(|block| {
                         let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let detail = tool_start_detail(name, &block["input"]);
+                        let label = detail.strip_prefix("▶ ").unwrap_or(&detail).to_string();
                         if let Some(id) = block.get("id").and_then(Value::as_str) {
-                            self.claude_tools.insert(id.to_string(), name.to_string());
+                            self.claude_tools.insert(id.to_string(), label);
                         }
-                        tool_start_detail(name, &block["input"])
+                        detail
                     })
                     .collect();
                 self.progress_many("tool", details)
@@ -204,14 +209,14 @@ impl StreamDecoder {
                             .get("tool_use_id")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        let name = self
+                        let label = self
                             .claude_tools
                             .remove(id)
                             .unwrap_or_else(|| "tool".to_string());
                         if block.get("is_error").and_then(Value::as_bool) == Some(true) {
-                            format!("✗ {name} — failed")
+                            format!("✗ {label} — failed")
                         } else {
-                            format!("✓ {name} — succeeded")
+                            format!("✓ {label} — succeeded")
                         }
                     })
                     .collect();
@@ -272,7 +277,7 @@ impl StreamDecoder {
                     .unwrap_or_default();
                 self.progress(
                     "command",
-                    &format!("{glyph} shell — {status}{exit}{command}"),
+                    &format!("{glyph} shell{command} — {status}{exit}"),
                 )
             }
             Some("item.started") => {
@@ -334,19 +339,31 @@ impl StreamDecoder {
             // Show a bounded, credential-redacted summary of what is being executed.
             // Opaque `[tool] Bash` rows made it impossible to audit a run; dumping raw args
             // would swing too far the other way because generated commands may contain keys.
-            Some("tool_execution_start") => self.progress("tool", &prime_tool_start_detail(value)),
+            Some("tool_execution_start") => {
+                let detail = prime_tool_start_detail(value);
+                let label = detail.strip_prefix("▶ ").unwrap_or(&detail).to_string();
+                if let Some(id) = value.get("toolCallId").and_then(Value::as_str) {
+                    self.prime_tools.insert(id.to_string(), label);
+                }
+                self.progress("tool", &detail)
+            }
             Some("tool_execution_end") => {
                 let tool = value
                     .get("toolName")
                     .and_then(Value::as_str)
                     .unwrap_or("tool");
+                let label = value
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.prime_tools.remove(id))
+                    .unwrap_or_else(|| tool.to_string());
                 let failed = value.get("isError").and_then(Value::as_bool) == Some(true);
                 let (glyph, status) = if failed {
                     ("✗", "failed")
                 } else {
                     ("✓", "succeeded")
                 };
-                self.progress("tool", &format!("{glyph} {tool} — {status}"))
+                self.progress("tool", &format!("{glyph} {label} — {status}"))
             }
             // A completed assistant message repeats the full text. Kept only as a fallback for
             // the case where no delta was seen (a non-streaming provider, or a run that failed
@@ -602,7 +619,10 @@ mod tests {
             Some("[tool] ▶ Bash — printf hello\n")
         );
         assert_eq!(start.answer, None);
-        assert_eq!(end.display.as_deref(), Some("[tool] ✓ Bash — succeeded\n"));
+        assert_eq!(
+            end.display.as_deref(),
+            Some("[tool] ✓ Bash — printf hello — succeeded\n")
+        );
         assert_eq!(end.answer, None);
     }
 
@@ -626,7 +646,7 @@ mod tests {
         assert_eq!(command.answer, None);
         assert_eq!(
             completed.display.as_deref(),
-            Some("[command] ✓ shell — succeeded (exit 0) — bash -lc ls\n")
+            Some("[command] ✓ shell — bash -lc ls — succeeded (exit 0)\n")
         );
         assert_eq!(completed.answer, None);
         assert_eq!(message.answer.as_deref(), Some("Done"));
@@ -705,7 +725,7 @@ mod tests {
         assert!(!shown.contains("sekrit"), "credential must not be logged");
         assert_eq!(
             finished.display.as_deref(),
-            Some("[tool] ✓ Bash — succeeded\n")
+            Some("[tool] ✓ Bash — echo hello; export TOKEN=<redacted> — succeeded\n")
         );
         assert_eq!(finished.answer, None);
         assert_eq!(text.answer.as_deref(), Some("Done"));

@@ -95,6 +95,10 @@ impl ExecAdapter for WorkflowManagerExec {
         match self.backend {
             // `bypassPermissions` is required so the manager can run `agentpit` via its Bash tool
             // non-interactively — `acceptEdits` only auto-accepts file edits, not Bash commands.
+            // Deliberately NOT the `auto` the worker adapter uses (`exec::autonomy`): that mode
+            // decides per action at run time, and this path exists to shell out to agentpit
+            // itself — the one dispatch whose whole job would read as escalating beyond the
+            // request. The manager keeps the posture that cannot change its mind mid-run.
             // The `--allowedTools` list scopes the manager to Bash/Read/Glob/Grep; Bash is the
             // load-bearing entry (it is how the manager invokes `agentpit`) and intentionally
             // grants full shell access, so this is a tool-surface restriction, NOT a sandbox.

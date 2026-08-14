@@ -198,10 +198,12 @@ async fn handle_request(
     conn_id: u64,
     out_tx: &mpsc::UnboundedSender<String>,
 ) -> Option<Response> {
-    if let RequestBody::Send { text, backend } = req.body {
-        return handle_send(shared, req.id, text, backend, out_tx);
+    let Request { id, body } = req;
+    match body {
+        RequestBody::Send { text, backend } => handle_send(shared, id, text, backend, out_tx),
+        RequestBody::ReplCell { code } => handle_repl_cell(shared, id, code, out_tx),
+        body => Some(handle_sync_request(shared, Request { id, body }, conn_id, out_tx).await),
     }
-    Some(handle_sync_request(shared, req, conn_id, out_tx).await)
 }
 
 /// Start a turn and reply asynchronously. `Some` only for immediate rejections (unknown
@@ -321,6 +323,146 @@ fn handle_send(
                     answer,
                 },
             ),
+        };
+        if let Ok(line) = serde_json::to_string(&response) {
+            let _ = reply_tx.send(line);
+        }
+    });
+    None
+}
+
+/// Start a TypeScript orchestration cell without occupying the connection's read loop.
+/// This mirrors `handle_send`: Esc/Ctrl-C can reach `Cancel`, and every attached client gets
+/// a balanced lifecycle around the cell's streamed dispatch output.
+fn handle_repl_cell(
+    shared: &Arc<WorkerShared>,
+    id: u64,
+    code: String,
+    out_tx: &mpsc::UnboundedSender<String>,
+) -> Option<Response> {
+    if shared
+        .busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Some(Response::err(
+            id,
+            "busy: a turn or cell is already running. Wait for it or `cancel` it first.",
+        ));
+    }
+    shared.touch();
+
+    let cancel = CancellationToken::new();
+    if let Ok(mut slot) = shared.cancel_current.lock() {
+        *slot = Some(cancel.clone());
+    }
+    let cell_shared = Arc::clone(shared);
+    let reply_tx = out_tx.clone();
+    tokio::spawn(async move {
+        struct CellGuard {
+            shared: Arc<WorkerShared>,
+            finished: bool,
+        }
+        impl Drop for CellGuard {
+            fn drop(&mut self) {
+                if let Ok(mut slot) = self.shared.cancel_current.lock() {
+                    *slot = None;
+                }
+                self.shared.busy.store(false, Ordering::SeqCst);
+                self.shared.touch();
+                if !self.finished {
+                    self.shared.broadcast(&Event::TurnFinished {
+                        status: "error".into(),
+                    });
+                }
+            }
+        }
+        let mut guard = CellGuard {
+            shared: Arc::clone(&cell_shared),
+            finished: false,
+        };
+        cell_shared.broadcast(&Event::TurnStarted {
+            backend: "cell".into(),
+        });
+
+        let started = std::time::Instant::now();
+        let (response, was_cancelled) = tokio::select! {
+            result = run_repl_cell(&cell_shared, &code, cancel.clone()) => (result, false),
+            _ = cancel.cancelled() => {
+                // Dropping `eval_cell` releases the mutex but leaves Deno mid-cell. Kill the
+                // sidecar so its next request cannot consume stale output; durable store/*
+                // survives, while heap state is intentionally lost on cancellation.
+                if let Some(repl) = cell_shared.repl.lock().await.take() {
+                    repl.shutdown().await;
+                }
+                (
+                    Err(anyhow::anyhow!("cell cancelled — heap lost; store/* survives")),
+                    true,
+                )
+            }
+        };
+        // The operation itself is over; a late Cancel must not change its recorded status
+        // while the journal entry and response are being prepared.
+        if let Ok(mut slot) = cell_shared.cancel_current.lock() {
+            *slot = None;
+        }
+
+        // Log the cell into the session (§10.7) — code + outcome, never the heap.
+        if let Ok(mut rec) = cell_shared.recorder.lock() {
+            let (ok, detail) = match &response {
+                Ok(crate::orchestrate::CellOutcome::Ok { repr }) => (true, repr.clone()),
+                Ok(crate::orchestrate::CellOutcome::RuntimeError { error })
+                | Ok(crate::orchestrate::CellOutcome::CheckFailed { error }) => {
+                    (false, error.clone())
+                }
+                Err(e) => (false, format!("{e:#}")),
+            };
+            let _ = rec.append_repl_cell(&code, ok, &detail, started.elapsed().as_millis() as u64);
+        }
+
+        let succeeded = matches!(response, Ok(crate::orchestrate::CellOutcome::Ok { .. }));
+        let status = if was_cancelled {
+            "cancelled"
+        } else if succeeded {
+            "ok"
+        } else {
+            "error"
+        };
+        cell_shared.broadcast(&Event::TurnFinished {
+            status: status.into(),
+        });
+        guard.finished = true;
+        drop(guard); // clear cancel + busy before the response reaches the requester
+
+        let response = match response {
+            Ok(crate::orchestrate::CellOutcome::Ok { repr }) => Response::ok(
+                id,
+                ResponseData::Cell {
+                    ok: true,
+                    repr,
+                    error: None,
+                    check_failed: false,
+                },
+            ),
+            Ok(crate::orchestrate::CellOutcome::RuntimeError { error }) => Response::ok(
+                id,
+                ResponseData::Cell {
+                    ok: false,
+                    repr: String::new(),
+                    error: Some(error),
+                    check_failed: false,
+                },
+            ),
+            Ok(crate::orchestrate::CellOutcome::CheckFailed { error }) => Response::ok(
+                id,
+                ResponseData::Cell {
+                    ok: false,
+                    repr: String::new(),
+                    error: Some(error),
+                    check_failed: true,
+                },
+            ),
+            Err(e) => Response::err(id, format!("{e:#}")),
         };
         if let Ok(line) = serde_json::to_string(&response) {
             let _ = reply_tx.send(line);
@@ -536,66 +678,8 @@ async fn handle_sync_request(
             }
         }
 
-        RequestBody::ReplCell { code } => {
-            // Cells share the turn's busy flag: a cell can dispatch, so it IS a turn.
-            if shared
-                .busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return Response::err(
-                    id,
-                    "busy: a turn or cell is already running. Wait for it or `cancel` it first.",
-                );
-            }
-            shared.touch();
-            let started = std::time::Instant::now();
-            let response = run_repl_cell(shared, &code).await;
-            // Log the cell into the session (§10.7) — code + outcome, never the heap.
-            if let Ok(mut rec) = shared.recorder.lock() {
-                let (ok, detail) = match &response {
-                    Ok(crate::orchestrate::CellOutcome::Ok { repr }) => (true, repr.clone()),
-                    Ok(crate::orchestrate::CellOutcome::RuntimeError { error })
-                    | Ok(crate::orchestrate::CellOutcome::CheckFailed { error }) => {
-                        (false, error.clone())
-                    }
-                    Err(e) => (false, format!("{e:#}")),
-                };
-                let _ =
-                    rec.append_repl_cell(&code, ok, &detail, started.elapsed().as_millis() as u64);
-            }
-            shared.busy.store(false, Ordering::SeqCst);
-            shared.touch();
-            match response {
-                Ok(crate::orchestrate::CellOutcome::Ok { repr }) => Response::ok(
-                    id,
-                    ResponseData::Cell {
-                        ok: true,
-                        repr,
-                        error: None,
-                        check_failed: false,
-                    },
-                ),
-                Ok(crate::orchestrate::CellOutcome::RuntimeError { error }) => Response::ok(
-                    id,
-                    ResponseData::Cell {
-                        ok: false,
-                        repr: String::new(),
-                        error: Some(error),
-                        check_failed: false,
-                    },
-                ),
-                Ok(crate::orchestrate::CellOutcome::CheckFailed { error }) => Response::ok(
-                    id,
-                    ResponseData::Cell {
-                        ok: false,
-                        repr: String::new(),
-                        error: Some(error),
-                        check_failed: true,
-                    },
-                ),
-                Err(e) => Response::err(id, format!("{e:#}")),
-            }
+        RequestBody::ReplCell { .. } => {
+            Response::err(id, "internal: ReplCell is handled on its own task")
         }
 
         RequestBody::Status => Response::ok(id, shared.status_data()),
@@ -629,6 +713,7 @@ async fn handle_sync_request(
 async fn run_repl_cell(
     shared: &Arc<WorkerShared>,
     code: &str,
+    cancel: CancellationToken,
 ) -> Result<crate::orchestrate::CellOutcome> {
     let repl_cfg = shared.engine.config.repl.clone();
     let artifacts = crate::orchestrate::artifacts_dir(&shared.session_id);
@@ -663,6 +748,7 @@ async fn run_repl_cell(
             let recorder = Arc::clone(&recorder);
             let broadcast_shared = Arc::clone(&broadcast_shared);
             let artifacts = artifacts.clone();
+            let call_cancel = cancel.clone();
             async move {
                 crate::orchestrate::handle_host_call(
                     call,
@@ -694,14 +780,7 @@ async fn run_repl_cell(
                                 }
                             });
                         let outcome = engine
-                            .run_turn(
-                                None,
-                                active,
-                                explicit,
-                                &task,
-                                CancellationToken::new(),
-                                on_event,
-                            )
+                            .run_turn(None, active, explicit, &task, call_cancel, on_event)
                             .await;
                         match outcome {
                             TurnOutcome::Completed {
@@ -788,6 +867,26 @@ mod tests {
         regs.execs.insert(BackendId::Opencode, exec);
         let mut config = crate::config::HubConfig::default();
         config.default.backend = BackendId::Opencode;
+        let engine = TurnEngine {
+            config,
+            regs: Arc::new(regs),
+            cwd: tmp.to_path_buf(),
+        };
+        WorkerShared::new(sid, recorder, engine)
+    }
+
+    fn test_shared_for_cell(tmp: &std::path::Path, deno: &std::path::Path) -> Arc<WorkerShared> {
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp) };
+        let log = SessionLog::create(&tmp.join("sessions"), "/w", None, None).unwrap();
+        let lease = SessionLease::acquire_at(&tmp.join("leases"), log.path()).unwrap();
+        let sid = log.session_id().to_string();
+        let recorder = SessionRecorder::from_parts(log, lease);
+        let mut regs = Registries::empty();
+        regs.execs.insert(BackendId::Opencode, Box::new(EchoExec));
+        let mut config = crate::config::HubConfig::default();
+        config.default.backend = BackendId::Opencode;
+        config.repl.deno_path = deno.display().to_string();
+        config.repl.typecheck = false;
         let engine = TurnEngine {
             config,
             regs: Arc::new(regs),
@@ -904,6 +1003,90 @@ mod tests {
             outcome.is_ok(),
             "cancel and turn completion must beat the 30 s child"
         );
+        shared.shutdown.cancel();
+        let _ = server.await;
+    }
+
+    /// A cell, like a normal turn, must leave the connection loop free for cancellation
+    /// and broadcast a balanced lifecycle to every attached screen.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn repl_cell_is_cancellable_and_finishes_for_every_client() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_deno = tmp.path().join("fake-deno");
+        std::fs::write(&fake_deno, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake_deno, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = test_shared_for_cell(tmp.path(), &fake_deno);
+        let sock = tmp.path().join("w.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let serve_shared = Arc::clone(&shared);
+        let server = tokio::spawn(async move { serve(serve_shared, listener).await });
+
+        let (mut r1, mut w1) = client(&sock).await;
+        let (mut r2, mut w2) = client(&sock).await;
+        send_req(&mut w1, 1, RequestBody::Attach { tail: 0 }).await;
+        send_req(&mut w2, 1, RequestBody::Attach { tail: 0 }).await;
+        let _ = recv_line(&mut r1).await;
+        let _ = recv_line(&mut r2).await;
+        send_req(
+            &mut w1,
+            2,
+            RequestBody::ReplCell {
+                code: "await new Promise(() => {})".into(),
+            },
+        )
+        .await;
+
+        let wait_started = async {
+            loop {
+                let line = recv_line(&mut r1).await;
+                if line.contains("turn_started") && line.contains("cell") {
+                    break;
+                }
+            }
+            loop {
+                let line = recv_line(&mut r2).await;
+                if line.contains("turn_started") && line.contains("cell") {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), wait_started)
+            .await
+            .expect("both clients receive cell start");
+        send_req(&mut w1, 3, RequestBody::Cancel).await;
+
+        let wait_first = async {
+            let (mut cancel_ok, mut cell_done, mut finished) = (false, false, false);
+            while !(cancel_ok && cell_done && finished) {
+                let line = recv_line(&mut r1).await;
+                let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                match value.get("id").and_then(serde_json::Value::as_u64) {
+                    Some(2) => cell_done = true,
+                    Some(3) => cancel_ok = value["ok"].as_bool() == Some(true),
+                    _ => finished |= line.contains("turn_finished") && line.contains("cancelled"),
+                }
+            }
+        };
+        let wait_second = async {
+            loop {
+                let line = recv_line(&mut r2).await;
+                if line.contains("turn_finished") && line.contains("cancelled") {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(wait_first, wait_second)
+        })
+        .await
+        .expect("cancel, response, and both lifecycle endings arrive promptly");
+        assert!(!shared.busy.load(Ordering::SeqCst));
+        assert!(shared.repl.lock().await.is_none());
+
         shared.shutdown.cancel();
         let _ = server.await;
     }

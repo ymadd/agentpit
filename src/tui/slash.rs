@@ -70,6 +70,10 @@ pub enum Protocol {
     Branch(String),
     Fork(Option<String>),
     Compact,
+    /// One TypeScript orchestration cell (§10). The worker's deno sidecar is already on the
+    /// far end of this screen's connection, so the cell needs no suspension and no second
+    /// implementation of `agentpit orchestrate` — only the verb.
+    Cell(String),
 }
 
 impl Protocol {
@@ -86,6 +90,7 @@ impl Protocol {
             },
             Protocol::Fork(at) => RequestBody::Fork { at: at.clone() },
             Protocol::Compact => RequestBody::Compact,
+            Protocol::Cell(code) => RequestBody::ReplCell { code: code.clone() },
         }
     }
 }
@@ -196,6 +201,7 @@ fn command_route(command: SlashCommand) -> Route {
         SlashCommand::Branch(target) => Route::Protocol(Protocol::Branch(target)),
         SlashCommand::Fork(at) => Route::Protocol(Protocol::Fork(at)),
         SlashCommand::Compact => Route::Protocol(Protocol::Compact),
+        SlashCommand::ReplCell(code) => Route::Protocol(Protocol::Cell(code)),
         SlashCommand::Config => Route::Suspend(Suspend::Config),
         SlashCommand::Status => Route::Suspend(Suspend::Status),
         SlashCommand::Login(backend) => Route::Suspend(Suspend::Login(backend)),
@@ -453,6 +459,34 @@ mod tests {
             RequestBody::Fork { at: None }
         );
         assert_eq!(Protocol::Compact.request(), RequestBody::Compact);
+        assert_eq!(
+            Protocol::Cell("S.n = 1".into()).request(),
+            RequestBody::ReplCell {
+                code: "S.n = 1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_cell_is_a_worker_verb_here_rather_than_a_suspension() {
+        // The deno sidecar is on the far end of the connection this screen already holds.
+        // Suspending for `agentpit orchestrate` would open a SECOND client on the same
+        // session, and the alternate-screen objection that keeps the five agent-run
+        // commands out (see below) does not apply to one round-trip.
+        assert_eq!(
+            route("/cell return S.plan"),
+            Route::Protocol(Protocol::Cell("return S.plan".into()))
+        );
+        // Everything after the name is the cell, spaces and all — not argv words.
+        assert_eq!(
+            route("/cell S.n = 1"),
+            Route::Protocol(Protocol::Cell("S.n = 1".into()))
+        );
+        // Code is not optional: an empty cell would spend a round-trip to evaluate nothing.
+        match route("/cell") {
+            Route::Unknown(msg) => assert!(msg.starts_with("usage: /cell <code>"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]

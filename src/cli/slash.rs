@@ -185,6 +185,10 @@ pub enum SlashCommand {
     Ensemble(String),
     Review(String),
     Workflow(String),
+    /// One orchestration-REPL cell (§10): TypeScript evaluated in the session worker's
+    /// deno sidecar. Carried over the wire as [`crate::daemon::protocol::RequestBody::ReplCell`],
+    /// so only a surface holding a daemon connection can run it.
+    ReplCell(String),
     Rescue(String),
     Refactor {
         path: String,
@@ -390,6 +394,33 @@ pub static BUILTINS: &[SlashSpec] = &[
         surfaces: Cow::Borrowed(&[Surface::Repl]),
         exec: ExecKind::Dispatch,
         parse: ParseRule::Fn(|rest| Ok(SlashCommand::Workflow(rest.to_string()))),
+    },
+    SlashSpec {
+        name: cow("cell"),
+        // No `ts` alias, tempting as the sidecar's own prompt is: `/t` would stop
+        // completing to `/tree`, and one round-trip command is not worth that.
+        aliases: NO_ALIASES,
+        forms: Cow::Borrowed(&[Form {
+            args: cow("<code>"),
+            description: cow(
+                "Run one TypeScript orchestration cell in this session's deno sidecar",
+            ),
+        }]),
+        category: Category::Agents,
+        // TUI-only, and not for the reason the other Agents rows are REPL-only: a cell is
+        // one `ReplCell` round-trip on the daemon connection the TUI already holds, so it
+        // needs neither the alternate screen nor a second implementation. `agentpit repl`
+        // is in-process and holds no such connection — `agentpit orchestrate` is its REPL.
+        surfaces: Cow::Borrowed(&[Surface::Tui]),
+        // A cell's whole point is that `dispatch()` can fan work out to backends.
+        exec: ExecKind::Dispatch,
+        parse: ParseRule::Fn(|rest| {
+            if rest.is_empty() {
+                Err("usage: /cell <code> — one TypeScript cell, e.g. /cell return S.plan")
+            } else {
+                Ok(SlashCommand::ReplCell(rest.to_string()))
+            }
+        }),
     },
     SlashSpec {
         name: cow("rescue"),
@@ -1408,15 +1439,15 @@ mod tests {
 
     #[test]
     fn the_tui_claims_worker_verbs_plus_the_subcommands_it_suspends_for() {
-        // /help is in-screen; /tree, /rewind, /branch, /fork and /compact use worker verbs
-        // over the protocol; the rest run CLI code with the alternate screen handed back.
-        // Anything else the REPL offers is NOT reachable in the TUI and must stay unknown
-        // there rather than reaching a backend.
+        // /help is in-screen; /cell, /tree, /rewind, /branch, /fork and /compact use worker
+        // verbs over the protocol; the rest run CLI code with the alternate screen handed
+        // back. Anything else the REPL offers is NOT reachable in the TUI and must stay
+        // unknown there rather than reaching a backend.
         assert_eq!(
             names_for(Surface::Tui),
             expected_names(
                 vec![
-                    "help", "status", "config", "learning", "arena", "profile", "outcome",
+                    "help", "status", "config", "cell", "learning", "arena", "profile", "outcome",
                     "doctor", "mcp", "diagnose", "login", "quit", "exit", "detach", "sessions",
                     "tree", "rewind", "branch", "fork", "compact",
                 ],
@@ -1424,6 +1455,9 @@ mod tests {
                 "similarity",
             )
         );
+        // /cell is the TUI's only Agents row: the REPL reaches the same sidecar through
+        // `agentpit orchestrate`, not through a slash command.
+        assert!(lookup("cell", Surface::Repl).is_none());
         assert!(lookup("menu", Surface::Tui).is_none());
         assert!(matches!(
             parse("/menu", Surface::Tui),
@@ -1735,6 +1769,9 @@ mod tests {
                 "ensemble",
                 "review",
                 "workflow",
+                // A cell can `dispatch()`; the worker runs it under the same busy flag a
+                // turn takes, which is what makes it a spend and not a local command.
+                "cell",
                 "rescue",
                 "refactor",
                 "explain",

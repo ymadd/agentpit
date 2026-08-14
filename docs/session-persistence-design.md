@@ -489,7 +489,10 @@ CodeAct 等）、**(a) サンドボックスなしの任意コード実行、(b)
 
 バックエンドの隔離は非対称である（実測）: codex は `--sandbox workspace-write` で
 OS サンドボックス内（`src/exec/codex.rs:24`）、claude はサンドボックスなし +
-`--permission-mode acceptEdits`（`src/exec/claude.rs:19`）でユーザーのローカル設定依存。
+`--permission-mode auto`（`exec::autonomy::claude_permission_mode`。分類器モデルが
+実行前に各アクションを判定する。分類器のないモデル、または管理ポリシーで auto mode を
+無効化した環境で `AGENTPIT_CLAUDE_PERMISSION_MODE=acceptEdits` を設定した場合は
+`acceptEdits`）でユーザーのローカル設定依存。
 REPL からの dispatch はこの非対称を吸収する:
 
 1. **隔離レベルを dispatch の一級引数に昇格**（既存 `AutonomyLevel` を拡張）。REPL からの

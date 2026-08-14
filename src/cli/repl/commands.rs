@@ -166,6 +166,17 @@ pub async fn handle_slash(
             Ok((state, LoopControl::Continue))
         }
 
+        // Unreachable: the registry row is `Surface::Tui` only, so `parse` never hands this
+        // client a cell. Spelled out rather than swept into a `_` arm so that a command
+        // added to the table still fails to compile here until it is given a meaning.
+        SlashCommand::ReplCell(_) => {
+            eprintln!(
+                "{}",
+                style("cells run in the TUI or in `agentpit orchestrate` — not here").yellow()
+            );
+            Ok((state, LoopControl::Continue))
+        }
+
         // ── the CLI subcommands, run in-process against this session's cwd ───────────
         // Each arm calls the same implementation `agentpit <name>` calls, with the flags
         // the slash form does not expose left at their CLI defaults.

@@ -142,6 +142,62 @@ enum KeyOutcome {
     Suspend(Suspend),
 }
 
+/// One mutable transcript row for an in-flight tool. Decoder completion lines repeat the
+/// same redacted label, so even parallel calls can settle the row they started.
+struct ActiveToolRow {
+    key: String,
+    label: String,
+    row: usize,
+    started: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ToolRowUpdate {
+    Started { key: String, label: String },
+    Finished { key: String, succeeded: bool },
+}
+
+/// Parse the tiny text protocol emitted by `StreamDecoder`. Other progress lines keep the
+/// legacy append-only rendering; only paired ▶/✓/✗ tool rows become mutable.
+fn parse_tool_row_update(line: &str) -> Option<ToolRowUpdate> {
+    let trimmed = line.trim_start();
+    let (head, rest) = trimmed.split_once(']')?;
+    let kind = head.strip_prefix('[')?;
+    if !matches!(kind, "tool" | "command") {
+        return None;
+    }
+    let rest = rest.trim_start();
+    if let Some(label) = rest.strip_prefix('▶') {
+        let label = label.trim().to_string();
+        if label.is_empty() {
+            return None;
+        }
+        return Some(ToolRowUpdate::Started {
+            key: format!("{kind}:{label}"),
+            label,
+        });
+    }
+
+    let (succeeded, marker) = if rest.starts_with('✓') {
+        (true, " — succeeded")
+    } else if rest.starts_with('✗') {
+        (false, " — failed")
+    } else {
+        return None;
+    };
+    let body = rest.chars().skip(1).collect::<String>();
+    let body = body.trim();
+    let status_at = body.rfind(marker)?;
+    let label = body[..status_at].trim();
+    if label.is_empty() {
+        return None;
+    }
+    Some(ToolRowUpdate::Finished {
+        key: format!("{kind}:{label}"),
+        succeeded,
+    })
+}
+
 /// A fullscreen list overlay (Agents / Tree / Help) drawn over the conversation.
 struct Overlay {
     kind: OverlayKind,
@@ -165,6 +221,8 @@ struct App {
     terminal: Option<Terminal<CrosstermBackend<std::io::Stdout>>>,
     mode: Mode,
     transcript: Vec<Line<'static>>,
+    /// Tool rows animate in place until their matching completion event arrives.
+    active_tool_rows: Vec<ActiveToolRow>,
     /// Rows from the bottom the view is scrolled up by; 0 = follow the newest.
     scroll_offset: usize,
     input: InputState,
@@ -181,6 +239,8 @@ struct App {
     last_ctrl_c: Option<Instant>,
     /// Request id of OUR in-flight send (its response ends the busy state).
     pending_send: Option<u64>,
+    /// Request id of an asynchronous `/cell`; its response carries the value/error.
+    pending_cell: Option<u64>,
     /// Suppresses repeated Esc/Ctrl-C cancellation requests while the worker is settling.
     cancelling: bool,
     backend_line: String,
@@ -200,6 +260,7 @@ impl App {
             terminal: None,
             mode: Mode::Chat,
             transcript: Vec::new(),
+            active_tool_rows: Vec::new(),
             scroll_offset: 0,
             input: InputState::default(),
             menu: SlashMenu::default(),
@@ -210,6 +271,7 @@ impl App {
             turn_started: Instant::now(),
             last_ctrl_c: None,
             pending_send: None,
+            pending_cell: None,
             cancelling: false,
             backend_line: String::new(),
             active_backend: None,
@@ -247,6 +309,93 @@ impl App {
             let drop = self.transcript.len() - TRANSCRIPT_CAP;
             self.transcript.drain(..drop);
             self.scroll_offset = self.scroll_offset.saturating_sub(drop);
+            self.active_tool_rows.retain_mut(|tool| {
+                if tool.row < drop {
+                    false
+                } else {
+                    tool.row -= drop;
+                    true
+                }
+            });
+        }
+    }
+
+    /// Append ordinary output, but turn paired tool progress into one mutable row:
+    /// `▶` starts the animation and the later `✓`/`✗` replaces that exact row.
+    fn push_stream_line(&mut self, line: &str) {
+        if let Some(update) = parse_tool_row_update(line) {
+            self.flush_markdown();
+            match update {
+                ToolRowUpdate::Started { key, label } => {
+                    self.push_line(theme::tool_running_line(self.tick, 0, &label));
+                    self.active_tool_rows.push(ActiveToolRow {
+                        key,
+                        label,
+                        row: self.transcript.len().saturating_sub(1),
+                        started: Instant::now(),
+                    });
+                }
+                ToolRowUpdate::Finished { key, succeeded } => {
+                    if let Some(index) = self
+                        .active_tool_rows
+                        .iter()
+                        .rposition(|tool| tool.key == key)
+                    {
+                        let tool = self.active_tool_rows.remove(index);
+                        if let Some(row) = self.transcript.get_mut(tool.row) {
+                            *row = theme::tool_finished_line(
+                                succeeded,
+                                tool.started.elapsed().as_millis() as u64,
+                                &tool.label,
+                            );
+                        }
+                    } else {
+                        // Attached mid-call or an older backend without a start event.
+                        self.push_line(theme::progress_line(line));
+                    }
+                }
+            }
+        } else if is_progress_line(line) {
+            self.flush_markdown();
+            self.push_line(theme::progress_line(line));
+        } else {
+            let rendered = self.md.render(line);
+            for row in rendered {
+                self.push_line(row);
+            }
+        }
+    }
+
+    /// Land anything the renderer is still holding — a table waiting for its last row —
+    /// before something that is not part of the answer takes the next transcript row.
+    fn flush_markdown(&mut self) {
+        let pending = self.md.flush();
+        for row in pending {
+            self.push_line(row);
+        }
+    }
+
+    fn animate_tool_rows(&mut self) {
+        for tool in &self.active_tool_rows {
+            if let Some(row) = self.transcript.get_mut(tool.row) {
+                *row = theme::tool_running_line(
+                    self.tick,
+                    tool.started.elapsed().as_millis() as u64,
+                    &tool.label,
+                );
+            }
+        }
+    }
+
+    fn settle_tool_rows(&mut self, succeeded: bool) {
+        for tool in self.active_tool_rows.drain(..) {
+            if let Some(row) = self.transcript.get_mut(tool.row) {
+                *row = theme::tool_finished_line(
+                    succeeded,
+                    tool.started.elapsed().as_millis() as u64,
+                    &tool.label,
+                );
+            }
         }
     }
 
@@ -367,6 +516,7 @@ impl App {
                 }
                 _ = tick.tick() => {
                     self.tick = self.tick.wrapping_add(1);
+                    self.animate_tool_rows();
                 }
             }
             if let Some(cmd) = suspend {
@@ -477,19 +627,15 @@ impl App {
             Frame::Event(Event::Chunk { text }) => {
                 self.busy = true;
                 for line in self.assembler.push(&text) {
-                    if is_progress_line(&line) {
-                        self.push_line(theme::progress_line(&line));
-                    } else {
-                        let rendered = self.md.render(&line);
-                        self.push_line(rendered);
-                    }
+                    self.push_stream_line(&line);
                 }
             }
             Frame::Event(Event::TurnFinished { status }) => {
                 if let Some(rest) = self.assembler.finish() {
-                    let rendered = self.md.render(&rest);
-                    self.push_line(rendered);
+                    self.push_stream_line(&rest);
                 }
+                self.flush_markdown();
+                self.settle_tool_rows(status == "ok");
                 if status != "ok" {
                     self.push_text(&format!("[turn ended: {status}]"), theme::style_notice());
                 }
@@ -501,7 +647,50 @@ impl App {
                 self.push_text(&format!("session: {text}"), theme::style_notice());
             }
             Frame::Response(resp) => {
-                if Some(resp.id) == self.pending_send {
+                if Some(resp.id) == self.pending_cell {
+                    self.pending_cell = None;
+                    self.flush_markdown();
+                    // TurnFinished normally cleared these first. If the user already sent a
+                    // new turn in the tiny event→response gap, do not let this older response
+                    // overwrite that newer lifecycle.
+                    if self.pending_send.is_none() {
+                        self.busy = false;
+                        self.cancelling = false;
+                        self.backend_line.clear();
+                    }
+                    match (resp.ok, resp.data) {
+                        (true, Some(ResponseData::Cell { ok: true, repr, .. })) => {
+                            for line in repr.lines() {
+                                self.push_text(line, theme::style_md_code());
+                            }
+                            self.scroll_offset = 0;
+                        }
+                        (
+                            true,
+                            Some(ResponseData::Cell {
+                                ok: false,
+                                error,
+                                check_failed,
+                                ..
+                            }),
+                        ) => {
+                            let (label, style) = if check_failed {
+                                ("type error (cell not run):", theme::style_notice())
+                            } else {
+                                ("runtime error:", theme::style_error())
+                            };
+                            self.notify(&format!("{label} {}", error.unwrap_or_default()), style);
+                        }
+                        (false, _) => self.notify(
+                            &format!("error: {}", resp.error.unwrap_or_default()),
+                            theme::style_error(),
+                        ),
+                        (_, other) => self.notify(
+                            &format!("unexpected cell response: {other:?}"),
+                            theme::style_error(),
+                        ),
+                    }
+                } else if Some(resp.id) == self.pending_send {
                     self.pending_send = None;
                     self.busy = false;
                     self.cancelling = false;
@@ -752,6 +941,7 @@ impl App {
                     // The visible conversation must follow the restored branch too; keeping
                     // the abandoned tail on screen made a successful rewind look ineffective.
                     self.transcript.clear();
+                    self.active_tool_rows.clear();
                     self.scroll_offset = 0;
                     self.attach().await?;
                     self.notify(
@@ -779,6 +969,28 @@ impl App {
                 ),
                 Err(e) => self.notify(&format!("error: {e:#}"), theme::style_error()),
             },
+            Protocol::Cell(code) => {
+                if self.busy {
+                    self.notify(
+                        "busy: wait for the running turn or cell, or press Esc to cancel it",
+                        theme::style_notice(),
+                    );
+                    return Ok(());
+                }
+                // Echo the source before sending it. The response is handled asynchronously
+                // in `on_frame`, leaving the main select loop free to redraw, animate tools,
+                // and deliver Esc/Ctrl-C while dispatch() is running.
+                for (index, source) in code.lines().enumerate() {
+                    let prompt = if index == 0 { "ts>" } else { "..." };
+                    self.push_text(&format!("{prompt} {source}"), theme::style_accent());
+                }
+                let id = self.conn.send_request(request).await?;
+                self.pending_cell = Some(id);
+                self.busy = true;
+                self.cancelling = false;
+                self.turn_started = Instant::now();
+                self.backend_line = "cell".into();
+            }
         }
         Ok(())
     }
@@ -1041,6 +1253,7 @@ impl App {
             self.file_menu = FileMenu::default();
         }
         self.transcript.clear();
+        self.active_tool_rows.clear();
         self.scroll_offset = 0;
         self.attach().await
     }
@@ -1087,10 +1300,14 @@ fn transcript_lines(who: &str, text: &str, md: &mut MdRenderer) -> Vec<Line<'sta
                 ])
             })
             .collect(),
-        backend => text
-            .split('\n')
-            .map(|text_line| {
-                let mut line = md.render(text_line);
+        backend => {
+            let mut lines: Vec<Line<'static>> = text
+                .split('\n')
+                .flat_map(|text_line| md.render(text_line))
+                .collect();
+            // The message ends here, so a table that ran to its last row lands with it.
+            lines.extend(md.flush());
+            for line in &mut lines {
                 line.spans.insert(
                     0,
                     Span::styled(
@@ -1100,9 +1317,9 @@ fn transcript_lines(who: &str, text: &str, md: &mut MdRenderer) -> Vec<Line<'sta
                 );
                 line.spans
                     .insert(0, Span::styled("◈ ".to_string(), theme::style_accent()));
-                line
-            })
-            .collect(),
+            }
+            lines
+        }
     }
 }
 
@@ -1134,7 +1351,7 @@ async fn fetch_roster() -> Vec<RosterRow> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_backend_modifier;
+    use super::{ToolRowUpdate, parse_tool_row_update, split_backend_modifier};
 
     #[test]
     fn known_leading_bang_backend_is_sent_out_of_band() {
@@ -1147,6 +1364,32 @@ mod tests {
             Ok((Some("claude".to_string()), String::new()))
         );
         assert!(split_backend_modifier("!unknown task").is_err());
+    }
+
+    #[test]
+    fn paired_tool_lines_keep_the_same_redacted_label_as_their_key() {
+        assert_eq!(
+            parse_tool_row_update("[tool] ▶ Read — src/tui/mod.rs"),
+            Some(ToolRowUpdate::Started {
+                key: "tool:Read — src/tui/mod.rs".to_string(),
+                label: "Read — src/tui/mod.rs".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_tool_row_update("[tool] ✓ Read — src/tui/mod.rs — succeeded"),
+            Some(ToolRowUpdate::Finished {
+                key: "tool:Read — src/tui/mod.rs".to_string(),
+                succeeded: true,
+            })
+        );
+        assert_eq!(
+            parse_tool_row_update("[command] ✗ shell — cargo test — failed (exit 101)"),
+            Some(ToolRowUpdate::Finished {
+                key: "command:shell — cargo test".to_string(),
+                succeeded: false,
+            })
+        );
+        assert_eq!(parse_tool_row_update("[search] running"), None);
     }
 
     #[test]

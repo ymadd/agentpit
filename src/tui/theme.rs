@@ -66,7 +66,7 @@ pub const HINTS: &[&str] = &[
     "← on an empty line lists every session with its live state",
     "/tree shows branches; Enter moves the leaf, f forks at the cursor",
     "!codex …  routes a single turn to codex without switching the default",
-    "agentpit orchestrate runs TypeScript cells that fan work out to backends",
+    "/cell <code>  runs one TypeScript cell here; state persists in S across cells",
 ];
 
 // ── semantic styles ─────────────────────────────────────────────────────────
@@ -190,7 +190,69 @@ pub fn turn_start_line(backend: &str) -> Line<'static> {
     ])
 }
 
-/// A tool/progress line: dim with the pulse glyph lead (folded-tool de-emphasis).
+fn tool_label_spans(label: &str) -> Vec<Span<'static>> {
+    match label.split_once(" — ") {
+        Some((name, detail)) => vec![
+            Span::styled(name.to_string(), style_muted().add_modifier(Modifier::BOLD)),
+            Span::styled("  ".to_string(), style_dim()),
+            Span::styled(detail.to_string(), style_dim()),
+        ],
+        None => vec![Span::styled(
+            label.to_string(),
+            style_muted().add_modifier(Modifier::BOLD),
+        )],
+    }
+}
+
+fn elapsed_text(elapsed_ms: u64) -> String {
+    if elapsed_ms < 10_000 {
+        format!("{:.1}s", elapsed_ms as f64 / 1000.0)
+    } else {
+        format!("{}s", elapsed_ms / 1000)
+    }
+}
+
+/// One animated row for a running tool. The same transcript row is redrawn on every tick.
+pub fn tool_running_line(tick: usize, elapsed_ms: u64, label: &str) -> Line<'static> {
+    let pulse = WORKING_PULSE[(tick / PULSE_TICKS) % WORKING_PULSE.len()];
+    let mut spans = vec![
+        Span::styled("  ".to_string(), style_dim()),
+        Span::styled(
+            format!("{pulse} "),
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(tool_label_spans(label));
+    spans.push(Span::styled(
+        format!("  · {}", elapsed_text(elapsed_ms)),
+        style_dim(),
+    ));
+    Line::from(spans)
+}
+
+/// The settled form of [`tool_running_line`], replacing its pulse with an explicit result.
+pub fn tool_finished_line(succeeded: bool, elapsed_ms: u64, label: &str) -> Line<'static> {
+    let (glyph, status, result_style) = if succeeded {
+        ("✓", "succeeded", Style::default().fg(GREEN))
+    } else {
+        ("✗", "failed", style_error())
+    };
+    let mut spans = vec![
+        Span::styled("  ".to_string(), style_dim()),
+        Span::styled(
+            format!("{glyph} "),
+            result_style.add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(tool_label_spans(label));
+    spans.push(Span::styled(
+        format!("  · {status} · {}", elapsed_text(elapsed_ms)),
+        result_style,
+    ));
+    Line::from(spans)
+}
+
+/// A tool/progress line that has no paired lifecycle event.
 pub fn progress_line(text: &str) -> Line<'static> {
     let detail_style = if text.contains('✓') {
         Style::default().fg(GREEN)
@@ -342,6 +404,33 @@ mod tests {
             progress_line("[tool] ▶ Bash — echo hi").spans[1].style.fg,
             Some(DIM)
         );
+    }
+
+    #[test]
+    fn mutable_tool_row_pulses_then_settles_in_place() {
+        let running_a: String = tool_running_line(0, 1_250, "Read — src/tui/mod.rs")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let running_b: String = tool_running_line(PULSE_TICKS * 2, 1_450, "Read — src/tui/mod.rs")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(running_a.contains('◇'));
+        assert!(running_b.contains('◆'));
+        assert!(running_a.contains("1.2s"));
+
+        let finished = tool_finished_line(true, 1_500, "Read — src/tui/mod.rs");
+        let flat: String = finished
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(flat.contains("✓"));
+        assert!(flat.contains("succeeded"));
+        assert_eq!(finished.spans.last().unwrap().style.fg, Some(GREEN));
     }
 
     #[test]

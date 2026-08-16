@@ -104,6 +104,7 @@ pub async fn dispatch_free_text(
             backend,
             transport,
             reason,
+            ..
         } => {
             eprintln!(
                 "{}",

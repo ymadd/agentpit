@@ -169,6 +169,17 @@ impl OutcomeLabel {
             OutcomeLabel::Bad => "bad",
         }
     }
+
+    /// The verdict a human typed (`agentpit outcome good`, the TUI's `/outcome bad`).
+    /// Case-insensitive; `None` for anything else. Shared by every entry point so the two
+    /// surfaces can never disagree about what a verdict is spelled like.
+    pub fn from_verdict(verdict: &str) -> Option<Self> {
+        match verdict.to_ascii_lowercase().as_str() {
+            "good" => Some(OutcomeLabel::Good),
+            "bad" => Some(OutcomeLabel::Bad),
+            _ => None,
+        }
+    }
 }
 
 /// One line in the event log. The `event` tag distinguishes variants.

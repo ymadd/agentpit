@@ -273,8 +273,15 @@ fn handle_send(
 
         let sink_shared = Arc::clone(&turn_shared);
         let on_event: Arc<dyn Fn(EngineEvent) + Send + Sync> = Arc::new(move |ev| match ev {
-            EngineEvent::Route { backend, .. } => sink_shared.broadcast(&Event::TurnStarted {
+            EngineEvent::Route {
+                backend,
+                reason,
+                run_id,
+                ..
+            } => sink_shared.broadcast(&Event::TurnStarted {
                 backend: backend.to_string(),
+                run_id: Some(run_id),
+                reason: Some(reason),
             }),
             EngineEvent::Chunk { text } => sink_shared.broadcast(&Event::Chunk { text }),
             EngineEvent::Notice { text } => sink_shared.broadcast(&Event::Notice { text }),
@@ -327,6 +334,15 @@ fn handle_send(
         if let Ok(line) = serde_json::to_string(&response) {
             let _ = reply_tx.send(line);
         }
+
+        // Fold this turn's telemetry back into the capability profiles once enough runs have
+        // accrued. AFTER the reply, on a blocking thread: the fold reads the whole event log
+        // and rewrites `profiles.toml`, and neither belongs between the answer and the user.
+        // The next turn's routing reads whatever it wrote.
+        let learning = turn_shared.engine.config.learning.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::cli::profile::auto_fold(learning.auto_fold_every_runs, learning.min_samples);
+        });
     });
     None
 }
@@ -383,6 +399,10 @@ fn handle_repl_cell(
         };
         cell_shared.broadcast(&Event::TurnStarted {
             backend: "cell".into(),
+            // A REPL cell is local execution, not a routed dispatch: no run to label, no
+            // route stage to explain.
+            run_id: None,
+            reason: None,
         });
 
         let started = std::time::Instant::now();

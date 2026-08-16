@@ -36,6 +36,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListSt
 
 use crate::daemon::client::{Conn, connect_daemon, create_session, open_session};
 use crate::daemon::protocol::{Event, Frame, RequestBody, ResponseData};
+use crate::events::{OutcomeLabel, RunLogger};
 use crate::types::BackendId;
 use chunks::{LineAssembler, is_progress_line};
 use completion::{Edit, FileMenu, SlashMenu};
@@ -246,6 +247,10 @@ struct App {
     backend_line: String,
     /// Backend of the most recent turn — what `/login` with no argument means here.
     active_backend: Option<String>,
+    /// Telemetry run of the most recent turn — what `/outcome` with no run id labels here.
+    /// Without it the verdict falls back to "newest run in the log", which is the wrong run
+    /// as soon as another session dispatches while this one is being read.
+    last_run_id: Option<String>,
     /// 100ms app-timer count driving the working pulse.
     tick: usize,
     /// Shown in the header; the session's cwd.
@@ -275,6 +280,7 @@ impl App {
             cancelling: false,
             backend_line: String::new(),
             active_backend: None,
+            last_run_id: None,
             tick: 0,
             cwd_label: String::new(),
         }
@@ -537,6 +543,14 @@ impl App {
     /// FIRST and re-entered LAST, so a subcommand that panics or a terminal that dies
     /// mid-command leaves the user in a usable shell rather than in raw mode.
     async fn suspend_and_run(&mut self, cmd: Suspend) -> bool {
+        // A verdict is a one-line append to the event log, not a screenful of CLI output.
+        // Dropping out of the alternate screen and waiting for a keypress would cost more
+        // than the label is worth, and the label is the learning layer's strongest evidence
+        // (weight 3.0) — the one source that measured zero across 97 real runs.
+        if let Suspend::Outcome { verdict, run_id } = &cmd {
+            self.record_outcome(verdict, run_id.clone());
+            return true;
+        }
         let label = cmd.label();
         self.leave_terminal();
         eprintln!("── {label} ──");
@@ -564,6 +578,34 @@ impl App {
         }
     }
 
+    /// Record the human's verdict on a run without leaving the TUI.
+    ///
+    /// The run id defaults to THIS session's last turn rather than the CLI's "newest run in
+    /// the log": with a second session (or a dashboard sweep) dispatching in parallel, the
+    /// newest run is routinely somebody else's, and a misattributed verdict is worse than no
+    /// verdict — it teaches the fold the wrong thing at the highest weight there is.
+    fn record_outcome(&mut self, verdict: &str, run_id: Option<String>) {
+        let Some(label) = OutcomeLabel::from_verdict(verdict) else {
+            self.push_text(
+                &format!("outcome: verdict must be `good` or `bad`, got `{verdict}`"),
+                theme::style_notice(),
+            );
+            return;
+        };
+        let Some(id) = run_id.or_else(|| self.last_run_id.clone()) else {
+            self.push_text(
+                "outcome: no run to label yet — send a turn first",
+                theme::style_notice(),
+            );
+            return;
+        };
+        RunLogger::adopt(id.clone()).outcome(label);
+        self.push_text(
+            &format!("outcome: {} recorded for run {id}", label.as_str()),
+            theme::style_dim(),
+        );
+    }
+
     /// The CLI implementation behind a suspended command — the same code the subcommand
     /// runs, so the TUI cannot drift from `agentpit status` / `agentpit login`.
     async fn run_suspended(&self, cmd: &Suspend) -> Result<()> {
@@ -581,6 +623,8 @@ impl App {
             Suspend::Similarity(words) => {
                 crate::cli::similarity_cmd::run_words(words.clone()).await
             }
+            // Unreachable from the TUI (`suspend_and_run` records verdicts in place); kept so
+            // the match stays exhaustive over the shared command set.
             Suspend::Outcome { verdict, run_id } => {
                 crate::cli::outcome::run(verdict.clone(), run_id.clone()).await
             }
@@ -616,12 +660,21 @@ impl App {
 
     fn on_frame(&mut self, frame: Frame) {
         match frame {
-            Frame::Event(Event::TurnStarted { backend }) => {
+            Frame::Event(Event::TurnStarted {
+                backend,
+                run_id,
+                reason,
+            }) => {
                 self.busy = true;
                 self.md.reset(); // a new turn is a new document — no fence carries over
                 self.turn_started = Instant::now();
-                self.push_line(theme::turn_start_line(&backend));
+                self.push_line(theme::turn_start_line(&backend, reason.as_deref()));
                 self.active_backend = Some(backend.clone());
+                // A cell broadcast carries no run: keep the last dispatch's id so a verdict
+                // typed after running a cell still lands on the turn it was about.
+                if run_id.is_some() {
+                    self.last_run_id = run_id;
+                }
                 self.backend_line = backend;
             }
             Frame::Event(Event::Chunk { text }) => {

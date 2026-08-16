@@ -114,7 +114,7 @@ pub async fn run(session: Option<String>) -> Result<()> {
                     );
                     return Ok(());
                 }
-                Ok(Frame::Event(Event::TurnStarted { backend })) => {
+                Ok(Frame::Event(Event::TurnStarted { backend, .. })) => {
                     eprintln!("{}", style(format!("[→ {backend}]")).dim());
                 }
                 Ok(Frame::Event(Event::Chunk { text })) => {

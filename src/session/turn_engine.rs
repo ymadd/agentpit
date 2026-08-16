@@ -28,6 +28,10 @@ pub enum EngineEvent {
         backend: BackendId,
         transport: &'static str,
         reason: String,
+        /// The telemetry run this turn writes under — the id `agentpit outcome` labels, so a
+        /// client can offer a verdict on the turn the user is actually looking at instead of
+        /// guessing at "the most recent run in the log".
+        run_id: String,
     },
     /// A streamed output chunk (already decoded — display text, not raw JSONL).
     Chunk { text: String },
@@ -128,11 +132,6 @@ impl TurnEngine {
         let transport = resolve_transport(backend_id, &self.regs)
             .map(|t| t.as_str())
             .unwrap_or("none");
-        on_event(EngineEvent::Route {
-            backend: backend_id,
-            transport,
-            reason: decision.reason.as_str().to_string(),
-        });
 
         let effective_model = crate::workflow::roles::resolve_model(
             None,
@@ -149,8 +148,16 @@ impl TurnEngine {
         )
         .map(|e| e.clamp_for(backend_id));
 
+        // The run must exist before the Route event goes out: the event carries the run id
+        // the client labels with, so it cannot be emitted before the logger names the run.
         let logger = RunLogger::start(RunKind::Rescue, &[backend_id], &self.cwd);
         decision.log(&logger, task, effective_model.as_deref(), effective_effort);
+        on_event(EngineEvent::Route {
+            backend: backend_id,
+            transport,
+            reason: decision.reason.as_str().to_string(),
+            run_id: logger.run_id().to_string(),
+        });
         logger.member_started(
             backend_id,
             false,

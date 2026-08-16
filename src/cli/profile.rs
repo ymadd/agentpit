@@ -149,7 +149,7 @@ pub async fn run(action: Option<Action>) -> Result<()> {
         Action::Learn {
             dry_run,
             min_samples,
-        } => learn(dry_run, min_samples, &profiles_path()),
+        } => learn(dry_run, false, min_samples, &profiles_path()),
         Action::Replay { policy } => replay(&policy),
     }
 }
@@ -443,7 +443,10 @@ fn similarity_replay_picker(
 
 /// `agentpit profile learn`: fold the event log into Learned scores and merge them into
 /// `profiles.toml` under the `benchmarked > learned > seeded` gate.
-fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
+///
+/// `quiet` suppresses every line of the report: the automatic fold ([`auto_fold`]) runs
+/// behind a finished dispatch, where printing would land in the middle of somebody's answer.
+fn learn(dry_run: bool, quiet: bool, min_samples: u16, profiles: &Path) -> Result<()> {
     use crate::profile::learn::fold_scores;
 
     let events = crate::events::events_path();
@@ -458,13 +461,15 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
     // re-diagnosing the task text saved at dispatch time.
     let (runs, labels) = labels_from_log(&log);
     let scores = fold_scores(&labels, min_samples);
-    println!(
-        "telemetry: {} runs, {} labels -> {} cell(s) with >= {} samples",
-        runs.len(),
-        labels.len(),
-        scores.values().map(|c| c.len()).sum::<usize>(),
-        min_samples,
-    );
+    if !quiet {
+        println!(
+            "telemetry: {} runs, {} labels -> {} cell(s) with >= {} samples",
+            runs.len(),
+            labels.len(),
+            scores.values().map(|c| c.len()).sum::<usize>(),
+            min_samples,
+        );
+    }
     // The similarity store accrues from the labels directly — its evidence thresholds are
     // its own ([auto_route.similarity].min_samples), independent of whether any profile
     // cell reached --min-samples this time.
@@ -473,7 +478,9 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
         update_route_samples(&labels);
     }
     if scores.is_empty() {
-        println!("nothing to write yet.");
+        if !quiet {
+            println!("nothing to write yet.");
+        }
         return Ok(());
     }
 
@@ -503,15 +510,17 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
                 continue;
             }
             changed += 1;
-            println!(
-                "  [{label}] {:<18} {} -> {}  (samples={}, conf={:.2})",
-                category.as_str(),
-                old.map(|s| s.value.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                score.value,
-                score.samples,
-                score.confidence,
-            );
+            if !quiet {
+                println!(
+                    "  [{label}] {:<18} {} -> {}  (samples={}, conf={:.2})",
+                    category.as_str(),
+                    old.map(|s| s.value.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    score.value,
+                    score.samples,
+                    score.confidence,
+                );
+            }
         }
         let frozen = learned
             .keys()
@@ -520,23 +529,74 @@ fn learn(dry_run: bool, min_samples: u16, profiles: &Path) -> Result<()> {
                     == Some(crate::profile::ProfileSource::Benchmarked)
             })
             .count();
-        if frozen > 0 {
+        if frozen > 0 && !quiet {
             println!("  [{label}] {frozen} benchmarked cell(s) left untouched");
         }
         merged.insert(after);
     }
 
     if changed == 0 {
-        println!("no cells changed.");
+        if !quiet {
+            println!("no cells changed.");
+        }
         return Ok(());
     }
     if dry_run {
-        println!("(dry run: {} not written)", profiles.display());
+        if !quiet {
+            println!("(dry run: {} not written)", profiles.display());
+        }
         return Ok(());
     }
     save_profiles(&merged, profiles)?;
-    println!("wrote {} ({changed} cell(s) updated).", profiles.display());
+    if !quiet {
+        println!("wrote {} ({changed} cell(s) updated).", profiles.display());
+    }
     Ok(())
+}
+
+/// Records the run count at the last automatic fold, so the next one waits for genuinely new
+/// evidence instead of re-folding the same log after every turn.
+fn auto_fold_marker() -> PathBuf {
+    crate::events::state_dir().join("last_fold")
+}
+
+/// The automatic side of `profile learn` (`[learning].auto_fold_every_runs`): fold the
+/// telemetry into `profiles.toml` once the log has grown by `every_runs` dispatches since
+/// the last fold. Returns whether a fold ran.
+///
+/// Silent and best-effort by construction — this runs behind a finished dispatch, so a
+/// missing log, an unreadable marker or an unwritable profile file must degrade to "not this
+/// time", never to an error on the user's turn.
+pub(crate) fn auto_fold(every_runs: u32, min_samples: u16) -> bool {
+    if every_runs == 0 {
+        return false;
+    }
+    let Ok(log) = fs::read_to_string(crate::events::events_path()) else {
+        return false;
+    };
+    // Counting the marker line beats parsing 100k of JSON on every turn; the fold itself
+    // parses the log properly a few lines below.
+    let runs = log.matches(r#""event":"run_started""#).count() as u64;
+    let marker = auto_fold_marker();
+    let last = fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if !fold_is_due(runs, last, every_runs) {
+        return false;
+    }
+    let _ = fs::write(&marker, runs.to_string());
+    let _ = learn(false, true, min_samples, &profiles_path());
+    true
+}
+
+/// Whether the log has grown enough since the fold at `last` runs to fold again.
+///
+/// `runs < last` means the log rotated or the state dir was replaced; folding (and resetting
+/// the marker) is the right answer there — the alternative wedges the fold forever behind a
+/// count the new log can never reach.
+fn fold_is_due(runs: u64, last: u64, every_runs: u32) -> bool {
+    every_runs > 0 && (runs < last || runs - last >= every_runs as u64)
 }
 
 /// Sync the similarity layer's sample store with this fold's labels.
@@ -1097,6 +1157,68 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn auto_fold_marks_the_log_position_so_the_next_turn_does_not_refold() {
+        // Without the marker every finished dispatch would re-fold the whole event log, which
+        // is the difference between "learning runs itself" and "every turn pays for it".
+        let _lock = crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = tempdir().unwrap();
+        let config = tempdir().unwrap();
+        // SAFETY: every crate test that mutates these serializes on STATE_ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", state.path());
+            std::env::set_var("XDG_CONFIG_HOME", config.path());
+        }
+
+        let events = crate::events::events_path();
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+        let run = |id: &str| {
+            format!(
+                r#"{{"event":"run_started","ts":1,"run_id":"{id}","pid":1,"kind":"rescue","members":["codex"],"cwd":"/x"}}"#
+            )
+        };
+        std::fs::write(&events, format!("{}\n{}\n", run("r-1"), run("r-2"))).unwrap();
+
+        assert!(auto_fold(2, 5), "two runs meet a two-run interval");
+        assert!(
+            !auto_fold(2, 5),
+            "nothing new since the marker — the fold must not run again"
+        );
+
+        std::fs::write(
+            &events,
+            format!("{}\n{}\n{}\n", run("r-1"), run("r-2"), run("r-3")),
+        )
+        .unwrap();
+        assert!(!auto_fold(2, 5), "one new run is under the interval");
+
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
+
+    #[test]
+    fn fold_is_due_only_after_enough_new_runs() {
+        assert!(!fold_is_due(9, 0, 10), "9 new runs is under the interval");
+        assert!(fold_is_due(10, 0, 10));
+        assert!(
+            !fold_is_due(15, 10, 10),
+            "the interval counts from the last fold, not from zero"
+        );
+        assert!(fold_is_due(20, 10, 10));
+        assert!(
+            !fold_is_due(100, 0, 0),
+            "0 turns the automatic fold off entirely"
+        );
+        assert!(
+            fold_is_due(3, 97, 10),
+            "a rotated log folds again instead of wedging behind an unreachable count"
+        );
+    }
+
+    #[test]
     fn slash_words_carry_the_sub_action_with_no_binary_name_in_front() {
         use clap::Parser;
         // A bare `/profile` is the CLI's bare `agentpit profile`: no sub-action, i.e. show.
@@ -1514,10 +1636,10 @@ mod tests {
         );
 
         // Dry run reports but writes nothing.
-        learn(true, 5, &profiles).unwrap();
+        learn(true, false, 5, &profiles).unwrap();
         assert!(!profiles.exists());
 
-        learn(false, 5, &profiles).unwrap();
+        learn(false, false, 5, &profiles).unwrap();
         let merged = load_profiles(Some(&profiles)).unwrap();
         let learned = merged.get(BackendId::Opencode).unwrap();
         assert_eq!(learned.source, ProfileSource::Learned);

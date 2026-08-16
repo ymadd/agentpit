@@ -9,10 +9,8 @@ use anyhow::{Context, Result};
 use crate::events::{Event, OutcomeLabel, RunKind, RunLogger, events_path};
 
 pub async fn run(verdict: String, run_id: Option<String>) -> Result<()> {
-    let outcome = match verdict.to_ascii_lowercase().as_str() {
-        "good" => OutcomeLabel::Good,
-        "bad" => OutcomeLabel::Bad,
-        other => anyhow::bail!("verdict must be `good` or `bad`, got `{other}`"),
+    let Some(outcome) = OutcomeLabel::from_verdict(&verdict) else {
+        anyhow::bail!("verdict must be `good` or `bad`, got `{verdict}`")
     };
 
     let run_id = match run_id {

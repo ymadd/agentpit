@@ -501,6 +501,42 @@ pub struct HubConfig {
     pub repl: ReplSection,
     #[serde(default)]
     pub mcp: McpSection,
+    #[serde(default)]
+    pub learning: LearningSection,
+}
+
+/// When the runtime folds its own telemetry back into `profiles.toml`.
+///
+/// The fold used to be manual only (`agentpit profile learn`), which meant the routing layer
+/// could accumulate months of evidence and still route on the hand-seeded priors — measured:
+/// 97 runs logged, 5 cells ready to promote, none of them ever written.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LearningSection {
+    /// Fold after this many dispatched runs have accrued since the last fold. `0` turns the
+    /// automatic fold off; `agentpit profile learn` keeps working either way.
+    #[serde(default = "default_auto_fold_every_runs")]
+    pub auto_fold_every_runs: u32,
+    /// Cells with fewer labels than this are not written back — the automatic side of
+    /// `profile learn --min-samples`.
+    #[serde(default = "default_auto_fold_min_samples")]
+    pub min_samples: u16,
+}
+
+fn default_auto_fold_every_runs() -> u32 {
+    10
+}
+
+fn default_auto_fold_min_samples() -> u16 {
+    crate::profile::learn::DEFAULT_MIN_SAMPLES
+}
+
+impl Default for LearningSection {
+    fn default() -> Self {
+        LearningSection {
+            auto_fold_every_runs: default_auto_fold_every_runs(),
+            min_samples: default_auto_fold_min_samples(),
+        }
+    }
 }
 
 /// Orchestration-REPL knobs (design §10.9).
@@ -883,6 +919,13 @@ review_members = ["antigravity", "opencode"]
 #                         # resume (claude/codex resume natively; others get composed context)
 # transcript_tail = 400   # entries rendered on attach (display only; context stays complete)
 # idle_evict_minutes = 30 # idle worker eviction (0 = never); the session file always survives
+
+# Runtime learning: fold the telemetry in events.jsonl back into profiles.toml on its own, so
+# auto-routing keeps improving without anyone remembering `agentpit profile learn`. Inspect
+# what it has learned with `agentpit learning`.
+# [learning]
+# auto_fold_every_runs = 10  # fold after this many new dispatches; 0 = manual folds only
+# min_samples          = 5   # labels a cell needs before the fold writes it back
 
 # Orchestration REPL (`agentpit orchestrate`): TypeScript cells in a sandboxed Deno
 # sidecar; dispatch()/store/session are the only exits. Needs deno on $PATH.

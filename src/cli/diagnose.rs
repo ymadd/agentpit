@@ -39,7 +39,8 @@ struct Routing {
     /// The router's own reason string (`route_table`, `similarity`, `profile`,
     /// `profile_cost_tiebreak`, `auto_long_context`, `auto_keyword`, `default`).
     reason: String,
-    /// True when the profile stage picked `backend` (reason `profile*`).
+    /// True when a capability-profile stage picked `backend` (reason `profile*`), whether it
+    /// scored the diagnosed category or the category-independent overall mean.
     from_profile: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<TaskCategory>,
@@ -101,12 +102,19 @@ fn build_report(
         RouteReason::Profile {
             category, score, ..
         } => (Some(category), Some(score)),
+        // The overall stage routes on capability without a category: reporting the diagnosis's
+        // own low-confidence guess here would read as "routed as Coding", which is the one
+        // thing this stage deliberately does NOT do.
+        RouteReason::ProfileOverall { score, .. } => (None, Some(score)),
         _ => (None, None),
     };
     let routing = Routing {
         backend: decision.backend,
         reason: decision.reason.as_str().to_string(),
-        from_profile: matches!(decision.reason, RouteReason::Profile { .. }),
+        from_profile: matches!(
+            decision.reason,
+            RouteReason::Profile { .. } | RouteReason::ProfileOverall { .. }
+        ),
         category,
         score,
     };
@@ -322,7 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_task_falls_back_to_default() {
+    fn low_confidence_task_routes_on_the_overall_score_without_a_category() {
+        // Below the gate the diagnosis's category is not trustworthy, so the report must not
+        // claim one — but the route is still a measured choice, not `default.backend`.
         let report = build_report(
             "alpha beta gamma",
             &auto_route_config(BackendId::Opencode),
@@ -332,10 +342,10 @@ mod tests {
         );
 
         assert!(report.diagnosis.confidence < LLM_ASSIST_CONFIDENCE_THRESHOLD);
-        assert_eq!(report.routing.reason, "default");
-        assert!(!report.routing.from_profile);
-        assert_eq!(report.routing.backend, BackendId::Opencode);
-        assert_eq!(report.routing.score, None);
+        assert_eq!(report.routing.reason, "profile_overall");
+        assert!(report.routing.from_profile);
+        assert_eq!(report.routing.category, None, "no category was trusted");
+        assert!(report.routing.score.is_some(), "the mean is a real reading");
     }
 
     #[test]

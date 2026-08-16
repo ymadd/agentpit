@@ -25,6 +25,15 @@ pub enum RouteReason {
         score: u8,
         cost_tiebreak: bool,
     },
+    /// No category signal cleared the diagnosis gate, so the task routed on the backends'
+    /// category-independent overall score (the mean of their scored categories) instead of
+    /// falling through to `default.backend`. Weaker evidence than [`RouteReason::Profile`] —
+    /// it says "this backend is better overall", not "better at THIS kind of work" — which
+    /// is why it sits last among the capability stages.
+    ProfileOverall {
+        score: u8,
+        cost_tiebreak: bool,
+    },
     /// kNN similarity route: the backend that won sufficiently-similar past tasks
     /// (`--features similarity` builds with the embedding model installed).
     Similarity {
@@ -51,6 +60,14 @@ impl RouteReason {
                 cost_tiebreak: true,
                 ..
             } => "profile_cost_tiebreak",
+            RouteReason::ProfileOverall {
+                cost_tiebreak: false,
+                ..
+            } => "profile_overall",
+            RouteReason::ProfileOverall {
+                cost_tiebreak: true,
+                ..
+            } => "profile_overall_cost_tiebreak",
             RouteReason::Similarity { .. } => "similarity",
             RouteReason::AutoLongContext => "auto_long_context",
             RouteReason::AutoKeyword => "auto_keyword",
@@ -83,6 +100,8 @@ impl RouteDecision {
             RouteReason::Profile {
                 category, score, ..
             } => (Some(category.as_str()), Some(score)),
+            // Category-independent by construction: the score is real, the category is not.
+            RouteReason::ProfileOverall { score, .. } => (None, Some(score)),
             _ => (None, None),
         };
         logger.route_decided(
@@ -216,20 +235,21 @@ impl Router {
             // backend has scored falls through to the legacy long-context / keyword heuristics
             // and ultimately `default` — we never let an uncertain guess steer work to an odd
             // backend.
+            let margin = self.config.auto_route.quality_margin;
+            let cost_of = |b: BackendId| {
+                self.config
+                    .backends
+                    .get(&b)
+                    .and_then(|o| o.cost)
+                    .unwrap_or(50)
+            };
+
             let diagnosis = diagnose::diagnose(task);
             diagnose_confidence = Some(diagnosis.confidence);
             if diagnosis.confidence >= LLM_ASSIST_CONFIDENCE_THRESHOLD {
                 let candidates = self
                     .profiles
                     .candidates_for(diagnosis.primary, &auto_available);
-                let margin = self.config.auto_route.quality_margin;
-                let cost_of = |b: BackendId| {
-                    self.config
-                        .backends
-                        .get(&b)
-                        .and_then(|o| o.cost)
-                        .unwrap_or(50)
-                };
                 if let Some((backend, score, cost_tiebreak)) =
                     pick_with_cost_tiebreak(&candidates, margin, cost_of)
                 {
@@ -251,6 +271,25 @@ impl Router {
                 return RouteDecision {
                     backend: auto.review_backend,
                     reason: RouteReason::AutoKeyword,
+                    diagnose_confidence,
+                };
+            }
+
+            // Last capability stage: the task never produced a category anyone could act on
+            // (measured: 15 of 17 auto-routed turns diagnosed at NEUTRAL_CONFIDENCE — short
+            // conversational prompts match no keyword), yet the profiles still know which
+            // backend is stronger across the board. Routing on that beats `default.backend`,
+            // which is a static pick that no measurement can ever move.
+            let overall = self.profiles.overall_candidates(&auto_available);
+            if let Some((backend, score, cost_tiebreak)) =
+                pick_with_cost_tiebreak(&overall, margin, cost_of)
+            {
+                return RouteDecision {
+                    backend,
+                    reason: RouteReason::ProfileOverall {
+                        score: score.value,
+                        cost_tiebreak,
+                    },
                     diagnose_confidence,
                 };
             }
@@ -355,6 +394,7 @@ mod tests {
             session: Default::default(),
             repl: Default::default(),
             mcp: Default::default(),
+            learning: Default::default(),
         }
     }
 
@@ -805,10 +845,12 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_diagnosis_does_not_take_profile_path() {
+    fn low_confidence_diagnosis_does_not_take_the_category_path() {
         // A signal-free task diagnoses to a low-confidence category. Even though the profiles
-        // do score that category, the confidence gate must keep us off the profile path so a
-        // misclassification can't steer work to an odd backend — we fall through to default.
+        // do score that category, the confidence gate must keep us off the CATEGORY path so a
+        // misclassification can't steer work to an odd backend. The task still routes on
+        // measured capability — see `signal_free_task_routes_on_the_overall_score` — just
+        // never on the category the diagnosis guessed.
         let mut cfg = base_config();
         cfg.routes.clear();
         cfg.default.backend = BackendId::Opencode;
@@ -825,8 +867,100 @@ mod tests {
             task: Some("alpha beta gamma"),
         });
 
-        // Profile path skipped (low confidence), no long-context, no keyword → default.
-        assert_eq!(d.reason, RouteReason::Default);
-        assert_eq!(d.backend, BackendId::Opencode);
+        // Category path skipped: the guessed category must not appear in the verdict.
+        assert!(
+            !matches!(d.reason, RouteReason::Profile { .. }),
+            "a low-confidence category must never steer the route, got {:?}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn signal_free_task_routes_on_the_overall_score() {
+        // The case this stage exists for: in real telemetry 15 of 17 auto-routed turns
+        // diagnosed at neutral confidence (short conversational prompts match no keyword) and
+        // every one fell through to `default.backend` — a static pick no measurement can move.
+        // Codex wins here on the MEAN (80 vs 60) even though Claude leads Coding, the category
+        // the low-confidence diagnosis guessed: overall capability, never the guessed category.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        cfg.default.backend = BackendId::Opencode;
+        let mut claude = CapabilityProfile::seeded(BackendId::Claude);
+        claude
+            .scores
+            .insert(TaskCategory::Coding, Score::seeded(90));
+        claude
+            .scores
+            .insert(TaskCategory::Review, Score::seeded(30));
+        let mut codex = CapabilityProfile::seeded(BackendId::Codex);
+        codex.scores.insert(TaskCategory::Coding, Score::seeded(80));
+        codex.scores.insert(TaskCategory::Review, Score::seeded(80));
+        let profiles = ProfileSet::from_profiles([claude, codex]);
+        let mut avail = available();
+        avail.insert(BackendId::Codex);
+        let r = Router::new(cfg, avail, profiles);
+
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("alpha beta gamma"),
+        });
+
+        assert_eq!(
+            d.reason,
+            RouteReason::ProfileOverall {
+                score: 80,
+                cost_tiebreak: false
+            },
+            "expected the overall-score stage, got {:?}",
+            d.reason
+        );
+        assert_eq!(d.backend, BackendId::Codex, "mean 80 beats mean 60");
+    }
+
+    #[test]
+    fn overall_score_never_outranks_a_confident_category_verdict() {
+        // Stage order: a task that DOES declare its category keeps taking the category path,
+        // even when another backend is stronger on the overall mean. The overall stage is the
+        // fallback for "no signal", not a second opinion on a confident diagnosis.
+        let mut cfg = base_config();
+        cfg.routes.clear();
+        let mut claude = CapabilityProfile::seeded(BackendId::Claude);
+        claude
+            .scores
+            .insert(TaskCategory::Review, Score::seeded(95));
+        claude
+            .scores
+            .insert(TaskCategory::Coding, Score::seeded(10));
+        let mut codex = CapabilityProfile::seeded(BackendId::Codex);
+        codex.scores.insert(TaskCategory::Review, Score::seeded(60));
+        codex.scores.insert(TaskCategory::Coding, Score::seeded(99));
+        let profiles = ProfileSet::from_profiles([claude, codex]);
+        let mut avail = available();
+        avail.insert(BackendId::Codex);
+        let r = Router::new(cfg, avail, profiles);
+
+        let d = r.resolve(&RouteRequest {
+            tool: RouteKey::Rescue,
+            explicit_backend: None,
+            task: Some("CATEGORY: review\nalpha beta gamma"),
+        });
+
+        assert_eq!(
+            d.backend,
+            BackendId::Claude,
+            "Review's argmax, not the mean"
+        );
+        assert!(
+            matches!(
+                d.reason,
+                RouteReason::Profile {
+                    category: TaskCategory::Review,
+                    ..
+                }
+            ),
+            "{:?}",
+            d.reason
+        );
     }
 }

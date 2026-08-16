@@ -179,7 +179,18 @@ pub enum Event {
     /// Streamed output chunk from the in-flight exchange.
     Chunk { text: String },
     /// A turn began (another client, or this one — clients render idempotently).
-    TurnStarted { backend: String },
+    TurnStarted {
+        backend: String,
+        /// Telemetry run id for this turn, so a client can label it (`/outcome`) without
+        /// guessing at the newest run in the log. `None` from a daemon predating the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// Why the router picked this backend (`profile`, `profile_overall`, `default`, …) —
+        /// the route stage is invisible in the TUI otherwise, and an unexplained backend
+        /// switch reads as a bug rather than as the learning layer working.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// The in-flight turn ended.
     TurnFinished { status: String },
     /// Human-readable side note (recovery marks, detach hints).
@@ -223,6 +234,27 @@ mod tests {
         })
         .unwrap();
         assert!(!plain.contains("backend"), "{plain}");
+    }
+
+    #[test]
+    fn turn_started_reads_frames_from_a_daemon_without_the_routing_fields() {
+        // A running daemon outlives the binary that starts a new client: an installed 0.2.x
+        // worker still broadcasts the bare form, and a TUI that fails to parse it renders no
+        // turn at all. The fields are additive, never required.
+        let old: Event = serde_json::from_str(r#"{"event":"turn_started","backend":"codex"}"#)
+            .expect("older frame must still parse");
+        assert_eq!(
+            old,
+            Event::TurnStarted {
+                backend: "codex".into(),
+                run_id: None,
+                reason: None,
+            }
+        );
+        // ... and they stay off the wire when absent, so an older client is unaffected too.
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("run_id"), "{json}");
+        assert!(!json.contains("reason"), "{json}");
     }
 
     #[test]

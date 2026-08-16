@@ -248,6 +248,46 @@ impl ProfileSet {
                     .then(a.samples.cmp(&b.samples))
             })
     }
+
+    /// Every available backend's CATEGORY-INDEPENDENT score: the mean of the categories it
+    /// has been scored on. The router's last capability stage reads this when the task
+    /// produced no usable category — a short conversational turn ("ok, go ahead") matches no
+    /// keyword and diagnoses at neutral confidence, and falling straight through to
+    /// `default.backend` from there ignored every measurement the learning layer ever made.
+    pub fn overall_candidates(&self, available: &HashSet<BackendId>) -> Vec<(BackendId, Score)> {
+        self.profiles
+            .values()
+            .filter(|profile| available.contains(&profile.backend))
+            .filter_map(|profile| Some((profile.backend, mean_score(profile)?)))
+            .collect()
+    }
+}
+
+/// A profile's scored categories collapsed into one reading. `samples`/`confidence` are
+/// averaged rather than summed: they describe how much evidence stands behind a cell, and a
+/// sum would let a backend with many thin cells outrank a well-measured one on the router's
+/// tiebreak. `source` reports the strongest provenance present, matching how
+/// [`CapabilityProfile`]'s own summary field is derived. `None` when nothing is scored.
+fn mean_score(profile: &CapabilityProfile) -> Option<Score> {
+    let n = profile.scores.len();
+    if n == 0 {
+        return None;
+    }
+    let sum_value: u32 = profile.scores.values().map(|s| s.value as u32).sum();
+    let sum_samples: u32 = profile.scores.values().map(|s| s.samples as u32).sum();
+    let sum_confidence: f32 = profile.scores.values().map(|s| s.confidence).sum();
+    let source = profile
+        .scores
+        .values()
+        .map(|s| s.source)
+        .max_by_key(|s| s.priority())
+        .unwrap_or(ProfileSource::Seeded);
+    Some(Score {
+        value: (sum_value as f32 / n as f32).round() as u8,
+        samples: (sum_samples / n as u32).min(u16::MAX as u32) as u16,
+        confidence: sum_confidence / n as f32,
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -262,6 +302,58 @@ mod tests {
 
     fn available(backends: &[BackendId]) -> HashSet<BackendId> {
         backends.iter().copied().collect()
+    }
+
+    #[test]
+    fn overall_candidates_average_the_scored_categories() {
+        // value/samples/confidence all average. `samples` breaks the router's tiebreak, so
+        // summing it would let a backend with many thin cells outrank one well-measured cell.
+        let mut codex = CapabilityProfile::seeded(BackendId::Codex);
+        codex.scores.insert(
+            TaskCategory::Coding,
+            Score {
+                value: 80,
+                samples: 10,
+                confidence: 0.8,
+                source: ProfileSource::Learned,
+            },
+        );
+        codex.scores.insert(
+            TaskCategory::Review,
+            Score {
+                value: 60,
+                samples: 4,
+                confidence: 0.4,
+                source: ProfileSource::Seeded,
+            },
+        );
+        let set = ProfileSet::from_profiles([codex, CapabilityProfile::seeded(BackendId::Claude)]);
+
+        let got = set.overall_candidates(&available(&[BackendId::Codex, BackendId::Claude]));
+
+        assert_eq!(got.len(), 1, "a backend with no scores is not a candidate");
+        let (backend, score) = got[0];
+        assert_eq!(backend, BackendId::Codex);
+        assert_eq!(score.value, 70);
+        assert_eq!(score.samples, 7, "averaged, not summed");
+        assert_eq!(
+            score.source,
+            ProfileSource::Learned,
+            "reports the strongest provenance present"
+        );
+    }
+
+    #[test]
+    fn overall_candidates_skip_unavailable_backends() {
+        let set = ProfileSet::from_profiles([
+            profile_with(BackendId::Codex, TaskCategory::Coding, 90),
+            profile_with(BackendId::Claude, TaskCategory::Coding, 50),
+        ]);
+
+        let got = set.overall_candidates(&available(&[BackendId::Claude]));
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, BackendId::Claude);
     }
 
     #[test]

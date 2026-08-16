@@ -183,11 +183,18 @@ pub fn user_lines(text: &str) -> Vec<Line<'static>> {
 }
 
 /// The dim marker line opening a backend's turn (`◈ codex`).
-pub fn turn_start_line(backend: &str) -> Line<'static> {
-    Line::from(vec![
+/// The turn's header row. `reason` is the router's stage (`profile`, `profile_overall`,
+/// `default`, …) — shown dimmed beside the backend so an auto-routed switch is legible as a
+/// decision rather than a surprise.
+pub fn turn_start_line(backend: &str, reason: Option<&str>) -> Line<'static> {
+    let mut spans = vec![
         Span::styled("◈ ".to_string(), Style::default().fg(ACCENT)),
         Span::styled(backend.to_string(), style_muted()),
-    ])
+    ];
+    if let Some(reason) = reason {
+        spans.push(Span::styled(format!("  {reason}"), style_dim()));
+    }
+    Line::from(spans)
 }
 
 fn tool_label_spans(label: &str) -> Vec<Span<'static>> {

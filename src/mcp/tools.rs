@@ -496,7 +496,8 @@ impl AgentpitTools {
                     "\n\n=== aggregator skipped ===\n{agg} not registered"
                 ));
             } else {
-                let agg_prompt = build_aggregator_prompt(&req.prompt, &outcomes);
+                let run_dir = agentpit_events::runs_dir().join(logger.run_id());
+                let agg_prompt = build_aggregator_prompt(&req.prompt, &outcomes, Some(&run_dir));
                 let cancel = CancellationToken::new();
                 let agg_model = crate::workflow::roles::resolve_model(
                     req.model.as_deref(),

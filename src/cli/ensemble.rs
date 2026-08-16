@@ -137,7 +137,81 @@ pub(crate) fn clamp_for_prompt(s: &str, max: usize) -> String {
     format!("{}\n[truncated: response exceeded {max} bytes]", &s[..end])
 }
 
-pub fn build_aggregator_prompt(original: &str, outcomes: &[MemberOutcome]) -> String {
+/// Total budget for the member responses embedded in one aggregator prompt. Past this, the
+/// largest responses are spilled to disk and cited by path instead of pasted in full
+/// (context-as-variable, §10.6) — the aggregator is itself a coding agent and can read the
+/// file when it needs the rest.
+///
+/// Measured over real telemetry: a review feeds the aggregator ~11k of member text and an
+/// ensemble reached 44k, while `MAX_MEMBER_PROMPT_BYTES` (a PER-member cap of 48k) never
+/// fired once. A total budget is what actually binds here — three members at 15k each are
+/// the problem, and no per-member cap sees it.
+pub(crate) const MAX_AGGREGATOR_PROMPT_BYTES: usize = 24 * 1024;
+
+/// How much of a spilled response still goes inline: enough to judge what that member said
+/// and whether it disagrees with the others. The rest is one file read away.
+const SPILL_HEAD_BYTES: usize = 2 * 1024;
+
+/// One member's block in the aggregator prompt, before the budget is applied.
+struct Section {
+    backend: BackendId,
+    header: String,
+    body: String,
+}
+
+/// Spill the largest member bodies to `dir` until the total fits [`MAX_AGGREGATOR_PROMPT_BYTES`],
+/// replacing each with its head plus a pointer to the full text.
+///
+/// Best-effort in both directions: nothing happens when the total already fits, when there is
+/// no run directory to spill into (`AGENTPIT_NO_EVENTS` leaves it uncreated — see
+/// [`crate::events::output_streamer`]), or when a write fails. The prompt is always valid;
+/// spilling only makes it cheaper.
+fn spill_over_budget(sections: &mut [Section], dir: Option<&Path>) {
+    let total = |s: &[Section]| s.iter().map(|x| x.body.len()).sum::<usize>();
+    if total(sections) <= MAX_AGGREGATOR_PROMPT_BYTES {
+        return;
+    }
+    // Only spill into a directory the run already owns; creating one here would write logs
+    // for a run that deliberately keeps none.
+    let Some(dir) = dir.filter(|d| d.is_dir()) else {
+        return;
+    };
+
+    // Largest first: each spill buys the most budget for the least lost detail.
+    let mut order: Vec<usize> = (0..sections.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(sections[i].body.len()));
+
+    for i in order {
+        if total(sections) <= MAX_AGGREGATOR_PROMPT_BYTES {
+            break;
+        }
+        let section = &sections[i];
+        if section.body.len() <= SPILL_HEAD_BYTES {
+            continue; // already smaller than what a spilled block would cost
+        }
+        let path = dir.join(format!("{}.answer.md", section.backend));
+        if std::fs::write(&path, &section.body).is_err() {
+            continue;
+        }
+        let mut head = SPILL_HEAD_BYTES;
+        while head > 0 && !section.body.is_char_boundary(head) {
+            head -= 1;
+        }
+        let full_len = section.body.len();
+        sections[i].body = format!(
+            "{}\n[truncated inline: full response is {full_len} bytes, saved at {} — read it \
+             if the head is not enough to judge this member]",
+            &section.body[..head],
+            path.display()
+        );
+    }
+}
+
+pub fn build_aggregator_prompt(
+    original: &str,
+    outcomes: &[MemberOutcome],
+    spill_dir: Option<&Path>,
+) -> String {
     let mut lines = vec![
         "You are aggregating independent responses from multiple coding agents to the user's original task.".to_string(),
         "Synthesize one best answer. Note disagreements explicitly. Cite each source as [backend].".to_string(),
@@ -148,17 +222,28 @@ pub fn build_aggregator_prompt(original: &str, outcomes: &[MemberOutcome]) -> St
         "# Responses".to_string(),
     ];
     let mut graded: Vec<&str> = Vec::new();
+    let mut sections: Vec<Section> = Vec::new();
     for o in outcomes {
         if let Some(out) = &o.output {
-            lines.push(String::new());
-            lines.push(format!("## [{}]", o.backend));
-            lines.push(clamp_for_prompt(out.trim(), MAX_MEMBER_PROMPT_BYTES));
+            sections.push(Section {
+                backend: o.backend,
+                header: format!("## [{}]", o.backend),
+                body: clamp_for_prompt(out.trim(), MAX_MEMBER_PROMPT_BYTES),
+            });
             graded.push(o.backend.as_str());
         } else if let Some(err) = &o.error {
-            lines.push(String::new());
-            lines.push(format!("## [{}] (failed)", o.backend));
-            lines.push(clamp_for_prompt(err, MAX_MEMBER_PROMPT_BYTES));
+            sections.push(Section {
+                backend: o.backend,
+                header: format!("## [{}] (failed)", o.backend),
+                body: clamp_for_prompt(err, MAX_MEMBER_PROMPT_BYTES),
+            });
         }
+    }
+    spill_over_budget(&mut sections, spill_dir);
+    for section in sections {
+        lines.push(String::new());
+        lines.push(section.header);
+        lines.push(section.body);
     }
     // Structured per-member grading (learned routing, Phase 2): the fenced JSON is parsed
     // back out by `parse_member_grades` and recorded as MemberGraded events — oracle labels
@@ -632,7 +717,8 @@ pub async fn run_resolved(
             agg_effort.map(|e| e.as_str()),
         );
         let started = Instant::now();
-        let agg_prompt = build_aggregator_prompt(&prompt, &outcomes);
+        let run_dir = agentpit_events::runs_dir().join(logger.run_id());
+        let agg_prompt = build_aggregator_prompt(&prompt, &outcomes, Some(&run_dir));
         let on_chunk = crate::events::output_streamer(logger.run_id(), aggregator_id, true);
         match dispatch(
             aggregator_id,
@@ -818,7 +904,7 @@ mod tests {
 
     #[test]
     fn aggregator_prompt_includes_responses() {
-        let text = build_aggregator_prompt("review src/", &fixture());
+        let text = build_aggregator_prompt("review src/", &fixture(), None);
         assert!(text.contains("# Original task"));
         assert!(text.contains("review src/"));
         assert!(text.contains("## [codex]"));
@@ -829,9 +915,87 @@ mod tests {
 
     #[test]
     fn aggregator_prompt_marks_failed_members() {
-        let text = build_aggregator_prompt("review src/", &fixture());
+        let text = build_aggregator_prompt("review src/", &fixture(), None);
         assert!(text.contains("## [claude] (failed)"));
         assert!(text.contains("auth missing"));
+    }
+
+    /// Two members whose bodies together blow the budget; `big` is the larger one.
+    fn oversized(big: usize, small: usize) -> Vec<MemberOutcome> {
+        vec![
+            MemberOutcome {
+                backend: BackendId::Codex,
+                transport: Some(Transport::Exec),
+                output: Some("C".repeat(big)),
+                error: None,
+            },
+            MemberOutcome {
+                backend: BackendId::Opencode,
+                transport: Some(Transport::Acp),
+                output: Some("O".repeat(small)),
+                error: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn aggregator_prompt_keeps_everything_inline_under_the_budget() {
+        // The common case must not change: a review's ~11k of member text is pasted in full,
+        // and no file is written. Spilling a prompt that already fits would cost the
+        // aggregator a file read for nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let outcomes = oversized(6 * 1024, 6 * 1024);
+
+        let text = build_aggregator_prompt("t", &outcomes, Some(dir.path()));
+
+        assert!(text.contains(&"C".repeat(6 * 1024)), "codex kept whole");
+        assert!(text.contains(&"O".repeat(6 * 1024)), "opencode kept whole");
+        assert!(!text.contains("truncated inline"));
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "nothing should be written under the budget"
+        );
+    }
+
+    #[test]
+    fn aggregator_prompt_spills_the_largest_member_past_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcomes = oversized(30 * 1024, 4 * 1024);
+
+        let text = build_aggregator_prompt("t", &outcomes, Some(dir.path()));
+
+        // The big one is cited by path, with its head still inline...
+        let spilled = dir.path().join("codex.answer.md");
+        assert!(spilled.is_file(), "the full response must land on disk");
+        assert_eq!(
+            std::fs::read_to_string(&spilled).unwrap().len(),
+            30 * 1024,
+            "the spilled file holds the WHOLE response, not the head"
+        );
+        assert!(text.contains(&spilled.display().to_string()));
+        assert!(text.contains("truncated inline"));
+        assert!(text.contains(&"C".repeat(SPILL_HEAD_BYTES)), "head inline");
+        assert!(!text.contains(&"C".repeat(SPILL_HEAD_BYTES + 1)));
+
+        // ...while the small one is untouched, and the prompt now fits.
+        assert!(text.contains(&"O".repeat(4 * 1024)));
+        assert!(!dir.path().join("opencode.answer.md").exists());
+        assert!(text.len() < MAX_AGGREGATOR_PROMPT_BYTES + 4 * 1024);
+    }
+
+    #[test]
+    fn spilling_needs_a_run_directory_that_already_exists() {
+        // `AGENTPIT_NO_EVENTS` leaves the run directory uncreated. The prompt must still be
+        // built (in full) rather than half-referencing files that were never written.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-run");
+        let outcomes = oversized(30 * 1024, 4 * 1024);
+
+        let text = build_aggregator_prompt("t", &outcomes, Some(&missing));
+
+        assert!(text.contains(&"C".repeat(30 * 1024)), "kept whole inline");
+        assert!(!text.contains("truncated inline"));
+        assert!(!missing.exists(), "must not create the run directory");
     }
 
     #[test]
@@ -857,14 +1021,14 @@ mod tests {
             output: Some("x".repeat(MAX_MEMBER_PROMPT_BYTES * 2)),
             error: None,
         }];
-        let text = build_aggregator_prompt("t", &outcomes);
+        let text = build_aggregator_prompt("t", &outcomes, None);
         assert!(text.contains("[truncated:"));
         assert!(text.len() < MAX_MEMBER_PROMPT_BYTES * 2);
     }
 
     #[test]
     fn aggregator_prompt_asks_for_grades_of_succeeding_members_only() {
-        let text = build_aggregator_prompt("t", &fixture());
+        let text = build_aggregator_prompt("t", &fixture(), None);
         // Gemini and Opencode produced output; Claude failed and must not be graded.
         assert!(text.contains("\"grades\""), "got: {text}");
         assert!(text.contains("codex, opencode"), "got: {text}");
@@ -875,7 +1039,7 @@ mod tests {
             output: None,
             error: Some("down".into()),
         }];
-        assert!(!build_aggregator_prompt("t", &failed).contains("# Grading"));
+        assert!(!build_aggregator_prompt("t", &failed, None).contains("# Grading"));
     }
 
     #[test]

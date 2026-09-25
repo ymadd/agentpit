@@ -1,0 +1,25 @@
+{
+  "schema": "agentpit.blueprint/1",
+  "name": "fix-until-green",
+  "title": "Plan, implement until tests pass, then sign off",
+  "inputs": {"goal": {"required": true, "description": "What to fix"}},
+  "workspace": {"mode": "in_place"},
+  "budget": {"max_steps": 12, "max_active_secs": 7200, "max_parallel": 1},
+  "policy": {"on_error": "gate", "on_budget": "gate"},
+  "nodes": [
+    {"id": "plan", "kind": "agent", "title": "Plan", "role": "planner", "access": "read",
+     "task": "Goal: {{goal}}\nWrite a short numbered plan. Do not edit files."},
+    {"id": "fix", "kind": "repeat", "title": "Until tests pass", "max_iterations": 4, "feedback": "last"},
+    {"id": "implement", "kind": "agent", "parent": "fix", "title": "Implement", "role": "coder",
+     "task": "Goal: {{goal}}\nPlan:\n{{nodes.plan.output}}\nIteration {{iteration}}.\n{{feedback}}\n{{instructions}}"},
+    {"id": "test", "kind": "check", "parent": "fix", "title": "cargo test", "command": "cargo test -q", "timeout_secs": 900},
+    {"id": "signoff", "kind": "gate", "title": "Sign-off", "prompt": "Loop result: {{nodes.fix.outcome}}. Accept?"}
+  ],
+  "edges": [
+    {"from": "plan", "to": "fix"},
+    {"from": "implement", "to": "test"},
+    {"from": "fix", "to": "signoff"},
+    {"from": "fix", "to": "signoff", "on": "exhausted"}
+  ],
+  "layout": {"plan": {"x": 40, "y": 80}, "fix": {"x": 320, "y": 40, "w": 420, "h": 220}}
+}

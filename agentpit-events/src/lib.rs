@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod loops;
 pub mod session;
 pub mod session_lease;
 
@@ -352,7 +353,7 @@ pub enum Event {
 pub const NOTE_BODY_MAX_BYTES: usize = 4096;
 
 /// `text` truncated to at most `max` bytes on a `char` boundary.
-fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
+pub(crate) fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
     let mut end = text.len().min(max);
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;

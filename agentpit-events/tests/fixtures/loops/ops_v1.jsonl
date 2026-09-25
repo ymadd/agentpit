@@ -1,0 +1,8 @@
+{"loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c2-0000-7000-8000-000000000001","op":"start"}
+{"loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c2-0000-7000-8000-000000000002","op":"pause","mode":"cancel"}
+{"loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c2-0000-7000-8000-000000000003","op":"resume","expect_seq":31}
+{"loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c2-0000-7000-8000-000000000004","op":"stop","mode":"graceful","reason":"enough"}
+{"loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c2-0000-7000-8000-000000000005","op":"cancel_step","step_id":"implement.i2.a1"}
+{"loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c0-7b1e-7f00-9c11-3e5f6a7b8c9d","op":"resolve_gate","gate_id":"g1","option":"approve","comment":"LGTM"}
+{"loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c2-0000-7000-8000-000000000007","op":"instruct","text":"Keep the old error text.","target":"implement"}
+{"loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c2-0000-7000-8000-000000000008","op":"set_budget","max_steps":20}

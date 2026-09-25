@@ -290,6 +290,7 @@ fn loaded(seq: u64, ev: LoopEvent) -> LoadedRecord {
         kind: ev.kind().to_string(),
         op: None,
         anc: ev.is_ancillary(),
+        raw: String::new(),
         body: Body::Known(ev),
     }
 }
@@ -677,4 +678,180 @@ fn instructions_are_consumed_once_by_a_matching_agent_step() {
         0,
         "the board counts only unconsumed instructions"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Regressions from the adversarial review.
+
+fn gate_with(id: &str, kind: GateKind, step: &str, options: Vec<GateOption>) -> LoopEvent {
+    LoopEvent::GateOpened(Box::new(GateOpened {
+        gate_id: id.into(),
+        kind,
+        step_id: Some(step.into()),
+        node: None,
+        iter: vec![],
+        prompt: "?".into(),
+        options,
+        deadline_ms: None,
+        on_timeout: None,
+    }))
+}
+
+fn option(id: &str, outcome: Option<Outcome>) -> GateOption {
+    GateOption {
+        id: id.into(),
+        label: None,
+        outcome,
+    }
+}
+
+#[test]
+fn a_write_agent_cannot_be_recorded_as_read() {
+    let state = state_after(JOURNAL, 8);
+    let mut start = step_started("implement", &[1], 1, NodeKind::Agent, None);
+    if let LoopEvent::StepStarted(s) = &mut start {
+        s.access = Some(Access::Read);
+    }
+    assert_eq!(code(state.admit(&start)), RejectCode::KindMismatch);
+}
+
+#[test]
+fn a_resolved_recovery_or_step_error_gate_decides_its_attempt_once() {
+    let mut state = state_after(RECOVERY, 13);
+    state.apply(&loaded(
+        14,
+        LoopEvent::GateResolved(GateResolved {
+            gate_id: "g1".into(),
+            option: "mark_done".into(),
+            comment: None,
+            by: Actor::human("cli"),
+        }),
+    ));
+    let again = gate_with(
+        "g2",
+        GateKind::Recovery,
+        "implement.i1.a1",
+        vec![option("fail", Some(Outcome::Fail))],
+    );
+    assert_eq!(code(state.admit(&again)), RejectCode::BadGateSubject);
+}
+
+#[test]
+fn error_gates_need_an_open_scope_and_ok_or_fail_overrides() {
+    // test.i1.a1 errors, then iteration 1 closes: a late step_error gate would rewrite a
+    // decided iteration.
+    let mut state = state_after(JOURNAL, 11);
+    state.apply(&loaded(12, finished("test.i1.a1", Outcome::Error)));
+    let gate = gate_with(
+        "g1",
+        GateKind::StepError,
+        "test.i1.a1",
+        vec![option("fail", Some(Outcome::Fail))],
+    );
+    state.admit(&gate).unwrap();
+    state.apply(&loaded(
+        13,
+        LoopEvent::IterationFinished(IterationFinished {
+            repeat: "fix".into(),
+            iter: vec![1],
+            decision: IterationDecision::Continue,
+        }),
+    ));
+    assert_eq!(code(state.admit(&gate)), RejectCode::BadIter);
+
+    // Overrides may only say ok or fail.
+    let state = state_after(RECOVERY, 12);
+    let weird = gate_with(
+        "g1",
+        GateKind::Recovery,
+        "implement.i1.a1",
+        vec![option("weird", Some(Outcome::Exhausted))],
+    );
+    assert_eq!(code(state.admit(&weird)), RejectCode::BadOption);
+}
+
+#[test]
+fn step_error_gates_are_for_agent_and_check_steps_only() {
+    let mut state = state_after(JOURNAL, 22);
+    state.apply(&loaded(
+        23,
+        LoopEvent::GateCancelled(GateCancelled {
+            gate_id: "g1".into(),
+            reason: GateCancelReason::TimedOut,
+        }),
+    ));
+    state.apply(&loaded(24, finished("signoff.a1", Outcome::Timeout)));
+    let gate = gate_with(
+        "g2",
+        GateKind::StepError,
+        "signoff.a1",
+        vec![option("ok", Some(Outcome::Ok))],
+    );
+    assert_eq!(code(state.admit(&gate)), RejectCode::BadGateSubject);
+}
+
+#[test]
+fn compute_time_budget_blocks_new_compute_steps() {
+    // 144 786 ms of compute used by seq 14; cap it at 120 s.
+    let mut state = state_after(JOURNAL, 14);
+    state.apply(&loaded(
+        15,
+        LoopEvent::BudgetChanged(BudgetChanged {
+            budget: Budget {
+                max_steps: 12,
+                max_active_secs: 120,
+                max_parallel: 1,
+            },
+            by: Actor::system(),
+        }),
+    ));
+    assert_eq!(
+        code(state.admit(&step_started("implement", &[2], 1, NodeKind::Agent, None))),
+        RejectCode::BudgetExhausted
+    );
+}
+
+#[test]
+fn extreme_seqs_never_panic_the_scan_or_the_fold() {
+    let first = JOURNAL.lines().next().unwrap();
+    let text = format!(
+        "{first}\n{{\"v\":1,\"seq\":{},\"ts\":1,\"kind\":\"loop_started\",\"data\":{{}}}}\n{{\"v\":1,\"seq\":1,\"ts\":1,\"kind\":\"loop_started\",\"data\":{{}}}}\n",
+        u64::MAX
+    );
+    let scan = scan_bytes(text.as_bytes());
+    assert!(!scan.is_clean());
+    let state = replay(&scan.records);
+    assert_eq!(state.head_seq, u64::MAX);
+}
+
+#[test]
+fn floats_in_a_frozen_blueprint_survive_the_journal() {
+    let mut doc: Value = serde_json::from_str(BLUEPRINT).unwrap();
+    doc["layout"]["plan"] = json!({"x": 0.1 + 0.2, "y": 123.456_789_012_345_67});
+    doc["x_future"] = json!(1.000_000_000_000_000_2e-7);
+    let mut line: Value = serde_json::from_str(JOURNAL.lines().next().unwrap()).unwrap();
+    line["data"]["blueprint"]["doc"] = doc.clone();
+    line["data"]["blueprint"]["rev"] = json!(blueprint_rev(&doc));
+    let ev = event(&line.to_string());
+    let encoded = encode_record(1, 1, None, &ev);
+    let back = decode_line(&encoded).unwrap();
+    let Some(LoopEvent::LoopCreated(c)) = back.event() else {
+        panic!("not loop_created");
+    };
+    assert_eq!(c.blueprint.doc, doc);
+    assert_eq!(blueprint_rev(&c.blueprint.doc), blueprint_rev(&doc));
+    LoopState::default()
+        .admit(&LoopEvent::LoopCreated(c.clone()))
+        .unwrap();
+}
+
+#[test]
+fn a_frozen_blueprint_with_a_newer_schema_is_read_only() {
+    let mut line: Value = serde_json::from_str(JOURNAL.lines().next().unwrap()).unwrap();
+    line["data"]["blueprint"]["doc"]["schema"] = json!("agentpit.blueprint/2");
+    let state = replay(&records(&format!("{line}\n")));
+    assert!(matches!(
+        state.writable(),
+        Err(ReadOnlyReason::Blueprint(_))
+    ));
 }

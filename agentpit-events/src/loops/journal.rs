@@ -130,11 +130,13 @@ pub fn scan_bytes(bytes: &[u8]) -> Scan {
                     detail: format!("seq {} kind {}", rec.seq, rec.kind),
                 })
             }
-            Some(prev) if rec.seq != prev.seq + 1 => scan.issues.push(ScanIssue::SeqOutOfOrder {
-                line: line_no,
-                expected: prev.seq + 1,
-                found: rec.seq,
-            }),
+            Some(prev) if prev.seq.checked_add(1) != Some(rec.seq) => {
+                scan.issues.push(ScanIssue::SeqOutOfOrder {
+                    line: line_no,
+                    expected: prev.seq.saturating_add(1),
+                    found: rec.seq,
+                })
+            }
             _ => {}
         }
         scan.records.push(rec);
@@ -272,6 +274,7 @@ fn encode_batch(
             op: d.op.clone(),
             anc: d.event.is_ancillary(),
             body: Body::Known(d.event.clone()),
+            raw: line,
         });
     }
     Ok((batch, records))
@@ -490,6 +493,7 @@ pub struct LoopJournal {
     state: LoopState,
 }
 
+/// A draft as the fold will see it once written (only ever applied to a scratch state).
 fn provisional(seq: u64, ts: u64, d: &Draft) -> LoadedRecord {
     LoadedRecord {
         seq,
@@ -498,6 +502,7 @@ fn provisional(seq: u64, ts: u64, d: &Draft) -> LoadedRecord {
         op: d.op.clone(),
         anc: d.event.is_ancillary(),
         body: Body::Known(d.event.clone()),
+        raw: String::new(),
     }
 }
 
@@ -509,7 +514,7 @@ fn admit_batch(state: &LoopState, now_ms: u64, drafts: &[Draft]) -> Result<(), C
     for (index, d) in drafts.iter().enumerate() {
         prov.admit(&d.event)
             .map_err(|rejection| CommitError::Rejected { index, rejection })?;
-        prov.apply(&provisional(prov.head_seq + 1, ts, d));
+        prov.apply(&provisional(prov.head_seq.saturating_add(1), ts, d));
     }
     Ok(())
 }

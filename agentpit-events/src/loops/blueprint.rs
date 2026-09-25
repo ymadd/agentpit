@@ -382,7 +382,8 @@ impl Blueprint {
     /// Unlike [`validate`] this never tightens across versions, so it is what decides
     /// whether a frozen blueprint may keep running after an upgrade (design §13).
     pub fn is_understood(&self) -> bool {
-        self.workspace.mode != WorkspaceMode::Unknown
+        self.schema == BLUEPRINT_SCHEMA_V1
+            && self.workspace.mode != WorkspaceMode::Unknown
             && !self.policy.on_error.is_unknown()
             && !self.policy.on_budget.is_unknown()
             && self

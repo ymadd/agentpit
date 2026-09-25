@@ -451,10 +451,11 @@ impl LoopState {
             self.warn(rec.seq, format!("duplicate seq {} ignored", rec.seq));
             return;
         }
-        if rec.seq != self.head_seq + 1 {
+        if self.head_seq.checked_add(1) != Some(rec.seq) {
+            let expected = self.head_seq.saturating_add(1);
             self.warn(
                 rec.seq,
-                format!("seq gap: expected {}, got {}", self.head_seq + 1, rec.seq),
+                format!("seq gap: expected {expected}, got {}", rec.seq),
             );
         }
         let prev_ts = self.last_ts;
@@ -1249,6 +1250,25 @@ impl LoopState {
             let Some(access) = s.access else {
                 return reject(C::IncompleteEffect, "compute steps record their access");
             };
+            // The blueprint's access is a floor: a write agent may not be recorded as read
+            // (it would then run next to other compute).
+            let declared =
+                self.blueprint
+                    .as_ref()
+                    .and_then(|bp| bp.node(&s.node))
+                    .map(|n| match &n.spec {
+                        NodeSpec::Agent(a) => a.access,
+                        _ => Access::Read,
+                    });
+            if declared == Some(Access::Write) && access != Access::Write {
+                return reject(C::KindMismatch, format!("{} is a write agent", s.node));
+            }
+            if self.usage.active_ms >= self.budget.max_active_secs.saturating_mul(1000) {
+                return reject(
+                    C::BudgetExhausted,
+                    format!("{}s of compute time used", self.budget.max_active_secs),
+                );
+            }
             if kind == NodeKind::Check && access != Access::Read {
                 return reject(C::KindMismatch, "checks are read-only");
             }
@@ -1543,28 +1563,52 @@ impl LoopState {
                     return reject(C::BadOption, "approval options map to ok or fail");
                 }
             }
-            GateKind::StepError => {
+            GateKind::StepError | GateKind::Recovery => {
                 expect_status(self.status, &[LoopStatus::Running, LoopStatus::Paused])?;
-                let ok = subject.is_some_and(|s| {
-                    s.status == StepStatus::Done
-                        && matches!(s.outcome, Some(Outcome::Error | Outcome::Timeout))
+                let subject = subject.filter(|s| {
+                    s.kind.is_compute()
                         && latest(s)
+                        && match g.kind {
+                            GateKind::StepError => {
+                                s.status == StepStatus::Done
+                                    && matches!(s.outcome, Some(Outcome::Error | Outcome::Timeout))
+                            }
+                            _ => s.status == StepStatus::Interrupted,
+                        }
                 });
-                if !ok {
+                let Some(s) = subject else {
                     return reject(
                         C::BadGateSubject,
-                        "a step_error gate follows the latest errored attempt",
+                        format!(
+                            "a {} gate follows the latest {} agent/check attempt",
+                            g.kind,
+                            if g.kind == GateKind::StepError {
+                                "errored"
+                            } else {
+                                "interrupted"
+                            }
+                        ),
+                    );
+                };
+                // An instance is decided once: a resolved step_error/recovery gate already
+                // chose what this attempt means.
+                if let Some(done) = self.gates.iter().find(|x| {
+                    x.step_id == g.step_id
+                        && x.status == GateStatus::Resolved
+                        && matches!(x.kind, GateKind::StepError | GateKind::Recovery)
+                }) {
+                    return reject(
+                        C::BadGateSubject,
+                        format!("{} already decided {}", done.gate_id, s.step_id),
                     );
                 }
-            }
-            GateKind::Recovery => {
-                expect_status(self.status, &[LoopStatus::Running, LoopStatus::Paused])?;
-                let ok = subject.is_some_and(|s| s.status == StepStatus::Interrupted && latest(s));
-                if !ok {
-                    return reject(
-                        C::BadGateSubject,
-                        "a recovery gate follows the latest interrupted attempt",
-                    );
+                // The answer may change the scope's outcome, so the scope must still be open.
+                self.check_context(&s.node, &s.iter)?;
+                if g.options.iter().any(|o| {
+                    o.outcome
+                        .is_some_and(|x| !matches!(x, Outcome::Ok | Outcome::Fail))
+                }) {
+                    return reject(C::BadOption, "an option may only override to ok or fail");
                 }
             }
             GateKind::Budget => {

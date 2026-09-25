@@ -664,8 +664,9 @@ impl LoopEvent {
 
     /// Whether a state-driving enum holds a value this build does not know. Such a
     /// record parses (so it can be displayed) but makes the journal read-only here,
-    /// because this build cannot tell what transition it records. Display-only enums
-    /// (skip/cancel/close reasons, surfaces, actors) never count.
+    /// because this build cannot tell what transition it records. Enums that `apply` or
+    /// `admit` branch on count (including step cancel causes and gate cancel reasons);
+    /// display-only ones (skip/close reasons, surfaces, actors) do not.
     pub fn has_unknown_values(&self) -> bool {
         match self {
             LoopEvent::LoopCreated(p) => p.workspace.is_unknown(),
@@ -676,7 +677,10 @@ impl LoopEvent {
             LoopEvent::StepStarted(p) => {
                 p.kind.is_unknown() || p.access.is_some_and(|a| a.is_unknown())
             }
-            LoopEvent::StepFinished(p) => p.outcome.is_unknown(),
+            LoopEvent::StepFinished(p) => {
+                p.outcome.is_unknown() || p.cancel.is_some_and(|c| c.is_unknown())
+            }
+            LoopEvent::GateCancelled(p) => p.reason.is_unknown(),
             LoopEvent::GateOpened(p) => {
                 p.kind.is_unknown()
                     || p.options
@@ -719,6 +723,9 @@ pub struct LoadedRecord {
     /// For a known kind, from [`KINDS`]; for an unknown kind, the line's own flag.
     pub anc: bool,
     pub body: Body,
+    /// The exact journal line (no trailing newline). Relays forward this, never a
+    /// re-encoding: a newer writer's extra fields and values survive an older relay.
+    pub raw: String,
 }
 
 impl LoadedRecord {
@@ -736,30 +743,6 @@ impl LoadedRecord {
             Body::Unknown { .. } => !self.anc,
         }
     }
-
-    /// Re-encode as a journal line (no trailing newline). Unknown bodies keep their data.
-    pub fn to_record(&self) -> Record {
-        let data = match &self.body {
-            Body::Known(ev) => ev.to_data(),
-            Body::Unknown { data, .. } => data.clone(),
-        };
-        let v = match &self.body {
-            Body::Unknown {
-                reason: UnknownReason::Version(v),
-                ..
-            } => *v,
-            _ => RECORD_V,
-        };
-        Record {
-            v,
-            seq: self.seq,
-            ts: self.ts,
-            kind: self.kind.clone(),
-            op: self.op.clone(),
-            anc: self.anc,
-            data,
-        }
-    }
 }
 
 /// Decode one line. `Err` only when the envelope itself is unusable (not JSON, or missing
@@ -773,6 +756,7 @@ pub fn decode_line(line: &str) -> Result<LoadedRecord, String> {
         op: rec.op.clone(),
         anc,
         body: Body::Unknown { reason, data },
+        raw: line.to_string(),
     };
     if rec.v != RECORD_V {
         return Ok(unknown(UnknownReason::Version(rec.v), rec.anc, rec.data));
@@ -788,6 +772,7 @@ pub fn decode_line(line: &str) -> Result<LoadedRecord, String> {
             op: rec.op.clone(),
             anc: info.ancillary,
             body: Body::Known(ev),
+            raw: line.to_string(),
         }),
         Ok(None) => Ok(unknown(UnknownReason::Kind, rec.anc, rec.data)),
         Err(e) => Ok(unknown(UnknownReason::Invalid(e), info.ancillary, rec.data)),
@@ -946,12 +931,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_records_re_encode_with_their_payload() {
-        let line = r#"{"v":1,"seq":9,"ts":1,"kind":"future_hint","anc":true,"data":{"x":1}}"#;
+    fn records_keep_their_exact_line_for_relays() {
+        // A newer writer's extra field and value must survive an older relay.
+        let line = r#"{"v":1,"seq":9,"ts":1,"kind":"node_skipped","data":{"node":"a","reason":"teleported","future":[1.5]}}"#;
         let r = decode_line(line).unwrap();
-        assert_eq!(
-            serde_json::to_value(r.to_record()).unwrap(),
-            serde_json::from_str::<Value>(line).unwrap()
-        );
+        assert!(matches!(r.body, Body::Known(_)));
+        assert_eq!(r.raw, line);
+        let unknown = r#"{"v":1,"seq":9,"ts":1,"kind":"future_hint","anc":true,"data":{"x":1}}"#;
+        assert_eq!(decode_line(unknown).unwrap().raw, unknown);
+    }
+
+    #[test]
+    fn cancel_causes_and_gate_cancel_reasons_drive_state() {
+        let r = decode_line(r#"{"v":1,"seq":9,"ts":1,"kind":"gate_cancelled","data":{"gate_id":"g1","reason":"evaporated"}}"#).unwrap();
+        assert!(r.blocks_writing());
+        let r = decode_line(r#"{"v":1,"seq":9,"ts":1,"kind":"step_finished","data":{"step_id":"x.a1","outcome":"cancelled","elapsed_ms":1,"cancel":"meteor"}}"#).unwrap();
+        assert!(r.blocks_writing());
     }
 }

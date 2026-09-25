@@ -194,7 +194,7 @@ Blueprint(name, scope, rev) ──凍結コピー──▶ Loop(lp-…) ─ jour
    - 次の `iteration_started.feedback`（`last` = 直前の周の分、`all` = それまでの全周の分。上限 16 件）に記録し、プロンプトの `{{feedback}}` に渡す。
 10. **テンプレート**: 使えるのは `{{goal}}`、`{{inputs.x}}`、`{{iteration}}`、`{{feedback}}`、`{{instructions}}`、`{{nodes.<id>.output|outcome}}` だけ。式も条件もない。`check.command` はテンプレート化しない（シェル注入を防ぐため）。
 11. **停止・一時停止・回復**:
-    - stop{graceful}: 実行中のステップの完了を待つ。stop{cancel}: 計算ステップを `cancel: stop` で取り消す。その後、開いているゲートを `gate_cancelled{stopped}` にし、イテレーションを内側から `cancelled` で閉じ、repeat ステップを cancelled で終え、`loop_finished{cancelled, stopped}` で終わる。
+    - stop{graceful}: 実行中のステップの完了を待つ。stop{cancel}: 計算ステップを `cancel: stop` で取り消す。その後、開いているゲートを `gate_cancelled{stopped}` にし、**階層ごとに内側から**片付ける（内側のイテレーションを `cancelled` で閉じる → その repeat ステップを最後の決定に従った outcome で終える → 外側のイテレーションを閉じる…）。最後に `loop_finished{cancelled, stopped}` で終わる。既に break した repeat は ok、解決済みのゲートのステップは選択肢の outcome で終える（§8.2 の規則どおり）。
     - pause{drain}: 何も新しく始めない。pause{cancel}: 計算ステップを `cancel: pause` で取り消し、resume で `cause: resume` として再試行する。
     - recovery ゲートが開いている間は、新しい計算を始めない（ループは pause しない）。
 
@@ -281,7 +281,8 @@ Blueprint(name, scope, rev) ──凍結コピー──▶ Loop(lp-…) ─ jour
 {"v":1,"seq":23,"ts":1790381211000,"kind":"gate_resolved","op":"0199a1c0-7b1e-7f00-9c11-3e5f6a7b8c9d","data":{"gate_id":"g1","option":"approve","by":{"kind":"human","client":"agentpit-dashboard/0.3.0"}}}
 ```
 
-- **wire フレーム**（P2）: `{"event":"loop_record","loop_id":"lp-…","rec":<ジャーナルの行そのもの>}`。ライターは1度だけシリアライズし、ディスクの行と wire の `rec` を同じ内容にする。
+- **wire フレーム**（P2）: `{"event":"loop_record","loop_id":"lp-…","rec":<ジャーナルの行そのもの>}`。ライターは1度だけシリアライズし、ディスクの行と wire の `rec` を同じ内容にする。中継（デーモン・ブリッジ）は `LoadedRecord.raw`（元の行）を流し、型から再エンコードしない。こうすると、新しいライターが足したフィールドや値が、古い中継を通っても消えない。
+- **数値**: `agentpit-events` は serde_json の `float_roundtrip` を有効にしている。凍結したブループリントの浮動小数点（React Flow の座標や未知のキー）が、ジャーナルを往復しても同じ値に戻り、fold と rev が一致する。
 
 ## 7. 操作スキーマ
 
@@ -347,7 +348,9 @@ running →（step_finished）→ done(outcome) ｜ running →（step_interrupt
   - step_id が `step_id(node, iter, attempt)` と一致すること。
   - attempt 1 は未決のインスタンスだけ。attempt > 1 は agent/check だけで、直前の試行が interrupted か、error/timeout/cancelled で終わっていること（ゲートの上書きで done になっていないこと）。retry_of = 直前の試行。直前の試行についてゲートが開いていないこと。
   - 計算ステップ: 予算内、並行性の規則、access・期限・（agent なら）担当とプロンプト・（check なら）コマンドがそろっていること。check は read。
-  - 消費する指示が存在し、未消費で、target が合っていること。
+  - 消費する指示が存在し、未消費で、target が合っていること。指示は一度だけ消費される。リトライのプロンプトには、retry_of をたどって前の試行が消費した指示を入れ直す（プロンプト blob に残るので、クラッシュ後も失われない）。
+  - agent の access はブループリントの値を下回れない（write の agent を read として記録できない。記録を誤ると他の計算と並行してしまうため）。
+  - 計算時間（`usage.active_ms`）が `max_active_secs` に達していたら、新しい計算ステップは始められない。
 - outcome の許可: agent/check = ok/fail/error/timeout/cancelled、gate = ok/fail/timeout/cancelled、repeat = ok/exhausted/cancelled。`cancel` は outcome が cancelled のときだけ付ける。
 - gate ステップの outcome はゲートの閉じ方に一致する（選択肢の outcome、timed_out → timeout、それ以外の取消 → cancelled）。ゲートが開いている間は終われない。
 - repeat ステップの outcome は最後の周の決定に一致する（break→ok、exhausted→exhausted、それ以外→cancelled）。周が開いている間は終われない。
@@ -372,7 +375,7 @@ pending（未記録）→ running → done(実効 outcome) ｜ interrupted ｜ s
 
 | 現状態 | レコード | 次状態 | ガード |
 |---|---|---|---|
-| — | `gate_opened` | open | ID は連番。選択肢は 1〜8 個で ID は一意。同じステップについて開いたゲートがないこと。種類ごとの主体（approval = 実行中の gate ステップで、ループは running。step_error = error/timeout で終わった最新試行。recovery = interrupted の最新試行。budget = 主体なしで、開いた予算ゲートがないこと）。approval 以外は paused 中も可 |
+| — | `gate_opened` | open | ID は連番。選択肢は 1〜8 個で ID は一意。同じステップについて開いたゲートがないこと。種類ごとの主体（approval = 実行中の gate ステップで、ループは running。step_error = error/timeout で終わった agent/check の最新試行。recovery = interrupted の agent/check の最新試行。budget = 主体なしで、開いた予算ゲートがないこと）。step_error/recovery は、(1) その試行について解決済みの step_error/recovery ゲートがない（インスタンスは一度だけ決まる）、(2) 試行のスコープ（周）がまだ開いている、(3) 選択肢の outcome は ok か fail だけ、を満たすこと。approval 以外は paused 中も可 |
 | open | `gate_resolved` | resolved | 選択肢 ∈ options |
 | open | `gate_cancelled` | cancelled | 停止・置換・期限切れ（on_timeout がないとき） |
 
@@ -539,7 +542,8 @@ git: refs/agentpit/loops/<id>/{base,landed,head}   （P4。gc から保護し、
   - C6: クレートをまたぐ識別子（backend、role、model、run_id）は文字列。
   - C7: `v: 2` は新しいジャーナルとして始め、v1 を書き換えない。
   - C8: ブループリントの未知のノード種別は、保存はできるが実行はできない。未知のキーは生の文書に残る。意味を変えるキーには `requires` を使う。
-  - C9: 既存の enum（Event/RunKind/LegStatus/BackendId/ExchangeStatus）への catch-all の追加は、学習と可用性の意味を変えるので**別の PR** にする（リーダを先に出し、新しい値を書き始めるのは1リリース後）。
+  - C9: 状態を駆動する未知の値の判定（`has_unknown_values`）は、`apply`/`admit` が分岐に使う enum をすべて含める（step の cancel 理由とゲートの取消理由を含む）。表示専用の enum（skip/close 理由、surface、actor）は含めない。凍結ブループリントの `schema` が v1 以外なら、実行できないものとして扱う。
+  - C10: 既存の enum（Event/RunKind/LegStatus/BackendId/ExchangeStatus）への catch-all の追加は、学習と可用性の意味を変えるので**別の PR** にする（リーダを先に出し、新しい値を書き始めるのは1リリース後）。
 - **固定テスト**: 全種別の golden 行（`kinds_v1.jsonl`）、未来の行（未知の種別・値・v2・フィールド）、fixture ジャーナルの再生と逐次 admit、全拒否コード、全診断コード。
 
 ## 14. 原則の改訂（提案。オーナー承認待ち＝Q1）
@@ -707,6 +711,7 @@ git: refs/agentpit/loops/<id>/{base,landed,head}   （P4。gc から保護し、
 - **学習の汚染**: Skipped の規則、プロンプト全体の task_hash、人間の明示的な判定だけでのラベル付けで抑える。learn.rs のフィクスチャテストで固定する。
 - **原則の改訂が、汎用 DAG エンジンへの免罪符と読まれる**: 非目標（式言語・任意のサイクル・実行中のグラフ変更・manager の置き換え）を改訂文に明記する。
 - **二つの承認系（asks とゲート）**: 受信箱を1つにし、出所のバッジを付ける。ask は manager 専用のまま。
+- **テンプレートの `{{`**: v1 では `{{` は必ずプレースホルダの開始として解釈し、エスケープはない。`format!("{{}}")` のような文字どおりの `{{` を含むタスクは `invalid_placeholder` になる。回避策は、コード片をファイルに置いて参照させること。エスケープ記法は、必要になった時点で `requires` 付きの機能として足す。
 - **LibreOffice の脆さ**: 専用プロファイル、タイムアウト、直列化で対処する。失敗は正常な状態であり、ループを落とさない。
 
 ## 19. 未決事項（レビューで決めたい）

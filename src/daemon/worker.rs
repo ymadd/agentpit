@@ -724,9 +724,22 @@ async fn handle_sync_request(
         RequestBody::Create { .. }
         | RequestBody::Ensure { .. }
         | RequestBody::List
-        | RequestBody::StopWorker { .. } => Response::err(
+        | RequestBody::StopWorker { .. }
+        | RequestBody::LoopStart { .. }
+        | RequestBody::LoopEnsure { .. }
+        | RequestBody::LoopList { .. }
+        | RequestBody::LoopStopRunner { .. } => Response::err(
             id,
             "this is a WORKER socket; daemon verbs go to daemon.sock (`agentpit daemon status`)",
+        ),
+
+        // Loop-runner verbs reaching a session worker = a socket-path mixup.
+        RequestBody::LoopAttach { .. }
+        | RequestBody::LoopStatus
+        | RequestBody::LoopRead { .. }
+        | RequestBody::LoopOp(_) => Response::err(
+            id,
+            "this is a session WORKER socket; loop verbs go to the loop's socket from `loop_ensure`",
         ),
 
         // A newer client's verb: answer it (with the caller's id), never act on it.

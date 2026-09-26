@@ -24,7 +24,11 @@
 //!   ignored. Neither is ever acted on.
 //! - Only a breaking change bumps [`PROTO_VERSION`].
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::loops::{Cursor, LoopSummary, OpRequest, OpResult, Origin};
 
 /// Bumped on breaking wire changes; checked in the `hello` handshake by BOTH sides.
 pub const PROTO_VERSION: u32 = 1;
@@ -33,6 +37,13 @@ pub const PROTO_VERSION: u32 = 1;
 pub const CODE_BAD_REQUEST: &str = "bad_request";
 /// [`Response::code`] for a request type the server does not know (a newer peer's verb).
 pub const CODE_UNSUPPORTED: &str = "unsupported";
+
+/// The `hello.features` entry for blueprint loops: the daemon's `loop_*` verbs and the loop
+/// runner's socket (docs/workspace-loop-design.md §11).
+pub const FEATURE_LOOPS: &str = "loops/1";
+
+/// `hello.role` of a loop runner.
+pub const ROLE_LOOP: &str = "loop";
 
 /// A request frame: `id` is caller-chosen and echoed in the response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -104,11 +115,116 @@ pub enum RequestBody {
     /// Cheap liveness/state probe.
     Status,
 
+    // ── daemon: blueprint loops (feature `loops/1`) ─────────────────────────────
+    /// Create a loop (idempotent per `op_id`, a canonical UUID the loop id derives from)
+    /// and ensure its runner.
+    LoopStart {
+        op_id: String,
+        blueprint: BlueprintSource,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        inputs: BTreeMap<String, String>,
+        /// Absolute working directory the loop runs in.
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Start running at once (otherwise the loop waits in `created` for a `start` op).
+        #[serde(default = "default_true")]
+        start: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
+    },
+    /// Ensure a live runner for an unfinished loop and return its socket.
+    LoopEnsure { loop_id: String },
+    /// Every loop's summary (from `head.json`; no runner is contacted).
+    LoopList {
+        #[serde(default)]
+        include_terminal: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    /// Stop a loop's runner (graceful; refused while compute steps run unless `force`).
+    /// The loop itself is not stopped: the next `loop_ensure` resumes it.
+    LoopStopRunner {
+        loop_id: String,
+        #[serde(default)]
+        force: bool,
+    },
+
+    // ── loop runner (feature `loops/1`) ─────────────────────────────────────────
+    /// Subscribe to the loop's journal: `loop_attached` comes back first, then every record
+    /// after `since` (all of them without a cursor, or after a reset) as `loop_record`
+    /// frames, then live records as they are written.
+    LoopAttach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<Cursor>,
+        /// Also stream `loop_chunk` frames (live agent output; lossy).
+        #[serde(default)]
+        chunks: bool,
+    },
+    /// The loop's board row.
+    LoopStatus,
+    /// A byte range of one step's file.
+    LoopRead {
+        what: LoopFile,
+        step_id: String,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
+    },
+    /// An operation on the loop (design §7). Answered with `op_result` AFTER the records it
+    /// caused, on the same connection.
+    LoopOp(OpRequest),
+
     /// A newer peer's request type this build does not know. Only ever produced by
     /// deserialization: servers answer it with a [`CODE_UNSUPPORTED`] error and never act
     /// on it. Its fields are dropped, so it is not meant to be sent.
     #[serde(other)]
     Unknown,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Where `loop_start` takes the blueprint from. The daemon freezes the document into the
+/// journal, so the source is never read again.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum BlueprintSource {
+    /// A file path (absolute, or relative to the request's `cwd`).
+    Path { path: String },
+    /// The document itself.
+    Inline { doc: serde_json::Value },
+    /// `<cwd>/.agentpit/blueprints/<name>.json`, then `~/.config/agentpit/blueprints/<name>.json`.
+    Named { name: String },
+    /// A newer client's source kind; answered `unsupported`.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Which per-step file `loop_read` returns.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopFile {
+    /// The rendered prompt (`prompts/<step>.md`).
+    Prompt,
+    /// The live output as streamed (`outputs/<step>.log`).
+    Output,
+    /// The final answer (`outputs/<step>.md`).
+    Answer,
+    /// A check's combined stdout/stderr (`checks/<step>.log`).
+    CheckLog,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One loop in `loop_list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoopRow {
+    pub summary: LoopSummary,
+    /// `"live"` (a runner is registered and alive) or `"absent"`.
+    pub runner: String,
 }
 
 /// A response frame: `ok:true` carries `data`, `ok:false` carries `error` (plus, from newer
@@ -237,6 +353,47 @@ pub enum ResponseData {
     },
     Unit,
 
+    /// `loop_start`: the loop (new, or the one this `op_id` already created) and its
+    /// runner's socket (absent when the loop has already finished).
+    LoopStarted {
+        loop_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket: Option<String>,
+        duplicate: bool,
+    },
+    /// `loop_ensure`.
+    LoopRunner {
+        loop_id: String,
+        socket: String,
+    },
+    /// `loop_list`, most recently updated first.
+    Loops {
+        loops: Vec<LoopRow>,
+    },
+    /// `loop_attach`: the journal head at the moment of attaching. With `reset`, the cursor
+    /// was from another incarnation (or ahead of the journal) and replay starts at seq 1.
+    LoopAttached {
+        loop_id: String,
+        uid: String,
+        head_seq: u64,
+        #[serde(default)]
+        reset: bool,
+    },
+    /// `loop_status`.
+    LoopSummary {
+        summary: Box<LoopSummary>,
+    },
+    /// `loop_read`: `text` covers bytes `[offset, next_offset)` of a file that is `size`
+    /// bytes long right now (lossily decoded at the edges).
+    LoopBytes {
+        offset: u64,
+        next_offset: u64,
+        size: u64,
+        text: String,
+    },
+    /// `loop_op` succeeded (failures are `ok:false` with the op error `code`).
+    OpResult(OpResult),
+
     /// A newer peer's response kind this build does not know. Only ever produced by
     /// deserialization: clients ignore it and never act on it.
     #[serde(other)]
@@ -277,6 +434,24 @@ pub enum Event {
     TurnFinished { status: String },
     /// Human-readable side note (recovery marks, detach hints).
     Notice { text: String },
+
+    /// One loop journal record, exactly as written to disk (`rec` is the journal line).
+    /// Decode it with `loops::decode_line` after re-serializing; relays pass it through.
+    LoopRecord {
+        loop_id: String,
+        rec: serde_json::Value,
+    },
+    /// Live output of a running agent step. `offset` is the byte offset of `text` in
+    /// `outputs/<step>.log`, so a late or lagging client fills gaps with `loop_read`.
+    /// Lossy by design: dropped when the client falls behind.
+    LoopChunk {
+        loop_id: String,
+        step_id: String,
+        offset: u64,
+        text: String,
+    },
+    /// Sent every 15 seconds while attached.
+    LoopHeartbeat { loop_id: String, head_seq: u64 },
 
     /// A newer worker's event this build does not know. Only ever produced by
     /// deserialization: attached clients skip it and never act on it.
@@ -521,13 +696,112 @@ mod tests {
 
     #[test]
     fn unknown_response_kind_parses_as_response_data_unknown() {
-        let line = r#"{"id":2,"ok":true,"data":{"kind":"loop_started","loop_id":"l1"}}"#;
+        let line = r#"{"id":2,"ok":true,"data":{"kind":"proposal_landed","proposal":"p1"}}"#;
         let resp: Response = serde_json::from_str(line).expect("unknown kind must parse");
         assert_eq!(resp.id, 2);
         assert_eq!(resp.data, Some(ResponseData::Unknown));
         // ... and through the untagged frame, it is still a Response (not an Event).
         match serde_json::from_str::<Frame>(line).unwrap() {
             Frame::Response(r) => assert_eq!(r.data, Some(ResponseData::Unknown)),
+            Frame::Event(e) => panic!("response parsed as event: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_ops_are_flat_under_the_request_envelope() {
+        // Design §7's example frame, byte for byte.
+        let line = r#"{"id":7,"type":"loop_op","loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c0-7b1e-7f00-9c11-3e5f6a7b8c9d","op":"resolve_gate","gate_id":"g1","option":"approve"}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        let RequestBody::LoopOp(op) = &req.body else {
+            panic!("expected loop_op, got {req:?}");
+        };
+        assert_eq!(op.op.name(), "resolve_gate");
+        assert_eq!(op.expect_seq, None);
+        let back: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            back,
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        );
+
+        // A newer op still reaches the runner (as `unknown`) with the caller's id.
+        let req: Request = serde_json::from_str(
+            r#"{"id":8,"type":"loop_op","loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","op_id":"0199a1c0-7b1e-7f00-9c11-3e5f6a7b8c9e","op":"land","proposal":"p1"}"#,
+        )
+        .unwrap();
+        assert!(matches!(req.body, RequestBody::LoopOp(ref o) if o.op.name() == "unknown"));
+    }
+
+    #[test]
+    fn loop_start_defaults_and_blueprint_sources() {
+        let req: Request = serde_json::from_str(
+            r#"{"id":1,"type":"loop_start","op_id":"0199a1c0-7b1e-7f00-9c11-3e5f6a7b8c9d","blueprint":{"source":"named","name":"fix-until-green"},"cwd":"/w"}"#,
+        )
+        .unwrap();
+        match req.body {
+            RequestBody::LoopStart {
+                blueprint,
+                start,
+                inputs,
+                origin,
+                ..
+            } => {
+                assert_eq!(
+                    blueprint,
+                    BlueprintSource::Named {
+                        name: "fix-until-green".into()
+                    }
+                );
+                assert!(start, "start defaults to true");
+                assert!(inputs.is_empty());
+                assert_eq!(origin, None);
+            }
+            other => panic!("expected loop_start, got {other:?}"),
+        }
+        let future: BlueprintSource =
+            serde_json::from_str(r#"{"source":"registry","id":"x"}"#).unwrap();
+        assert_eq!(future, BlueprintSource::Unknown);
+        let file: LoopFile = serde_json::from_str(r#""check_log""#).unwrap();
+        assert_eq!(file, LoopFile::CheckLog);
+        assert_eq!(
+            serde_json::from_str::<LoopFile>(r#""diff""#).unwrap(),
+            LoopFile::Unknown
+        );
+    }
+
+    #[test]
+    fn loop_frames_round_trip_through_frame() {
+        let raw = r#"{"v":1,"seq":23,"ts":1790381211000,"kind":"gate_resolved","op":"0199a1c0-7b1e-7f00-9c11-3e5f6a7b8c9d","data":{"gate_id":"g1","option":"approve","by":{"kind":"human","client":"agentpit-dashboard/0.3.0"},"future":1.5}}"#;
+        let line = format!(
+            r#"{{"event":"loop_record","loop_id":"lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b","rec":{raw}}}"#
+        );
+        match serde_json::from_str::<Frame>(&line).unwrap() {
+            Frame::Event(Event::LoopRecord { rec, .. }) => {
+                // The record survives the relay with every field, unknown ones included.
+                let decoded =
+                    crate::loops::decode_line(&serde_json::to_string(&rec).unwrap()).unwrap();
+                assert_eq!(decoded.seq, 23);
+                assert_eq!(decoded.kind, "gate_resolved");
+                assert_eq!(rec["data"]["future"], 1.5);
+            }
+            other => panic!("expected loop_record, got {other:?}"),
+        }
+        let resp = Response::ok(
+            7,
+            ResponseData::OpResult(OpResult {
+                op_id: "0199a1c0-7b1e-7f00-9c11-3e5f6a7b8c9d".into(),
+                outcome: crate::loops::OpOutcome::Applied,
+                seq: Some(23),
+                head_seq: 25,
+                result: None,
+            }),
+        );
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":7,"ok":true,"data":{"kind":"op_result","op_id":"0199a1c0-7b1e-7f00-9c11-3e5f6a7b8c9d","outcome":"applied","seq":23,"head_seq":25}}"#
+        );
+        match serde_json::from_str::<Frame>(&json).unwrap() {
+            Frame::Response(r) => assert_eq!(r, resp),
             Frame::Event(e) => panic!("response parsed as event: {e:?}"),
         }
     }

@@ -700,7 +700,12 @@ impl App {
                 self.push_text(&format!("session: {text}"), theme::style_notice());
             }
             // A newer worker's event kind: nothing to render, and never an error.
-            Frame::Event(Event::Unknown) => {}
+            Frame::Event(
+                Event::Unknown
+                | Event::LoopRecord { .. }
+                | Event::LoopChunk { .. }
+                | Event::LoopHeartbeat { .. },
+            ) => {}
             Frame::Response(resp) => {
                 if Some(resp.id) == self.pending_cell {
                     self.pending_cell = None;

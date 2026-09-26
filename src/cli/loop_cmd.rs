@@ -51,6 +51,10 @@ pub enum Action {
         all: bool,
         #[arg(long)]
         json: bool,
+        /// Keep running and print each loop again whenever it changes (one line, or one
+        /// JSON object per line with --json).
+        #[arg(long)]
+        watch: bool,
     },
     /// Show one loop: stage, agents, iterations, open gates, budget.
     Show {
@@ -146,7 +150,13 @@ pub async fn run(action: Action) -> Result<()> {
             watch,
             json,
         } => start(blueprint, inputs, goal, title, cwd, !no_start, watch, json).await,
-        Action::Ls { all, json } => list(all, json).await,
+        Action::Ls { all, json, watch } => {
+            if watch {
+                watch_list(all, json).await
+            } else {
+                list(all, json).await
+            }
+        }
         Action::Show { loop_ref, json } => show(&resolve_loop(&loop_ref)?, json).await,
         Action::Watch { loop_ref, output } => watch(&resolve_loop(&loop_ref)?, output).await,
         Action::Pause { loop_ref, cancel } => {
@@ -495,21 +505,65 @@ async fn list(all: bool, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    for LoopRow { summary: s, runner } in &loops {
-        println!(
-            "{}  {:<22} {:<28} {}{}",
-            short(&s.loop_id),
-            status_label(s),
-            clamp_text(&s.title, 28),
-            stage(s),
-            if runner == "live" || s.status.is_terminal() {
-                String::new()
-            } else {
-                format!("  {}", style("(no runner)").dim())
-            }
-        );
+    for row in &loops {
+        println!("{}", row_line(row));
     }
     Ok(())
+}
+
+fn row_line(row: &LoopRow) -> String {
+    let s = &row.summary;
+    format!(
+        "{}  {:<22} {:<28} {}{}",
+        short(&s.loop_id),
+        status_label(s),
+        clamp_text(&s.title, 28),
+        stage(s),
+        if row.runner == "live" || s.status.is_terminal() {
+            String::new()
+        } else {
+            format!("  {}", style("(parked)").dim())
+        }
+    )
+}
+
+/// `ls --watch`: the rows now, then every change as it happens (daemon `loop_watch`).
+async fn watch_list(all: bool, json: bool) -> Result<()> {
+    let mut d = daemon().await?;
+    let resp = ask(
+        &mut d,
+        RequestBody::LoopWatch {
+            include_terminal: all,
+        },
+    )
+    .await?;
+    let ResponseData::Loops { loops } = ok(resp)? else {
+        bail!("unexpected answer to loop_watch");
+    };
+    let print = |row: &LoopRow| {
+        if json {
+            println!("{}", serde_json::to_string(row).unwrap_or_default());
+        } else {
+            println!("{}", row_line(row));
+        }
+    };
+    for row in &loops {
+        print(row);
+    }
+    loop {
+        match d.recv_frame().await {
+            Ok(Frame::Event(Event::LoopRow { row })) => print(&row),
+            Ok(Frame::Event(Event::LoopGone { loop_id })) => {
+                if json {
+                    println!("{}", serde_json::json!({ "gone": loop_id }));
+                } else {
+                    println!("{}  {}", short(&loop_id), style("deleted").dim());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => bail!("the daemon went away; run `agentpit loop ls --watch` again"),
+        }
+    }
 }
 
 fn status_label(s: &LoopSummary) -> String {
@@ -560,16 +614,9 @@ fn stage(s: &LoopSummary) -> String {
 }
 
 async fn show(loop_id: &str, json: bool) -> Result<()> {
-    let summary = match reach(loop_id).await? {
-        Reach::Runner(socket) => {
-            let mut conn = Conn::connect(&socket).await?;
-            match ok(ask(&mut conn, RequestBody::LoopStatus).await?)? {
-                ResponseData::LoopSummary { summary } => *summary,
-                other => bail!("unexpected answer to loop_status: {other:?}"),
-            }
-        }
-        Reach::Disk(_) => read_summary(loop_id)?,
-    };
+    // The journal is the truth and is on this machine: folding it needs no runner, so
+    // looking at a parked loop does not wake it.
+    let summary = read_summary(loop_id)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());

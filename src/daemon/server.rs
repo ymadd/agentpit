@@ -82,6 +82,19 @@ pub async fn run_daemon() -> Result<()> {
             }
         })
     };
+    // Parked loops have no timer of their own: wake them for gate deadlines.
+    let waker = {
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => wake_due_loops().await,
+                    _ = stop.cancelled() => break,
+                }
+            }
+        })
+    };
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -94,6 +107,7 @@ pub async fn run_daemon() -> Result<()> {
         }
     }
     sweeper.abort();
+    waker.abort();
     registry::remove_owner(&owner_path);
     let _ = std::fs::remove_file(&socket);
     Ok(())
@@ -150,6 +164,14 @@ async fn handle_connection(stream: UnixStream, shutdown: tokio_util::sync::Cance
         }
         let response = match serde_json::from_str::<Request>(&line) {
             Err(e) => Response::bad_request(&line, e),
+            // A watch takes over the connection until the client leaves.
+            Ok(Request {
+                id,
+                body: RequestBody::LoopWatch { include_terminal },
+            }) => {
+                serve_loop_watch(id, include_terminal, reader, write_half, shutdown).await;
+                return;
+            }
             Ok(req) => handle_request(req, &shutdown).await,
         };
         let Ok(resp_line) = serde_json::to_string(&response) else {
@@ -159,6 +181,71 @@ async fn handle_connection(stream: UnixStream, shutdown: tokio_util::sync::Cance
             || write_half.write_all(b"\n").await.is_err()
         {
             break;
+        }
+    }
+}
+
+/// How often `loop_watch` looks for changed loops. The board's budget is 300ms (design §12).
+const LOOP_WATCH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// `loop_watch`: the current rows, then `loop_row` / `loop_gone` frames as loops change,
+/// until the client disconnects (or the daemon stops).
+async fn serve_loop_watch(
+    id: u64,
+    include_terminal: bool,
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    use crate::daemon::protocol::Event;
+    async fn send(w: &mut tokio::net::unix::OwnedWriteHalf, line: String) -> bool {
+        w.write_all(line.as_bytes()).await.is_ok() && w.write_all(b"\n").await.is_ok()
+    }
+    let mut watcher = crate::loops::control::RowWatcher::new(include_terminal);
+    let loops = watcher.snapshot();
+    let first =
+        serde_json::to_string(&Response::ok(id, ResponseData::Loops { loops })).unwrap_or_default();
+    if !send(&mut writer, first).await {
+        return;
+    }
+    let mut tick = tokio::time::interval(LOOP_WATCH_INTERVAL);
+    let mut sink = String::new();
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let (rows, gone) = watcher.poll();
+                for row in rows {
+                    let frame = Event::LoopRow { row: Box::new(row) };
+                    if !send(&mut writer, serde_json::to_string(&frame).unwrap_or_default()).await {
+                        return;
+                    }
+                }
+                for loop_id in gone {
+                    let frame = Event::LoopGone { loop_id };
+                    if !send(&mut writer, serde_json::to_string(&frame).unwrap_or_default()).await {
+                        return;
+                    }
+                }
+            }
+            // Nothing is read on a watching connection except its end.
+            n = reader.read_line(&mut sink) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+                sink.clear();
+            }
+            _ = shutdown.cancelled() => return,
+        }
+    }
+}
+
+/// Wake parked loops whose gate deadlines are due, so a timeout fires even when nobody is
+/// watching (a parked runner has no timer). Checked every 15s, 20s ahead.
+pub async fn wake_due_loops() {
+    let due = crate::loops::control::loops_due(agentpit_events::now_ms(), 20_000);
+    for loop_id in due {
+        if let Err(e) = crate::loops::control::ensure_runner(&loop_id).await {
+            eprintln!("agentpit daemon: could not wake {loop_id}: {}", e.message);
         }
     }
 }

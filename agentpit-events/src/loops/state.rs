@@ -1730,6 +1730,7 @@ impl LoopState {
                 })
                 .collect(),
             pending_instructions: self.pending_instructions().count(),
+            next_deadline_ms: open.iter().filter_map(|g| g.deadline_ms).min(),
             usage: self.usage,
             budget: self.budget,
             head_seq: self.head_seq,
@@ -1841,6 +1842,10 @@ pub struct LoopSummary {
     pub open_gate_count: usize,
     #[serde(default)]
     pub pending_instructions: usize,
+    /// The earliest deadline among ALL open gates (the summary lists only a few): when a
+    /// parked loop must be woken to act on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_deadline_ms: Option<u64>,
     pub usage: Usage,
     pub budget: Budget,
     pub head_seq: u64,

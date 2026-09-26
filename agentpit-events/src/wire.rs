@@ -142,6 +142,13 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
     },
+    /// Follow every loop's board row: answered with `loops` (the current rows), then this
+    /// connection receives `loop_row` whenever a row changes and `loop_gone` when a loop is
+    /// deleted, until it closes. A watching connection takes no further requests.
+    LoopWatch {
+        #[serde(default)]
+        include_terminal: bool,
+    },
     /// Stop a loop's runner (graceful; refused while compute steps run unless `force`).
     /// The loop itself is not stopped: the next `loop_ensure` resumes it.
     LoopStopRunner {
@@ -452,6 +459,10 @@ pub enum Event {
     },
     /// Sent every 15 seconds while attached.
     LoopHeartbeat { loop_id: String, head_seq: u64 },
+    /// `loop_watch`: a loop's board row changed (or a loop appeared).
+    LoopRow { row: Box<LoopRow> },
+    /// `loop_watch`: a loop was deleted.
+    LoopGone { loop_id: String },
 
     /// A newer worker's event this build does not know. Only ever produced by
     /// deserialization: attached clients skip it and never act on it.

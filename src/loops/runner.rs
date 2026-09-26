@@ -69,6 +69,9 @@ pub struct RunnerEnv {
     pub build: String,
     /// Let the router consult learned profiles and suspensions on disk (off in tests).
     pub learned_routing: bool,
+    /// Park (close the journal and exit) after this long with nothing to do and no client;
+    /// `None` never parks.
+    pub park_after: Option<Duration>,
 }
 
 pub struct RunnerPaths {
@@ -153,6 +156,7 @@ pub async fn run_until(
     heartbeat.tick().await;
     let journal_file = journal_path(&paths.dir);
 
+    let mut idle_since: Option<tokio::time::Instant> = None;
     let result = loop {
         runner.drive();
         runner.flush_head();
@@ -162,13 +166,30 @@ pub async fn run_until(
         if runner.exit.is_none() && runner.is_done() {
             runner.close(CloseReason::Terminal);
         }
+        // Nothing to do and nobody watching: park until a client or a deadline needs us.
+        let mut park_in = None;
+        match (runner.parkable(), runner.env.park_after) {
+            (true, Some(after)) => {
+                let since = *idle_since.get_or_insert_with(tokio::time::Instant::now);
+                let idle = since.elapsed();
+                if idle >= after {
+                    runner.close(CloseReason::Idle);
+                } else {
+                    park_in = Some(after - idle);
+                }
+            }
+            _ => idle_since = None,
+        }
         if runner.exit.is_some() {
             break Ok(());
         }
-        let sleep = runner
+        let mut sleep = runner
             .wake_at
             .map(|w| Duration::from_millis(w.saturating_sub(now_ms()).max(1)))
             .unwrap_or(Duration::from_secs(3600));
+        if let Some(p) = park_in {
+            sleep = sleep.min(p);
+        }
         tokio::select! {
             Some(msg) = effect_rx.recv() => runner.on_effect(msg),
             Some(input) = rx.recv() => runner.on_input(input),
@@ -297,6 +318,16 @@ impl Runner {
 
     fn is_done(&self) -> bool {
         self.state().status.is_terminal() && self.effects.is_empty()
+    }
+
+    /// Nothing running, nothing to decide, nobody connected: only a person (or a gate
+    /// deadline, which the daemon wakes us for) can move the loop now.
+    fn parkable(&self) -> bool {
+        self.effects.is_empty()
+            && self.conns.is_empty()
+            && self.stalled.is_none()
+            && self.exit.is_none()
+            && !self.state().status.is_terminal()
     }
 
     // --- committing ---------------------------------------------------------------------
@@ -1267,6 +1298,11 @@ pub async fn run_from_cli(loop_id: &str, socket: &Path) -> Result<()> {
     let dir = loop_dir(loop_id).ok_or_else(|| anyhow!("{loop_id} is not a loop id"))?;
     let loaded = crate::config::load_config(None)?;
     let regs = crate::dispatch::build_registries(&loaded.config);
+    // AGENTPIT_LOOP_PARK_SECS overrides the config (tests, and trying parking out).
+    let park_after = std::env::var("AGENTPIT_LOOP_PARK_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(loaded.config.loops.park_after_minutes.saturating_mul(60));
     run(
         loop_id,
         RunnerPaths {
@@ -1279,6 +1315,7 @@ pub async fn run_from_cli(loop_id: &str, socket: &Path) -> Result<()> {
             regs: Arc::new(regs),
             build: format!("agentpit/{}", env!("CARGO_PKG_VERSION")),
             learned_routing: true,
+            park_after: (park_after > 0).then(|| Duration::from_secs(park_after)),
         },
     )
     .await

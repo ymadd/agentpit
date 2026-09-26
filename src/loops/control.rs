@@ -103,69 +103,27 @@ struct Located {
     path: Option<String>,
 }
 
+/// A blueprint file (the shared store's reader: regular files only, size-capped).
 fn read_doc(path: &Path) -> Result<serde_json::Value, OpError> {
-    use std::io::Read;
-    let unreadable = |e: std::io::Error| {
-        op_error(
+    agentpit_events::loops::read_doc(path).map_err(|e| match e {
+        StoreError::NotFound => op_error(
+            ErrorCode::NotFound,
+            format!("no file at {}; check the path", path.display()),
+        ),
+        StoreError::Io(e) => op_error(
             ErrorCode::NotFound,
             format!("cannot read {}: {e}; check the path", path.display()),
-        )
-    };
-    let meta = std::fs::metadata(path).map_err(unreadable)?;
-    // Only regular files: a FIFO would block, a device could stream forever.
-    if !meta.is_file() {
-        return Err(op_error(
-            ErrorCode::Validation,
-            format!(
-                "{} is not a regular file; pass a blueprint .json file",
-                path.display()
-            ),
-        ));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|f| f.take(MAX_DOC_BYTES as u64 + 1).read_to_end(&mut bytes))
-        .map_err(unreadable)?;
-    if bytes.len() > MAX_DOC_BYTES {
-        return Err(op_error(
-            ErrorCode::Validation,
-            format!(
-                "{} is larger than {MAX_DOC_BYTES} bytes; split the blueprint",
-                path.display()
-            ),
-        ));
-    }
-    let text = String::from_utf8(bytes).map_err(|_| {
-        op_error(
-            ErrorCode::Validation,
-            format!("{} is not UTF-8 text; save it as UTF-8", path.display()),
-        )
-    })?;
-    serde_json::from_str(&text).map_err(|e| {
-        op_error(
-            ErrorCode::Validation,
-            format!("{} is not JSON ({e}); fix the syntax", path.display()),
-        )
+        ),
+        other => op_error(ErrorCode::Validation, format!("{other}; fix the file")),
     })
 }
 
 /// Where a named blueprint lives: the project's `.agentpit/blueprints`, then the user's.
 pub fn named_blueprint_paths(cwd: &Path, name: &str) -> Vec<(BlueprintScope, PathBuf)> {
-    vec![
-        (
-            BlueprintScope::Project,
-            cwd.join(".agentpit")
-                .join("blueprints")
-                .join(format!("{name}.json")),
-        ),
-        (
-            BlueprintScope::User,
-            crate::config::xdg_config_home()
-                .join("agentpit")
-                .join("blueprints")
-                .join(format!("{name}.json")),
-        ),
-    ]
+    blueprint_dirs(Some(cwd))
+        .into_iter()
+        .map(|(scope, dir)| (scope, dir.join(format!("{name}.json"))))
+        .collect()
 }
 
 fn locate(source: &BlueprintSource, cwd: &Path) -> Result<Located, OpError> {
@@ -643,6 +601,163 @@ pub fn list_loops(include_terminal: bool, limit: Option<usize>) -> Vec<LoopRow> 
 }
 
 // ---------------------------------------------------------------------------------------
+// loop_watch.
+
+/// What a loop's row was built from, so an unchanged loop is not re-read every poll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    head: (u64, u64),
+    journal: (u64, u64),
+}
+
+fn file_stamp(path: &Path) -> (u64, u64) {
+    std::fs::metadata(path)
+        .map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as u64);
+            (mtime, m.len())
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Board rows for `loop_watch`: polls the loop directories (cheap: two `stat`s per loop
+/// when nothing changed) and reports what changed since the last poll.
+pub struct RowWatcher {
+    include_terminal: bool,
+    summaries: BTreeMap<String, (Stamp, LoopSummary)>,
+    sent: BTreeMap<String, LoopRow>,
+    /// Terminal loops already reported once (not repeated when `include_terminal` is off).
+    finished: std::collections::BTreeSet<String>,
+}
+
+impl RowWatcher {
+    pub fn new(include_terminal: bool) -> RowWatcher {
+        RowWatcher {
+            include_terminal,
+            summaries: BTreeMap::new(),
+            sent: BTreeMap::new(),
+            finished: Default::default(),
+        }
+    }
+
+    fn scan(&mut self) -> BTreeMap<String, LoopRow> {
+        let mut rows = BTreeMap::new();
+        let Ok(entries) = std::fs::read_dir(loops_dir()) else {
+            self.summaries.clear();
+            return rows;
+        };
+        let mut present = std::collections::BTreeSet::new();
+        for e in entries.filter_map(Result::ok) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !is_valid_loop_id(&name) {
+                continue;
+            }
+            let dir = e.path();
+            let stamp = Stamp {
+                head: file_stamp(&head_path(&dir)),
+                journal: file_stamp(&journal_path(&dir)),
+            };
+            let summary = match self.summaries.get(&name) {
+                Some((s, summary)) if *s == stamp => summary.clone(),
+                _ => {
+                    let Some(summary) = loop_summary(&dir) else {
+                        continue;
+                    };
+                    self.summaries
+                        .insert(name.clone(), (stamp, summary.clone()));
+                    summary
+                }
+            };
+            present.insert(name.clone());
+            let runner = match load_runner(&name) {
+                Some(r) if r.alive() => "live",
+                _ => "absent",
+            };
+            rows.insert(
+                name,
+                LoopRow {
+                    summary,
+                    runner: runner.into(),
+                },
+            );
+        }
+        self.summaries.retain(|k, _| present.contains(k));
+        rows
+    }
+
+    fn visible(&self, row: &LoopRow) -> bool {
+        self.include_terminal || !row.summary.status.is_terminal()
+    }
+
+    /// The rows to start from, most recently updated first.
+    pub fn snapshot(&mut self) -> Vec<LoopRow> {
+        let rows = self.scan();
+        let mut out = Vec::new();
+        for (id, row) in rows {
+            if self.visible(&row) {
+                out.push(row.clone());
+            } else {
+                self.finished.insert(id.clone());
+            }
+            self.sent.insert(id, row);
+        }
+        out.sort_by(|a, b| b.summary.updated_ts.cmp(&a.summary.updated_ts));
+        out
+    }
+
+    /// What changed since the last call: rows to (re)send, and loops that are gone. A loop
+    /// that finishes is sent once more (so a board sees it end) even when terminal loops
+    /// are otherwise left out.
+    pub fn poll(&mut self) -> (Vec<LoopRow>, Vec<String>) {
+        let rows = self.scan();
+        let mut changed = Vec::new();
+        for (id, row) in &rows {
+            if self.sent.get(id) == Some(row) {
+                continue;
+            }
+            if self.visible(row) || self.finished.insert(id.clone()) {
+                changed.push(row.clone());
+            }
+        }
+        let gone: Vec<String> = self
+            .sent
+            .keys()
+            .filter(|id| !rows.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in &gone {
+            self.finished.remove(id);
+        }
+        self.sent = rows;
+        (changed, gone)
+    }
+}
+
+/// Loops a parked runner must be woken for: no live runner, not finished, and a gate
+/// deadline due within `lead_ms`.
+pub fn loops_due(now_ms: u64, lead_ms: u64) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(loops_dir()) else {
+        return vec![];
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !is_valid_loop_id(&name) {
+                return None;
+            }
+            let summary = loop_summary(&e.path())?;
+            let due = summary.next_deadline_ms? <= now_ms.saturating_add(lead_ms);
+            let live = load_runner(&name).is_some_and(|r| r.alive());
+            (due && !live && !summary.status.is_terminal() && summary.writable).then_some(name)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------
 // loop_stop_runner.
 
 /// Stop a loop's runner. Graceful (`writer_closed{shutdown}`) unless steps are running;
@@ -719,5 +834,108 @@ pub async fn stop_runner(loop_id: &str, force: bool) -> Result<String, OpError> 
             remove_runner(loop_id);
             Ok(note)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        crate::ask::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn summary(loop_id: &str, status: LoopStatus, updated: u64) -> LoopSummary {
+        LoopSummary {
+            loop_id: loop_id.into(),
+            uid: "9c41e07a2b5d4f18".into(),
+            title: "t".into(),
+            blueprint: BlueprintHead {
+                name: "b".into(),
+                rev: "b1-0".into(),
+            },
+            status,
+            waiting: false,
+            pause: None,
+            stop: None,
+            finish: None,
+            active: vec![],
+            iterations: vec![],
+            open_gates: vec![],
+            open_gate_count: 0,
+            pending_instructions: 0,
+            next_deadline_ms: None,
+            usage: Usage::default(),
+            budget: Budget::default(),
+            head_seq: 1,
+            updated_ts: updated,
+            writable: true,
+        }
+    }
+
+    fn write_head(s: &LoopSummary) {
+        let dir = loops_dir().join(&s.loop_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(head_path(&dir), serde_json::to_vec(s).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_watcher_reports_changes_endings_and_deletions_once() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let a = "lp-0000000000000000000000000000000a";
+        let b = "lp-0000000000000000000000000000000b";
+        write_head(&summary(a, LoopStatus::Running, 10));
+        write_head(&summary(b, LoopStatus::Succeeded, 5));
+
+        let mut w = RowWatcher::new(false);
+        let first = w.snapshot();
+        assert_eq!(first.len(), 1, "finished loops are left out");
+        assert_eq!(first[0].summary.loop_id, a);
+        assert_eq!(w.poll(), (vec![], vec![]), "nothing changed");
+
+        // A change is reported once; so is the end of a loop.
+        let mut changed = summary(a, LoopStatus::Running, 11);
+        changed.waiting = true;
+        write_head(&changed);
+        let (rows, gone) = w.poll();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].summary.waiting);
+        assert!(gone.is_empty());
+        write_head(&summary(a, LoopStatus::Failed, 12));
+        let (rows, _) = w.poll();
+        assert_eq!(rows[0].summary.status, LoopStatus::Failed);
+        assert_eq!(w.poll(), (vec![], vec![]));
+
+        // A deleted loop is gone.
+        std::fs::remove_dir_all(loops_dir().join(a)).unwrap();
+        let (rows, gone) = w.poll();
+        assert!(rows.is_empty());
+        assert_eq!(gone, vec![a.to_string()]);
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn only_parked_loops_with_a_due_deadline_are_woken() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let due = "lp-0000000000000000000000000000000d";
+        let later = "lp-0000000000000000000000000000000e";
+        let done = "lp-0000000000000000000000000000000f";
+        let mut s = summary(due, LoopStatus::Running, 1);
+        s.next_deadline_ms = Some(1_000);
+        write_head(&s);
+        let mut s = summary(later, LoopStatus::Running, 1);
+        s.next_deadline_ms = Some(1_000_000);
+        write_head(&s);
+        let mut s = summary(done, LoopStatus::Cancelled, 1);
+        s.next_deadline_ms = Some(1_000);
+        write_head(&s);
+        assert_eq!(loops_due(900, 200), vec![due.to_string()]);
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 }

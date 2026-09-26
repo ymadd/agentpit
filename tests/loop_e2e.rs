@@ -14,6 +14,8 @@ struct Env {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     work: PathBuf,
+    /// Extra environment for every command (and so for the daemon and its runners).
+    extra: Vec<(&'static str, &'static str)>,
 }
 
 impl Env {
@@ -32,20 +34,27 @@ impl Env {
             _tmp: tmp,
             root,
             work,
+            extra: vec![],
         }
     }
 
-    fn cmd(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agentpit"))
-            .args(args)
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentpit"));
+        cmd.args(args)
             .current_dir(&self.work)
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("NO_COLOR", "1")
-            .env_remove("AGENTPIT_PARENT_RUN_ID")
-            .output()
-            .unwrap()
+            .env_remove("AGENTPIT_PARENT_RUN_ID");
+        for (k, v) in &self.extra {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    fn cmd(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -195,10 +204,9 @@ fn a_killed_runner_is_recovered_by_the_next_command_and_the_loop_completes() {
     assert!(alive(check_pid), "the check should outlive its runner");
     std::fs::write(env.work.join("done"), "").unwrap();
 
-    // Any loop command brings the runner back: it kills the orphan, records the
-    // interruption, and retries the (read-only) check on its own.
-    let summary = env.show(&loop_id);
-    assert_eq!(summary["loop_id"], loop_id.as_str());
+    // Any command that acts on the loop brings the runner back (`show` only reads the
+    // journal): it kills the orphan, records the interruption, and retries the check.
+    env.ok(&["loop", "resume", &loop_id]);
     wait_for("the sign-off gate", Duration::from_secs(30), || {
         env.show(&loop_id)["waiting"] == true
     });
@@ -291,4 +299,79 @@ fn a_damaged_journal_is_shown_from_disk_and_refuses_changes() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("damaged"), "{err}");
+}
+
+#[test]
+fn a_parked_loop_wakes_when_its_gate_is_answered_and_watchers_see_it() {
+    let mut env = Env::new();
+    env.extra.push(("AGENTPIT_LOOP_PARK_SECS", "1"));
+    let bp = env.work.join("gate.json");
+    std::fs::write(
+        &bp,
+        serde_json::json!({
+            "schema": "agentpit.blueprint/1",
+            "name": "gate-only",
+            "nodes": [{"id": "ok", "kind": "gate", "prompt": "Ship it?"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let started: Value =
+        serde_json::from_str(&env.ok(&["loop", "start", bp.to_str().unwrap(), "--json"])).unwrap();
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+
+    // With nobody attached, the waiting runner parks: its journal is closed `idle` and its
+    // registration is gone, but the board row still shows the gate.
+    let registry = env
+        .root
+        .join(format!("state/agentpit/daemon/loops/{loop_id}.json"));
+    wait_for("the runner to park", Duration::from_secs(20), || {
+        env.records(&loop_id)
+            .last()
+            .is_some_and(|r| r["kind"] == "writer_closed" && r["data"]["reason"] == "idle")
+            && !registry.exists()
+    });
+    assert_eq!(env.show(&loop_id)["waiting"], true);
+
+    // A watcher sees the loop change live.
+    let mut watcher = env
+        .command(&["loop", "ls", "--watch", "--all", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = watcher.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Answering wakes it and the loop completes.
+    let begin = Instant::now();
+    assert!(
+        env.ok(&["loop", "gate", &loop_id, "g1", "approve"])
+            .contains("done")
+    );
+    wait_for("the loop to succeed", Duration::from_secs(20), || {
+        env.show(&loop_id)["status"] == "succeeded"
+    });
+    let took = begin.elapsed();
+    assert!(took < Duration::from_secs(5), "waking took {took:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = false;
+    while Instant::now() < deadline && !seen {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            seen = line.contains(&loop_id) && line.contains("\"succeeded\"");
+        }
+    }
+    let _ = watcher.kill();
+    let _ = watcher.wait();
+    assert!(seen, "the watcher never saw the loop finish");
 }

@@ -728,7 +728,8 @@ async fn handle_sync_request(
         | RequestBody::LoopStart { .. }
         | RequestBody::LoopEnsure { .. }
         | RequestBody::LoopList { .. }
-        | RequestBody::LoopStopRunner { .. } => Response::err(
+        | RequestBody::LoopStopRunner { .. }
+        | RequestBody::LoopWatch { .. } => Response::err(
             id,
             "this is a WORKER socket; daemon verbs go to daemon.sock (`agentpit daemon status`)",
         ),

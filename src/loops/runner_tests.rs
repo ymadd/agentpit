@@ -98,6 +98,7 @@ struct Harness {
     work: PathBuf,
     stop: CancellationToken,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    park_after: Option<Duration>,
 }
 
 impl Harness {
@@ -158,6 +159,7 @@ impl Harness {
             work,
             stop: CancellationToken::new(),
             task: None,
+            park_after: None,
         }
     }
 
@@ -169,6 +171,7 @@ impl Harness {
             regs: Arc::new(regs),
             build: "test".into(),
             learned_routing: false,
+            park_after: self.park_after,
         };
         let paths = RunnerPaths {
             dir: self.dir.clone(),
@@ -914,5 +917,56 @@ async fn every_cancel_step_is_answered_with_its_own_op_id() {
     assert_eq!(rb.op_id, "op-cancel-bbbb");
     assert_eq!(rb.outcome, OpOutcome::Noop);
     w.until("the end", |s| s.status.is_terminal()).await;
+    h.finished().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_idle_waiting_runner_parks_and_a_new_one_resumes_the_gate() {
+    let _env = lock_env();
+    let doc = json!({
+        "schema": "agentpit.blueprint/1",
+        "name": "one-gate",
+        "nodes": [{"id": "ok", "kind": "gate", "prompt": "Ship it?"}]
+    });
+    let mut h = Harness::new(doc, &[]);
+    h.park_after = Some(Duration::from_millis(300));
+    {
+        let (mut w, _) = h.run_watched().await;
+        w.until("the gate", |s| s.open_gates().next().is_some())
+            .await;
+        // Connections keep it up; once they are gone it parks.
+    }
+    let parked = h.finished().await;
+    assert!(parked.is_ok(), "{parked:?}");
+    let (state, scan) = read_loop(&h.dir).unwrap();
+    assert_eq!(state.status, LoopStatus::Running);
+    let last = scan.records.last().unwrap();
+    assert_eq!(last.kind, "writer_closed");
+    assert!(last.raw.contains("\"idle\""), "{}", last.raw);
+    let head: LoopSummary =
+        serde_json::from_slice(&std::fs::read(h.dir.join("head.json")).unwrap()).unwrap();
+    assert!(head.waiting, "head.json still shows the waiting gate");
+
+    // A new runner picks the gate up where it was; answering it finishes the loop.
+    h.park_after = None;
+    h.start();
+    let (mut w, _) = Watch::attach(h.connect().await, None).await;
+    w.until("the gate again", |s| s.open_gates().next().is_some())
+        .await;
+    let mut conn = h.connect().await;
+    let resp = conn
+        .request_raw(op_request(
+            LoopOp::ResolveGate {
+                gate_id: "g1".into(),
+                option: "approve".into(),
+                comment: None,
+            },
+            "op-approve-parked",
+        ))
+        .await
+        .unwrap();
+    assert!(resp.ok, "{resp:?}");
+    w.until("the end", |s| s.status.is_terminal()).await;
+    assert_eq!(w.state.status, LoopStatus::Succeeded);
     h.finished().await.unwrap();
 }

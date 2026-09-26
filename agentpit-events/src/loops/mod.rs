@@ -21,6 +21,8 @@ pub mod journal;
 pub mod ops;
 pub mod record;
 pub mod state;
+pub mod store;
+pub mod view;
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +33,8 @@ pub use journal::*;
 pub use ops::*;
 pub use record::*;
 pub use state::*;
+pub use store::*;
+pub use view::*;
 
 /// Bumped by additive schema changes (new kinds, new optional fields, new enum values).
 /// Written into every `writer_opened`; a journal last opened by a writer with a HIGHER

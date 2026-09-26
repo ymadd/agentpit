@@ -133,7 +133,9 @@ pub async fn run(session: Option<String>) -> Result<()> {
                     Event::Unknown
                     | Event::LoopRecord { .. }
                     | Event::LoopChunk { .. }
-                    | Event::LoopHeartbeat { .. },
+                    | Event::LoopHeartbeat { .. }
+                    | Event::LoopRow { .. }
+                    | Event::LoopGone { .. },
                 )) => {}
                 Ok(Frame::Response(resp)) if resp.id == req_id => {
                     if !resp.ok {

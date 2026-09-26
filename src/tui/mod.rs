@@ -704,7 +704,9 @@ impl App {
                 Event::Unknown
                 | Event::LoopRecord { .. }
                 | Event::LoopChunk { .. }
-                | Event::LoopHeartbeat { .. },
+                | Event::LoopHeartbeat { .. }
+                | Event::LoopRow { .. }
+                | Event::LoopGone { .. },
             ) => {}
             Frame::Response(resp) => {
                 if Some(resp.id) == self.pending_cell {

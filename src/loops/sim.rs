@@ -149,8 +149,8 @@ impl Sim {
             .spec;
         let deadline = Some(self.now + 60_000);
         match spec {
-            NodeSpec::Agent(a) => Prep {
-                access: Some(a.access),
+            NodeSpec::Agent(_) | NodeSpec::Manager(_) => Prep {
+                access: spec.access(),
                 assignee: Some(Assignee {
                     backend: "fake".into(),
                     ..Assignee::default()

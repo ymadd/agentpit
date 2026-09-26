@@ -274,7 +274,7 @@ pub fn classify(state: &LoopState, op: &LoopOp, by: &Actor) -> Result<OpPlan, Op
                     .blueprint
                     .as_ref()
                     .and_then(|bp| bp.node(t))
-                    .is_some_and(|n| matches!(n.spec, NodeSpec::Agent(_)));
+                    .is_some_and(|n| n.spec.kind() == NodeKind::Agent);
                 if !is_agent {
                     return Err(op_error(
                         ErrorCode::Validation,

@@ -21,10 +21,13 @@ const FIELDS = {
   ],
   manager: [
     ["title", "text"],
-    ["role", "text"],
-    ["backend", "text"],
+    ["backend", "select", ["", "claude", "codex"]],
+    ["workflow", "text"],
     ["model", "text"],
-    ["max_calls", "number", 1, 32],
+    ["effort", "text"],
+    ["access", "select", ["write", "read"]],
+    ["verdict", "bool"],
+    ["retries", "number", 0, 3],
     ["timeout_secs", "number", 1, 86400],
     ["task", "area"],
   ],
@@ -77,7 +80,7 @@ function Field({ label, kind, value, onCommit, options, min, max }) {
         <select className="lp-input" value={value ?? options[0]} onChange={(e) => onCommit(e.target.value)}>
           {options.map((o) => (
             <option key={o} value={o}>
-              {o}
+              {o || "—"}
             </option>
           ))}
         </select>

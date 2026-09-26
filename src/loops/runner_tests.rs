@@ -970,3 +970,40 @@ async fn an_idle_waiting_runner_parks_and_a_new_one_resumes_the_gate() {
     assert_eq!(w.state.status, LoopStatus::Succeeded);
     h.finished().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_manager_node_journals_its_manager_and_reports_why_it_could_not_start() {
+    let _g = lock_env();
+    // The workflow type does not exist, so the manager cannot be resolved: the step is
+    // journaled as an agent step played by the manager role, then ends `error` without
+    // launching anything (a real manager would need credentials in a test).
+    let doc = json!({
+        "schema": "agentpit.blueprint/1",
+        "name": "managed",
+        "inputs": {"goal": {"required": true}},
+        "policy": {"on_error": "fail"},
+        "nodes": [
+            {"id": "lead", "kind": "manager", "workflow": "nope", "task": "Goal: {{goal}}"}
+        ],
+        "edges": []
+    });
+    let mut h = Harness::new(doc, &[("goal", "ship it")]);
+    let (mut w, _conn) = h.run_watched().await;
+    w.until("the loop to end", |s| s.status.is_terminal()).await;
+    h.finished().await.unwrap();
+    let state = h.state();
+    assert_eq!(state.status, LoopStatus::Failed);
+    let step = state.step("lead.a1").expect("the manager step ran");
+    assert_eq!(step.kind, NodeKind::Agent);
+    assert_eq!(step.outcome, Some(Outcome::Error));
+    let who = step.assignee.as_ref().unwrap();
+    assert_eq!(who.role.as_deref(), Some("manager"));
+    assert_eq!(who.route.as_deref(), Some("unresolved"));
+    assert!(step.run_id.is_none(), "no run was started");
+    assert!(
+        step.error.as_deref().unwrap_or_default().contains("nope"),
+        "{:?}",
+        step.error
+    );
+    assert!(h.prompt("lead.a1").starts_with("Goal: ship it"));
+}

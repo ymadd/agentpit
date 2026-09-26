@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::classify::{Admission, OpPlan, admit_op, op_error, rejection_error};
 use super::effects::{
-    AgentJob, CheckJob, EffectMsg, EffectTx, StepDone, run_agent, run_check, write_blob,
+    AgentJob, AgentWork, CheckJob, EffectMsg, EffectTx, StepDone, run_agent, run_check, write_blob,
 };
 use super::paths::head_path;
 use super::prompt::{agent_prompt, gate_prompt};
@@ -49,6 +49,8 @@ use crate::types::BackendId;
 
 /// Agent steps without `timeout_secs`.
 pub const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 30 * 60;
+/// A manager node runs a whole workflow (several dispatches) in its one step.
+pub const DEFAULT_MANAGER_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 /// Check steps without `timeout_secs`.
 pub const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 15 * 60;
 /// Frames queued per connection before chunks are dropped / the connection is closed.
@@ -457,6 +459,13 @@ impl Runner {
                     return false;
                 }
             },
+            NodeSpec::Manager(spec) => match self.prep_manager(plan, spec, now) {
+                Ok((prep, job)) => (prep, Some(Job::Agent(Box::new(job)))),
+                Err(e) => {
+                    self.fatal = Some(anyhow!("write the prompt of {step_id}: {e}"));
+                    return false;
+                }
+            },
             NodeSpec::Check(spec) => {
                 let (prep, job) = self.prep_check(plan, spec, now);
                 (prep, Some(Job::Check(job)))
@@ -510,7 +519,15 @@ impl Runner {
             .expect("a writable loop has a header");
         let step_id = plan.step_id();
         let texts = instruction_texts(state, plan);
-        let body = agent_prompt(state, &self.dir, &plan.node, spec, &plan.iter, &texts);
+        let body = agent_prompt(
+            state,
+            &self.dir,
+            &plan.node,
+            &spec.task,
+            spec.verdict,
+            &plan.iter,
+            &texts,
+        );
         let cast = self.resolve_cast(spec, &body);
         let prompt = match &cast.role {
             Some(role) => {
@@ -601,6 +618,121 @@ impl Runner {
             deadline_ms,
             logger,
             regs: Arc::clone(&self.env.regs),
+            work: AgentWork::Dispatch,
+        };
+        Ok((prep, job))
+    }
+
+    /// A manager node's step: an agent step played by the workflow manager. The manager is
+    /// resolved here (explicit backend, the workflow type's, the manager role's, the
+    /// configured one) and passed on explicitly, so the journaled assignee is what runs.
+    fn prep_manager(
+        &self,
+        plan: &StartPlan,
+        spec: &ManagerSpec,
+        now: u64,
+    ) -> std::io::Result<(Prep, AgentJob)> {
+        let state = self.state();
+        let created = state
+            .created
+            .as_deref()
+            .expect("a writable loop has a header");
+        let step_id = plan.step_id();
+        let texts = instruction_texts(state, plan);
+        let prompt = agent_prompt(
+            state,
+            &self.dir,
+            &plan.node,
+            &spec.task,
+            spec.verdict,
+            &plan.iter,
+            &texts,
+        );
+        let saved = crate::exec::redact_secrets(&prompt);
+        let blob = write_blob(&self.dir, &prompt_rel(&step_id), saved.as_bytes())?;
+        let cwd = PathBuf::from(&created.cwd);
+        let cast =
+            (|| -> std::result::Result<(BackendId, Option<String>, Option<Effort>), String> {
+                let explicit = match spec.backend.as_deref() {
+                    Some(name) => Some(
+                        BackendId::from_str(name).map_err(|_| format!("unknown backend {name}"))?,
+                    ),
+                    None => None,
+                };
+                let effort = match spec.effort.as_deref() {
+                    Some(e) => Some(Effort::from_str(e).map_err(|x| format!("effort {e:?}: {x}"))?),
+                    None => None,
+                };
+                crate::cli::workflow::manager_cast(
+                    &self.env.config,
+                    spec.workflow.as_deref(),
+                    explicit,
+                    spec.model.as_deref(),
+                    effort,
+                )
+                .map_err(|e| format!("{e:#}"))
+            })();
+        let run_id = agentpit_events::next_run_id();
+        let deadline_ms = now
+            + spec
+                .timeout_secs
+                .unwrap_or(DEFAULT_MANAGER_TIMEOUT_SECS)
+                .saturating_mul(1000);
+        let (backend_name, model, effort) = match &cast {
+            Ok((b, m, e)) => (b.as_str().to_string(), m.clone(), *e),
+            Err(_) => (
+                spec.backend
+                    .clone()
+                    .unwrap_or_else(|| "unassigned".to_string()),
+                spec.model.clone(),
+                None,
+            ),
+        };
+        let prep = Prep {
+            access: Some(spec.access),
+            assignee: Some(Assignee {
+                role: Some(crate::workflow::roles::MANAGER_ROLE.to_string()),
+                backend: backend_name,
+                model: model.clone(),
+                effort: effort.map(|e| e.as_str().to_string()),
+                transport: cast.is_ok().then(|| "exec".to_string()),
+                route: Some(
+                    if cast.is_ok() {
+                        "manager"
+                    } else {
+                        "unresolved"
+                    }
+                    .to_string(),
+                ),
+            }),
+            run_id: cast.is_ok().then(|| run_id.clone()),
+            prompt: Some(blob),
+            command: None,
+            deadline_ms: Some(deadline_ms),
+            gate: None,
+        };
+        let job = AgentJob {
+            step_id,
+            node: plan.node.clone(),
+            loop_dir: self.dir.clone(),
+            cwd,
+            prompt,
+            backend: cast.map(|(b, _, _)| b),
+            model,
+            effort,
+            verdict: spec.verdict,
+            deadline_ms,
+            logger: None,
+            regs: Arc::clone(&self.env.regs),
+            work: AgentWork::Manager {
+                workflow_type: spec.workflow.clone(),
+                link: crate::cli::workflow::ManagerLink {
+                    parent_run_id: created.root_run_id.clone(),
+                    loop_ref: self.loop_id.clone(),
+                    role: plan.node.clone(),
+                    run_id,
+                },
+            },
         };
         Ok((prep, job))
     }

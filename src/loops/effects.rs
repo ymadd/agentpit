@@ -135,8 +135,44 @@ pub struct AgentJob {
     pub effort: Option<Effort>,
     pub verdict: bool,
     pub deadline_ms: u64,
+    /// The step's run in events.jsonl (dispatch only: a manager run logs itself).
     pub logger: Option<RunLogger>,
     pub regs: Arc<Registries>,
+    pub work: AgentWork,
+}
+
+/// Who plays an agent step.
+pub enum AgentWork {
+    /// One stateless dispatch to the backend.
+    Dispatch,
+    /// A `manager` node: the workflow manager, with the prompt as its goal, dispatching to
+    /// the configured roles itself (`agentpit workflow` in one step).
+    Manager {
+        workflow_type: Option<String>,
+        link: crate::cli::workflow::ManagerLink,
+    },
+}
+
+/// The final answer of either kind of agent step.
+struct Answer {
+    output: String,
+    auth_failed: bool,
+}
+
+trait MapOkAnswer {
+    fn map_ok_answer(self) -> impl std::future::Future<Output = anyhow::Result<Answer>> + Send;
+}
+
+impl<F> MapOkAnswer for F
+where
+    F: std::future::Future<Output = anyhow::Result<String>> + Send,
+{
+    async fn map_ok_answer(self) -> anyhow::Result<Answer> {
+        self.await.map(|output| Answer {
+            output,
+            auth_failed: false,
+        })
+    }
 }
 
 /// Appends streamed output to `outputs/<step>.log` and forwards it with its offset.
@@ -199,17 +235,52 @@ pub async fn run_agent(job: AgentJob, cancel: CancellationToken, tx: EffectTx) -
     };
 
     let token = cancel.child_token();
-    let fut = dispatch_continuing(
-        backend,
-        &job.prompt,
-        &job.cwd,
-        token.clone(),
-        on_chunk,
-        &job.regs,
-        job.model.as_deref(),
-        job.effort,
-        None,
-    );
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Answer>> + Send>> =
+        match &job.work {
+            AgentWork::Dispatch => {
+                let (prompt, cwd, regs) =
+                    (job.prompt.clone(), job.cwd.clone(), Arc::clone(&job.regs));
+                let (model, effort, token) = (job.model.clone(), job.effort, token.clone());
+                Box::pin(async move {
+                    dispatch_continuing(
+                        backend,
+                        &prompt,
+                        &cwd,
+                        token,
+                        on_chunk,
+                        &regs,
+                        model.as_deref(),
+                        effort,
+                        None,
+                    )
+                    .await
+                    .map(|r| Answer {
+                        output: r.output,
+                        auth_failed: r.auth_failed,
+                    })
+                })
+            }
+            AgentWork::Manager {
+                workflow_type,
+                link,
+            } => Box::pin(
+                crate::cli::workflow::run_capture(
+                    job.prompt.clone(),
+                    workflow_type.clone(),
+                    Some(backend),
+                    None,
+                    None,
+                    false,
+                    job.model.clone(),
+                    job.effort,
+                    job.cwd.clone(),
+                    token.clone(),
+                    on_chunk,
+                    Some(link.clone()),
+                )
+                .map_ok_answer(),
+            ),
+        };
     tokio::pin!(fut);
     let limit = remaining(job.deadline_ms);
     let (result, timed_out) = tokio::select! {

@@ -314,6 +314,7 @@ fn main() {
             app_update::app_restart,
             workflow_gen::workflow_generate,
             workflow_gen::workflow_describe,
+            workflow_gen::blueprint_generate,
             bridge::loops_board,
             bridge::daemon_status,
             bridge::loop_open,

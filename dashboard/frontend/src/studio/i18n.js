@@ -308,6 +308,8 @@ export const JA = {
   "Project directory": "プロジェクトのディレクトリ",
   "＋ New blueprint": "＋ 新規ブループリント",
   "Import a Studio sketch": "Studio のスケッチを取り込む",
+  "Designing…": "設計中…",
+  "Describe the loop you want (the AI proposes a blueprint)": "作りたいループを説明してください（AI がブループリントを提案します）",
   "Blueprint name (a-z, 0-9, - and _)": "ブループリント名（a-z、0-9、- と _）",
   "Delete {name}?": "{name} を削除しますか？",
   "No blueprints yet.": "ブループリントはまだありません。",

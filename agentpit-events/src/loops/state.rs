@@ -1278,14 +1278,11 @@ impl LoopState {
             };
             // The blueprint's access is a floor: a write agent may not be recorded as read
             // (it would then run next to other compute).
-            let declared =
-                self.blueprint
-                    .as_ref()
-                    .and_then(|bp| bp.node(&s.node))
-                    .map(|n| match &n.spec {
-                        NodeSpec::Agent(a) => a.access,
-                        _ => Access::Read,
-                    });
+            let declared = self
+                .blueprint
+                .as_ref()
+                .and_then(|bp| bp.node(&s.node))
+                .map(|n| n.spec.access().unwrap_or(Access::Read));
             if declared == Some(Access::Write) && access != Access::Write {
                 return reject(C::KindMismatch, format!("{} is a write agent", s.node));
             }

@@ -64,6 +64,8 @@ export const saveBlueprint = (scope, name, doc, baseRev, project) =>
 export const deleteBlueprint = (scope, name, baseRev, project) =>
   call("blueprint_delete", { scope, name, baseRev, project: project || null });
 export const validateBlueprint = (doc) => call("blueprint_validate", { doc });
+export const generateBlueprint = (description, cwd) =>
+  call("blueprint_generate", { description, cwd: cwd || null });
 export const pendingAsks = () => call("get_pending_asks");
 export const answerAsk = (askId, value) => call("answer_ask", { askId, value });
 

@@ -636,7 +636,7 @@ impl<'a> Ctx<'a> {
                         // Any agent may have side effects (its tools do not honour `read`),
                         // and its process may still be running: a person decides (§9.4).
                         // A check is deterministic and is simply run again.
-                        if matches!(spec, NodeSpec::Agent(_)) {
+                        if spec.kind() == NodeKind::Agent {
                             Class::Act(Decision::OpenGate {
                                 kind: GateKind::Recovery,
                                 step_id: Some(latest.step_id.clone()),
@@ -907,10 +907,10 @@ impl<'a> Ctx<'a> {
                 },
             });
         }
-        let access = match self.spec(&plan.node) {
-            Some(NodeSpec::Agent(a)) => a.access,
-            _ => Access::Read,
-        };
+        let access = self
+            .spec(&plan.node)
+            .and_then(NodeSpec::access)
+            .unwrap_or(Access::Read);
         let running = self.running_compute();
         if access == Access::Write && !running.is_empty() {
             return None;
@@ -1017,9 +1017,5 @@ fn resolved_option(g: &GateRun) -> Option<&str> {
 }
 
 fn retries_of(spec: &NodeSpec) -> u32 {
-    match spec {
-        NodeSpec::Agent(a) => a.retries,
-        NodeSpec::Check(c) => c.retries,
-        _ => 0,
-    }
+    spec.retries()
 }

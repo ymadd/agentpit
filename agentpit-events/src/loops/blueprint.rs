@@ -145,27 +145,90 @@ pub struct Node {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeSpec {
     Agent(AgentSpec),
+    /// The workflow manager improvises inside one step (design §4.2): the escape hatch for
+    /// work whose decomposition should stay model-driven.
+    Manager(ManagerSpec),
     Check(CheckSpec),
     Gate(GateSpec),
     Repeat(RepeatSpec),
-    /// A kind this build does not run (`manager`, `ensemble`, `arena`, …, or one from a
-    /// newer agentpit). It parses, so the document stays editable, but never validates as
+    /// A kind this build does not run (`ensemble`, `arena`, …, or one from a newer
+    /// agentpit). It parses, so the document stays editable, but never validates as
     /// runnable.
     #[serde(other)]
     Unsupported,
 }
 
 impl NodeSpec {
+    /// The kind its steps have in the journal. A manager node's steps are agent steps (one
+    /// compute attempt with an assignee and a prompt); only who plays them differs.
     pub fn kind(&self) -> NodeKind {
         match self {
-            NodeSpec::Agent(_) => NodeKind::Agent,
+            NodeSpec::Agent(_) | NodeSpec::Manager(_) => NodeKind::Agent,
             NodeSpec::Check(_) => NodeKind::Check,
             NodeSpec::Gate(_) => NodeKind::Gate,
             NodeSpec::Repeat(_) => NodeKind::Repeat,
             NodeSpec::Unsupported => NodeKind::Unknown,
         }
     }
+
+    /// Whether its compute steps may modify the working tree (agent and manager nodes).
+    pub fn access(&self) -> Option<Access> {
+        match self {
+            NodeSpec::Agent(a) => Some(a.access),
+            NodeSpec::Manager(m) => Some(m.access),
+            _ => None,
+        }
+    }
+
+    /// Automatic retries on error/timeout (agent, manager and check nodes).
+    pub fn retries(&self) -> u32 {
+        match self {
+            NodeSpec::Agent(a) => a.retries,
+            NodeSpec::Manager(m) => m.retries,
+            NodeSpec::Check(c) => c.retries,
+            _ => 0,
+        }
+    }
+
+    /// The prompt template of an agent or manager node.
+    pub fn task(&self) -> Option<&str> {
+        match self {
+            NodeSpec::Agent(a) => Some(&a.task),
+            NodeSpec::Manager(m) => Some(&m.task),
+            _ => None,
+        }
+    }
 }
+
+/// A `manager` node: `agentpit workflow` in one step. The manager (claude or codex) gets the
+/// rendered task as its goal and dispatches to the configured roles as it sees fit; the
+/// loop sees one agent step whose answer is the manager's synthesis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerSpec {
+    /// The goal handed to the manager (a prompt template, like an agent's task).
+    pub task: String,
+    /// `claude` or `codex`; absent = the workflow's usual manager resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// A `[workflow.types.<name>]` preset (manager, roster, brief).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default)]
+    pub access: Access,
+    #[serde(default)]
+    pub verdict: bool,
+    #[serde(default)]
+    pub retries: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Backends that can run a workflow manager.
+pub const MANAGER_BACKENDS: &[&str] = &["claude", "codex"];
 
 /// One stateless dispatch (design §4.2). The cast is a `role` (resolved through
 /// `[workflow.roles]`), an explicit `backend`, or — with neither — the router, optionally
@@ -394,6 +457,7 @@ impl Blueprint {
             && self.nodes.iter().all(|n| match &n.spec {
                 NodeSpec::Unsupported => false,
                 NodeSpec::Agent(a) => !a.access.is_unknown(),
+                NodeSpec::Manager(m) => !m.access.is_unknown(),
                 NodeSpec::Check(_) => true,
                 NodeSpec::Gate(g) => g.options.iter().all(|o| !o.outcome.is_unknown()),
                 NodeSpec::Repeat(r) => !r.feedback.is_unknown(),
@@ -873,7 +937,7 @@ fn check_nodes(bp: &Blueprint, doc: &Value, index: &BlueprintIndex, d: &mut Diag
                     "unsupported_node_kind",
                     path("kind"),
                     id,
-                    format!("node kind {raw:?} cannot run in this agentpit; use agent, check, gate or repeat."),
+                    format!("node kind {raw:?} cannot run in this agentpit; use agent, manager, check, gate or repeat."),
                 );
             }
             NodeSpec::Agent(a) => {
@@ -891,6 +955,34 @@ fn check_nodes(bp: &Blueprint, doc: &Value, index: &BlueprintIndex, d: &mut Diag
                 }
                 check_retries(d, a.retries, path("retries"), id);
                 check_timeout(d, a.timeout_secs, path("timeout_secs"), id);
+            }
+            NodeSpec::Manager(m) => {
+                check_text(d, &m.task, path("task"), id, "task");
+                if let Some(b) = &m.backend {
+                    if !MANAGER_BACKENDS.contains(&b.as_str()) {
+                        d.err(
+                            "unsupported_manager",
+                            path("backend"),
+                            id,
+                            format!("backend {b:?} cannot run a workflow manager; use claude or codex, or leave it out."),
+                        );
+                    }
+                }
+                if let Some(w) = &m.workflow {
+                    if !is_valid_blueprint_name(w) {
+                        d.err(
+                            "invalid_name",
+                            path("workflow"),
+                            id,
+                            format!("workflow {w:?} is not a workflow type name; use [a-z0-9_-]."),
+                        );
+                    }
+                }
+                if m.access.is_unknown() {
+                    unknown_value(d, &path("access"), id);
+                }
+                check_retries(d, m.retries, path("retries"), id);
+                check_timeout(d, m.timeout_secs, path("timeout_secs"), id);
             }
             NodeSpec::Check(c) => {
                 if c.command.trim().is_empty() {
@@ -1194,6 +1286,7 @@ fn check_templates(bp: &Blueprint, index: &BlueprintIndex, d: &mut Diags) {
     for (i, node) in bp.nodes.iter().enumerate() {
         let (field, template, is_agent) = match &node.spec {
             NodeSpec::Agent(a) => ("task", a.task.as_str(), true),
+            NodeSpec::Manager(m) => ("task", m.task.as_str(), true),
             NodeSpec::Gate(g) => ("prompt", g.prompt.as_str(), false),
             _ => continue,
         };
@@ -1281,10 +1374,12 @@ fn check_templates(bp: &Blueprint, index: &BlueprintIndex, d: &mut Diags) {
 
 fn check_cast(bp: &Blueprint, env: &ValidateEnv, d: &mut Diags) {
     for (i, node) in bp.nodes.iter().enumerate() {
-        let NodeSpec::Agent(a) = &node.spec else {
-            continue;
+        let (role, backend) = match &node.spec {
+            NodeSpec::Agent(a) => (a.role.as_ref(), a.backend.as_ref()),
+            NodeSpec::Manager(m) => (None, m.backend.as_ref()),
+            _ => continue,
         };
-        if let (Some(role), Some(roles)) = (&a.role, &env.roles) {
+        if let (Some(role), Some(roles)) = (role, &env.roles) {
             if !roles.contains(role) {
                 d.warn(
                     "unknown_role",
@@ -1296,7 +1391,7 @@ fn check_cast(bp: &Blueprint, env: &ValidateEnv, d: &mut Diags) {
                 );
             }
         }
-        if let (Some(backend), Some(backends)) = (&a.backend, &env.backends) {
+        if let (Some(backend), Some(backends)) = (backend, &env.backends) {
             if !backends.contains(backend) {
                 d.warn(
                     "unknown_backend",
@@ -1324,6 +1419,7 @@ fn worst_steps(bp: &Blueprint, index: &BlueprintIndex, scope: Option<&str>, dept
         .fold(0u64, |acc, n| {
             let w = match &n.spec {
                 NodeSpec::Agent(a) => 1 + u64::from(a.retries),
+                NodeSpec::Manager(m) => 1 + u64::from(m.retries),
                 NodeSpec::Check(c) => 1 + u64::from(c.retries),
                 NodeSpec::Gate(_) | NodeSpec::Unsupported => 0,
                 NodeSpec::Repeat(r) => u64::from(r.max_iterations).saturating_mul(worst_steps(
@@ -1479,7 +1575,14 @@ mod tests {
             ),
             (
                 "unsupported_node_kind",
-                with(&|d| d["nodes"][0]["kind"] = json!("manager")),
+                with(&|d| d["nodes"][0]["kind"] = json!("ensemble")),
+            ),
+            (
+                "unsupported_manager",
+                with(&|d| {
+                    d["nodes"][0] =
+                        json!({"id": "a", "kind": "manager", "task": "x", "backend": "gemini"})
+                }),
             ),
             (
                 "unknown_parent",
@@ -1629,9 +1732,40 @@ mod tests {
     }
 
     #[test]
+    fn a_manager_node_is_an_agent_step_played_by_the_workflow_manager() {
+        let mut doc = minimal();
+        doc["nodes"][0] = json!({
+            "id": "m", "kind": "manager", "task": "Goal: {{goal}}\n{{instructions}}",
+            "backend": "codex", "workflow": "review", "retries": 1, "x_keep": true
+        });
+        let v = validate(&doc, &ValidateEnv::default());
+        assert!(v.is_runnable(), "{:?}", v.diagnostics);
+        let bp = v.blueprint.as_ref().unwrap();
+        assert_eq!(bp.nodes[0].spec.kind(), NodeKind::Agent);
+        assert_eq!(bp.nodes[0].spec.access(), Some(Access::Write));
+        assert_eq!(bp.nodes[0].spec.retries(), 1);
+        assert_eq!(v.bounds.unwrap().worst_steps, 2);
+
+        doc["nodes"][0]["backend"] = json!("gemini");
+        doc["nodes"][0]["workflow"] = json!("Not A Type");
+        let codes = codes_of(&doc);
+        assert!(
+            codes.contains(&"unsupported_manager".to_string()),
+            "{codes:?}"
+        );
+        assert!(codes.contains(&"invalid_name".to_string()), "{codes:?}");
+
+        doc["nodes"][0] = json!({"id": "m", "kind": "manager", "task": "{{nodes.nope.output}}"});
+        assert!(
+            codes_of(&doc).iter().any(|c| c.contains("unknown")),
+            "templates are checked"
+        );
+    }
+
+    #[test]
     fn unsupported_kind_parses_keeps_unknown_keys_and_blocks_run() {
         let mut doc = minimal();
-        doc["nodes"][0] = json!({"id": "m", "kind": "manager", "goal": "x", "future_key": 1});
+        doc["nodes"][0] = json!({"id": "m", "kind": "ensemble", "goal": "x", "future_key": 1});
         doc["future_top"] = json!({"a": 1});
         let v = validate(&doc, &ValidateEnv::default());
         let bp = v

@@ -444,6 +444,29 @@ function Blueprints({ t, onDesign, onStarted }) {
     }
   };
 
+  // The AI proposes; a person reviews it on the canvas before saving over anything or
+  // starting it. The proposal is saved under a fresh name (never over an existing file).
+  const [generating, setGenerating] = useState(false);
+  const generate = async () => {
+    const description = window.prompt(t("Describe the loop you want (the AI proposes a blueprint)"));
+    if (!description || !description.trim()) return;
+    setGenerating(true);
+    setErr(null);
+    try {
+      const design = await api.generateBlueprint(description.trim(), project.trim() || null);
+      const taken = new Set(list.map((b) => b.name));
+      let name = design.doc?.name || "generated";
+      for (let i = 2; taken.has(name); i++) name = `${design.doc?.name || "generated"}-${i}`;
+      const doc = { ...design.doc, name };
+      await api.saveBlueprint(scopeFor(), name, doc, null, project.trim() || null);
+      onDesign({ scope: scopeFor(), name, project: project.trim() || null });
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
   const remove = async (b) => {
     if (!window.confirm(t("Delete {name}?", { name: b.name }))) return;
     try {
@@ -469,6 +492,9 @@ function Blueprints({ t, onDesign, onStarted }) {
         </label>
         <button className="lp-btn" onClick={create}>
           {t("＋ New blueprint")}
+        </button>
+        <button className="lp-btn" disabled={generating} onClick={generate}>
+          {generating ? t("Designing…") : t("✨ Generate")}
         </button>
         <button className="lp-btn" onClick={() => setImporting((v) => !v)}>
           {t("Import a Studio sketch")}

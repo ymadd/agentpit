@@ -301,23 +301,24 @@ pub fn agent_prompt(
     state: &LoopState,
     loop_dir: &Path,
     node: &str,
-    spec: &AgentSpec,
+    task: &str,
+    verdict: bool,
     iter: &[u32],
     instructions: &[&str],
 ) -> String {
-    let mut text = render_template(&spec.task, |t| {
+    let mut text = render_template(task, |t| {
         resolve_token(state, loop_dir, node, iter, instructions, t)
     });
     let feedback = current_feedback(state, node, iter);
-    if !feedback.is_empty() && !mentions(&spec.task, "feedback") {
+    if !feedback.is_empty() && !mentions(task, "feedback") {
         text.push_str("\n\n");
         text.push_str(&feedback_block(&feedback));
     }
-    if !instructions.is_empty() && !mentions(&spec.task, "instructions") {
+    if !instructions.is_empty() && !mentions(task, "instructions") {
         text.push_str("\n\n");
         text.push_str(&instructions_block(instructions));
     }
-    if spec.verdict {
+    if verdict {
         text.push_str("\n\n");
         text.push_str(VERDICT_INSTRUCTION);
     }

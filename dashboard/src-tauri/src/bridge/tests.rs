@@ -888,3 +888,66 @@ async fn the_gate_resolution_in_the_final_view_names_who_answered() {
         0
     );
 }
+
+#[tokio::test]
+async fn random_kills_of_runner_daemon_and_app_end_on_the_disk_fold() {
+    let world = World::new(&fixture_lines(1..=4));
+    let runner = Fake::runner(&world.journal());
+    runner.listen(&world.runner_socket());
+    let daemon = Fake::daemon(vec![world.row("live")], &world.runner_socket());
+    daemon.listen(&world.daemon_socket());
+
+    // "The app" is a bridge; restarting it is dropping it and opening the loop again.
+    let paths = world.bridge.paths.clone();
+    let mut host = Arc::clone(&world.host);
+    let mut bridge = Arc::clone(&world.bridge);
+    bridge.board_snapshot();
+    bridge.open_loop(LOOP_ID).await.unwrap();
+
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let lines = fixture_lines(5..=26);
+    let mut kills = Vec::new();
+    for line in &lines {
+        // The runner commits (disk first), then streams it to whoever is attached.
+        world.append(std::slice::from_ref(line));
+        runner.broadcast(&serde_json::from_str(&record_frame(line)).unwrap());
+        tokio::time::sleep(Duration::from_millis(5 + next() % 25)).await;
+        if kills.len() < 20 {
+            match next() % 3 {
+                0 => {
+                    runner.kill_all();
+                    kills.push("runner");
+                }
+                1 => {
+                    daemon.kill_all();
+                    kills.push("daemon");
+                }
+                _ => {
+                    bridge.close_loop(LOOP_ID);
+                    drop(bridge);
+                    host = Arc::new(TestHost::default());
+                    bridge = Bridge::new(host.clone(), paths.clone());
+                    bridge.board_snapshot();
+                    bridge.open_loop(LOOP_ID).await.unwrap();
+                    kills.push("app");
+                }
+            }
+        }
+    }
+    assert_eq!(kills.len(), 20, "{kills:?}");
+    let truth = world.disk_view();
+    let last = until("the app to show the whole journal", || {
+        host.last("loops:view", |p| p["view"]["summary"]["head_seq"] == 26)
+    })
+    .await;
+    assert_eq!(last["view"], truth, "kills: {kills:?}");
+    // What loop_open answers now is the same.
+    let reopened = serde_json::to_value(bridge.open_loop(LOOP_ID).await.unwrap()).unwrap();
+    assert_eq!(reopened, truth);
+}

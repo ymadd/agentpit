@@ -155,6 +155,47 @@ pub fn scan_file(path: &Path) -> std::io::Result<Scan> {
     Ok(scan_bytes(&bytes))
 }
 
+/// The seq of a journal's last complete line, read from the end of the file (a few KB,
+/// not the whole journal). `None` for an empty journal or a last line that does not
+/// decode. Readers use it to tell whether a cached `head.json` is current: a runner that
+/// dies between appending and rewriting `head.json` leaves the cache one commit behind.
+pub fn last_seq(path: &Path) -> std::io::Result<Option<u64>> {
+    use std::io::{Seek, SeekFrom};
+    const STEP: u64 = 8 * 1024;
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut take = STEP.min(len);
+    loop {
+        f.seek(SeekFrom::Start(len - take))?;
+        let mut buf = vec![0; take as usize];
+        f.read_exact(&mut buf)?;
+        // Ignore a torn tail: only lines ended by '\n' were acknowledged.
+        let Some(end) = buf.iter().rposition(|b| *b == b'\n') else {
+            if take == len || take > MAX_LINE_BYTES as u64 {
+                return Ok(None);
+            }
+            take = (take + STEP).min(len);
+            continue;
+        };
+        let body = &buf[..end];
+        match body.iter().rposition(|b| *b == b'\n') {
+            Some(start) => return Ok(line_seq(&body[start + 1..])),
+            // The whole buffer is inside the last line: it starts the file, or read more.
+            None if take == len => return Ok(line_seq(body)),
+            None if take > MAX_LINE_BYTES as u64 => return Ok(None),
+            None => take = (take + STEP).min(len),
+        }
+    }
+}
+
+fn line_seq(line: &[u8]) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Seq {
+        seq: u64,
+    }
+    serde_json::from_slice::<Seq>(line).ok().map(|s| s.seq)
+}
+
 /// Read a loop without taking the lease (dashboards, `agentpit loop show`).
 pub fn read_loop(loop_dir: &Path) -> std::io::Result<(LoopState, Scan)> {
     let scan = scan_file(&journal_path(loop_dir))?;
@@ -652,6 +693,29 @@ mod tests {
             dir,
             leases,
         }
+    }
+
+    #[test]
+    fn last_seq_reads_the_last_acknowledged_line_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("journal.jsonl");
+        assert!(last_seq(&path).is_err(), "no journal");
+        fs::write(&path, "").unwrap();
+        assert_eq!(last_seq(&path).unwrap(), None);
+        fs::write(&path, "{\"seq\":1}\n").unwrap();
+        assert_eq!(last_seq(&path).unwrap(), Some(1));
+        // A torn tail is not a record yet.
+        fs::write(&path, "{\"seq\":1}\n{\"seq\":2,\"data\":\"x").unwrap();
+        assert_eq!(last_seq(&path).unwrap(), Some(1));
+        // Lines longer than one read step.
+        let big = "y".repeat(20_000);
+        let text = format!(
+            "{{\"seq\":1}}\n{{\"seq\":2,\"pad\":\"{big}\"}}\n{{\"seq\":3,\"pad\":\"{big}\"}}\n"
+        );
+        fs::write(&path, text).unwrap();
+        assert_eq!(last_seq(&path).unwrap(), Some(3));
+        fs::write(&path, "not json\n").unwrap();
+        assert_eq!(last_seq(&path).unwrap(), None);
     }
 
     fn created() -> LoopCreated {

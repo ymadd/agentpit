@@ -564,11 +564,14 @@ async fn probe(socket: &Path) -> bool {
 // ---------------------------------------------------------------------------------------
 // loop_list.
 
-/// A loop's board row from `head.json`, or from a fold of its journal when the runner
-/// never wrote one (or it is unreadable).
+/// A loop's board row from `head.json` when it is current, else from a fold of its
+/// journal: the runner may never have written one, or may have died between appending a
+/// record and rewriting it (then the cache is behind the journal — for a finished loop,
+/// forever, since no runner will run it again).
 pub fn loop_summary(dir: &Path) -> Option<LoopSummary> {
     if let Ok(text) = std::fs::read_to_string(head_path(dir))
         && let Ok(summary) = serde_json::from_str::<LoopSummary>(&text)
+        && last_seq(&journal_path(dir)).ok().flatten() == Some(summary.head_seq)
     {
         return Some(summary);
     }
@@ -882,10 +885,48 @@ mod tests {
         }
     }
 
+    /// A head.json that is current: the journal's last line has its seq.
     fn write_head(s: &LoopSummary) {
         let dir = loops_dir().join(&s.loop_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(head_path(&dir), serde_json::to_vec(s).unwrap()).unwrap();
+        std::fs::write(
+            journal_path(&dir),
+            format!(
+                "{{\"v\":1,\"seq\":{},\"ts\":0,\"kind\":\"x\",\"data\":{{}}}}\n",
+                s.head_seq
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_head_behind_its_journal_is_not_trusted() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let journal = include_str!(
+            "../../agentpit-events/tests/fixtures/loops/journal_fix_until_green.jsonl"
+        );
+        let loop_id = "lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b";
+        let dir = loops_dir().join(loop_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The runner wrote seq 1..=26 but died before rewriting head.json after seq 22.
+        let upto22: String = journal.lines().take(22).map(|l| format!("{l}\n")).collect();
+        std::fs::write(journal_path(&dir), &upto22).unwrap();
+        let stale = read_loop(&dir).unwrap().0.summary().unwrap();
+        std::fs::write(head_path(&dir), serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert_eq!(
+            loop_summary(&dir).unwrap(),
+            stale,
+            "a current head is used as is"
+        );
+        std::fs::write(journal_path(&dir), journal).unwrap();
+        let row = loop_summary(&dir).unwrap();
+        assert_eq!(row.head_seq, 26);
+        assert_eq!(row.status, LoopStatus::Succeeded);
+        assert_eq!(list_loops(true, None)[0].summary, row);
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     #[test]

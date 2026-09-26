@@ -375,3 +375,179 @@ fn a_parked_loop_wakes_when_its_gate_is_answered_and_watchers_see_it() {
     let _ = watcher.wait();
     assert!(seen, "the watcher never saw the loop finish");
 }
+
+/// A display that keeps itself up: `loop ls --watch --all --json` (the board's feed),
+/// restarted whenever it exits (its daemon died) or is killed (the app died), remembering
+/// the last row it printed for each loop.
+struct Display {
+    rows: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Value>>>,
+    child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Display {
+    fn start(env: &Env) -> Display {
+        use std::io::BufRead;
+        use std::sync::atomic::Ordering;
+        let rows: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Value>>> =
+            Default::default();
+        let child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>> =
+            Default::default();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut cmd = env.command(&["loop", "ls", "--watch", "--all", "--json"]);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let (r, c, s) = (rows.clone(), child.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            while !s.load(Ordering::SeqCst) {
+                let Ok(mut proc) = cmd.spawn() else {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                };
+                let stdout = proc.stdout.take().unwrap();
+                *c.lock().unwrap() = Some(proc);
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    if let Ok(v) = serde_json::from_str::<Value>(&line)
+                        && let Some(id) = v["summary"]["loop_id"].as_str()
+                    {
+                        r.lock()
+                            .unwrap()
+                            .insert(id.to_string(), v["summary"].clone());
+                    }
+                }
+                if let Some(mut p) = c.lock().unwrap().take() {
+                    let _ = p.wait();
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        Display {
+            rows,
+            child,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Kill the display process (it is restarted, and starts from a fresh snapshot).
+    fn kill(&self) {
+        if let Some(p) = self.child.lock().unwrap().as_mut() {
+            let _ = p.kill();
+        }
+    }
+
+    fn row(&self, loop_id: &str) -> Option<Value> {
+        self.rows.lock().unwrap().get(loop_id).cloned()
+    }
+}
+
+impl Drop for Display {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.kill();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn pid_in(path: &Path) -> Option<u64> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v["pid"].as_u64()
+}
+
+#[test]
+fn random_kills_of_daemon_runner_and_display_end_on_what_loop_show_says() {
+    let env = Env::new();
+    // Ten short check attempts before one passes: plenty of commits to land kills between.
+    let bp = env.work.join("ticks.json");
+    std::fs::write(
+        &bp,
+        serde_json::json!({
+            "schema": "agentpit.blueprint/1",
+            "name": "ticks",
+            "budget": {"max_steps": 200, "max_active_secs": 600, "max_parallel": 1},
+            "nodes": [
+                {"id": "until", "kind": "repeat", "max_iterations": 20},
+                {"id": "tick", "kind": "check", "parent": "until",
+                 "command": "n=$(cat count 2>/dev/null || echo 0); n=$((n+1)); echo $n > count; sleep 0.3; [ $n -ge 10 ]"}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let started: Value =
+        serde_json::from_str(&env.ok(&["loop", "start", bp.to_str().unwrap(), "--json"])).unwrap();
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let display = Display::start(&env);
+
+    // A fixed seed keeps a failure reproducible; it is printed to find it again.
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let registry = env
+        .root
+        .join(format!("state/agentpit/daemon/loops/{loop_id}.json"));
+    let owner = env.root.join("state/agentpit/daemon/owner.json");
+    let mut kills = Vec::new();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(150 + next() % 350));
+        // Kill the chosen process; when it is not running right now, kill the display.
+        let target = match next() % 3 {
+            0 => pid_in(&registry)
+                .filter(|p| alive(*p))
+                .map(|pid| ("runner", pid)),
+            1 => pid_in(&owner)
+                .filter(|p| alive(*p))
+                .map(|pid| ("daemon", pid)),
+            _ => None,
+        };
+        match target {
+            Some((what, pid)) => {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                kills.push(what);
+            }
+            None => {
+                display.kill();
+                kills.push("display");
+            }
+        }
+        // What an open canvas does: bring a runner that should be running back (this also
+        // autostarts the daemon). Refused once the loop has finished, which is fine.
+        let _ = env.cmd(&["loop", "resume", &loop_id]);
+    }
+    eprintln!("kills: {kills:?}");
+    assert_eq!(kills.len(), 20);
+
+    wait_for("the loop to finish", Duration::from_secs(90), || {
+        let _ = env.cmd(&["loop", "resume", &loop_id]);
+        env.show(&loop_id)["status"] == "succeeded"
+    });
+    // The display ends on exactly the state `loop show` folds from the journal.
+    let truth = env.show(&loop_id);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if display.row(&loop_id).as_ref() == Some(&truth) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the display ended on {}\nbut loop show says {}\n(kills: {kills:?})",
+            serde_json::to_string_pretty(&display.row(&loop_id)).unwrap(),
+            serde_json::to_string_pretty(&truth).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // And the journal stayed one valid history through every crash.
+    let records = env.records(&loop_id);
+    let seqs: Vec<u64> = records.iter().filter_map(|r| r["seq"].as_u64()).collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+}

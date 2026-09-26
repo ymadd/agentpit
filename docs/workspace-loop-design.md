@@ -12,8 +12,8 @@
 > - 新しい UI シェル（**オーナー決定 2026-09-25**。既存の Tauri アプリを拡張する）
 > - 汎用ワークフロー言語（式言語・任意サイクル・実行中のノード生成）
 > - `agentpit workflow`（manager 経路）の置き換え。manager 経路はそのまま残す
-> **ステータス: P1（スキーマ実装）完了（2026-09-25）。§14 の原則改訂はオーナー承認済み（Q1、2026-09-26）。P2（デーモンの窓口）実装済み（2026-09-26、§17 P2 の「実装メモ」）**。
-> 実装: `agentpit-events/src/loops/`（`mod.rs` `blueprint.rs` `record.rs` `state.rs` `ops.rs` `journal.rs`）、固定テスト `agentpit-events/tests/loops_golden.rs` と `tests/fixtures/loops/`。P2: `agentpit-events/src/wire.rs`、`src/loops/`（`sched.rs` `records.rs` `runner.rs` `effects.rs` `classify.rs` `prompt.rs` `proc.rs` `control.rs` `paths.rs`）、`src/cli/loop_cmd.rs`、`tests/loop_e2e.rs`。
+> **ステータス: P1（スキーマ実装）完了（2026-09-25）。§14 の原則改訂はオーナー承認済み（Q1、2026-09-26）。P2（デーモンの窓口）実装済み（2026-09-26、§17 P2 の「実装メモ」）。P3（画面での確認と実行）実装済み（2026-09-26、§17 P3 の「実装メモ」）**。
+> 実装: `agentpit-events/src/loops/`（`mod.rs` `blueprint.rs` `record.rs` `state.rs` `ops.rs` `journal.rs`）、固定テスト `agentpit-events/tests/loops_golden.rs` と `tests/fixtures/loops/`。P2: `agentpit-events/src/wire.rs`、`src/loops/`（`sched.rs` `records.rs` `runner.rs` `effects.rs` `classify.rs` `prompt.rs` `proc.rs` `control.rs` `paths.rs`）、`src/cli/loop_cmd.rs`、`tests/loop_e2e.rs`。P3: `agentpit-events/src/loops/`（`view.rs` `store.rs` `files.rs`）、`dashboard/src-tauri/src/bridge/`、`dashboard/frontend/src/loops/`。
 > **根拠**:
 > - agentpit 現状調査（2026-09-25、9 サブシステムのコード読解。主要主張 14 点は file:line で再検証済み）
 > - 独立 4 設計案（耐久性優先／UI 優先／ループ意味論優先／相互運用優先）と 3 審査、統合案への 3 方向の敵対的検証
@@ -155,7 +155,8 @@ Blueprint(name, scope, rev) ──凍結コピー──▶ Loop(lp-…) ─ jour
 | `gate` | 人間の承認。選択肢ごとに outcome（ok/fail）を持つ。既定は approve(ok) / reject(fail) | ジャーナルに裏付けられたゲート（src/ask は変えない。ミラーは任意） | ok / fail / timeout / cancelled |
 | `repeat` | 子を1周ずつ回す有界ループ（最大 20 周、入れ子は 3 段まで） | スケジューラのみ | ok（break）/ exhausted / cancelled |
 
-- 予約名（`Unsupported` としてパースはでき、保存・編集もできるが、実行はできない）: `manager`（P3。`run_capture` を1ノードの中で即興させる）、`ensemble`、`arena`、`apply`。
+- `manager`（P3 で実装）: `run_capture` を1ノードの中で即興させる。ステップはジャーナル上 `agent` として記録し、outcome も agent と同じ（§17 P3 の実装メモ）。
+- 予約名（`Unsupported` としてパースはでき、保存・編集もできるが、実行はできない）: `ensemble`、`arena`、`apply`。
 - エッジの `on` は `ok|fail|error|timeout|exhausted|not_ok|always`（省略時は `ok`）。種別ごとの許可表:
 
 | 起点の kind | 使える `on` |
@@ -689,6 +690,28 @@ git: refs/agentpit/loops/<id>/{base,landed,head}   （P4。gc から保護し、
   - 退避中のループのゲートが受信箱に出て、答えると 2 秒以内にランナーが起きる。
   - 古い base_rev での保存は conflict のダイアログになる。未知のキーが往復で残る。
   - 旧 Workflow Run の表示と asks は変わらない。
+- **実装メモ（2026-09-26。設計から確定・変更した点）**:
+  - **射影**: `LoopView`（`agentpit-events/src/loops/view.rs`）は summary・凍結ブループリント・ノード別の状態（表示するインスタンスは囲む repeat の現在の周。開いたゲートがあれば `waiting`）・直近 50 ステップ・ゲート・指示・警告・`source`（scope・path・cwd・inputs）を持つ。ブリッジも CLI も同じ fold から作る。
+  - **ブループリントの CRUD はファイル**（`agentpit-events/src/loops/store.rs`）: `<project>/.agentpit/blueprints/` と `~/.config/agentpit/blueprints/`。保存は `base_rev`（= `blueprint_rev`）の CAS と tmp+rename、新規は既存があれば conflict、文書の name はファイル名と一致させる。未知のキーは文書ごとそのまま保存する。全クライアントが同じマシンにいるので、§5 の表の daemon verb（`blueprint_*`）は作らず、ブリッジと CLI が同じ store を直接使う。
+  - **watch**: daemon の `loop_watch{include_terminal}` は `loops`（その時点の行）を返し、以後 200ms ごとに各ループの head.json とジャーナルの stat を見て、変わった行だけ `loop_row`、消えたループを `loop_gone` で流す。CLI は `agentpit loop ls --watch [--json]`。
+  - **head.json は信用しすぎない**: head.json の `head_seq` がジャーナルの最後の確定行の seq（末尾数 KB だけ読む `journal::last_seq`）と一致するときだけ使い、ずれていればジャーナルを fold する（ランナーが追記と head.json 更新の間で死ぬと、終端したループの行が永久に古いままになるため）。
+  - **退避と起床**: ランナーは、計算ステップも接続もなく、停止中でも終端でもない状態（waiting・paused・未開始）が `[loops].park_after_minutes`（既定 10 分、0 で無効。テスト用に `AGENTPIT_LOOP_PARK_SECS`）続くと `writer_closed{idle}` を書いて終了する。起こすのは (1) 操作（どのクライアントでも `loop_ensure` を経由する）と (2) デーモンの waker（15 秒ごと。開いたゲートの最早の期限 `LoopSummary.next_deadline_ms` の 20 秒前）。`loop show` とブリッジの表示は起こさない（ディスクから読む）。
+  - **manager ノード**: `NodeSpec::Manager`（task・backend=claude|codex・model・effort・workflow（型）・access・verdict・retries・timeout、既定 2 時間）。ジャーナル上は **agent ステップ**として記録する（新しいレコード種別も enum 値も足さない。旧版は凍結文書の `manager` を未対応として read-only にする）。ランナーは `cli::workflow::manager_cast`（`run_capture` と同じ解決順）で manager を先に決めて `step_started` の担当（role `manager`、route `manager`）と先行採番の run id に書き、`run_capture` を `ManagerLink` 付きで走らせる（ループのルート run の子になる）。出力は `outputs/<step>.log` に流れ、合成結果が answer になる。
+  - **AI 設計**: `agentpit workflow new --format blueprint "<説明>" [--json] [--write]`。実在のロール名と backend id をプロンプトに固定し、検証エラーがあれば診断を1回だけ返して修復させる（修復が壊れていれば最初の案と診断を返す）。`--json` は `{doc, rev, runnable, diagnostics, repaired}`、`--write` はプロジェクトの `.agentpit/blueprints/<name>.json` に新規作成だけ。ダッシュボードの「✨ 生成」は提案を新しい名前で保存して設計キャンバスで開く（開始は人が行う）。
+  - **ブリッジ**（`dashboard/src-tauri/src/bridge/`）: 発見は owner.json → runtime dir の socket、応答がなければ同梱 CLI の `agentpit daemon start`（10 秒に1回まで）。`loops/1` のないデーモンは `daemon_outdated` で止める。
+    - ボード: `loop_watch` 1本を張り続け（再接続は 250ms→5s）、行の塊は 15ms の静穏か 60ms で1回にまとめて `loops:board` と `loops:inbox` を出す。行からゲートが消えたらジャーナルを読んで「誰がどう答えたか」を受信箱の履歴に足す（2つ目の窓の要件）。
+    - ビュー: `loop_open` はまずディスクから fold して即座に返し、ランナーが live（またはあるべき＝running で人待ちでない。落ちたランナーの回復）なら cursor 付きで attach する。退避中・終端・read-only はジャーナルのサイズを 500ms ごとに見るだけで、起こさない。接続が切れるたびにディスクを読み直す（ディスクが正）。直後に `writer_closed` があるループは、行が live と言っていても attach しない（退避直後の古い行で起こさないため）。`loops:view` は 40ms に1回まで（静かな後の最初の変化は即時）、`loops:chunks` は 50ms ごと。
+    - コマンド: `loops_board` `daemon_status` `loop_open/close` `loop_start`（origin=dashboard、op_id で冪等）`loop_control` `gate_resolve` `step_output`（ディスクから。そのループのステップだけ）`blueprints_list/get/save/delete/validate` `blueprint_generate`。エラーは `{code, message, details}`。
+  - **画面**（`dashboard/frontend/src/loops/`。Workflow Run・Learning と同じ島の形）: ボード（状態・段階・担当・予算・一時停止/再開/停止）、受信箱（全ループのゲート + 既存の asks。退避中は「答えると起きる」と表示。最近の回答と回答者）、ブループリント（一覧・新規・削除・開始・✨ 生成・Studio スケッチの取り込み）、キャンバス（設計／実行の切り替え）。
+    - 実行: 凍結ブループリントにノードの phase/outcome、repeat のグループと n/max、担当チップ、発火したエッジ、選択（または自動追従）したステップの出力末尾（ディスクの末尾 + ライブ chunk。欠けたらディスクから読み直す）、ゲートの回答、指示、ステップの取り消し。
+    - 設計: ノードの追加・接続・移動・削除、種別ごとのインスペクタ、文書の設定、生 JSON、検証（300ms の debounce、ノードの強調）、`base_rev` 付きの保存と conflict ダイアログ（編集を続ける／自分の編集を捨てて読み直す／上書き）、保存してから開始。編集は未知のキーを保つ純関数（`canvas.js`）で行う。
+    - Studio の localStorage スケッチの取り込みは一度きりのボタン（描いたものだけ。seed は出さない）。線形の鎖にし、ask→gate、dynamic→manager、fanout とサブスウォームは注記して落とす（§4.5）。
+  - **受け入れ基準の対応**:
+    - ノード遷移: ヘッドレスの Chromium で偽のブリッジから 40 回の遷移を流し、イベントから DOM の反映まで p95 17ms（ブリッジ側の間引きは最大 40ms）。
+    - ランダム kill: `tests/loop_e2e.rs` の `random_kills_of_daemon_runner_and_display_end_on_what_loop_show_says`（実バイナリで runner・daemon・表示を 20 回 kill -9。表示の最後の行が `loop show --json` と一致し、ジャーナルの seq に欠番がない）と、ブリッジの `random_kills_of_runner_daemon_and_app_end_on_the_disk_fold`（runner 接続・daemon 接続・アプリ全体を 20 回。最後の `loops:view` がディスクの fold と一致）。
+    - 退避中のゲート: `a_parked_loop_wakes_when_its_gate_is_answered_and_watchers_see_it`（実バイナリで 5 秒以内に完走。起床自体は ensure の直後）と、ブリッジの `looking_at_a_parked_loop_does_not_wake_it`。
+    - conflict と未知のキー: store のテストとブリッジの `unknown_keys_round_trip_through_save_and_get`、キャンバスの `canvas.test.js`。
+    - 旧 Workflow Run と asks: 既存のコードと命令は変更なし（受信箱は `get_pending_asks`/`answer_ask` をそのまま使う）。
 
 ### P4: 編集機能（ステップ4）
 

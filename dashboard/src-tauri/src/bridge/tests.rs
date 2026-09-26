@@ -951,3 +951,168 @@ async fn random_kills_of_runner_daemon_and_app_end_on_the_disk_fold() {
     let reopened = serde_json::to_value(bridge.open_loop(LOOP_ID).await.unwrap()).unwrap();
     assert_eq!(reopened, truth);
 }
+
+// ---------------------------------------------------------------------------------------
+// Against the real binary (opt-in: `AGENTPIT_E2E_BIN=target/debug/agentpit cargo test -p
+// agentpit-dashboard real_daemon -- --ignored`). The fakes above pin the protocol as
+// written; this pins it against what the daemon and runner actually do.
+
+fn real_bin() -> Option<PathBuf> {
+    std::env::var_os("AGENTPIT_E2E_BIN")
+        .map(PathBuf::from)
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+}
+
+#[tokio::test]
+#[ignore = "needs AGENTPIT_E2E_BIN (a built agentpit binary)"]
+async fn real_daemon_parked_gate_from_the_inbox_wakes_the_loop_and_views_follow() {
+    let Some(bin) = real_bin() else {
+        eprintln!("AGENTPIT_E2E_BIN is not set; skipping");
+        return;
+    };
+    let tmp = tempfile::Builder::new()
+        .prefix("apbr")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = tmp.path().to_path_buf();
+    for d in ["state", "run", "config", "w"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    // The bridge derives its paths from the environment, like the app.
+    std::env::set_var("XDG_STATE_HOME", root.join("state"));
+    std::env::set_var("XDG_RUNTIME_DIR", root.join("run"));
+    std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+    std::env::set_var("AGENTPIT_LOOP_PARK_SECS", "1");
+    let run = |args: &[&str]| {
+        std::process::Command::new(&bin)
+            .args(args)
+            .current_dir(root.join("w"))
+            .output()
+            .unwrap()
+    };
+
+    let host = Arc::new(TestHost::default());
+    {
+        let bin = bin.clone();
+        let cwd = root.join("w");
+        *host.on_start.lock().unwrap() = Some(Box::new(move || {
+            let st = std::process::Command::new(&bin)
+                .args(["daemon", "start"])
+                .current_dir(&cwd)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }));
+    }
+    let bridge = Bridge::new(host.clone(), Paths::from_env());
+    bridge.board_snapshot();
+    until("the daemon (autostarted)", || {
+        (bridge.daemon_status().state == board::StatusState::Connected).then_some(())
+    })
+    .await;
+    assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+
+    let bp = root.join("w/gate.json");
+    std::fs::write(
+        &bp,
+        serde_json::json!({
+            "schema": "agentpit.blueprint/1",
+            "name": "gate-then-check",
+            "nodes": [
+                {"id": "ok", "kind": "gate", "prompt": "Ship it?"},
+                {"id": "after", "kind": "check", "command": "echo shipped"}
+            ],
+            "edges": [{"from": "ok", "to": "after"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let req: StartRequest = serde_json::from_value(serde_json::json!({
+        "blueprint": {"source": "path", "path": bp.display().to_string()},
+        "cwd": root.join("w").display().to_string(),
+        "title": "real daemon"
+    }))
+    .unwrap();
+    let loop_id = bridge.start_loop(req).await.unwrap().loop_id;
+
+    // Nobody looks: it parks, and its gate is in the inbox marked parked.
+    let inbox = until("the parked gate in the inbox", || {
+        host.last("loops:inbox", |p| {
+            p["gates"].as_array().is_some_and(|g| {
+                g.iter()
+                    .any(|g| g["loop_id"] == loop_id.as_str() && g["parked"] == true)
+            })
+        })
+    })
+    .await;
+    assert_eq!(inbox["gates"][0]["gate_id"], "g1");
+
+    // Opening it does not wake it.
+    let view = bridge.open_loop(&loop_id).await.unwrap();
+    assert!(view.summary.waiting);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let journal =
+        std::fs::read_to_string(root.join(format!("state/agentpit/loops/{loop_id}/journal.jsonl")))
+            .unwrap();
+    assert!(
+        journal.lines().last().unwrap().contains("\"idle\""),
+        "looking must not wake the loop: {}",
+        journal.lines().last().unwrap()
+    );
+
+    // Answering from the inbox wakes it; the open view follows it to the end.
+    let begin = std::time::Instant::now();
+    let answered = bridge
+        .control(
+            &loop_id,
+            LoopOp::ResolveGate {
+                gate_id: "g1".into(),
+                option: "approve".into(),
+                comment: Some("ok from the inbox".into()),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(answered.outcome, OpOutcome::Applied);
+    let woke = begin.elapsed();
+    assert!(woke < Duration::from_secs(2), "waking took {woke:?}");
+    let done = until("the view to finish", || {
+        host.last("loops:view", |p| {
+            p["loop_id"] == loop_id.as_str() && p["view"]["summary"]["status"] == "succeeded"
+        })
+    })
+    .await;
+    // The view, the board and `loop show --json` agree.
+    let show: Value =
+        serde_json::from_slice(&run(&["loop", "show", &loop_id, "--json"]).stdout).unwrap();
+    assert_eq!(done["view"]["summary"], show);
+    until("the board row", || {
+        host.last("loops:board", |p| {
+            p["rows"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|r| r["summary"] == show))
+        })
+    })
+    .await;
+    let answer = until("who answered", || {
+        host.last("loops:inbox", |p| {
+            p["answered"].as_array().is_some_and(|a| !a.is_empty())
+        })
+    })
+    .await;
+    assert_eq!(answer["answered"][0]["comment"], "ok from the inbox");
+    assert!(answer["answered"][0]["by"]["client"]
+        .as_str()
+        .unwrap()
+        .starts_with("agentpit-dashboard/"));
+    let out = bridge
+        .step_output(&loop_id, "after.a1", LoopFile::CheckLog, Some(0), None)
+        .await
+        .unwrap();
+    assert!(out.text.contains("shipped"), "{out:?}");
+
+    bridge.close_loop(&loop_id);
+    let _ = run(&["daemon", "stop"]);
+}

@@ -395,6 +395,7 @@ mod tests {
             repl: Default::default(),
             mcp: Default::default(),
             learning: Default::default(),
+            loops: Default::default(),
         }
     }
 

@@ -503,6 +503,31 @@ pub struct HubConfig {
     pub mcp: McpSection,
     #[serde(default)]
     pub learning: LearningSection,
+    #[serde(default)]
+    pub loops: LoopsSection,
+}
+
+/// Blueprint loops (docs/workspace-loop-design.md).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LoopsSection {
+    /// Minutes a runner with nothing to do (waiting on a person, paused, or never started)
+    /// and no client attached stays up before it parks: it closes its journal and exits,
+    /// and the next `loop_ensure` (any client action) or a due gate deadline brings it
+    /// back. `0` never parks.
+    #[serde(default = "default_park_after_minutes")]
+    pub park_after_minutes: u64,
+}
+
+fn default_park_after_minutes() -> u64 {
+    10
+}
+
+impl Default for LoopsSection {
+    fn default() -> Self {
+        LoopsSection {
+            park_after_minutes: default_park_after_minutes(),
+        }
+    }
 }
 
 /// When the runtime folds its own telemetry back into `profiles.toml`.

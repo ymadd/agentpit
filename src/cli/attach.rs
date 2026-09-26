@@ -126,6 +126,17 @@ pub async fn run(session: Option<String>) -> Result<()> {
                 Ok(Frame::Event(Event::Notice { text })) => {
                     eprintln!("{} {text}", style("session:").yellow());
                 }
+                // A newer worker's event kind: nothing to render, and never an error.
+                // Loop frames never reach a session worker's connection; a newer worker's
+                // events are skipped.
+                Ok(Frame::Event(
+                    Event::Unknown
+                    | Event::LoopRecord { .. }
+                    | Event::LoopChunk { .. }
+                    | Event::LoopHeartbeat { .. }
+                    | Event::LoopRow { .. }
+                    | Event::LoopGone { .. },
+                )) => {}
                 Ok(Frame::Response(resp)) if resp.id == req_id => {
                     if !resp.ok {
                         eprintln!(

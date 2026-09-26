@@ -15,6 +15,7 @@ pub mod workflow_manager;
 pub use autonomy::{AskTier, AutonomyLevel};
 pub use base::{ExecOutcome, ExecRunOptions, ExecSpec, run_spec};
 pub use stream::StreamFormat;
+pub(crate) use stream::redact_secrets;
 pub use workflow_manager::{McpConfigGuard, WorkflowManagerExec, is_supported_manager};
 
 /// Trait implemented by exec-mode backends (direct CLI spawn).

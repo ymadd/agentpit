@@ -19,7 +19,8 @@ use crate::daemon::paths::{
     daemon_owner_path, daemon_socket_path, ensure_runtime_dir, worker_socket_path, workers_dir,
 };
 use crate::daemon::protocol::{
-    PROTO_VERSION, Request, RequestBody, Response, ResponseData, SessionRow,
+    CODE_UNSUPPORTED, FEATURE_LOOPS, PROTO_VERSION, Request, RequestBody, Response, ResponseData,
+    SessionRow,
 };
 use crate::daemon::registry::{self, OwnerRecord, WorkerRecord};
 use crate::session::list_all;
@@ -81,6 +82,19 @@ pub async fn run_daemon() -> Result<()> {
             }
         })
     };
+    // Parked loops have no timer of their own: wake them for gate deadlines.
+    let waker = {
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => wake_due_loops().await,
+                    _ = stop.cancelled() => break,
+                }
+            }
+        })
+    };
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -93,6 +107,7 @@ pub async fn run_daemon() -> Result<()> {
         }
     }
     sweeper.abort();
+    waker.abort();
     registry::remove_owner(&owner_path);
     let _ = std::fs::remove_file(&socket);
     Ok(())
@@ -148,7 +163,15 @@ async fn handle_connection(stream: UnixStream, shutdown: tokio_util::sync::Cance
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Err(e) => Response::err(0, format!("bad request: {e}")),
+            Err(e) => Response::bad_request(&line, e),
+            // A watch takes over the connection until the client leaves.
+            Ok(Request {
+                id,
+                body: RequestBody::LoopWatch { include_terminal },
+            }) => {
+                serve_loop_watch(id, include_terminal, reader, write_half, shutdown).await;
+                return;
+            }
             Ok(req) => handle_request(req, &shutdown).await,
         };
         let Ok(resp_line) = serde_json::to_string(&response) else {
@@ -162,10 +185,77 @@ async fn handle_connection(stream: UnixStream, shutdown: tokio_util::sync::Cance
     }
 }
 
+/// How often `loop_watch` looks for changed loops. The board's budget is 300ms (design §12).
+const LOOP_WATCH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// `loop_watch`: the current rows, then `loop_row` / `loop_gone` frames as loops change,
+/// until the client disconnects (or the daemon stops).
+async fn serve_loop_watch(
+    id: u64,
+    include_terminal: bool,
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    use crate::daemon::protocol::Event;
+    async fn send(w: &mut tokio::net::unix::OwnedWriteHalf, line: String) -> bool {
+        w.write_all(line.as_bytes()).await.is_ok() && w.write_all(b"\n").await.is_ok()
+    }
+    let mut watcher = crate::loops::control::RowWatcher::new(include_terminal);
+    let loops = watcher.snapshot();
+    let first =
+        serde_json::to_string(&Response::ok(id, ResponseData::Loops { loops })).unwrap_or_default();
+    if !send(&mut writer, first).await {
+        return;
+    }
+    let mut tick = tokio::time::interval(LOOP_WATCH_INTERVAL);
+    let mut sink = String::new();
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let (rows, gone) = watcher.poll();
+                for row in rows {
+                    let frame = Event::LoopRow { row: Box::new(row) };
+                    if !send(&mut writer, serde_json::to_string(&frame).unwrap_or_default()).await {
+                        return;
+                    }
+                }
+                for loop_id in gone {
+                    let frame = Event::LoopGone { loop_id };
+                    if !send(&mut writer, serde_json::to_string(&frame).unwrap_or_default()).await {
+                        return;
+                    }
+                }
+            }
+            // Nothing is read on a watching connection except its end.
+            n = reader.read_line(&mut sink) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+                sink.clear();
+            }
+            _ = shutdown.cancelled() => return,
+        }
+    }
+}
+
+/// Wake parked loops whose gate deadlines are due, so a timeout fires even when nobody is
+/// watching (a parked runner has no timer). Checked every 15s, 20s ahead.
+pub async fn wake_due_loops() {
+    let due = crate::loops::control::loops_due(agentpit_events::now_ms(), 20_000);
+    for loop_id in due {
+        if let Err(e) = crate::loops::control::ensure_runner(&loop_id).await {
+            eprintln!("agentpit daemon: could not wake {loop_id}: {}", e.message);
+        }
+    }
+}
+
 async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationToken) -> Response {
     let id = req.id;
     match req.body {
-        RequestBody::Hello { proto } => {
+        RequestBody::Hello {
+            proto, features, ..
+        } => {
             if proto != PROTO_VERSION {
                 return Response::err(
                     id,
@@ -181,8 +271,76 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
                     proto: PROTO_VERSION,
                     role: "daemon".into(),
                     pid: std::process::id(),
+                    // Offered to clients that negotiate; an older client's bare hello gets
+                    // the bytes it always did.
+                    features: if features.is_empty() {
+                        vec![]
+                    } else {
+                        daemon_features()
+                    },
                 },
             )
+        }
+
+        RequestBody::LoopStart {
+            op_id,
+            blueprint,
+            inputs,
+            cwd,
+            title,
+            start,
+            origin,
+        } => {
+            let req = crate::loops::control::StartRequest {
+                op_id,
+                blueprint,
+                inputs,
+                cwd,
+                title,
+                start,
+                origin,
+            };
+            match crate::loops::control::start_loop(req).await {
+                Ok((loop_id, socket, duplicate)) => Response::ok(
+                    id,
+                    ResponseData::LoopStarted {
+                        loop_id,
+                        socket: socket.map(|s| s.display().to_string()),
+                        duplicate,
+                    },
+                ),
+                Err(e) => loop_error(id, e),
+            }
+        }
+
+        RequestBody::LoopEnsure { loop_id } => {
+            match crate::loops::control::ensure_runner(&loop_id).await {
+                Ok(socket) => Response::ok(
+                    id,
+                    ResponseData::LoopRunner {
+                        loop_id,
+                        socket: socket.display().to_string(),
+                    },
+                ),
+                Err(e) => loop_error(id, e),
+            }
+        }
+
+        RequestBody::LoopList {
+            include_terminal,
+            limit,
+        } => Response::ok(
+            id,
+            ResponseData::Loops {
+                loops: crate::loops::control::list_loops(include_terminal, limit),
+            },
+        ),
+
+        RequestBody::LoopStopRunner { loop_id, force } => {
+            match crate::loops::control::stop_runner(&loop_id, force).await {
+                Ok(note) => Response::ok(id, ResponseData::Lines { lines: vec![note] }),
+                Err(e) => loop_error(id, e),
+            }
         }
 
         RequestBody::Create { cwd } => {
@@ -318,12 +476,38 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
             Response::ok(id, ResponseData::Unit)
         }
 
+        // A newer client's verb: answer it (with the caller's id), never act on it.
+        RequestBody::Unknown => Response::err_code(
+            id,
+            CODE_UNSUPPORTED,
+            "this daemon does not know that control request (it predates your agentpit); \
+             run `agentpit daemon stop` and retry so it restarts on your current version.",
+        ),
+
         // Worker-only verbs on the daemon socket = a mixup; answer clearly (mirror image
         // of the worker's guard).
         _ => Response::err(
             id,
             "this is the DAEMON socket; session verbs go to the worker socket returned by `ensure`",
         ),
+    }
+}
+
+/// Capabilities the daemon offers in `hello` (design §11).
+pub fn daemon_features() -> Vec<String> {
+    let mut f = vec![FEATURE_LOOPS.to_string()];
+    for kind in ["agent", "check", "gate", "repeat"] {
+        f.push(format!("bp.node.{kind}"));
+    }
+    f.push("bp.workspace.in_place".into());
+    f
+}
+
+fn loop_error(id: u64, e: agentpit_events::loops::OpError) -> Response {
+    let resp = Response::err_code(id, e.code.as_str(), e.message);
+    match e.details {
+        Some(d) => resp.with_details(d),
+        None => resp,
     }
 }
 
@@ -428,6 +612,8 @@ async fn request_worker_inner(socket: &Path, body: RequestBody) -> Result<Respon
         id: 0,
         body: RequestBody::Hello {
             proto: PROTO_VERSION,
+            features: vec![],
+            client: None,
         },
     })?;
     write_half.write_all(hello.as_bytes()).await?;
@@ -492,7 +678,7 @@ fn force_kill_worker(record: &registry::WorkerRecord) -> String {
 /// refused (or failed to answer) a graceful shutdown — so SIGKILL, not SIGTERM, is what
 /// "force" must mean (M10): a worker ignoring TERM would otherwise survive a "forced"
 /// stop that reported success.
-fn kill_pid(pid: u32) -> Result<()> {
+pub(crate) fn kill_pid(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
         let status = std::process::Command::new("kill")
@@ -508,4 +694,79 @@ fn kill_pid(pid: u32) -> Result<()> {
         let _ = pid;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::protocol::{CODE_BAD_REQUEST, CODE_UNSUPPORTED};
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+    /// Write one raw line, read one raw response line back.
+    async fn roundtrip(
+        r: &mut BufReader<OwnedReadHalf>,
+        w: &mut OwnedWriteHalf,
+        line: &str,
+    ) -> (String, Response) {
+        w.write_all(line.as_bytes()).await.unwrap();
+        w.write_all(b"\n").await.unwrap();
+        let mut raw = String::new();
+        r.read_line(&mut raw).await.unwrap();
+        let resp = serde_json::from_str(&raw).unwrap();
+        (raw, resp)
+    }
+
+    /// The daemon's line loop, driven over a socket pair (no daemon socket, no state dir):
+    /// a newer client's verb is answered `unsupported` with ITS id, a malformed line is
+    /// answered `bad_request` with the id it carried, and neither ends the connection.
+    #[tokio::test]
+    async fn unknown_verbs_and_bad_lines_are_answered_with_the_callers_id() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let conn = tokio::spawn(handle_connection(theirs, shutdown.clone()));
+        let (r, mut w) = ours.into_split();
+        let mut r = BufReader::new(r);
+
+        // An older client's bare hello gets the same bytes it always did.
+        let (raw, resp) = roundtrip(&mut r, &mut w, r#"{"id":1,"type":"hello","proto":1}"#).await;
+        assert!(resp.ok, "{raw}");
+        assert!(matches!(
+            resp.data,
+            Some(ResponseData::Hello { ref role, ref features, .. })
+                if role == "daemon" && features.is_empty()
+        ));
+        assert!(!raw.contains("features") && !raw.contains("code"), "{raw}");
+
+        let (_, resp) = roundtrip(&mut r, &mut w, r#"{"id":5,"type":"teleport","to":"x"}"#).await;
+        assert_eq!(resp.id, 5);
+        assert!(!resp.ok);
+        assert_eq!(resp.code.as_deref(), Some(CODE_UNSUPPORTED));
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap()
+                .contains("agentpit daemon stop"),
+            "{resp:?}"
+        );
+
+        // `ensure` without its `session`: a known verb with a malformed body.
+        let (_, resp) = roundtrip(&mut r, &mut w, r#"{"id":9,"type":"ensure"}"#).await;
+        assert_eq!(resp.id, 9, "{resp:?}");
+        assert!(!resp.ok);
+        assert_eq!(resp.code.as_deref(), Some(CODE_BAD_REQUEST));
+
+        // Not JSON at all: no id to echo, so 0.
+        let (_, resp) = roundtrip(&mut r, &mut w, "not json").await;
+        assert_eq!(resp.id, 0);
+        assert_eq!(resp.code.as_deref(), Some(CODE_BAD_REQUEST));
+
+        // The connection keeps serving.
+        let (_, resp) = roundtrip(&mut r, &mut w, r#"{"id":11,"type":"hello","proto":1}"#).await;
+        assert_eq!(resp.id, 11);
+        assert!(resp.ok);
+
+        drop((r, w));
+        conn.await.unwrap();
+        assert!(!shutdown.is_cancelled());
+    }
 }

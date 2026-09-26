@@ -488,7 +488,8 @@ fn first_string_arg<'a>(args: &'a Value, names: &[&str]) -> Option<&'a str> {
         .find_map(|name| args.get(*name).and_then(Value::as_str))
 }
 
-fn redact_secrets(text: &str) -> String {
+/// Mask credential-looking assignments and flags (`token=…`, `--api-key …`).
+pub(crate) fn redact_secrets(text: &str) -> String {
     // Covers environment assignments and common CLI options while leaving the command
     // structure visible. The transcript is durable, so err on the side of redaction.
     static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {

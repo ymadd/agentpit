@@ -25,8 +25,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod loops;
 pub mod session;
 pub mod session_lease;
+pub mod wire;
 
 /// Backend agents agentpit can route to. Lives here so the event schema and the CLI
 /// share one definition. The CLI re-exports this as `crate::types::BackendId`.
@@ -206,6 +208,11 @@ pub enum Event {
         /// `None` = dispatched by backend / not part of a role.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
+        /// The blueprint loop (`lp-…`) this run belongs to: its root run and every agent step's
+        /// child run carry it, so a run can be traced back to the loop that dispatched it.
+        /// Additive: absent on every other run and on older lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loop_ref: Option<String>,
     },
     MemberStarted {
         ts: u64,
@@ -352,7 +359,7 @@ pub enum Event {
 pub const NOTE_BODY_MAX_BYTES: usize = 4096;
 
 /// `text` truncated to at most `max` bytes on a `char` boundary.
-fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
+pub(crate) fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
     let mut end = text.len().min(max);
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
@@ -665,7 +672,8 @@ fn process_nonce() -> u128 {
 }
 
 /// Generate a globally-unique run id: `<pid>-<process-nonce>-<monotonic-counter>`.
-fn next_run_id() -> String {
+/// Public so a caller can name a run before starting it ([`RunLink::run_id`]).
+pub fn next_run_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}-{}-{}", process::id(), process_nonce(), n)
@@ -678,6 +686,22 @@ pub fn next_ask_token() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("ask-{}-{}-{}", process::id(), process_nonce(), n)
+}
+
+/// How a run links into the execution tree, for [`RunLogger::start_linked`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunLink<'a> {
+    /// The workflow role this run plays (or, for a loop, `loop:<name>` / the node's role).
+    pub role: Option<&'a str>,
+    /// The run this one was dispatched from; `None` = a top-level run.
+    pub parent_run_id: Option<&'a str>,
+    /// Recursion depth below the top-level run.
+    pub depth: u32,
+    /// The blueprint loop the run belongs to.
+    pub loop_ref: Option<&'a str>,
+    /// Use this id (from [`next_run_id`]) instead of a fresh one — for a run whose id must
+    /// be recorded elsewhere before the run is announced.
+    pub run_id: Option<&'a str>,
 }
 
 /// Best-effort emitter scoped to a single run. Cheap to clone (shares the run id).
@@ -714,16 +738,6 @@ impl RunLogger {
         cwd: &std::path::Path,
         role: Option<&str>,
     ) -> Self {
-        let enabled = events_enabled();
-        if enabled {
-            // Bound on-disk state before this run adds to it.
-            prune_run_outputs(50);
-            compact_events_log(COMPACT_THRESHOLD_BYTES, COMPACT_KEEP_RUNS);
-        }
-        let logger = RunLogger {
-            run_id: next_run_id(),
-            enabled,
-        };
         // Names mirror the main crate's `workflow::guard` constants (this crate can't depend on it).
         let parent_run_id = std::env::var("AGENTPIT_PARENT_RUN_ID")
             .ok()
@@ -732,6 +746,41 @@ impl RunLogger {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(0);
+        Self::start_linked(
+            kind,
+            members,
+            cwd,
+            RunLink {
+                role,
+                parent_run_id: parent_run_id.as_deref(),
+                depth,
+                loop_ref: None,
+                run_id: None,
+            },
+        )
+    }
+
+    /// Like [`start_with_role`](Self::start_with_role), but every link is passed explicitly
+    /// and nothing is read from the environment. The loop runner uses this: it is a
+    /// long-lived process that dispatches many steps, so an inherited
+    /// `AGENTPIT_PARENT_RUN_ID` would be wrong for all of them (docs/workspace-loop-design.md
+    /// §10).
+    pub fn start_linked(
+        kind: RunKind,
+        members: &[BackendId],
+        cwd: &std::path::Path,
+        link: RunLink<'_>,
+    ) -> Self {
+        let enabled = events_enabled();
+        if enabled {
+            // Bound on-disk state before this run adds to it.
+            prune_run_outputs(50);
+            compact_events_log(COMPACT_THRESHOLD_BYTES, COMPACT_KEEP_RUNS);
+        }
+        let logger = RunLogger {
+            run_id: link.run_id.map_or_else(next_run_id, str::to_string),
+            enabled,
+        };
         logger.emit(Event::RunStarted {
             ts: now_ms(),
             run_id: logger.run_id.clone(),
@@ -739,9 +788,10 @@ impl RunLogger {
             kind,
             members: members.to_vec(),
             cwd: cwd.display().to_string(),
-            parent_run_id,
-            depth,
-            role: role.map(str::to_string),
+            parent_run_id: link.parent_run_id.map(str::to_string),
+            depth: link.depth,
+            role: link.role.map(str::to_string),
+            loop_ref: link.loop_ref.map(str::to_string),
         });
         logger
     }
@@ -1087,6 +1137,7 @@ mod tests {
             parent_run_id: None,
             depth: 0,
             role: None,
+            loop_ref: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"kind\":\"bench\""), "got: {json}");
@@ -1124,6 +1175,7 @@ mod tests {
             parent_run_id: Some("r0".into()),
             depth: 1,
             role: Some("reviewer".into()),
+            loop_ref: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         match serde_json::from_str::<Event>(&json).unwrap() {
@@ -1192,6 +1244,72 @@ mod tests {
                 assert_eq!(parent_run_id, None);
                 assert_eq!(depth, 0);
                 assert_eq!(role, None);
+            }
+            _ => panic!("expected RunStarted"),
+        }
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("AGENTPIT_PARENT_RUN_ID");
+            std::env::remove_var("AGENTPIT_WORKFLOW_DEPTH");
+        }
+    }
+
+    #[test]
+    fn start_linked_ignores_the_environment_and_records_the_loop() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+            // A runner inherits these from whatever started the daemon; they must not leak
+            // into the explicit links.
+            std::env::set_var("AGENTPIT_PARENT_RUN_ID", "r-inherited");
+            std::env::set_var("AGENTPIT_WORKFLOW_DEPTH", "5");
+        }
+        RunLogger::start_linked(
+            RunKind::Rescue,
+            &[BackendId::Codex],
+            tmp.path(),
+            RunLink {
+                role: Some("implementer"),
+                parent_run_id: Some("r-root"),
+                depth: 1,
+                loop_ref: Some("lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b"),
+                run_id: None,
+            },
+        );
+        RunLogger::start_linked(RunKind::Workflow, &[], tmp.path(), RunLink::default());
+        let contents = std::fs::read_to_string(tmp.path().join("agentpit/events.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        match serde_json::from_str::<Event>(lines[0]).unwrap() {
+            Event::RunStarted {
+                parent_run_id,
+                depth,
+                role,
+                loop_ref,
+                ..
+            } => {
+                assert_eq!(parent_run_id.as_deref(), Some("r-root"));
+                assert_eq!(depth, 1);
+                assert_eq!(role.as_deref(), Some("implementer"));
+                assert_eq!(
+                    loop_ref.as_deref(),
+                    Some("lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b")
+                );
+            }
+            _ => panic!("expected RunStarted"),
+        }
+        // No links at all: nothing from the environment, and the key stays off the line.
+        assert!(!lines[1].contains("loop_ref"), "{}", lines[1]);
+        match serde_json::from_str::<Event>(lines[1]).unwrap() {
+            Event::RunStarted {
+                parent_run_id,
+                depth,
+                loop_ref,
+                ..
+            } => {
+                assert_eq!(parent_run_id, None);
+                assert_eq!(depth, 0);
+                assert_eq!(loop_ref, None);
             }
             _ => panic!("expected RunStarted"),
         }

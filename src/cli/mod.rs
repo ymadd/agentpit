@@ -21,6 +21,7 @@ pub mod guidance;
 pub mod init;
 pub mod learning;
 pub mod login;
+pub mod loop_cmd;
 pub mod mcp_cmd;
 pub mod menu;
 pub mod note;
@@ -234,9 +235,14 @@ pub enum Command {
         /// (`new`/`list`) Emit JSON instead of the human-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// (`new` only) Append the generated `[workflow.types.*]` (+ any new roles) to config.toml.
+        /// (`new` only) Append the generated `[workflow.types.*]` (+ any new roles) to config.toml;
+        /// with `--format blueprint`, save the blueprint to `.agentpit/blueprints/<name>.json`.
         #[arg(long, default_value_t = false)]
         write: bool,
+        /// (`new` only) What to design: a manager-driven workflow type (default) or a blueprint
+        /// that runs as a bounded loop (`agentpit loop start`).
+        #[arg(long, value_enum, default_value_t = workflow::DesignFormat::Workflow)]
+        format: workflow::DesignFormat,
         #[arg(long)]
         cwd: Option<String>,
     },
@@ -345,6 +351,13 @@ pub enum Command {
     Attach {
         /// Session id (unique prefix/suffix accepted). Omit to start a fresh session.
         session: Option<String>,
+    },
+
+    /// Blueprint loops: start, watch and steer designed agent loops (plan → implement ⇄
+    /// check → sign-off), each run by its own background runner.
+    Loop {
+        #[command(subcommand)]
+        action: loop_cmd::Action,
     },
 
     /// Manage the background daemon that keeps sessions running while detached.
@@ -560,14 +573,28 @@ pub async fn run(cli: Cli) -> Result<()> {
             effort,
             json,
             write,
+            format,
             cwd,
         } => {
+            if format != workflow::DesignFormat::Workflow
+                && type_or_goal != workflow::RESERVED_TYPE_NEW
+            {
+                anyhow::bail!("--format only applies to `agentpit workflow new`");
+            }
             // `new` is reserved: `agentpit workflow new "<description>"` generates a workflow.
             if type_or_goal == workflow::RESERVED_TYPE_NEW {
                 let description = goal.ok_or_else(|| {
                     anyhow::anyhow!("usage: agentpit workflow new \"<description>\"")
                 })?;
-                workflow::generate(description, manager, model, json, write, cwd).await
+                match format {
+                    workflow::DesignFormat::Workflow => {
+                        workflow::generate(description, manager, model, json, write, cwd).await
+                    }
+                    workflow::DesignFormat::Blueprint => {
+                        workflow::generate_blueprint(description, manager, model, json, write, cwd)
+                            .await
+                    }
+                }
             } else if type_or_goal == workflow::RESERVED_TYPE_LIST {
                 // `list` is reserved: print the configured workflow types.
                 if goal.is_some() {
@@ -640,6 +667,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Sessions { action } => sessions::run(action).await,
 
         Command::Attach { session } => attach::run(session).await,
+
+        Command::Loop { action } => loop_cmd::run(action).await,
 
         Command::Daemon { action } => daemon_cmd::run(action).await,
 

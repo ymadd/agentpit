@@ -147,6 +147,11 @@ best fit な worker に動的ディスパッチ（`rescue`/`ensemble`）。静�
 `src/workflow/guard.rs` = `ENV_DEPTH` を子へインクリメント継承、`MAX_DEPTH_CEILING=32` +
 `check_not_exceeded` で fan-out 暴走を Rust 側で強制停止。worker は sub-boss になれる構造が既にある。
 
+> **改訂（2026-09-26、オーナー承認）**: manager 駆動の `agentpit workflow` には静的DAGを課さない（**不変**）。
+> ただし、人間が保存して開始した**ブループリント**から生まれたループに限り、実行系が段の順序・有界ループ
+> （max_iterations 必須、≤20、入れ子 ≤3）・ゲート・予算を拘束する。任意のサイクルは書けず、静的な最悪
+> ステップ数を検証時に示す。詳細は `docs/workspace-loop-design.md` §14.1。
+
 ### 3.2 差分（3点）
 
 1. **プロファイル注入** — manager プロンプトに能力行列を差し込み「best fit」を勘から事実へ
@@ -187,6 +192,11 @@ best fit な worker に動的ディスパッチ（`rescue`/`ensemble`）。静�
 の manager が受け取るロール名ロスター（ワーカーロールが1つでもあれば AVAILABLE ROLES +
 `rescue --role` / `dispatch_task {"role"}` 文法に切替わる）、(3) MCP `dispatch_task` の
 `role` 引数。manager 自身の解決順にも `roles.manager` が組み込まれている（下記）。
+
+> **改訂（2026-09-26、オーナー承認）**: CAST は引き続きロール（`resolve_role` は不変）。ブループリントは
+> **人間が所有する明示的な SCRIPT** だが、固定するのは**制御フロー（順序・分岐・有界反復・検査・ゲート・予算）
+> だけ**で、エッジは閉じた outcome の語彙でしか分岐しない。ノードの内側（分解・道具の使い方）は即興のまま。
+> 詳細は `docs/workspace-loop-design.md` §14.2。
 
 #### スキーマ（`[workflow.roles.<name>]`）
 
@@ -287,6 +297,11 @@ exec backend（claude/codex/agy）は結果を返すと**プロセス終了**（
 1. **worker は stateless ワンショットのまま**（exec 境界による強制、スタイルでない）。
 2. **「Conductor」= 新規ステートフル仲介者ではなく既存の workflow manager**。
    状態所有型 Conductor は manager より重い SPOF。
+   > **改訂（2026-09-26、オーナー承認）**: **状態を所有する**常駐 Conductor は作らない（維持）。ブループリント
+   > ループのランナーは、(a) 唯一の状態が fold(ジャーナル) で全作用が耐久化した認可レコードの後、(b) 1ループ
+   > 1プロセス、(c) LLM を含まない決定的コード、(d) 作用の出口は既存の choke point だけ、という
+   > **状態を所有しない再起動可能な実行器**として認める。kill -9 の後も再生で同じ状態に戻る。
+   > 詳細は `docs/workspace-loop-design.md` §14.3。
 3. **`src/ask` は不変・human専用のまま**。隔離ゲート（`exec/base.rs:62` の `env_remove(ENV_ASK_ALLOWED)`
    vs `workflow.rs:178` の manager限定セット）は worker が ask チャネルに入らないからこそ意味を持つ。
 4. **④ は `guard.rs`（MAX_DEPTH_CEILING=32, check_not_exceeded）で停止保証済み**。
@@ -333,6 +348,11 @@ DEFER（gold-bench の収束タスクでゲート）
 >   ACPではない）の stateless 3レグで出た結果。これは「stateless 3レグが収束品質で劣る」という
 >   un-defer条件の**逆方向**の実証であり、常駐ループを今作る根拠にならない。`dispatch.rs:77-78`の
 >   ACP配線も opencode のみのまま変化なし。
+
+> **un-defer（2026-09-26、オーナー承認、カーソルのみ）**: Tauri ブリッジとループランナーの回復が第2の長命
+> reader にあたる。カーソルは**ループジャーナルの seq に限り**、クライアントが保持する（サーバ側にクライアント
+> ごとの状態を持たない）。events.jsonl と Note は、カーソルなし・宛先なしのまま。詳細は
+> `docs/workspace-loop-design.md` §14.4。
 
 public surface 破壊なし: `agentpit ask` と `ask_human` MCP は human専用のまま。すべて加算的。
 

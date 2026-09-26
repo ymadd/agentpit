@@ -61,6 +61,34 @@ pub async fn workflow_generate(
     run_designer(&app, &description).await
 }
 
+/// Design a blueprint from a description: `agentpit workflow new "<description>" --format
+/// blueprint --json`. Returns `{doc, rev, runnable, diagnostics, repaired}`; the Studio opens
+/// the proposal for a person to review, save and start (the AI only proposes).
+#[tauri::command]
+pub async fn blueprint_generate(
+    app: AppHandle,
+    description: String,
+    cwd: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let description = description.trim().to_string();
+    if description.is_empty() {
+        return Err("説明を入力してください。".into());
+    }
+    let mut args: Vec<String> = vec![
+        "workflow".into(),
+        "new".into(),
+        description,
+        "--format".into(),
+        "blueprint".into(),
+        "--json".into(),
+    ];
+    if let Some(cwd) = cwd.filter(|c| std::path::Path::new(c).is_absolute()) {
+        args.push("--cwd".into());
+        args.push(cwd);
+    }
+    run_cli_json(&app, args, None, "blueprint generation").await
+}
+
 /// Run `agentpit workflow describe --json` with the workflow `spec` written to the
 /// child's STDIN, and parse the `{"description": "..."}` it prints on stdout. Same shell-out model
 /// as the designer above — a single CLI implementation, reached over process boundaries.

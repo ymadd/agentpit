@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod effort;
 pub mod events;
 pub mod exec;
+pub mod loops;
 pub mod mcp;
 pub mod orchestrate;
 pub mod profile;

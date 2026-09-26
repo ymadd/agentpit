@@ -644,6 +644,7 @@ impl AgentpitTools {
             self.cwd.clone(),
             CancellationToken::new(),
             noop_sink(),
+            None,
         )
         .await
         {

@@ -21,7 +21,7 @@ use crate::auth::check_auth;
 use crate::config::{HubConfig, RoleConfig, WorkflowSection, WorkflowStep};
 use crate::dispatch::{Registries, dispatch};
 use crate::effort::Effort;
-use crate::events::{LegStatus, RunKind, RunLogger};
+use crate::events::{LegStatus, RunKind, RunLink, RunLogger};
 use crate::exec::{AskTier, McpConfigGuard, WorkflowManagerExec, is_supported_manager};
 use crate::types::BackendId;
 use crate::workflow::{guard, roles};
@@ -62,6 +62,7 @@ pub async fn run(
         cwd,
         cancel,
         terminal_sink,
+        None,
     )
     .await?;
 
@@ -83,6 +84,9 @@ pub async fn run(
 /// the tee sink is built INSIDE this function — after the logger starts — and layered over
 /// `terminal_sink`. The caller supplies `cwd` and `cancel`; the config is loaded here so both
 /// callers stay simple.
+///
+/// `link` places the run under a workspace loop (a blueprint `manager` node): the manager's
+/// run is a child of the loop's root run and uses the run id the loop already journaled.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_capture(
     goal: String,
@@ -96,6 +100,7 @@ pub(crate) async fn run_capture(
     cwd: PathBuf,
     cancel: CancellationToken,
     terminal_sink: Arc<dyn Fn(&str) + Send + Sync>,
+    link: Option<ManagerLink>,
 ) -> Result<String> {
     let ctx = load_context()?;
     let config = &ctx.loaded.config;
@@ -201,7 +206,21 @@ pub(crate) async fn run_capture(
 
     // 8. Start the run first: the prompt (step 9) and the child_env (step 10) both need the
     //    run id, which only exists once the logger has started.
-    let logger = RunLogger::start(RunKind::Workflow, &[manager], &cwd);
+    let logger = match &link {
+        None => RunLogger::start(RunKind::Workflow, &[manager], &cwd),
+        Some(l) => RunLogger::start_linked(
+            RunKind::Workflow,
+            &[manager],
+            &cwd,
+            RunLink {
+                role: Some(&l.role),
+                parent_run_id: l.parent_run_id.as_deref(),
+                depth: 1,
+                loop_ref: Some(&l.loop_ref),
+                run_id: Some(&l.run_id),
+            },
+        ),
+    };
     // The manager backend comes from config/flags, not the router; the RouteDecided line exists
     // for its task_hash (re-run detection, kNN) and for the learning fold's per-run coverage.
     logger.route_decided(
@@ -371,6 +390,58 @@ pub(crate) async fn run_capture(
             Err(err)
         }
     }
+}
+
+/// Where a manager run sits when a workspace loop's `manager` node starts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerLink {
+    /// The loop's root run.
+    pub parent_run_id: Option<String>,
+    pub loop_ref: String,
+    /// The node id, as the run's role label.
+    pub role: String,
+    /// Pre-generated, so the loop journals it before the manager starts.
+    pub run_id: String,
+}
+
+/// The manager a `run_capture` would pick, resolved without probing credentials: the loop
+/// runner records the assignee before the step starts and then passes it explicitly, so
+/// what is journaled is what runs. An unconfigured manager falls back to the first
+/// implicit candidate (the run's own auth preflight then says how to log in).
+pub(crate) fn manager_cast(
+    config: &HubConfig,
+    workflow_type: Option<&str>,
+    explicit: Option<BackendId>,
+    model: Option<&str>,
+    effort: Option<Effort>,
+) -> Result<(BackendId, Option<String>, Option<Effort>)> {
+    let eff = resolve_workflow_type(&config.workflow, workflow_type)?;
+    let implicit = implicit_manager_candidates(config.default.backend)[0];
+    let (manager, _persona, role_model, role_effort) = resolve_manager_backend(
+        explicit,
+        eff.type_manager_backend,
+        &config.workflow.roles,
+        eff.manager_backend,
+        implicit,
+    )?;
+    if !is_supported_manager(manager) {
+        anyhow::bail!("supported workflow managers: claude, codex (got: {manager})");
+    }
+    let model = roles::resolve_model(
+        model,
+        role_model.as_deref(),
+        config
+            .backends
+            .get(&manager)
+            .and_then(|o| o.model.as_deref()),
+    );
+    let effort = crate::effort::resolve_effort(
+        effort,
+        role_effort,
+        config.backends.get(&manager).and_then(|o| o.effort),
+    )
+    .map(|e| e.clamp_for(manager));
+    Ok((manager, model, effort))
 }
 
 /// Resolve the worker roster the manager may dispatch to: explicit `--agents` → configured
@@ -1480,41 +1551,10 @@ pub async fn generate(
 
     let cancel = CancellationToken::new();
     install_ctrlc_cancel(cancel.clone());
-    let noop: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_: &str| {});
-    let designer_model = roles::resolve_model(
-        model.as_deref(),
-        None,
-        config
-            .backends
-            .get(&backend)
-            .and_then(|o| o.model.as_deref()),
-    );
-    let designer_effort = crate::effort::resolve_effort(
-        None,
-        None,
-        config.backends.get(&backend).and_then(|o| o.effort),
-    )
-    .map(|e| e.clamp_for(backend));
-    let res = dispatch(
-        backend,
-        &prompt,
-        &cwd,
-        cancel,
-        noop,
-        &ctx.regs,
-        designer_model.as_deref(),
-        designer_effort,
-    )
-    .await?;
-    if res.auth_failed {
-        anyhow::bail!(
-            "[{backend}] auth failure during generation. Run `{}`.",
-            auth.login_command
-        );
-    }
+    let output = designer_ask(&ctx, backend, model.as_deref(), &cwd, &cancel, &prompt).await?;
 
-    let proposal = parse_proposal(&res.output).map_err(|e| {
-        let snippet: String = res.output.chars().take(800).collect();
+    let proposal = parse_proposal(&output).map_err(|e| {
+        let snippet: String = output.chars().take(800).collect();
         anyhow::anyhow!("{e}\n--- raw model output (first 800 chars) ---\n{snippet}")
     })?;
 
@@ -1560,6 +1600,333 @@ pub async fn generate(
     );
     Ok(())
 }
+
+/// One designer turn: `prompt` to `backend` (normal dispatch posture, no sub-agents), the
+/// raw answer back. The designer's model: `--model`, else the backend's configured default.
+async fn designer_ask(
+    ctx: &super::common::Context,
+    backend: BackendId,
+    model: Option<&str>,
+    cwd: &std::path::Path,
+    cancel: &CancellationToken,
+    prompt: &str,
+) -> Result<String> {
+    let config = &ctx.loaded.config;
+    let noop: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_: &str| {});
+    let designer_model = roles::resolve_model(
+        model,
+        None,
+        config
+            .backends
+            .get(&backend)
+            .and_then(|o| o.model.as_deref()),
+    );
+    let designer_effort = crate::effort::resolve_effort(
+        None,
+        None,
+        config.backends.get(&backend).and_then(|o| o.effort),
+    )
+    .map(|e| e.clamp_for(backend));
+    let res = dispatch(
+        backend,
+        prompt,
+        cwd,
+        cancel.clone(),
+        noop,
+        &ctx.regs,
+        designer_model.as_deref(),
+        designer_effort,
+    )
+    .await?;
+    if res.auth_failed {
+        anyhow::bail!(
+            "[{backend}] auth failure during generation. Run `{}`.",
+            check_auth(backend).await.login_command
+        );
+    }
+    Ok(res.output)
+}
+
+/// What `agentpit workflow new` designs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DesignFormat {
+    /// A `[workflow.types.*]` preset for the manager-driven `agentpit workflow`.
+    Workflow,
+    /// A blueprint (`agentpit.blueprint/1`) that runs as a bounded loop.
+    Blueprint,
+}
+
+/// A designed blueprint: the document, what validation still says about it, and whether a
+/// repair round was needed. `--json` prints exactly this.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BlueprintDesign {
+    pub doc: serde_json::Value,
+    pub rev: String,
+    pub runnable: bool,
+    pub diagnostics: Vec<agentpit_events::loops::Diagnostic>,
+    pub repaired: bool,
+}
+
+/// `agentpit workflow new --format blueprint "<description>"`: a one-shot designer proposes
+/// a blueprint; if it does not validate, the diagnostics go back to the model ONCE for a
+/// repair (design §4.5). The AI only proposes: `--write` saves it for a person to review,
+/// and starting it stays a human action.
+pub async fn generate_blueprint(
+    description: String,
+    manager: Option<BackendId>,
+    model: Option<String>,
+    json: bool,
+    write: bool,
+    cwd: Option<String>,
+) -> Result<()> {
+    let cwd = resolve_cwd(cwd)?;
+    let ctx = load_context()?;
+    let config = &ctx.loaded.config;
+    let backend = manager
+        .or(config.workflow.manager_backend)
+        .unwrap_or(config.default.backend);
+    let auth = check_auth(backend).await;
+    if !auth.ok {
+        anyhow::bail!(
+            "[{backend}] not authenticated. Run `{}`, or call `agentpit login {backend}`.",
+            auth.login_command
+        );
+    }
+    let mut available: Vec<BackendId> = ctx.regs.available().into_iter().collect();
+    available.sort();
+    let role_names: Vec<String> = roles::worker_roles(&config.workflow.roles)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let env = crate::loops::control::validate_env();
+    eprintln!("Designing a blueprint with {backend}… (one-shot, one repair round at most)");
+    let cancel = CancellationToken::new();
+    install_ctrlc_cancel(cancel.clone());
+    let design = design_blueprint(&description, &available, &role_names, &env, |prompt| {
+        let (ctx, cwd, cancel, model) = (&ctx, &cwd, &cancel, model.as_deref());
+        async move { designer_ask(ctx, backend, model, cwd, cancel, &prompt).await }
+    })
+    .await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&design)?);
+        return Ok(());
+    }
+    println!("{}", agentpit_events::loops::pretty(&design.doc));
+    for d in &design.diagnostics {
+        eprintln!("{}: {} {}", d.severity, d.path, d.message);
+    }
+    if !design.runnable {
+        anyhow::bail!(
+            "the proposal still has errors after one repair round (above); edit it in the \
+             dashboard or by hand"
+        );
+    }
+    let name = design.doc["name"].as_str().unwrap_or_default().to_string();
+    if write {
+        use agentpit_events::loops::{
+            BlueprintScope, StoreError, project_blueprints_dir, save_blueprint,
+        };
+        let dir = project_blueprints_dir(&cwd);
+        match save_blueprint(
+            BlueprintScope::Project,
+            &dir,
+            &name,
+            &design.doc,
+            None,
+            &env,
+        ) {
+            Ok(saved) => eprintln!("Wrote {}", saved.entry.path),
+            Err(StoreError::Conflict { .. }) => anyhow::bail!(
+                "{}/{name}.json already exists; choose another name or edit it in the dashboard",
+                dir.display()
+            ),
+            Err(e) => anyhow::bail!("could not save the blueprint: {e}"),
+        }
+        eprintln!("Start it with:  agentpit loop start {name} --goal \"<goal>\"");
+    } else {
+        eprintln!(
+            "\nReview the above, then save it as .agentpit/blueprints/{name}.json (or re-run with --write)."
+        );
+    }
+    Ok(())
+}
+
+/// The designer loop, separated from dispatch so it is testable: ask for a blueprint,
+/// validate it, and give the model one chance to fix what validation found.
+pub(crate) async fn design_blueprint<F, Fut>(
+    description: &str,
+    available: &[BackendId],
+    roles: &[String],
+    env: &agentpit_events::loops::ValidateEnv,
+    mut ask: F,
+) -> Result<BlueprintDesign>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    use agentpit_events::loops::validate;
+    let first = ask(blueprint_designer_prompt(description, available, roles)).await?;
+    let mut doc = parse_blueprint_answer(&first).map_err(|e| {
+        let snippet: String = first.chars().take(800).collect();
+        anyhow::anyhow!("{e}\n--- raw model output (first 800 chars) ---\n{snippet}")
+    })?;
+    let mut v = validate(&doc, env);
+    let mut repaired = false;
+    if v.has_errors() {
+        let answer = ask(blueprint_repair_prompt(&doc, &v.diagnostics)).await?;
+        // A repair that does not even parse keeps the first proposal and its diagnostics.
+        if let Ok(fixed) = parse_blueprint_answer(&answer) {
+            doc = fixed;
+            v = validate(&doc, env);
+            repaired = true;
+        }
+    }
+    Ok(BlueprintDesign {
+        runnable: !v.has_errors(),
+        rev: v.rev,
+        diagnostics: v.diagnostics,
+        doc,
+        repaired,
+    })
+}
+
+/// The JSON object in a designer answer, with the fields a person would otherwise have to
+/// fix by hand made canonical: the schema id, and a file-safe name.
+fn parse_blueprint_answer(raw: &str) -> Result<serde_json::Value> {
+    let json = extract_json(raw)?;
+    let mut doc: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("could not parse the generated blueprint JSON: {e}"))?;
+    let Some(obj) = doc.as_object_mut() else {
+        anyhow::bail!("the generated blueprint is not a JSON object");
+    };
+    obj.insert(
+        "schema".into(),
+        serde_json::Value::String(agentpit_events::loops::BLUEPRINT_SCHEMA_V1.into()),
+    );
+    let name = obj
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(kebab)
+        .filter(|n| agentpit_events::loops::is_valid_blueprint_name(n))
+        .unwrap_or_else(|| "generated".to_string());
+    obj.insert("name".into(), serde_json::Value::String(name));
+    Ok(doc)
+}
+
+fn kebab(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if (c == '-' || c == '_' || c.is_whitespace()) && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').chars().take(64).collect()
+}
+
+/// Teaches the blueprint schema and PINS the real role names and backend ids.
+fn blueprint_designer_prompt(
+    description: &str,
+    available: &[BackendId],
+    roles: &[String],
+) -> String {
+    let ids = available
+        .iter()
+        .map(BackendId::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cast = if roles.is_empty() {
+        format!(
+            "No roles are configured: give agents a \"backend\" (one of: {ids}) or neither (the router picks)."
+        )
+    } else {
+        format!(
+            "Prefer \"role\" (one of: {}) for agents; or a \"backend\" (one of: {ids}); never both.",
+            roles.join(", ")
+        )
+    };
+    format!(
+        "=== AGENTPIT BLUEPRINT DESIGNER ===\n\
+You design a BLUEPRINT: a small graph that agentpit runs as a bounded loop. It fixes the\n\
+control flow (order, branches on outcomes, bounded repeats, checks, human gates, budget);\n\
+the work inside each node stays model-driven. You are NOT doing the task.\n\
+\n\
+Output ONE JSON object and NOTHING else (no prose, no markdown fence). Schema:\n\
+{{\n\
+  \"schema\": \"agentpit.blueprint/1\",\n\
+  \"name\": \"<kebab file name>\", \"title\": \"<short label>\", \"description\": \"<when to use it>\",\n\
+  \"inputs\": {{ \"goal\": {{ \"required\": true, \"description\": \"<what the goal is>\" }} }},\n\
+  \"budget\": {{ \"max_steps\": <agent+check attempts, e.g. 12>, \"max_active_secs\": 3600, \"max_parallel\": 1 }},\n\
+  \"policy\": {{ \"on_error\": \"gate\", \"on_budget\": \"gate\" }},\n\
+  \"nodes\": [ ... ], \"edges\": [ ... ]\n\
+}}\n\
+\n\
+NODE KINDS (every node: \"id\" ^[a-z][a-z0-9_-]{{0,31}}$ with no dots, \"kind\", \"title\"):\n\
+- agent: \"task\" (prompt template), \"access\": \"read\"|\"write\", optional \"verdict\": true (the answer\n\
+  must end with VERDICT: PASS|FAIL; FAIL counts as fail), \"retries\": 0-3. {cast}\n\
+- manager: \"task\" — the workflow manager improvises inside this one step (use it only for\n\
+  open-ended work that needs its own decomposition).\n\
+- check: \"command\" (sh -c; exit 0 = ok; NOT a template), optional \"timeout_secs\".\n\
+- gate: \"prompt\" (a question for a person), optional \"options\": [{{\"id\",\"label\",\"outcome\":\"ok\"|\"fail\"}}]\n\
+  (default approve=ok / reject=fail).\n\
+- repeat: \"max_iterations\" 1-20, \"feedback\": \"last\"|\"all\"|\"none\". Children name it in \"parent\".\n\
+  An iteration that ends with a failure no edge handles runs again; a clean one breaks out.\n\
+EDGES: {{\"from\",\"to\",\"on\"}} with on = ok (default) | fail | error | timeout | exhausted (repeat) |\n\
+not_ok | always. Edges join nodes of the same scope. No cycles: loop with a repeat.\n\
+TEMPLATES (tasks, gate prompts): {{{{goal}}}}, {{{{inputs.<name>}}}}, {{{{iteration}}}}, {{{{feedback}}}},\n\
+{{{{instructions}}}}, {{{{nodes.<id>.output}}}}, {{{{nodes.<id>.outcome}}}} — nothing else.\n\
+\n\
+RULES: keep it small (3-8 nodes). Put a check after agents that change code. Put a gate\n\
+before anything irreversible. Budget max_steps must cover the worst case (repeat bodies\n\
+count once per iteration).\n\
+\n\
+EXAMPLE:\n\
+{example}\n\
+\n\
+=== DESCRIPTION ===\n\
+{description}\n",
+        example = BLUEPRINT_EXAMPLE,
+    )
+}
+
+/// The one repair round: the model's own document plus every diagnostic, fix them all.
+fn blueprint_repair_prompt(
+    doc: &serde_json::Value,
+    diagnostics: &[agentpit_events::loops::Diagnostic],
+) -> String {
+    let issues: Vec<String> = diagnostics
+        .iter()
+        .filter(|d| d.severity == agentpit_events::loops::Severity::Error)
+        .map(|d| {
+            if d.path.is_empty() {
+                format!("- {}", d.message)
+            } else {
+                format!("- {}: {}", d.path, d.message)
+            }
+        })
+        .collect();
+    format!(
+        "=== AGENTPIT BLUEPRINT REPAIR ===\n\
+The blueprint below does not validate. Fix EVERY error and output the corrected JSON object\n\
+only (no prose, no fence). Keep everything that is not wrong.\n\
+\n\
+ERRORS:\n{}\n\
+\n\
+BLUEPRINT:\n{}\n",
+        issues.join("\n"),
+        agentpit_events::loops::pretty(doc)
+    )
+}
+
+const BLUEPRINT_EXAMPLE: &str = r#"{"schema":"agentpit.blueprint/1","name":"fix-until-green","title":"Plan, fix until tests pass, sign off",
+ "inputs":{"goal":{"required":true}},"budget":{"max_steps":12,"max_active_secs":7200,"max_parallel":1},
+ "nodes":[{"id":"plan","kind":"agent","title":"Plan","access":"read","task":"Goal: {{goal}}\nWrite a short numbered plan."},
+  {"id":"fix","kind":"repeat","title":"Until tests pass","max_iterations":4,"feedback":"last"},
+  {"id":"implement","kind":"agent","parent":"fix","title":"Implement","task":"Goal: {{goal}}\nPlan:\n{{nodes.plan.output}}\n{{feedback}}\n{{instructions}}"},
+  {"id":"test","kind":"check","parent":"fix","title":"Tests","command":"cargo test -q"},
+  {"id":"signoff","kind":"gate","title":"Sign-off","prompt":"Result: {{nodes.fix.outcome}}. Accept?"}],
+ "edges":[{"from":"plan","to":"fix"},{"from":"implement","to":"test"},{"from":"fix","to":"signoff"},{"from":"fix","to":"signoff","on":"exhausted"}]}"#;
 
 /// Build the designer system-prompt. Teaches the model the JSON schema and PINS the real backend
 /// ids it may choose from, so `manager_backend`/`backends` never name a backend agentpit lacks.
@@ -2009,6 +2376,96 @@ fn toml_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- blueprint designer ----
+
+    fn valid_blueprint_answer() -> String {
+        format!("Here you go:\n```json\n{BLUEPRINT_EXAMPLE}\n```")
+    }
+
+    #[tokio::test]
+    async fn a_valid_blueprint_needs_no_repair() {
+        let mut prompts = Vec::new();
+        let design = design_blueprint(
+            "fix flaky tests",
+            &[BackendId::Claude, BackendId::Codex],
+            &["coder".to_string()],
+            &agentpit_events::loops::ValidateEnv::default(),
+            |p| {
+                prompts.push(p);
+                async { Ok(valid_blueprint_answer()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(design.runnable, "{:?}", design.diagnostics);
+        assert!(!design.repaired);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("one of: coder"), "roles are pinned");
+        assert!(
+            prompts[0].contains("claude, codex"),
+            "backend ids are pinned"
+        );
+        assert!(prompts[0].contains("fix flaky tests"));
+        assert_eq!(design.doc["name"], "fix-until-green");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_go_back_once_and_the_repair_is_kept() {
+        let broken = r#"{"name":"My Loop!","nodes":[{"id":"a","kind":"agent","task":"do {{goal}}"},
+            {"id":"r","kind":"repeat"}],"edges":[{"from":"a","to":"ghost"}],
+            "inputs":{"goal":{"required":true}}}"#;
+        let fixed = r#"{"name":"my-loop","nodes":[{"id":"a","kind":"agent","task":"do {{goal}}"}],
+            "edges":[],"inputs":{"goal":{"required":true}}}"#;
+        let mut prompts: Vec<String> = Vec::new();
+        let design = design_blueprint(
+            "x",
+            &[BackendId::Claude],
+            &[],
+            &agentpit_events::loops::ValidateEnv::default(),
+            |p| {
+                let answer = if prompts.is_empty() { broken } else { fixed };
+                prompts.push(p);
+                async move { Ok(answer.to_string()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(prompts.len(), 2, "exactly one repair round");
+        assert!(prompts[1].contains("REPAIR"));
+        assert!(prompts[1].contains("max_iterations"), "{}", prompts[1]);
+        assert!(
+            prompts[1].contains("\"name\": \"my-loop\""),
+            "the name is made file-safe"
+        );
+        assert!(design.repaired);
+        assert!(design.runnable, "{:?}", design.diagnostics);
+        assert_eq!(design.doc["schema"], "agentpit.blueprint/1");
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_repair_keeps_the_first_proposal_and_its_errors() {
+        let broken = r#"{"name":"x","nodes":[{"id":"r","kind":"repeat"}],"edges":[]}"#;
+        let mut calls = 0;
+        let design = design_blueprint(
+            "x",
+            &[BackendId::Claude],
+            &[],
+            &agentpit_events::loops::ValidateEnv::default(),
+            |_| {
+                calls += 1;
+                let answer = if calls == 1 { broken } else { "sorry, no" };
+                async move { Ok(answer.to_string()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(!design.runnable);
+        assert!(!design.repaired);
+        assert!(!design.diagnostics.is_empty());
+        assert_eq!(design.doc["nodes"][0]["id"], "r");
+    }
 
     #[test]
     fn prompt_includes_agents_goal_grammar_and_synthesis() {
@@ -2729,6 +3186,30 @@ goal\n";
             implicit_manager_candidates(BackendId::Antigravity),
             [BackendId::Claude, BackendId::Codex]
         );
+    }
+
+    #[test]
+    fn a_loop_manager_node_resolves_the_manager_it_will_run() {
+        let mut config = HubConfig::default();
+        config.default.backend = BackendId::Antigravity;
+        // Unconfigured: the first implicit candidate (antigravity cannot manage → claude).
+        assert_eq!(
+            manager_cast(&config, None, None, None, None).unwrap().0,
+            BackendId::Claude
+        );
+        // An explicit backend wins; a model given by the node wins over config.
+        let (b, model, _) =
+            manager_cast(&config, None, Some(BackendId::Codex), Some("o3"), None).unwrap();
+        assert_eq!((b, model.as_deref()), (BackendId::Codex, Some("o3")));
+        // The manager role's backend applies when nothing more explicit is given.
+        config.workflow.roles = role_map(&[("manager", &[BackendId::Codex], None)]);
+        assert_eq!(
+            manager_cast(&config, None, None, None, None).unwrap().0,
+            BackendId::Codex
+        );
+        // A backend that cannot manage, or an unknown workflow type, is an error.
+        assert!(manager_cast(&config, None, Some(BackendId::Opencode), None, None).is_err());
+        assert!(manager_cast(&config, Some("nope"), None, None, None).is_err());
     }
 
     #[test]

@@ -18,7 +18,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::daemon::protocol::{Event, PROTO_VERSION, Request, RequestBody, Response, ResponseData};
+use crate::daemon::protocol::{
+    CODE_UNSUPPORTED, Event, PROTO_VERSION, Request, RequestBody, Response, ResponseData,
+};
 use crate::session::turn_engine::{EngineEvent, TurnEngine, TurnOutcome};
 use crate::session::{SessionRecorder, SharedRecorder, SummaryReason};
 use crate::types::BackendId;
@@ -168,7 +170,7 @@ async fn handle_connection(shared: Arc<WorkerShared>, stream: UnixStream, conn_i
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Err(e) => Some(Response::err(0, format!("bad request: {e}"))),
+            Err(e) => Some(Response::bad_request(&line, e)),
             Ok(req) => handle_request(&shared, req, conn_id, &out_tx).await,
         };
         // `None` = the handler replies through `out_tx` itself later (a running turn).
@@ -499,7 +501,7 @@ async fn handle_sync_request(
 ) -> Response {
     let id = req.id;
     match req.body {
-        RequestBody::Hello { proto } => {
+        RequestBody::Hello { proto, .. } => {
             if proto != PROTO_VERSION {
                 return Response::err(
                     id,
@@ -515,6 +517,7 @@ async fn handle_sync_request(
                     proto: PROTO_VERSION,
                     role: "worker".into(),
                     pid: std::process::id(),
+                    features: vec![],
                 },
             )
         }
@@ -721,9 +724,31 @@ async fn handle_sync_request(
         RequestBody::Create { .. }
         | RequestBody::Ensure { .. }
         | RequestBody::List
-        | RequestBody::StopWorker { .. } => Response::err(
+        | RequestBody::StopWorker { .. }
+        | RequestBody::LoopStart { .. }
+        | RequestBody::LoopEnsure { .. }
+        | RequestBody::LoopList { .. }
+        | RequestBody::LoopStopRunner { .. }
+        | RequestBody::LoopWatch { .. } => Response::err(
             id,
             "this is a WORKER socket; daemon verbs go to daemon.sock (`agentpit daemon status`)",
+        ),
+
+        // Loop-runner verbs reaching a session worker = a socket-path mixup.
+        RequestBody::LoopAttach { .. }
+        | RequestBody::LoopStatus
+        | RequestBody::LoopRead { .. }
+        | RequestBody::LoopOp(_) => Response::err(
+            id,
+            "this is a session WORKER socket; loop verbs go to the loop's socket from `loop_ensure`",
+        ),
+
+        // A newer client's verb: answer it (with the caller's id), never act on it.
+        RequestBody::Unknown => Response::err_code(
+            id,
+            CODE_UNSUPPORTED,
+            "this session worker does not know that request (it predates your agentpit); \
+             run `agentpit daemon stop --all` so the worker restarts on your current version.",
         ),
     }
 }
@@ -1132,6 +1157,8 @@ mod tests {
             1,
             RequestBody::Hello {
                 proto: PROTO_VERSION,
+                features: vec![],
+                client: None,
             },
         )
         .await;
@@ -1143,7 +1170,16 @@ mod tests {
         ));
 
         // wrong protocol version is refused with guidance
-        send_req(&mut w, 2, RequestBody::Hello { proto: 999 }).await;
+        send_req(
+            &mut w,
+            2,
+            RequestBody::Hello {
+                proto: 999,
+                features: vec![],
+                client: None,
+            },
+        )
+        .await;
         let resp: Response = serde_json::from_str(&recv_line(&mut r).await).unwrap();
         assert!(!resp.ok);
         assert!(resp.error.unwrap().contains("agentpit update"));
@@ -1221,6 +1257,56 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serve_task)
             .await
             .expect("serve loop must exit after shutdown");
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    /// A newer client's verb is answered `unsupported` with ITS id, a malformed line is
+    /// answered `bad_request` with the id it did carry (it used to be 0, leaving the caller
+    /// waiting forever), and neither ends the connection.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn unknown_verbs_and_bad_lines_are_answered_with_the_callers_id() {
+        let _env = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = test_shared(tmp.path());
+        let sock = tmp.path().join("w.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let serve_task = tokio::spawn(serve(Arc::clone(&shared), listener));
+        let (mut r, mut w) = client(&sock).await;
+
+        w.write_all(b"{\"id\":5,\"type\":\"teleport\",\"to\":\"x\"}\n")
+            .await
+            .unwrap();
+        let resp: Response = serde_json::from_str(&recv_line(&mut r).await).unwrap();
+        assert_eq!(resp.id, 5);
+        assert!(!resp.ok);
+        assert_eq!(resp.code.as_deref(), Some(CODE_UNSUPPORTED));
+        assert!(
+            resp.error.as_deref().unwrap().contains("daemon stop --all"),
+            "{resp:?}"
+        );
+
+        // `send` without its `text`: a known verb with a malformed body.
+        w.write_all(b"{\"id\":9,\"type\":\"send\"}\n")
+            .await
+            .unwrap();
+        let resp: Response = serde_json::from_str(&recv_line(&mut r).await).unwrap();
+        assert_eq!(resp.id, 9, "{resp:?}");
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.code.as_deref(),
+            Some(crate::daemon::protocol::CODE_BAD_REQUEST)
+        );
+        assert!(!shared.busy.load(Ordering::SeqCst), "no turn may start");
+
+        // The connection keeps serving.
+        send_req(&mut w, 10, RequestBody::Status).await;
+        let resp: Response = serde_json::from_str(&recv_line(&mut r).await).unwrap();
+        assert_eq!(resp.id, 10);
+        assert!(resp.ok, "{resp:?}");
+
+        shared.shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serve_task).await;
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
@@ -1308,6 +1394,8 @@ mod tests {
             1,
             RequestBody::Hello {
                 proto: PROTO_VERSION,
+                features: vec![],
+                client: None,
             },
         )
         .await;

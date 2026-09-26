@@ -49,6 +49,8 @@ use crate::types::BackendId;
 
 /// Agent steps without `timeout_secs`.
 pub const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 30 * 60;
+/// How long a starting runner waits for a lease still held by an exiting one.
+const LEASE_WAIT: Duration = Duration::from_secs(3);
 /// A manager node runs a whole workflow (several dispatches) in its one step.
 pub const DEFAULT_MANAGER_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 /// Check steps without `timeout_secs`.
@@ -99,7 +101,18 @@ pub async fn run_until(
         return Err(anyhow!("{loop_id} is not a loop id"));
     }
     let writer = WriterInfo::current(&env.build);
-    let journal = match LoopJournal::open(&paths.dir, &paths.leases_root, now_ms(), &writer) {
+    // The previous runner may still be on its way out (it parked a moment ago): give its
+    // lease a moment to be released before calling the loop taken.
+    let busy_until = tokio::time::Instant::now() + LEASE_WAIT;
+    let opened = loop {
+        match LoopJournal::open(&paths.dir, &paths.leases_root, now_ms(), &writer) {
+            Err(JournalError::Busy { .. }) if tokio::time::Instant::now() < busy_until => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => break other,
+        }
+    };
+    let journal = match opened {
         Ok(Opened::Writable(j)) => j,
         Ok(Opened::ReadOnly { reason, .. }) => {
             return Err(anyhow!(
@@ -219,9 +232,6 @@ pub async fn run_until(
     // an external stop) die with the process; the next runner recovers their steps.
     drop(listener);
     let _ = std::fs::remove_file(&paths.socket);
-    if runner.exit.is_some() {
-        super::control::remove_runner_if(&me);
-    }
     for e in runner.effects.values() {
         e.cancel.cancel();
     }
@@ -233,6 +243,14 @@ pub async fn run_until(
         }
     })
     .await;
+    // Release the journal's lease BEFORE deregistering: once the record is gone the daemon
+    // may start the next runner at once (a parked loop woken by an answer), and that
+    // runner must find the lease free.
+    let closed = runner.exit.is_some();
+    drop(runner);
+    if closed {
+        super::control::remove_runner_if(&me);
+    }
     result
 }
 

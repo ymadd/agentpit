@@ -20,6 +20,9 @@ use crate::events::{RunKind, RunLink, RunLogger};
 
 /// How long `loop_ensure` waits for a fresh runner to answer.
 const RUNNER_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `loop_ensure` waits for a registered runner that stopped answering to finish
+/// exiting (a parking runner deregisters only after releasing the lease).
+const EXITING_RUNNER_WAIT: Duration = Duration::from_secs(3);
 /// Environment a runner must not inherit: it links its runs explicitly (design §10).
 const SCRUBBED_ENV: &[&str] = &[
     "AGENTPIT_PARENT_RUN_ID",
@@ -465,18 +468,27 @@ pub async fn ensure_runner_with(loop_id: &str, exe: &Path) -> Result<PathBuf, Op
             format!("the journal of {loop_id} is damaged ({issue}); it can only be read"),
         ));
     }
-    // A registered runner that is alive but not answering is wedged: it holds the lease,
-    // so a new one could not start anyway.
-    if let Some(record) = load_runner(loop_id)
+    // A registered runner that is alive but not answering is either on its way out (it
+    // parked or finished a moment ago, and deregisters after releasing the lease) or
+    // wedged. Give the first a moment; the second holds the lease, so a new runner could
+    // not start anyway.
+    let exiting_until = tokio::time::Instant::now() + EXITING_RUNNER_WAIT;
+    while let Some(record) = load_runner(loop_id)
         && record.alive()
     {
-        return Err(op_error(
-            ErrorCode::Unavailable,
-            format!(
-                "the runner of {loop_id} (pid {}) is alive but not answering; stop it with force",
-                record.pid
-            ),
-        ));
+        if probe(&socket).await {
+            return Ok(socket);
+        }
+        if tokio::time::Instant::now() > exiting_until {
+            return Err(op_error(
+                ErrorCode::Unavailable,
+                format!(
+                    "the runner of {loop_id} (pid {}) is alive but not answering; stop it with force",
+                    record.pid
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     remove_runner(loop_id);
 

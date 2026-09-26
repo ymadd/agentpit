@@ -1007,3 +1007,37 @@ async fn a_manager_node_journals_its_manager_and_reports_why_it_could_not_start(
     );
     assert!(h.prompt("lead.a1").starts_with("Goal: ship it"));
 }
+
+#[tokio::test]
+async fn a_runner_waits_briefly_for_the_lease_of_one_on_its_way_out() {
+    let _g = lock_env();
+    let doc = json!({
+        "schema": "agentpit.blueprint/1",
+        "name": "one-gate",
+        "nodes": [{"id": "ok", "kind": "gate", "prompt": "Ship it?"}]
+    });
+    let mut h = Harness::new(doc, &[]);
+    // Another writer still holds the journal (a parked runner still exiting) and lets go
+    // a moment later: the new runner must start, not report the loop as taken.
+    let held = match LoopJournal::open(
+        &h.dir,
+        &h.root.join("leases"),
+        agentpit_events::now_ms(),
+        &WriterInfo::current("exiting"),
+    )
+    .unwrap()
+    {
+        Opened::Writable(j) => j,
+        Opened::ReadOnly { reason, .. } => panic!("{reason}"),
+    };
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drop(held);
+    });
+    h.start();
+    let (mut w, resp) = Watch::attach(h.connect().await, None).await;
+    assert!(resp.ok, "{resp:?}");
+    release.await.unwrap();
+    w.until("the new writer", |s| s.epoch == 3).await;
+    h.crash().await;
+}

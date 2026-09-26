@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::daemon::paths::runtime_dir;
 use crate::events::state_dir;
 
+pub use agentpit_events::loops::{answer_rel, check_log_rel, output_log_rel, prompt_rel};
+
 /// `head.json`: the loop's [`LoopSummary`](agentpit_events::loops::LoopSummary), rewritten
 /// after every commit (never ahead of the journal).
 pub const HEAD_FILE: &str = "head.json";
@@ -22,22 +24,6 @@ pub fn loop_socket_path(loop_id: &str) -> Option<PathBuf> {
 /// Durable runner records (`<loop_id>.json`), like `daemon/workers`.
 pub fn runners_dir() -> PathBuf {
     state_dir().join("daemon").join("loops")
-}
-
-pub fn prompt_rel(step_id: &str) -> String {
-    format!("prompts/{step_id}.md")
-}
-
-pub fn output_log_rel(step_id: &str) -> String {
-    format!("outputs/{step_id}.log")
-}
-
-pub fn answer_rel(step_id: &str) -> String {
-    format!("outputs/{step_id}.md")
-}
-
-pub fn check_log_rel(step_id: &str) -> String {
-    format!("checks/{step_id}.log")
 }
 
 pub fn head_path(loop_dir: &Path) -> PathBuf {

@@ -36,7 +36,7 @@ use super::classify::{Admission, OpPlan, admit_op, op_error, rejection_error};
 use super::effects::{
     AgentJob, CheckJob, EffectMsg, EffectTx, StepDone, run_agent, run_check, write_blob,
 };
-use super::paths::{answer_rel, check_log_rel, head_path, output_log_rel, prompt_rel};
+use super::paths::head_path;
 use super::prompt::{agent_prompt, gate_prompt};
 use super::records::{GatePrep, Prep, decision_events, start_events};
 use super::sched::{self, Decision, StartPlan};
@@ -56,8 +56,6 @@ const OUT_CAPACITY: usize = 4096;
 const HEARTBEAT: Duration = Duration::from_secs(15);
 /// Longest request line accepted.
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
-const READ_DEFAULT_BYTES: u64 = 64 * 1024;
-const READ_MAX_BYTES: u64 = 1024 * 1024;
 /// Scheduler rounds per input: far above any real fan-out, a guard against a livelock bug.
 const MAX_ROUNDS: usize = 10_000;
 
@@ -1184,14 +1182,8 @@ impl Runner {
                 format!("{step_id} is not a step of this loop"),
             );
         }
-        let rel = match what {
-            LoopFile::Prompt => prompt_rel(step_id),
-            LoopFile::Output => output_log_rel(step_id),
-            LoopFile::Answer => answer_rel(step_id),
-            LoopFile::CheckLog => check_log_rel(step_id),
-            LoopFile::Unknown => {
-                return Response::err_code(id, CODE_UNSUPPORTED, "unknown file kind");
-            }
+        let Some(rel) = step_file_rel(what, step_id) else {
+            return Response::err_code(id, CODE_UNSUPPORTED, "unknown file kind");
         };
         match read_range(
             &self.dir.join(rel),
@@ -1361,47 +1353,12 @@ fn instruction_texts<'a>(state: &'a LoopState, plan: &StartPlan) -> Vec<&'a str>
 }
 
 fn read_range(path: &Path, offset: u64, max: u64) -> std::io::Result<ResponseData> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ResponseData::LoopBytes {
-                offset,
-                next_offset: offset,
-                size: 0,
-                text: String::new(),
-            });
-        }
-        Err(e) => return Err(e),
-    };
-    let size = f.metadata()?.len();
-    let mut start = offset.min(size);
-    f.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::new();
-    f.take(max).read_to_end(&mut buf)?;
-    // Page on character boundaries: skip the tail of a character cut by `offset`, and stop
-    // before one cut by `max` (the next page starts with it).
-    let lead = buf
-        .iter()
-        .take(3)
-        .take_while(|b| (**b & 0xC0) == 0x80)
-        .count();
-    if start > 0 && lead > 0 {
-        buf.drain(..lead);
-        start += lead as u64;
-    }
-    if let Err(e) = std::str::from_utf8(&buf)
-        && e.error_len().is_none()
-        && e.valid_up_to() > 0
-        && start + (buf.len() as u64) < size
-    {
-        buf.truncate(e.valid_up_to());
-    }
+    let page = read_page(path, offset, max)?;
     Ok(ResponseData::LoopBytes {
-        offset: start,
-        next_offset: start + buf.len() as u64,
-        size,
-        text: String::from_utf8_lossy(&buf).into_owned(),
+        offset: page.offset,
+        next_offset: page.next_offset,
+        size: page.size,
+        text: page.text,
     })
 }
 

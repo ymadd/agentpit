@@ -4,6 +4,7 @@
 mod app_update;
 mod arena;
 mod asks;
+mod bridge;
 mod cli_link;
 mod cli_runner;
 mod cli_versions;
@@ -255,6 +256,27 @@ fn extract_marked_path(stdout: &str) -> Option<&str> {
     (!path.is_empty()).then_some(path)
 }
 
+/// The loop bridge's way out: webview events, and the bundled CLI to start the daemon.
+struct TauriHost(AppHandle);
+
+impl bridge::Host for TauriHost {
+    fn emit(&self, event: &str, payload: serde_json::Value) {
+        let _ = self.0.emit(event, payload);
+    }
+
+    fn start_daemon(&self) -> bridge::BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let args = ["daemon".to_string(), "start".to_string()];
+            let output = cli_runner::run(&self.0, &args, None).await?;
+            if output.success {
+                Ok(())
+            } else {
+                Err(output.failure_message("agentpit daemon start"))
+            }
+        })
+    }
+}
+
 fn main() {
     #[cfg(unix)]
     adopt_login_shell_path();
@@ -291,10 +313,28 @@ fn main() {
             app_update::app_update_install,
             app_update::app_restart,
             workflow_gen::workflow_generate,
-            workflow_gen::workflow_describe
+            workflow_gen::workflow_describe,
+            bridge::loops_board,
+            bridge::daemon_status,
+            bridge::loop_open,
+            bridge::loop_close,
+            bridge::loop_start,
+            bridge::loop_control,
+            bridge::gate_resolve,
+            bridge::step_output,
+            bridge::blueprints_list,
+            bridge::blueprint_get,
+            bridge::blueprint_save,
+            bridge::blueprint_delete,
+            bridge::blueprint_validate
         ])
         .setup(|app| {
             spawn_watcher(app.handle().clone());
+            let host = std::sync::Arc::new(TauriHost(app.handle().clone()));
+            app.manage(bridge::BridgeState(bridge::Bridge::new(
+                host,
+                bridge::Paths::from_env(),
+            )));
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -340,6 +340,24 @@ fn known_backends() -> Vec<String> {
         .collect()
 }
 
+/// Role and backend names blueprint validation checks against (warnings only). Mirrors the
+/// CLI's `loops::control::validate_env` so the Studio shows the same diagnostics as
+/// `agentpit loop validate`: every configured role except the reserved manager.
+pub(crate) fn blueprint_validate_env() -> agentpit_events::loops::ValidateEnv {
+    let payload = settings_get_at(&config_path());
+    agentpit_events::loops::ValidateEnv {
+        roles: Some(
+            payload
+                .roles
+                .into_iter()
+                .map(|r| r.name)
+                .filter(|n| n != "manager")
+                .collect(),
+        ),
+        backends: Some(known_backends().into_iter().collect()),
+    }
+}
+
 /// Workflow type names the CLI claims as `agentpit workflow` subcommands (`new` launches the
 /// generator, `list` prints the catalog), so a `[workflow.types.*]` cannot use them. Shipped to
 /// the UI in the payload so its client-side validator can never drift from this gate.

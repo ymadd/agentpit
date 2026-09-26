@@ -17,6 +17,7 @@
 //! read-only for this build; fields are only ever added, as optional.
 
 pub mod blueprint;
+pub mod files;
 pub mod journal;
 pub mod ops;
 pub mod record;
@@ -29,6 +30,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use blueprint::*;
+pub use files::*;
 pub use journal::*;
 pub use ops::*;
 pub use record::*;

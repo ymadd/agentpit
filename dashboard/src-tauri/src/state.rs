@@ -212,6 +212,7 @@ impl Tracker {
                 parent_run_id,
                 depth,
                 role,
+                ..
             } => {
                 let run = self.ensure(&run_id);
                 run.pid = pid;

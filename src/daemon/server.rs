@@ -19,7 +19,8 @@ use crate::daemon::paths::{
     daemon_owner_path, daemon_socket_path, ensure_runtime_dir, worker_socket_path, workers_dir,
 };
 use crate::daemon::protocol::{
-    CODE_UNSUPPORTED, PROTO_VERSION, Request, RequestBody, Response, ResponseData, SessionRow,
+    CODE_UNSUPPORTED, FEATURE_LOOPS, PROTO_VERSION, Request, RequestBody, Response, ResponseData,
+    SessionRow,
 };
 use crate::daemon::registry::{self, OwnerRecord, WorkerRecord};
 use crate::session::list_all;
@@ -165,7 +166,9 @@ async fn handle_connection(stream: UnixStream, shutdown: tokio_util::sync::Cance
 async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationToken) -> Response {
     let id = req.id;
     match req.body {
-        RequestBody::Hello { proto, .. } => {
+        RequestBody::Hello {
+            proto, features, ..
+        } => {
             if proto != PROTO_VERSION {
                 return Response::err(
                     id,
@@ -181,9 +184,76 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
                     proto: PROTO_VERSION,
                     role: "daemon".into(),
                     pid: std::process::id(),
-                    features: vec![],
+                    // Offered to clients that negotiate; an older client's bare hello gets
+                    // the bytes it always did.
+                    features: if features.is_empty() {
+                        vec![]
+                    } else {
+                        daemon_features()
+                    },
                 },
             )
+        }
+
+        RequestBody::LoopStart {
+            op_id,
+            blueprint,
+            inputs,
+            cwd,
+            title,
+            start,
+            origin,
+        } => {
+            let req = crate::loops::control::StartRequest {
+                op_id,
+                blueprint,
+                inputs,
+                cwd,
+                title,
+                start,
+                origin,
+            };
+            match crate::loops::control::start_loop(req).await {
+                Ok((loop_id, socket, duplicate)) => Response::ok(
+                    id,
+                    ResponseData::LoopStarted {
+                        loop_id,
+                        socket: socket.map(|s| s.display().to_string()),
+                        duplicate,
+                    },
+                ),
+                Err(e) => loop_error(id, e),
+            }
+        }
+
+        RequestBody::LoopEnsure { loop_id } => {
+            match crate::loops::control::ensure_runner(&loop_id).await {
+                Ok(socket) => Response::ok(
+                    id,
+                    ResponseData::LoopRunner {
+                        loop_id,
+                        socket: socket.display().to_string(),
+                    },
+                ),
+                Err(e) => loop_error(id, e),
+            }
+        }
+
+        RequestBody::LoopList {
+            include_terminal,
+            limit,
+        } => Response::ok(
+            id,
+            ResponseData::Loops {
+                loops: crate::loops::control::list_loops(include_terminal, limit),
+            },
+        ),
+
+        RequestBody::LoopStopRunner { loop_id, force } => {
+            match crate::loops::control::stop_runner(&loop_id, force).await {
+                Ok(note) => Response::ok(id, ResponseData::Lines { lines: vec![note] }),
+                Err(e) => loop_error(id, e),
+            }
         }
 
         RequestBody::Create { cwd } => {
@@ -333,6 +403,24 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
             id,
             "this is the DAEMON socket; session verbs go to the worker socket returned by `ensure`",
         ),
+    }
+}
+
+/// Capabilities the daemon offers in `hello` (design §11).
+pub fn daemon_features() -> Vec<String> {
+    let mut f = vec![FEATURE_LOOPS.to_string()];
+    for kind in ["agent", "check", "gate", "repeat"] {
+        f.push(format!("bp.node.{kind}"));
+    }
+    f.push("bp.workspace.in_place".into());
+    f
+}
+
+fn loop_error(id: u64, e: agentpit_events::loops::OpError) -> Response {
+    let resp = Response::err_code(id, e.code.as_str(), e.message);
+    match e.details {
+        Some(d) => resp.with_details(d),
+        None => resp,
     }
 }
 
@@ -503,7 +591,7 @@ fn force_kill_worker(record: &registry::WorkerRecord) -> String {
 /// refused (or failed to answer) a graceful shutdown — so SIGKILL, not SIGTERM, is what
 /// "force" must mean (M10): a worker ignoring TERM would otherwise survive a "forced"
 /// stop that reported success.
-fn kill_pid(pid: u32) -> Result<()> {
+pub(crate) fn kill_pid(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
         let status = std::process::Command::new("kill")

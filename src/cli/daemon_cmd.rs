@@ -33,6 +33,14 @@ pub enum Action {
         #[arg(long)]
         socket: String,
     },
+    /// Run a blueprint loop's runner (spawned by the daemon; never run by hand).
+    #[command(hide = true)]
+    Loop {
+        #[arg(long = "loop")]
+        loop_id: String,
+        #[arg(long)]
+        socket: String,
+    },
 }
 
 pub async fn run(action: Action) -> Result<()> {
@@ -133,6 +141,10 @@ pub async fn run(action: Action) -> Result<()> {
 
         Action::Worker { session, socket } => {
             crate::daemon::worker::run_worker(session, socket.into()).await
+        }
+
+        Action::Loop { loop_id, socket } => {
+            crate::loops::runner::run_from_cli(&loop_id, std::path::Path::new(&socket)).await
         }
     }
 }

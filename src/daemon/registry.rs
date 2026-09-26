@@ -20,31 +20,41 @@ pub struct WorkerRecord {
     pub socket: String,
 }
 
+/// True when `pid` is alive AND is still the incarnation `start_id` names. Fails OPEN on
+/// identity uncertainty (empty stored/current start id) — right for sweeping and display,
+/// where wrongly declaring a live process dead is the worse error.
+pub fn process_alive(pid: u32, start_id: &str) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    if start_id.is_empty() {
+        return true;
+    }
+    let current = process_start_id(pid);
+    current.is_empty() || current == start_id
+}
+
+/// Strict identity for destructive actions: true only when the process is PROVABLY the
+/// incarnation `start_id` names. Fails CLOSED on uncertainty — after pid reuse or a
+/// transient start-id read failure, a SIGKILL aimed at a long-dead process must not land
+/// on whatever unrelated process wears its pid now.
+pub fn process_same_incarnation(pid: u32, start_id: &str) -> bool {
+    if !pid_alive(pid) || start_id.is_empty() {
+        return false;
+    }
+    let current = process_start_id(pid);
+    !current.is_empty() && current == start_id
+}
+
 impl WorkerRecord {
-    /// True when the recorded pid is alive AND is still the same incarnation. Fails OPEN
-    /// on identity uncertainty (empty stored/current start id) — right for sweeping and
-    /// display, where wrongly declaring a live worker dead is the worse error.
+    /// See [`process_alive`].
     pub fn alive(&self) -> bool {
-        if !pid_alive(self.pid) {
-            return false;
-        }
-        if self.start_id.is_empty() {
-            return true;
-        }
-        let current = process_start_id(self.pid);
-        current.is_empty() || current == self.start_id
+        process_alive(self.pid, &self.start_id)
     }
 
-    /// Strict identity for destructive actions: true only when the process is PROVABLY the
-    /// incarnation this record described. Fails CLOSED on uncertainty — after pid reuse or
-    /// a transient start-id read failure, a SIGKILL aimed at a long-dead worker must not
-    /// land on whatever unrelated process wears its pid now.
+    /// See [`process_same_incarnation`].
     pub fn same_incarnation(&self) -> bool {
-        if !pid_alive(self.pid) || self.start_id.is_empty() {
-            return false;
-        }
-        let current = process_start_id(self.pid);
-        !current.is_empty() && current == self.start_id
+        process_same_incarnation(self.pid, &self.start_id)
     }
 }
 

@@ -5,8 +5,17 @@
 //! holds what only the runner needs: the scheduler that decides the next record, and the
 //! translation of its decisions into records.
 
+pub mod classify;
+pub mod control;
+pub mod effects;
+pub mod paths;
+pub mod proc;
+pub mod prompt;
 pub mod records;
+pub mod runner;
 pub mod sched;
 
+#[cfg(test)]
+mod runner_tests;
 #[cfg(test)]
 mod sim;

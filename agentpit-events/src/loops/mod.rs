@@ -359,6 +359,12 @@ pub fn loop_id_from_op(op_id: &str) -> Option<String> {
     Some(format!("lp-{hex}"))
 }
 
+/// A fresh operation id: a UUIDv7 (time-sortable, canonical form, so it may also name a
+/// loop via [`loop_id_from_op`]).
+pub fn new_op_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
 /// Client-chosen idempotency key: 8..=64 bytes of `[A-Za-z0-9._-]`. UUIDv7 recommended.
 pub fn is_valid_op_id(s: &str) -> bool {
     (8..=64).contains(&s.len()) && crate::is_safe_log_component(s)

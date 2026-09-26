@@ -21,6 +21,7 @@ pub mod guidance;
 pub mod init;
 pub mod learning;
 pub mod login;
+pub mod loop_cmd;
 pub mod mcp_cmd;
 pub mod menu;
 pub mod note;
@@ -347,6 +348,13 @@ pub enum Command {
         session: Option<String>,
     },
 
+    /// Blueprint loops: start, watch and steer designed agent loops (plan → implement ⇄
+    /// check → sign-off), each run by its own background runner.
+    Loop {
+        #[command(subcommand)]
+        action: loop_cmd::Action,
+    },
+
     /// Manage the background daemon that keeps sessions running while detached.
     Daemon {
         #[command(subcommand)]
@@ -640,6 +648,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Sessions { action } => sessions::run(action).await,
 
         Command::Attach { session } => attach::run(session).await,
+
+        Command::Loop { action } => loop_cmd::run(action).await,
 
         Command::Daemon { action } => daemon_cmd::run(action).await,
 

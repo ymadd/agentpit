@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::paths::{answer_rel, check_log_rel, output_log_rel};
-use super::proc::{signal_group, terminate_group};
+use super::proc::{group_alive, signal_group};
 use super::prompt::{excerpt, file_tail, parse_verdict};
 use crate::dispatch::{Registries, dispatch_continuing};
 use crate::effort::Effort;
@@ -72,13 +72,15 @@ impl StepDone {
 }
 
 /// What an effect tells the runner.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub enum EffectMsg {
-    /// A check's process group (for killing orphans after a runner crash).
+    /// A check's process group (for killing orphans after a runner crash). The check is
+    /// held until `ack` fires, which the runner does once `step_spawned` is durable.
     Spawned {
         step_id: String,
         pid: u32,
         start_id: String,
+        ack: tokio::sync::oneshot::Sender<()>,
     },
     /// Live agent output; `offset` is where `text` starts in `outputs/<step>.log`.
     Chunk {
@@ -214,8 +216,11 @@ pub async fn run_agent(job: AgentJob, cancel: CancellationToken, tx: EffectTx) -
         r = &mut fut => (r, false),
         _ = tokio::time::sleep(limit) => {
             // Let the dispatch wind its process down (interrupt, then kill) before reporting.
+            // A deadline that passes while a cancel is already winding it down is not a
+            // timeout: the cancel is what ended it.
+            let by_cancel = cancel.is_cancelled();
             token.cancel();
-            (fut.await, true)
+            (fut.await, !by_cancel)
         }
     };
     let mut done = StepDone {
@@ -224,6 +229,10 @@ pub async fn run_agent(job: AgentJob, cancel: CancellationToken, tx: EffectTx) -
     };
 
     let (done, leg, error) = match result {
+        _ if cancel.is_cancelled() && !timed_out => {
+            done.outcome = Outcome::Cancelled;
+            (done, LegStatus::Skipped, None)
+        }
         _ if timed_out => {
             let msg = format!(
                 "{} did not finish within its {}s deadline",
@@ -242,7 +251,9 @@ pub async fn run_agent(job: AgentJob, cancel: CancellationToken, tx: EffectTx) -
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            let outcome = if msg.contains("timed out") {
+            // Only the dispatch's own cap is a timeout; an agent's output that merely
+            // mentions one ("connection timed out") is an error.
+            let outcome = if msg.contains("dispatch timed out after") {
                 Outcome::Timeout
             } else {
                 Outcome::Error
@@ -374,13 +385,19 @@ pub async fn run_check(job: CheckJob, cancel: CancellationToken, tx: EffectTx) -
             );
         }
     };
+    // The command waits for one line on stdin before it runs: the runner releases it only
+    // after `step_spawned` (its process group) is durable, so a runner crash in between
+    // leaves nothing the next runner cannot find. If the runner dies first, stdin closes
+    // and the command never runs. After the release stdin is at EOF, like /dev/null.
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
+        .arg(r#"read -r _ || exit 125; exec sh -c "$1""#)
+        .arg("agentpit-check")
         .arg(&job.command)
         .current_dir(&job.cwd)
         .env("AGENTPIT_LOOP_ID", &job.loop_id)
         .env("AGENTPIT_STEP_ID", &job.step_id)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true);
@@ -397,12 +414,42 @@ pub async fn run_check(job: CheckJob, cancel: CancellationToken, tx: EffectTx) -
         }
     };
     let pid = child.id().unwrap_or(0);
-    if pid > 0 {
+    let stdin = child.stdin.take();
+    let released = if pid > 0 {
+        let (ack, acked) = tokio::sync::oneshot::channel();
         let _ = tx.send(EffectMsg::Spawned {
             step_id: job.step_id.clone(),
             pid,
             start_id: agentpit_events::session_lease::process_start_id(pid),
+            ack,
         });
+        tokio::select! {
+            r = acked => r.is_ok(),
+            _ = cancel.cancelled() => false,
+        }
+    } else {
+        true
+    };
+    if !released {
+        signal_group(pid, 9);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return if cancel.is_cancelled() {
+            StepDone {
+                outcome: Outcome::Cancelled,
+                ..done
+            }
+        } else {
+            done.failed(
+                &job.node,
+                Outcome::Error,
+                "the runner could not record the check's process; retry the step".into(),
+            )
+        };
+    }
+    if let Some(mut stdin) = stdin {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(b"\n").await;
     }
     let limit = remaining(job.deadline_ms);
     enum End {
@@ -421,9 +468,21 @@ pub async fn run_check(job: CheckJob, cancel: CancellationToken, tx: EffectTx) -
             signal_group(pid, 9);
         }
         End::TimedOut | End::Cancelled => {
-            terminate_group(pid, Duration::from_secs(2)).await;
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            // TERM the group, reaping the leader while waiting: an unreaped leader is a
+            // zombie that keeps the group "alive" for the whole grace period.
+            signal_group(pid, 15);
+            let graceful = tokio::time::timeout(Duration::from_secs(2), async {
+                let _ = child.wait().await;
+                while group_alive(pid) {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await;
+            if graceful.is_err() {
+                signal_group(pid, 9);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
         }
     }
     let tail = file_tail(&log_path, LOG_TAIL_BYTES).filter(|t| !t.trim().is_empty());

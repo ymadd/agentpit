@@ -12,8 +12,8 @@
 > - 新しい UI シェル（**オーナー決定 2026-09-25**。既存の Tauri アプリを拡張する）
 > - 汎用ワークフロー言語（式言語・任意サイクル・実行中のノード生成）
 > - `agentpit workflow`（manager 経路）の置き換え。manager 経路はそのまま残す
-> **ステータス: P1（スキーマ実装）完了（2026-09-25）。§14 の原則改訂はオーナー承認済み（Q1、2026-09-26）。P2 着手**。
-> 実装: `agentpit-events/src/loops/`（`mod.rs` `blueprint.rs` `record.rs` `state.rs` `ops.rs` `journal.rs`）、固定テスト `agentpit-events/tests/loops_golden.rs` と `tests/fixtures/loops/`。
+> **ステータス: P1（スキーマ実装）完了（2026-09-25）。§14 の原則改訂はオーナー承認済み（Q1、2026-09-26）。P2（デーモンの窓口）実装済み（2026-09-26、§17 P2 の「実装メモ」）**。
+> 実装: `agentpit-events/src/loops/`（`mod.rs` `blueprint.rs` `record.rs` `state.rs` `ops.rs` `journal.rs`）、固定テスト `agentpit-events/tests/loops_golden.rs` と `tests/fixtures/loops/`。P2: `agentpit-events/src/wire.rs`、`src/loops/`（`sched.rs` `records.rs` `runner.rs` `effects.rs` `classify.rs` `prompt.rs` `proc.rs` `control.rs` `paths.rs`）、`src/cli/loop_cmd.rs`、`tests/loop_e2e.rs`。
 > **根拠**:
 > - agentpit 現状調査（2026-09-25、9 サブシステムのコード読解。主要主張 14 点は file:line で再検証済み）
 > - 独立 4 設計案（耐久性優先／UI 優先／ループ意味論優先／相互運用優先）と 3 審査、統合案への 3 方向の敵対的検証
@@ -450,9 +450,11 @@ git: refs/agentpit/loops/<id>/{base,landed,head}   （P4。gc から保護し、
 ### 9.4 クラッシュ回復（ランナーの起動時。P2）
 
 1. リースを取る（Busy なら、生きているランナーがいるので終了する）。
-2. スキャンして fold する。書けないなら read-only で配信する（ファイルには触れない）。
+2. スキャンして fold する。書けないなら read-only で配信する（ファイルには触れない）。**P2 の実装**: ランナーは書けないジャーナルを開かずに終了し、デーモンの `loop_ensure` が `read_only`（壊れた行・新しい版の記録・理解できない凍結ブループリント）を返す。クライアント（CLI、P3 のブリッジ）は同じ fold でディスクから直接表示する。
 3. `writer_opened{epoch+1, truncated_tail_bytes}` を書く（このとき末尾を切り詰める）。計算時間は、旧ライターの最後のレコードまでで数える（クラッシュの空白は数えない）。
 4. **孤児を始末する**: `orphaned_steps()` の各ステップについて、`step_spawned` の pid/start_id が同じ実体なら SIGTERM を送り、2 秒後に SIGKILL を送る。
+   - **P2 の実装**: 始末はプロセス**グループ**単位。check は自分のグループで走り、agent はランナー自身のグループ（ランナーはグループリーダー）で走るので、agent の孤児は旧ランナーの `writer_opened.pid` のグループとして始末する。リーダーが生きていて start_id が違う（pid の再利用）なら触らない。自分のグループは決して触らない。
+   - **check の起動は `step_spawned` の fsync を待つ**: check のシェルは stdin の1行を待ってから本体を実行し、ランナーは `step_spawned` を書いてからその1行を送る。ランナーがその前に死ねば stdin が閉じて本体は走らない。したがって、始末できない check の孤児は生まれない（§4.3 規則 8 の強化）。
 5. マトリクスに従って処理する:
 
 | 対象 | in_place | worktree（P4） |
@@ -644,8 +646,25 @@ git: refs/agentpit/loops/<id>/{base,landed,head}   （P4。gc から保護し、
   - (b) **テレメトリの明示リンク**: `RunLogger::start_linked`、`RunStarted.loop_ref`（dashboard の state.rs:205 に `..` を追加）。
   - (c) **ランナー**: actor と、純関数で重点的にテストする `sched::next`。ノードは agent（role/backend/ルータ、プロンプトのレンダと blob 化、verdict）、check（統合 verify）、gate（期限つき）、repeat。in_place のみ。予算、回復マトリクス、孤児の kill、op の分類（§7 の表）。attach（ディスクからの再生、read-your-writes、有界チャネル）、chunk の offset、head.json、env の除去。
   - (d) **デーモン verb と CLI**: `loop_start`（ブループリントの解決・検証・凍結・claim、ループごとの ensure mutex）、`loop_ensure`、`loop_list`、`loop_stop_runner`。CLI は `agentpit loop start|ls|show|watch|op|gate|validate`。
-  - (e) 任意: asks ミラー。
+  - (e) 任意: asks ミラー。**P2 では見送り**（Q4。P3 の受信箱で扱う）。
 - **除外**: worktree と提案、manager/ensemble/arena ノード、watch、ブループリントの CRUD、待機中ループの退避、Tauri。
+- **実装メモ（2026-09-26。設計から確定・変更した点）**:
+  - **CLI**: `agentpit loop start|ls|show|watch|pause|resume|stop|gate|instruct|cancel-step|budget|validate`（汎用の `op` の代わりに操作ごとの動詞）。ループ id は一意な前方一致・後方一致で指定できる。`--no-start` で作ったループは `resume` で開始する。全要求にタイムアウトを付ける（attach 後のストリームを除く）。
+  - **機能交渉**: デーモンは `features` を送ってきたクライアントにだけ `loops/1` などを返す（旧クライアントへの hello はバイト単位で不変）。CLI は `loops/1` がなければ古いデーモンだと告げて止まる。ランナーの hello は `role: "loop"`。
+  - **終端したループ**: ランナーは終端すると `writer_closed{terminal}` を書いて終了し、ルート run を閉じる。`loop_ensure` は終端したループを `gone` で返し（ライターとして開き直さない、§9.6）、CLI の show/watch はディスクから読む。同じ op_id の `loop_start` が終端済みのループに当たれば `duplicate` で socket なし。
+  - **ランナーの登録**: ランナー自身が bind 後に `daemon/loops/<id>.json` を書き、正常終了時に消す（デーモンが途中で落ちても登録が欠けない）。`loop_stop_runner{force}` はランナーのプロセスグループ（agent を含む）と、ジャーナルに記録された check のグループを kill する。
+  - **`loop_start`**: 同じループ id の作成はループごとの mutex で直列化する（同時の再送は `duplicate`）。ルート run の id は先に採番して `loop_created` に入れ、`RunStarted` は作成に成功してから出す（`RunLink::run_id`）。パス指定のブループリントは通常ファイルだけを上限つきで読む。
+  - **スケジューラ（レビューで確定）**:
+    - 自動リトライの回数は、そのインスタンスの error/timeout で終わった試行だけで数える（一時停止・回復・指示による再実行は数えない）。
+    - 中断した agent は access に関係なく recovery ゲート（read の agent もツールで副作用を持ちうる）。check だけが自動で再試行する（§9.4 の表どおり）。
+    - 計算時間は実行中の区間を含めて数える（`LoopState::active_ms_at(now)`）。並列の計算が途切れなくても `max_active_secs` が効く。
+    - 予算ゲートは、予算が足りるようになった（`set_budget`）か、トップレベルが終わろうとしている時点で `gate_cancelled{superseded}` にする（開いたままだと `loop_finished` が admit されない）。
+    - 上限（`HARD_MAX_*`）に達して `extend` が効かないときは、ゲートを開かず `on_budget: fail` と同じく停止して `failed/budget` で終える。
+    - `loop_stop_requested.reason = "budget"` はスケジューラ専用。人が同じ文字列で止めた場合は `"budget (stopped by a person)"` に書き換える（`cancelled/stopped` で終わる）。
+  - **プロンプト**: 入れ子の repeat の中の agent には、外側から内側までの全イテレーションのフィードバックを渡す（内側の1周目が空でも、外側のレビュー指摘が届く）。リトライ（retry_of の連鎖）は前の試行が消費した指示を引き継ぐ（§8.2）。`prompts/<step>.md` は既存の秘密情報マスク（`exec::redact_secrets`）を通して保存し、agent には元の文面を送る。VERDICT 行は Markdown の装飾（`**VERDICT:** PASS` など）を無視して読む。
+  - **配信**: 1つのバッチの途中で送れなくなった接続には、それ以降のレコードを送らない（欠番を作らない）。chunk・heartbeat は接続キューに 1/4 の余裕があるときだけ送る。`loop_read` は文字の途中で切らない。
+  - **受け入れ基準の対応**: 1・2・4・5・7 は `src/loops/runner_tests.rs`（偽の exec + 実 UDS）、3 は同ファイルの in-process 版と `tests/loop_e2e.rs`（実バイナリで runner を kill -9、check の孤児が始末され自動で再試行される）、6 は `src/daemon/server.rs` と `wire.rs` のテスト、8 は CI。基準 5 の「1k レコード」は 60 件の連続 commit 中の attach で確認している。
+  - **敵対的レビュー**: 4 観点（スケジューラ・ランナー・回復とデーモン・操作と CLI）で 37 件、懐疑的検証で 35 件を確認し、すべて修正した（上記の各項目と回帰テスト）。
 - **受け入れ基準**（実際の UDS と偽の ExecAdapter で。worker.rs の EchoExec/SlowExec の手法）:
   1. plan → repeat{implement → check（1回目は失敗、2回目で成功）} → gate が、2周目で break → waiting → CLI で承認 → succeeded になる。2周目のプロンプトに check の末尾がフィードバックとして入っている。
   2. events.jsonl に Workflow のルート（`role:"loop:fix-until-green"`）と、`parent_run_id` = ルートの子 run がある。
@@ -719,8 +738,8 @@ git: refs/agentpit/loops/<id>/{base,landed,head}   （P4。gc から保護し、
 - **Q1（原則の改訂）**: §14 の 3 件（静的DAG／CAST／Conductor）を、オーナーの決定として日付付きで `agent-hub-design.md` に追記してよいか。**決定（2026-09-26）: 承認**。追記済み。
 - **Q2（ブループリントの形式と置き場）**: JSON。プロジェクト `.agentpit/blueprints/` とユーザ `~/.config/agentpit/blueprints/` の両方、名前が衝突したらプロジェクトを優先。TOML は将来の import/export。**提案: この形**。
 - **Q3（学習ラベル）**: task_hash はレンダ済みプロンプト全体から取り（反復で変わる）、OutcomeNoted は人間の明示的な判定のときだけ出す。**提案: この保守的な形**。
-- **Q4（ゲートの asks ミラー）**: 既存のコックピットからも答えられるよう、既定で on にするか。**提案: on**。
-- **Q5（in_place の中断時の方針）**: recovery ゲートを出し、自動では再実行しない。**提案: この形**。
+- **Q4（ゲートの asks ミラー）**: 既存のコックピットからも答えられるよう、既定で on にするか。**提案: on**。P2 では未実装（P3 の受信箱と合わせて決める）。
+- **Q5（in_place の中断時の方針）**: recovery ゲートを出し、自動では再実行しない。**提案: この形**。P2 で実装（agent は access に関係なくゲート、check は自動で再試行）。
 - **Q6（既定のワークスペース）**: キーを省略したときの既定は、互換のため in_place で固定する。P4 以降、AI 設計器と `builtin:edit` は worktree を明示する。スナップショットには未コミット・未追跡を含める。**提案: はい**。
 - **Q7（着地の意味）**: 作業ツリーだけを書き換え、index とコミットには触れない（コミットはユーザが行う）。**提案: はい**。stage/commit モードは将来。
 - **Q8（待機中ランナーの常駐）**: P2 では非終端のランナーを常駐させる。P3 で waiting/paused を退避し、スイーパが期限で起こす。**提案: この段階導入**。

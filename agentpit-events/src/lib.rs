@@ -672,7 +672,8 @@ fn process_nonce() -> u128 {
 }
 
 /// Generate a globally-unique run id: `<pid>-<process-nonce>-<monotonic-counter>`.
-fn next_run_id() -> String {
+/// Public so a caller can name a run before starting it ([`RunLink::run_id`]).
+pub fn next_run_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}-{}-{}", process::id(), process_nonce(), n)
@@ -698,6 +699,9 @@ pub struct RunLink<'a> {
     pub depth: u32,
     /// The blueprint loop the run belongs to.
     pub loop_ref: Option<&'a str>,
+    /// Use this id (from [`next_run_id`]) instead of a fresh one — for a run whose id must
+    /// be recorded elsewhere before the run is announced.
+    pub run_id: Option<&'a str>,
 }
 
 /// Best-effort emitter scoped to a single run. Cheap to clone (shares the run id).
@@ -751,6 +755,7 @@ impl RunLogger {
                 parent_run_id: parent_run_id.as_deref(),
                 depth,
                 loop_ref: None,
+                run_id: None,
             },
         )
     }
@@ -773,7 +778,7 @@ impl RunLogger {
             compact_events_log(COMPACT_THRESHOLD_BYTES, COMPACT_KEEP_RUNS);
         }
         let logger = RunLogger {
-            run_id: next_run_id(),
+            run_id: link.run_id.map_or_else(next_run_id, str::to_string),
             enabled,
         };
         logger.emit(Event::RunStarted {
@@ -1269,6 +1274,7 @@ mod tests {
                 parent_run_id: Some("r-root"),
                 depth: 1,
                 loop_ref: Some("lp-0199a1b2c3d47e5f8a9b0c1d2e3f4a5b"),
+                run_id: None,
             },
         );
         RunLogger::start_linked(RunKind::Workflow, &[], tmp.path(), RunLink::default());

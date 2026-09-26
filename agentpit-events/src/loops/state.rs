@@ -405,6 +405,12 @@ impl LoopState {
         self.instructions.iter().filter(|i| i.consumed_by.is_none())
     }
 
+    /// Compute time used as of `now_ms`: the folded total plus the span still open while
+    /// compute steps of this writer run (the fold only adds a span when the last one ends).
+    pub fn active_ms_at(&self, now_ms: u64) -> u64 {
+        self.usage.active_ms + self.active_since.map_or(0, |s| now_ms.saturating_sub(s))
+    }
+
     /// Running, no compute step running, and at least one gate waiting for a person.
     pub fn is_waiting(&self) -> bool {
         self.status == LoopStatus::Running

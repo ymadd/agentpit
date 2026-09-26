@@ -237,3 +237,58 @@ fn a_killed_runner_is_recovered_by_the_next_command_and_the_loop_completes() {
     assert!(watched.contains("finished succeeded"), "{watched}");
     assert!(watched.contains("runner restarted (epoch 3)"), "{watched}");
 }
+
+#[test]
+fn a_damaged_journal_is_shown_from_disk_and_refuses_changes() {
+    let env = Env::new();
+    let bp = env.work.join("gate.json");
+    std::fs::write(
+        &bp,
+        serde_json::json!({
+            "schema": "agentpit.blueprint/1",
+            "name": "gate-only",
+            "nodes": [{"id": "ok", "kind": "gate", "prompt": "Ship it?"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let started: Value =
+        serde_json::from_str(&env.ok(&["loop", "start", bp.to_str().unwrap(), "--json"])).unwrap();
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    wait_for("the gate", Duration::from_secs(20), || {
+        env.show(&loop_id)["waiting"] == true
+    });
+
+    // Crash the runner, then damage a line in the middle of the journal.
+    let registry = env
+        .root
+        .join(format!("state/agentpit/daemon/loops/{loop_id}.json"));
+    let runner: Value = serde_json::from_str(&std::fs::read_to_string(&registry).unwrap()).unwrap();
+    let runner_pid = runner["pid"].as_u64().unwrap();
+    Command::new("kill")
+        .args(["-9", &runner_pid.to_string()])
+        .status()
+        .unwrap();
+    wait_for("the runner to die", Duration::from_secs(10), || {
+        !alive(runner_pid)
+    });
+    let journal = env.loop_dir(&loop_id).join("journal.jsonl");
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    lines[2] = "{this is not json}".into();
+    std::fs::write(&journal, lines.join("\n") + "\n").unwrap();
+
+    // `show` answers at once, from disk; an operation says why it cannot be done.
+    let begin = Instant::now();
+    let summary = env.show(&loop_id);
+    assert!(
+        begin.elapsed() < Duration::from_secs(5),
+        "show took {:?}",
+        begin.elapsed()
+    );
+    assert_eq!(summary["loop_id"], loop_id.as_str());
+    let out = env.cmd(&["loop", "gate", &loop_id, "g1", "approve"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("damaged"), "{err}");
+}

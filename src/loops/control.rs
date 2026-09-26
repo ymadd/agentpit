@@ -50,7 +50,7 @@ pub fn load_runner(loop_id: &str) -> Option<RunnerRecord> {
     serde_json::from_str(&std::fs::read_to_string(record_path(loop_id)).ok()?).ok()
 }
 
-fn save_runner(record: &RunnerRecord) -> std::io::Result<()> {
+pub(crate) fn save_runner(record: &RunnerRecord) -> std::io::Result<()> {
     std::fs::create_dir_all(runners_dir())?;
     let path = record_path(&record.loop_id);
     let tmp = path.with_extension("json.tmp");
@@ -63,6 +63,14 @@ fn save_runner(record: &RunnerRecord) -> std::io::Result<()> {
 
 fn remove_runner(loop_id: &str) {
     let _ = std::fs::remove_file(record_path(loop_id));
+}
+
+/// Remove the registry record only if it still describes `me` (a newer runner may have
+/// replaced it).
+pub(crate) fn remove_runner_if(me: &RunnerRecord) {
+    if load_runner(&me.loop_id).is_some_and(|r| r.pid == me.pid && r.start_id == me.start_id) {
+        remove_runner(&me.loop_id);
+    }
 }
 
 /// One `loop_ensure` at a time per loop, so two clients never spawn two runners (the
@@ -96,13 +104,29 @@ struct Located {
 }
 
 fn read_doc(path: &Path) -> Result<serde_json::Value, OpError> {
-    let meta = std::fs::metadata(path).map_err(|e| {
+    use std::io::Read;
+    let unreadable = |e: std::io::Error| {
         op_error(
             ErrorCode::NotFound,
             format!("cannot read {}: {e}; check the path", path.display()),
         )
-    })?;
-    if meta.len() as usize > MAX_DOC_BYTES {
+    };
+    let meta = std::fs::metadata(path).map_err(unreadable)?;
+    // Only regular files: a FIFO would block, a device could stream forever.
+    if !meta.is_file() {
+        return Err(op_error(
+            ErrorCode::Validation,
+            format!(
+                "{} is not a regular file; pass a blueprint .json file",
+                path.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_DOC_BYTES as u64 + 1).read_to_end(&mut bytes))
+        .map_err(unreadable)?;
+    if bytes.len() > MAX_DOC_BYTES {
         return Err(op_error(
             ErrorCode::Validation,
             format!(
@@ -111,10 +135,10 @@ fn read_doc(path: &Path) -> Result<serde_json::Value, OpError> {
             ),
         ));
     }
-    let text = std::fs::read_to_string(path).map_err(|e| {
+    let text = String::from_utf8(bytes).map_err(|_| {
         op_error(
-            ErrorCode::NotFound,
-            format!("cannot read {}: {e}; check the path", path.display()),
+            ErrorCode::Validation,
+            format!("{} is not UTF-8 text; save it as UTF-8", path.display()),
         )
     })?;
     serde_json::from_str(&text).map_err(|e| {
@@ -284,7 +308,12 @@ pub async fn start_loop(req: StartRequest) -> Result<(String, Option<PathBuf>, b
         ));
     };
     let dir = loop_dir(&loop_id).expect("derived ids are valid");
+    // Creation is serialized per loop id, so a concurrent retry of the same op waits and
+    // then finds the loop (`duplicate`) instead of racing the creation.
+    let lock = ensure_lock(&loop_id);
+    let guard = lock.lock().await;
     if journal_path(&dir).exists() {
+        drop(guard);
         return existing(&loop_id).await.map(|s| (loop_id, s, true));
     }
 
@@ -296,7 +325,12 @@ pub async fn start_loop(req: StartRequest) -> Result<(String, Option<PathBuf>, b
         ));
     }
     let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let located = locate(&req.blueprint, &cwd)?;
+    let located = {
+        let (source, cwd) = (req.blueprint.clone(), cwd.clone());
+        tokio::task::spawn_blocking(move || locate(&source, &cwd))
+            .await
+            .map_err(|e| op_error(ErrorCode::Internal, format!("read the blueprint: {e}")))??
+    };
     let v = validate(&located.doc, &validate_env());
     let Some(bp) = v.blueprint.clone().filter(|_| v.is_runnable()) else {
         let first = v
@@ -321,18 +355,10 @@ pub async fn start_loop(req: StartRequest) -> Result<(String, Option<PathBuf>, b
         .or_else(|| bp.title.clone())
         .unwrap_or_else(|| bp.name.clone());
 
-    // The loop's root run: the existing dashboard shows every step as its child.
-    let root = RunLogger::start_linked(
-        RunKind::Workflow,
-        &[],
-        &cwd,
-        RunLink {
-            role: Some(&format!("loop:{}", bp.name)),
-            parent_run_id: None,
-            depth: 0,
-            loop_ref: Some(&loop_id),
-        },
-    );
+    // The loop's root run: the existing dashboard shows every step as its child. Named
+    // now (it goes into loop_created), announced only once the loop exists.
+    let root_run_id = agentpit_events::next_run_id();
+    let bp_name = bp.name.clone();
     let created = LoopCreated {
         loop_id: loop_id.clone(),
         uid: new_uid(),
@@ -354,7 +380,7 @@ pub async fn start_loop(req: StartRequest) -> Result<(String, Option<PathBuf>, b
             client: None,
             session_id: None,
         }),
-        root_run_id: Some(root.run_id().to_string()),
+        root_run_id: Some(root_run_id.clone()),
     };
     let writer = WriterInfo::current(&format!("agentpit/{}", env!("CARGO_PKG_VERSION")));
     std::fs::create_dir_all(&dir).map_err(|e| {
@@ -375,7 +401,16 @@ pub async fn start_loop(req: StartRequest) -> Result<(String, Option<PathBuf>, b
         // Dropping the journal releases the lease for the runner.
         Ok(journal) => drop(journal),
         Err(CommitError::Journal(JournalError::AlreadyExists | JournalError::Busy { .. })) => {
+            drop(guard);
             return existing(&loop_id).await.map(|s| (loop_id, s, true));
+        }
+        Err(CommitError::Journal(e @ JournalError::LineTooLarge { .. })) => {
+            return Err(op_error(
+                ErrorCode::Validation,
+                format!(
+                    "the blueprint and inputs are too large for one record ({e}); shorten them"
+                ),
+            ));
         }
         Err(e) => {
             return Err(op_error(
@@ -384,6 +419,19 @@ pub async fn start_loop(req: StartRequest) -> Result<(String, Option<PathBuf>, b
             ));
         }
     }
+    RunLogger::start_linked(
+        RunKind::Workflow,
+        &[],
+        &cwd,
+        RunLink {
+            role: Some(&format!("loop:{bp_name}")),
+            parent_run_id: None,
+            depth: 0,
+            loop_ref: Some(&loop_id),
+            run_id: Some(&root_run_id),
+        },
+    );
+    drop(guard);
     let socket = ensure_runner(&loop_id).await?;
     Ok((loop_id, Some(socket), false))
 }
@@ -430,7 +478,7 @@ pub async fn ensure_runner_with(loop_id: &str, exe: &Path) -> Result<PathBuf, Op
     if probe(&socket).await {
         return Ok(socket);
     }
-    let (state, _) = read_loop(&dir)
+    let (state, scan) = read_loop(&dir)
         .map_err(|e| op_error(ErrorCode::Internal, format!("read {loop_id}: {e}")))?;
     if state.status.is_terminal() {
         return Err(OpError {
@@ -444,6 +492,13 @@ pub async fn ensure_runner_with(loop_id: &str, exe: &Path) -> Result<PathBuf, Op
     }
     if let Err(reason) = state.writable() {
         return Err(op_error(ErrorCode::ReadOnly, reason.to_string()));
+    }
+    // A damaged journal opens read-only for any writer: a runner would only exit again.
+    if let Some(issue) = scan.issues.first() {
+        return Err(op_error(
+            ErrorCode::ReadOnly,
+            format!("the journal of {loop_id} is damaged ({issue}); it can only be read"),
+        ));
     }
     // A registered runner that is alive but not answering is wedged: it holds the lease,
     // so a new one could not start anyway.
@@ -489,12 +544,24 @@ pub async fn ensure_runner_with(loop_id: &str, exe: &Path) -> Result<PathBuf, Op
         .spawn()
         .map_err(|e| op_error(ErrorCode::Internal, format!("spawn the runner: {e}")))?;
     let pid = child.id().unwrap_or(0);
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
 
     let deadline = tokio::time::Instant::now() + RUNNER_START_TIMEOUT;
     while !probe(&socket).await {
+        // A runner that exits before answering will never answer: say why at once.
+        if let Ok(Some(status)) = child.try_wait() {
+            let why = super::prompt::file_tail(&dir.join(RUNNER_LOG), 600)
+                .and_then(|t| {
+                    t.lines()
+                        .rev()
+                        .find(|l| l.contains("Error"))
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("it exited with {status}"));
+            return Err(op_error(
+                ErrorCode::Unavailable,
+                format!("the runner of {loop_id} could not start: {}", why.trim()),
+            ));
+        }
         if tokio::time::Instant::now() > deadline {
             return Err(op_error(
                 ErrorCode::Unavailable,
@@ -507,6 +574,10 @@ pub async fn ensure_runner_with(loop_id: &str, exe: &Path) -> Result<PathBuf, Op
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Reap it when it ends: an unreaped runner lingers as a zombie that still looks alive.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
     let _ = save_runner(&RunnerRecord {
         loop_id: loop_id.to_string(),
         pid,
@@ -610,8 +681,34 @@ pub async fn stop_runner(loop_id: &str, force: bool) -> Result<String, OpError> 
         _ => {
             let note = match &record {
                 Some(r) if process_same_incarnation(r.pid, &r.start_id) => {
-                    let _ = crate::daemon::server::kill_pid(r.pid);
-                    format!("killed runner pid {}", r.pid)
+                    // The runner leads a process group holding its agents; each check has
+                    // a group of its own. Leaving them running would leave work going on
+                    // with no deadline and nobody watching.
+                    if !super::proc::signal_group(r.pid, 9) {
+                        let _ = crate::daemon::server::kill_pid(r.pid);
+                    }
+                    let mut reaped = 0;
+                    if let Some(dir) = loop_dir(loop_id)
+                        && let Ok((state, _)) = read_loop(&dir)
+                    {
+                        for step in state.running_steps() {
+                            if let (Some(pid), Some(start_id)) =
+                                (step.pid, step.pid_start_id.as_deref())
+                                && super::proc::reap_orphan_group(pid, start_id).await
+                            {
+                                reaped += 1;
+                            }
+                        }
+                    }
+                    format!(
+                        "killed runner pid {} with its agents{}",
+                        r.pid,
+                        if reaped > 0 {
+                            format!(" and {reaped} check(s)")
+                        } else {
+                            String::new()
+                        }
+                    )
                 }
                 Some(r) => format!(
                     "pid {} is no longer the recorded runner; removed its record without killing",

@@ -142,10 +142,21 @@ pub fn extended_budget(b: Budget) -> Budget {
     }
 }
 
-/// Whether the budget no longer allows another compute step.
-pub fn budget_exhausted(state: &LoopState) -> bool {
-    state.usage.steps >= state.budget.max_steps
-        || state.usage.active_ms >= state.budget.max_active_secs.saturating_mul(1000)
+/// Whether the budget no longer allows another compute step, counting compute time that
+/// is still running at `now_ms` (several overlapping steps keep one span open).
+pub fn budget_exhausted(state: &LoopState, now_ms: u64) -> bool {
+    exhausted_under(state, state.budget, now_ms)
+}
+
+fn exhausted_under(state: &LoopState, budget: Budget, now_ms: u64) -> bool {
+    state.usage.steps >= budget.max_steps
+        || state.active_ms_at(now_ms) >= budget.max_active_secs.saturating_mul(1000)
+}
+
+/// Whether answering `extend` would let the loop go on (both dimensions are capped at the
+/// hard limits, so at a cap it would change nothing).
+pub fn budget_extendable(state: &LoopState, now_ms: u64) -> bool {
+    !exhausted_under(state, extended_budget(state.budget), now_ms)
 }
 
 /// Decide what to do next. Pure.
@@ -158,7 +169,7 @@ pub fn next(state: &LoopState, now_ms: u64) -> Plan {
     {
         return plan;
     }
-    let ctx = Ctx::new(state, bp);
+    let ctx = Ctx::new(state, bp, now_ms);
 
     // Gate deadlines come first in every non-terminal state.
     let mut deadline_decision = None;
@@ -179,6 +190,21 @@ pub fn next(state: &LoopState, now_ms: u64) -> Plan {
             Some(d) => plan.wake_at = Some(plan.wake_at.map_or(d, |w| w.min(d))),
             None => {}
         }
+    }
+
+    // A budget gate that no longer applies (the budget was raised, or nothing is left to
+    // start) is closed, or it would keep the loop from finishing.
+    if deadline_decision.is_none()
+        && matches!(state.status, LoopStatus::Running | LoopStatus::Paused)
+        && let Some(g) = state
+            .open_gates()
+            .find(|g| g.kind == GateKind::Budget && !budget_exhausted(state, now_ms))
+    {
+        plan.decision = Some(Decision::CancelGate {
+            gate_id: g.gate_id.clone(),
+            reason: GateCancelReason::Superseded,
+        });
+        return plan;
     }
 
     match state.status {
@@ -259,15 +285,32 @@ struct Ctx<'a> {
     state: &'a LoopState,
     bp: &'a Blueprint,
     index: BlueprintIndex,
+    now: u64,
 }
 
 impl<'a> Ctx<'a> {
-    fn new(state: &'a LoopState, bp: &'a Blueprint) -> Self {
+    fn new(state: &'a LoopState, bp: &'a Blueprint, now: u64) -> Self {
         Ctx {
             state,
             bp,
             index: bp.index(),
+            now,
         }
+    }
+
+    /// Attempts of one instance that ended `error` or `timeout` — what automatic retries
+    /// are counted against (re-runs after a pause, a crash or an instruction are not
+    /// failures).
+    fn failed_attempts(&self, node: &str, iter: &[u32]) -> u32 {
+        self.state
+            .steps
+            .values()
+            .filter(|s| {
+                s.node == node
+                    && s.iter == iter
+                    && matches!(s.outcome, Some(Outcome::Error | Outcome::Timeout))
+            })
+            .count() as u32
     }
 
     fn spec(&self, node: &str) -> Option<&'a NodeSpec> {
@@ -494,6 +537,16 @@ impl<'a> Ctx<'a> {
             return;
         }
         let unhandled = self.first_unhandled(scope);
+        if scope.repeat.is_none()
+            && let Some(g) = self.state.open_gates().find(|g| g.step_id.is_none())
+        {
+            // A budget gate outlived the work it was about.
+            out.offer(Decision::CancelGate {
+                gate_id: g.gate_id.clone(),
+                reason: GateCancelReason::Superseded,
+            });
+            return;
+        }
         match &scope.repeat {
             None => out.offer(Decision::Finish(match unhandled {
                 None => LoopFinished {
@@ -580,8 +633,10 @@ impl<'a> Ctx<'a> {
                     }
                     Some(_) => Class::Settled(Outcome::Cancelled, Some(CancelCause::ScopeEnded)),
                     None => {
-                        let writes = matches!(spec, NodeSpec::Agent(a) if a.access != Access::Read);
-                        if writes {
+                        // Any agent may have side effects (its tools do not honour `read`),
+                        // and its process may still be running: a person decides (§9.4).
+                        // A check is deterministic and is simply run again.
+                        if matches!(spec, NodeSpec::Agent(_)) {
                             Class::Act(Decision::OpenGate {
                                 kind: GateKind::Recovery,
                                 step_id: Some(latest.step_id.clone()),
@@ -612,7 +667,9 @@ impl<'a> Ctx<'a> {
                         }
                         Some(_) => Class::Settled(outcome, cancel),
                         None if draining => Class::Settled(outcome, cancel),
-                        None if inst.attempts <= retries_of(spec) => {
+                        None if self.failed_attempts(&latest.node, &latest.iter)
+                            <= retries_of(spec) =>
+                        {
                             Class::Act(Decision::Start(self.retry_plan(latest, StartCause::Retry)))
                         }
                         None if self.bp.policy.on_error == OnError::Gate => {
@@ -829,11 +886,17 @@ impl<'a> Ctx<'a> {
         {
             return None;
         }
-        if budget_exhausted(self.state) {
+        if budget_exhausted(self.state, self.now) {
             if self.state.open_gates().any(|g| g.kind == GateKind::Budget) {
                 return None;
             }
+            // At the hard caps `extend` cannot help: stop as if the policy said so.
+            let extendable = budget_extendable(self.state, self.now);
             return Some(match self.bp.policy.on_budget {
+                _ if !extendable => Decision::Stop {
+                    mode: StopMode::Graceful,
+                    reason: STOP_REASON_BUDGET.into(),
+                },
                 OnBudget::Fail => Decision::Stop {
                     mode: StopMode::Graceful,
                     reason: STOP_REASON_BUDGET.into(),

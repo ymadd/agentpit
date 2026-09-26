@@ -98,8 +98,9 @@ pub const VERDICT_INSTRUCTION: &str = "When you are done, end your answer with o
      `VERDICT: PASS` or `VERDICT: FAIL`. For FAIL, list the concrete problems right above that \
      line: they are handed to the next iteration.";
 
-/// Read `VERDICT: PASS|FAIL` from the last non-empty line (markdown emphasis and code
-/// ticks around it are ignored). `None` when the answer has no verdict line.
+/// Read `VERDICT: PASS|FAIL` from the last non-empty line. Markdown decoration anywhere on
+/// that line (`**VERDICT:** PASS`, `**Verdict**: FAIL`, `` `VERDICT: PASS` ``, `> …`) and
+/// a trailing period are ignored. `None` when the answer has no verdict line.
 pub fn parse_verdict(answer: &str) -> Option<Verdict> {
     let mut lines: Vec<&str> = answer.lines().collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
@@ -107,17 +108,14 @@ pub fn parse_verdict(answer: &str) -> Option<Verdict> {
     }
     let last = lines.pop()?;
     let bare: String = last
-        .trim()
-        .trim_matches(|c: char| c == '*' || c == '`' || c == '_' || c == '#' || c == '>')
+        .chars()
+        .filter(|c| !matches!(c, '*' | '_' | '`' | '#' | '>'))
+        .collect::<String>()
         .trim()
         .to_ascii_uppercase();
-    let verdict = bare.strip_prefix("VERDICT")?.trim_start();
-    let verdict = verdict
-        .strip_prefix(':')
-        .unwrap_or(verdict)
-        .trim()
-        .trim_matches(|c: char| c == '*' || c == '`' || c == '.');
-    let pass = match verdict {
+    let rest = bare.strip_prefix("VERDICT")?.trim_start();
+    let rest = rest.strip_prefix(':').unwrap_or(rest).trim();
+    let pass = match rest.trim_end_matches(['.', '!']).trim_end() {
         "PASS" => true,
         "FAIL" => false,
         _ => return None,
@@ -183,7 +181,7 @@ pub fn resolve_token(
         ["goal"] => Some(created.inputs.get("goal").cloned().unwrap_or_default()),
         ["inputs", name] => Some(created.inputs.get(*name).cloned().unwrap_or_default()),
         ["iteration"] => Some(iter.last().map(u32::to_string).unwrap_or_default()),
-        ["feedback"] => Some(feedback_block(current_feedback(state, node, iter))),
+        ["feedback"] => Some(feedback_block(&current_feedback(state, node, iter))),
         ["instructions"] => Some(instructions_block(instructions)),
         ["nodes", target, "outcome"] => Some(
             node_instance(state, node, target, iter)
@@ -204,17 +202,23 @@ fn repeat_chain(state: &LoopState, node: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The feedback handed to the iteration of `node`'s innermost repeat that `iter` names.
-pub fn current_feedback<'a>(state: &'a LoopState, node: &str, iter: &[u32]) -> &'a [FeedbackItem] {
+/// The feedback handed to every iteration enclosing a step of `node` at `iter`, outermost
+/// first: an inner repeat's first iteration starts empty, but what the outer one was told
+/// (a reviewer's findings) still applies inside it.
+pub fn current_feedback(state: &LoopState, node: &str, iter: &[u32]) -> Vec<FeedbackItem> {
     let chain = repeat_chain(state, node);
-    let (Some(repeat), Some((_, outer))) = (chain.last(), iter.split_last()) else {
-        return &[];
-    };
-    state
-        .repeats
-        .get(&instance_key(repeat, outer))
-        .filter(|r| r.current == iter[iter.len() - 1])
-        .map_or(&[], |r| r.feedback.as_slice())
+    let mut out = Vec::new();
+    for (depth, repeat) in chain.iter().enumerate() {
+        let Some(&n) = iter.get(depth) else { break };
+        if let Some(run) = state
+            .repeats
+            .get(&instance_key(repeat, &iter[..depth]))
+            .filter(|r| r.current == n)
+        {
+            out.extend(run.feedback.iter().cloned());
+        }
+    }
+    out
 }
 
 /// The instance of `target` a template of `node` at `iter` means: the one in the same or
@@ -307,7 +311,7 @@ pub fn agent_prompt(
     let feedback = current_feedback(state, node, iter);
     if !feedback.is_empty() && !mentions(&spec.task, "feedback") {
         text.push_str("\n\n");
-        text.push_str(&feedback_block(feedback));
+        text.push_str(&feedback_block(&feedback));
     }
     if !instructions.is_empty() && !mentions(&spec.task, "instructions") {
         text.push_str("\n\n");
@@ -367,6 +371,19 @@ mod tests {
             parse_verdict("`verdict: fail`").map(|v| v.pass),
             Some(false)
         );
+        for line in [
+            "**VERDICT:** PASS",
+            "**Verdict**: PASS",
+            "> VERDICT: PASS.",
+            "## Verdict: PASS",
+        ] {
+            assert_eq!(parse_verdict(line).map(|v| v.pass), Some(true), "{line}");
+        }
+        assert_eq!(
+            parse_verdict("**Verdict**: FAIL").map(|v| v.pass),
+            Some(false)
+        );
+        assert_eq!(parse_verdict("VERDICT: PASSED"), None);
         // Mentioned earlier but not the last line: no verdict.
         assert_eq!(
             parse_verdict("VERDICT: PASS\nbut wait, one more thing"),

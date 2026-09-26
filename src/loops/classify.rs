@@ -5,6 +5,7 @@ use agentpit_events::loops::*;
 use serde_json::json;
 
 use super::records::gate_follow_up;
+use super::sched::STOP_REASON_BUDGET;
 
 /// What an accepted operation does.
 #[derive(Debug, Clone, PartialEq)]
@@ -141,7 +142,15 @@ pub fn classify(state: &LoopState, op: &LoopOp, by: &Actor) -> Result<OpPlan, Op
                     .as_deref()
                     .map(str::trim)
                     .filter(|r| !r.is_empty())
-                    .map(|r| clamp_text(r, MAX_SHORT_BYTES)),
+                    .map(|r| {
+                        // The scheduler's budget marker ends a loop *failed*; a person's
+                        // stop must never be read as one.
+                        if r == STOP_REASON_BUDGET {
+                            format!("{r} (stopped by a person)")
+                        } else {
+                            clamp_text(r, MAX_SHORT_BYTES)
+                        }
+                    }),
             });
             match status {
                 S::Created | S::Running | S::Paused => commit(vec![event]),
@@ -228,10 +237,10 @@ pub fn classify(state: &LoopState, op: &LoopOp, by: &Actor) -> Result<OpPlan, Op
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
                 .map(str::to_string);
-            if comment.as_ref().is_some_and(|c| c.len() > MAX_TEXT_BYTES) {
+            if comment.as_ref().is_some_and(|c| c.len() > MAX_DETAIL_BYTES) {
                 return Err(op_error(
                     ErrorCode::Validation,
-                    format!("the comment is longer than {MAX_TEXT_BYTES} bytes; shorten it"),
+                    format!("the comment is longer than {MAX_DETAIL_BYTES} bytes; shorten it"),
                 ));
             }
             let mut events = vec![LoopEvent::GateResolved(GateResolved {
@@ -558,6 +567,24 @@ mod tests {
             classify(&running, &budget(99), &by()).unwrap(),
             OpPlan::Commit { .. }
         ));
+    }
+
+    #[test]
+    fn a_person_cannot_stop_a_loop_as_a_budget_failure() {
+        let running = state_after(vec![LoopEvent::LoopStarted]);
+        let stop = LoopOp::Stop {
+            mode: StopMode::Cancel,
+            reason: Some(" budget ".into()),
+        };
+        match classify(&running, &stop, &by()).unwrap() {
+            OpPlan::Commit { events, .. } => match &events[0] {
+                LoopEvent::LoopStopRequested(s) => {
+                    assert_ne!(s.reason.as_deref(), Some(STOP_REASON_BUDGET));
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

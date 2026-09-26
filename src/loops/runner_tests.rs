@@ -30,6 +30,7 @@ const AGENT_SCRIPT: &str = r#"
 case "$1" in *HANG*) [ -f unhang ] || exec sleep 30;; esac
 case "$1" in *"Iteration 2."*) touch fixed;; esac
 case "$1" in *REVIEW*) printf 'the fix is missing a test\nVERDICT: FAIL\n'; exit 0;; esac
+case "$1" in *FLAKY*) [ -f flaked ] || { touch flaked; echo 'transient failure' >&2; exit 1; };; esac
 printf 'done: %s\n' "$(printf '%s' "$1" | head -n 1)"
 "#;
 
@@ -296,6 +297,17 @@ impl Watch {
                     .map(|g| (&g.gate_id, g.kind, g.status))
                     .collect::<Vec<_>>()
             );
+        }
+    }
+}
+
+/// Read frames until the answer to request `id`.
+async fn answer_to(conn: &mut Conn, id: u64) -> Response {
+    loop {
+        if let Frame::Response(r) = conn.recv_frame().await.unwrap()
+            && r.id == id
+        {
+            return r;
         }
     }
 }
@@ -816,4 +828,91 @@ async fn a_failing_verdict_is_feedback_and_step_files_are_readable() {
     h.finished().await.unwrap();
     let answer = std::fs::read_to_string(h.dir.join("outputs/review.i1.a1.md")).unwrap();
     assert!(answer.ends_with("VERDICT: FAIL\n"));
+}
+
+#[tokio::test]
+async fn a_retry_keeps_the_instructions_its_first_attempt_consumed() {
+    let _env = lock_env();
+    let doc = json!({
+        "schema": "agentpit.blueprint/1",
+        "name": "flaky",
+        "nodes": [{"id": "work", "kind": "agent", "backend": "codex", "retries": 1,
+                   "task": "FLAKY work\n{{instructions}}"}]
+    });
+    let mut h = Harness::new(doc, &[]);
+    h.start();
+    let (mut w, _) = Watch::attach(h.connect().await, None).await;
+    let mut conn = h.connect().await;
+    let resp = conn
+        .request_raw(op_request(
+            LoopOp::Instruct {
+                text: "keep the public API stable".into(),
+                target: None,
+            },
+            "op-instruct-1",
+        ))
+        .await
+        .unwrap();
+    assert!(resp.ok, "{resp:?}");
+    let resp = conn
+        .request_raw(op_request(LoopOp::Start, "op-start-flaky"))
+        .await
+        .unwrap();
+    assert!(resp.ok, "{resp:?}");
+    w.until("the end", |s| s.status.is_terminal()).await;
+    assert_eq!(w.state.status, LoopStatus::Succeeded);
+    assert_eq!(w.state.steps["work.a1"].outcome, Some(Outcome::Error));
+    assert_eq!(w.state.steps["work.a2"].cause, StartCause::Retry);
+    assert!(h.prompt("work.a1").contains("keep the public API stable"));
+    assert!(
+        h.prompt("work.a2").contains("keep the public API stable"),
+        "the retry lost the instruction:\n{}",
+        h.prompt("work.a2")
+    );
+    h.finished().await.unwrap();
+}
+
+#[tokio::test]
+async fn every_cancel_step_is_answered_with_its_own_op_id() {
+    let _env = lock_env();
+    // Ignores SIGTERM, so the cancel takes the full grace period: both cancels land while
+    // the step is still winding down.
+    let doc = json!({
+        "schema": "agentpit.blueprint/1",
+        "name": "slow-check",
+        "nodes": [{"id": "wait", "kind": "check", "command": "trap '' TERM; touch running; sleep 30"}]
+    });
+    let mut h = Harness::new(doc, &[]);
+    let (mut w, _) = h.run_watched().await;
+    let running = h.work.join("running");
+    for _ in 0..200 {
+        if running.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(running.exists(), "the check never ran");
+    let mut a = h.connect().await;
+    let mut b = h.connect().await;
+    let cancel = |op_id: &str| {
+        op_request(
+            LoopOp::CancelStep {
+                step_id: "wait.a1".into(),
+            },
+            op_id,
+        )
+    };
+    let id_a = a.send_request(cancel("op-cancel-aaaa")).await.unwrap();
+    // Make sure A is registered first.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let id_b = b.send_request(cancel("op-cancel-bbbb")).await.unwrap();
+    let ra = answer_to(&mut a, id_a).await;
+    let rb = answer_to(&mut b, id_b).await;
+    let (ra, rb) = (op_result(&ra).clone(), op_result(&rb).clone());
+    assert_eq!(ra.op_id, "op-cancel-aaaa");
+    assert_eq!(ra.outcome, OpOutcome::Applied);
+    assert_eq!(rb.op_id, "op-cancel-bbbb");
+    assert_eq!(rb.outcome, OpOutcome::Noop);
+    w.until("the end", |s| s.status.is_terminal()).await;
+    h.finished().await.unwrap();
 }

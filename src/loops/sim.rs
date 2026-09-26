@@ -608,14 +608,33 @@ fn pause_cancel_then_resume_reruns_the_cancelled_step() {
     assert_eq!(sim.started.last().unwrap().cause, StartCause::Resume);
 }
 
+fn crash(sim: &mut Sim, step: &str) {
+    let epoch = sim.state.epoch;
+    sim.commit(vec![
+        LoopEvent::WriterOpened(WriterOpened {
+            epoch: epoch + 1,
+            pid: 2,
+            start_id: String::new(),
+            build: "sim".into(),
+            schema_minor: SCHEMA_MINOR,
+            truncated_tail_bytes: 0,
+        }),
+        LoopEvent::StepInterrupted(StepInterrupted {
+            step_id: step.into(),
+            epoch,
+        }),
+    ]);
+}
+
 #[test]
-fn an_interrupted_writer_asks_a_person_and_an_interrupted_reader_just_retries() {
+fn an_interrupted_agent_asks_a_person_and_an_interrupted_check_just_retries() {
     let d = doc(
         json!([
             {"id": "w", "kind": "agent", "task": "edit"},
-            {"id": "r", "kind": "agent", "task": "read", "access": "read"}
+            {"id": "r", "kind": "agent", "task": "read", "access": "read"},
+            {"id": "c", "kind": "check", "command": "true"}
         ]),
-        json!([{"from": "w", "to": "r"}]),
+        json!([{"from": "w", "to": "r"}, {"from": "r", "to": "c"}]),
     );
     // Each node's first attempt is the one "running" when the runner dies.
     let mut sim = Sim::new(
@@ -629,35 +648,166 @@ fn an_interrupted_writer_asks_a_person_and_an_interrupted_reader_just_retries() 
         }),
         approve_all(),
     );
-    let crash = |sim: &mut Sim, step: &str| {
-        let epoch = sim.state.epoch;
-        sim.commit(vec![
-            LoopEvent::WriterOpened(WriterOpened {
-                epoch: epoch + 1,
-                pid: 2,
-                start_id: String::new(),
-                build: "sim".into(),
-                schema_minor: SCHEMA_MINOR,
-                truncated_tail_bytes: 0,
-            }),
-            LoopEvent::StepInterrupted(StepInterrupted {
-                step_id: step.into(),
-                epoch,
-            }),
-        ]);
-    };
     sim.run();
     crash(&mut sim, "w.a1");
     sim.run();
     assert_eq!(sim.state.gates[0].kind, GateKind::Recovery);
     assert_eq!(sim.started[1].cause, StartCause::Recovery);
-    // The reader hangs, the runner dies again: no gate this time, just a retry.
+    // A read-only agent may still have side effects: a person decides too.
     assert_eq!(sim.running(), BTreeSet::from(["r.a1".to_string()]));
     crash(&mut sim, "r.a1");
     sim.run();
+    assert_eq!(sim.state.gates[1].kind, GateKind::Recovery);
+    // A check is just run again.
+    assert_eq!(sim.running(), BTreeSet::from(["c.a1".to_string()]));
+    crash(&mut sim, "c.a1");
+    sim.run();
     assert_eq!(sim.state.status, LoopStatus::Succeeded);
-    assert_eq!(sim.state.gates.len(), 1);
-    assert_eq!(sim.state.instance("r", &[]).unwrap().attempts, 2);
+    assert_eq!(sim.state.gates.len(), 2);
+    assert_eq!(sim.state.instance("c", &[]).unwrap().attempts, 2);
+}
+
+#[test]
+fn a_raised_budget_closes_the_gate_it_made_obsolete() {
+    let mut d = doc(
+        json!([
+            {"id": "a", "kind": "agent", "task": "x"},
+            {"id": "b", "kind": "agent", "task": "y"}
+        ]),
+        json!([{"from": "a", "to": "b"}]),
+    );
+    d["budget"] = json!({"max_steps": 1});
+    let mut sim = Sim::new(d, ok_script(), Box::new(|_| None));
+    sim.run();
+    assert_eq!(
+        sim.state.open_gates().next().unwrap().kind,
+        GateKind::Budget
+    );
+    // `agentpit loop budget --max-steps 5` instead of answering the gate.
+    let mut budget = sim.state.budget;
+    budget.max_steps = 5;
+    sim.commit(vec![LoopEvent::BudgetChanged(BudgetChanged {
+        budget,
+        by: Actor::human("sim"),
+    })]);
+    sim.run();
+    assert_eq!(sim.state.status, LoopStatus::Succeeded);
+    assert_eq!(
+        sim.state.gates[0].cancel_reason,
+        Some(GateCancelReason::Superseded)
+    );
+}
+
+#[test]
+fn a_failure_while_the_budget_gate_is_open_still_ends_the_loop() {
+    let mut d = doc(
+        json!([
+            {"id": "a", "kind": "agent", "task": "x", "access": "read"},
+            {"id": "b", "kind": "check", "command": "false"},
+            {"id": "c", "kind": "agent", "task": "y", "access": "read"}
+        ]),
+        json!([{"from": "a", "to": "c"}]),
+    );
+    d["budget"] = json!({"max_steps": 2, "max_parallel": 2});
+    let mut sim = Sim::new(
+        d,
+        Box::new(|p| match p.node.as_str() {
+            "b" => Effect::Hang,
+            _ => Effect::Finish(Outcome::Ok, vec![]),
+        }),
+        Box::new(|_| None),
+    );
+    sim.run();
+    assert_eq!(
+        sim.state.open_gates().next().unwrap().kind,
+        GateKind::Budget
+    );
+    sim.finish("b.a1", Outcome::Fail, None);
+    sim.run();
+    assert_eq!(sim.state.status, LoopStatus::Failed);
+    let finish = sim.state.finish.as_ref().unwrap();
+    assert_eq!(finish.reason, FinishReason::UnhandledOutcome);
+    assert_eq!(finish.node.as_deref(), Some("b"));
+}
+
+#[test]
+fn re_runs_after_a_crash_do_not_use_up_error_retries() {
+    let mut d = doc(
+        json!([{"id": "c", "kind": "check", "command": "x", "retries": 1}]),
+        json!([]),
+    );
+    d["policy"] = json!({"on_error": "fail"});
+    let mut sim = Sim::new(
+        d,
+        Box::new(|p| match p.attempt {
+            1 => Effect::Hang,
+            2 => Effect::Finish(Outcome::Error, vec![]),
+            _ => Effect::Finish(Outcome::Ok, vec![]),
+        }),
+        approve_all(),
+    );
+    sim.run();
+    crash(&mut sim, "c.a1");
+    sim.run();
+    // a1 interrupted, a2 (recovery) errored once, a3 is the one automatic retry.
+    assert_eq!(sim.state.status, LoopStatus::Succeeded, "{:?}", sim.kinds);
+    assert_eq!(sim.started.last().unwrap().cause, StartCause::Retry);
+}
+
+#[test]
+fn at_the_hard_cap_the_budget_stops_the_loop_instead_of_asking_again() {
+    let mut d = doc(
+        json!([
+            {"id": "a", "kind": "agent", "task": "x"},
+            {"id": "b", "kind": "agent", "task": "y"}
+        ]),
+        json!([{"from": "a", "to": "b"}]),
+    );
+    d["budget"] = json!({"max_active_secs": HARD_MAX_ACTIVE_SECS});
+    let mut sim = Sim::new(
+        d,
+        Box::new(|p| match p.node.as_str() {
+            "a" => Effect::Hang,
+            _ => Effect::Finish(Outcome::Ok, vec![]),
+        }),
+        approve_all(),
+    );
+    sim.run();
+    sim.now += HARD_MAX_ACTIVE_SECS * 1000;
+    sim.finish("a.a1", Outcome::Ok, None);
+    sim.run();
+    assert!(sim.state.gates.is_empty(), "extend could not have helped");
+    assert_eq!(sim.state.status, LoopStatus::Failed);
+    assert_eq!(
+        sim.state.finish.as_ref().unwrap().reason,
+        FinishReason::Budget
+    );
+}
+
+#[test]
+fn overlapping_compute_counts_against_the_time_budget() {
+    let mut d = doc(
+        json!([
+            {"id": "slow", "kind": "check", "command": "x"},
+            {"id": "a", "kind": "agent", "task": "x", "access": "read"},
+            {"id": "b", "kind": "agent", "task": "y", "access": "read"}
+        ]),
+        json!([{"from": "a", "to": "b"}]),
+    );
+    d["budget"] = json!({"max_active_secs": 600, "max_parallel": 2});
+    let mut sim = Sim::new(d, Box::new(|_| Effect::Hang), Box::new(|_| None));
+    sim.run();
+    assert_eq!(sim.running().len(), 2);
+    sim.now += 700_000;
+    sim.finish("a.a1", Outcome::Ok, None);
+    sim.run();
+    // `slow` never stopped, so the folded total is still 0 — but 700s have been used.
+    assert_eq!(sim.state.usage.active_ms, 0);
+    assert!(sim.state.instance("b", &[]).is_none(), "b must not start");
+    assert_eq!(
+        sim.state.open_gates().next().unwrap().kind,
+        GateKind::Budget
+    );
 }
 
 #[test]
@@ -779,4 +929,37 @@ fn instructions_go_to_the_next_matching_agent_step() {
         sim.state.instructions[0].consumed_by.as_deref(),
         Some("implement.i1.a1")
     );
+}
+
+#[test]
+fn an_inner_repeat_still_sees_what_the_outer_iteration_was_told() {
+    let d = doc(
+        json!([
+            {"id": "outer", "kind": "repeat", "max_iterations": 2},
+            {"id": "inner", "kind": "repeat", "max_iterations": 1, "parent": "outer"},
+            {"id": "implement", "kind": "agent", "task": "{{feedback}}", "parent": "inner"},
+            {"id": "review", "kind": "check", "command": "x", "parent": "outer"}
+        ]),
+        json!([{"from": "inner", "to": "review"}]),
+    );
+    let mut sim = Sim::new(
+        d,
+        Box::new(|p| match (p.node.as_str(), p.iter.as_slice()) {
+            ("review", [1]) => {
+                Effect::Finish(Outcome::Fail, vec![check_feedback("review", &p.step_id())])
+            }
+            _ => Effect::Finish(Outcome::Ok, vec![]),
+        }),
+        approve_all(),
+    );
+    sim.run();
+    assert_eq!(sim.state.status, LoopStatus::Succeeded);
+    assert!(
+        sim.started
+            .iter()
+            .any(|p| p.node == "implement" && p.iter == [2, 1])
+    );
+    let fb = super::prompt::current_feedback(&sim.state, "implement", &[2, 1]);
+    assert_eq!(fb.len(), 1, "{fb:?}");
+    assert_eq!(fb[0].node, "review");
 }

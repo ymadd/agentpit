@@ -137,6 +137,15 @@ pub async fn run_until(
     let _ = std::fs::remove_file(&paths.socket);
     let listener = UnixListener::bind(&paths.socket)
         .with_context(|| format!("bind {}", paths.socket.display()))?;
+    // Register ourselves, so the daemon can find (and, forced, stop) this runner however
+    // it was started.
+    let me = super::control::RunnerRecord {
+        loop_id: loop_id.to_string(),
+        pid: std::process::id(),
+        start_id: agentpit_events::session_lease::process_start_id(std::process::id()),
+        socket: paths.socket.display().to_string(),
+    };
+    let _ = super::control::save_runner(&me);
 
     let mut writers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut next_conn: u64 = 1;
@@ -163,8 +172,8 @@ pub async fn run_until(
         tokio::select! {
             Some(msg) = effect_rx.recv() => runner.on_effect(msg),
             Some(input) = rx.recv() => runner.on_input(input),
-            accepted = listener.accept() => {
-                if let Ok((stream, _)) = accepted {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
                     let id = next_conn;
                     next_conn += 1;
                     writers.push(spawn_connection(
@@ -176,7 +185,9 @@ pub async fn run_until(
                     ));
                     writers.retain(|h| !h.is_finished());
                 }
-            }
+                // Out of descriptors (EMFILE) keeps failing at once: back off, don't spin.
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            },
             _ = tokio::time::sleep(sleep) => {}
             _ = heartbeat.tick() => runner.heartbeat(),
             _ = stop.cancelled() => break Ok(()),
@@ -187,6 +198,9 @@ pub async fn run_until(
     // an external stop) die with the process; the next runner recovers their steps.
     drop(listener);
     let _ = std::fs::remove_file(&paths.socket);
+    if runner.exit.is_some() {
+        super::control::remove_runner_if(&me);
+    }
     for e in runner.effects.values() {
         e.cancel.cancel();
     }
@@ -233,9 +247,10 @@ struct Effect {
     cancel: CancellationToken,
     /// Why it is being cancelled (the first reason asked for wins).
     cause: Option<CancelCause>,
-    /// A `cancel_step` op to credit the `step_finished` to, and who to answer.
+    /// The `cancel_step` op the `step_finished` is credited to.
     op: Option<String>,
-    waiters: Vec<(u64, u64)>,
+    /// `cancel_step` requests to answer when the step has ended: (conn, request id, op id).
+    waiters: Vec<(u64, u64, String)>,
 }
 
 struct Runner {
@@ -309,7 +324,12 @@ impl Runner {
         for r in records {
             let frame = record_frame(&self.loop_id, &r.raw);
             for (id, c) in &self.conns {
-                if c.attached && c.tx.try_send(Out::Line(frame.clone())).is_err() {
+                // Once one record did not fit, the connection gets nothing more: a later
+                // record without the earlier one would be a gap the cursor then skips.
+                if c.attached
+                    && !dead.contains(id)
+                    && c.tx.try_send(Out::Line(frame.clone())).is_err()
+                {
                     dead.push(*id);
                 }
             }
@@ -341,6 +361,8 @@ impl Runner {
             }))]);
         }
         self.stalled = Some(msg);
+        // No timer while stalled: a past deadline would otherwise wake us every millisecond.
+        self.wake_at = None;
     }
 
     // --- scheduling -----------------------------------------------------------------------
@@ -458,12 +480,7 @@ impl Runner {
             .as_deref()
             .expect("a writable loop has a header");
         let step_id = plan.step_id();
-        let texts: Vec<&str> = plan
-            .instructions
-            .iter()
-            .filter_map(|id| state.instructions.iter().find(|i| &i.instruction_id == id))
-            .map(|i| i.text.as_str())
-            .collect();
+        let texts = instruction_texts(state, plan);
         let body = agent_prompt(state, &self.dir, &plan.node, spec, &plan.iter, &texts);
         let cast = self.resolve_cast(spec, &body);
         let prompt = match &cast.role {
@@ -472,7 +489,10 @@ impl Runner {
             }
             None => body,
         };
-        let blob = write_blob(&self.dir, &prompt_rel(&step_id), prompt.as_bytes())?;
+        // The durable copy (served by `loop_read`) masks credentials; the agent gets the
+        // prompt as written.
+        let saved = crate::exec::redact_secrets(&prompt);
+        let blob = write_blob(&self.dir, &prompt_rel(&step_id), saved.as_bytes())?;
         let cwd = PathBuf::from(&created.cwd);
         let logger = cast.backend.as_ref().ok().map(|b| {
             let logger = RunLogger::start_linked(
@@ -484,6 +504,7 @@ impl Runner {
                     parent_run_id: created.root_run_id.as_deref(),
                     depth: 1,
                     loop_ref: Some(&self.loop_id),
+                    run_id: None,
                 },
             );
             match &cast.decision {
@@ -720,18 +741,24 @@ impl Runner {
     // --- effects --------------------------------------------------------------------------
 
     fn on_effect(&mut self, msg: EffectMsg) {
-        self.stalled = None;
         match msg {
             EffectMsg::Spawned {
                 step_id,
                 pid,
                 start_id,
+                ack,
             } => {
-                let _ = self.commit(&[Draft::new(LoopEvent::StepSpawned(StepSpawned {
+                self.stalled = None;
+                let committed = self.commit(&[Draft::new(LoopEvent::StepSpawned(StepSpawned {
                     step_id,
                     pid,
                     start_id,
                 }))]);
+                // The check waits for this: nothing runs before its group is on disk, so
+                // a crash can never leave an orphan the next runner cannot find.
+                if committed.is_ok() {
+                    let _ = ack.send(());
+                }
             }
             EffectMsg::Chunk {
                 step_id,
@@ -746,13 +773,17 @@ impl Runner {
                 })
                 .unwrap_or_default();
                 for c in self.conns.values() {
-                    if c.attached && c.chunks {
-                        // Lossy by design: the output log has every byte.
+                    // Lossy by design (the output log has every byte), and never allowed to
+                    // crowd out the durable records behind it.
+                    if c.attached && c.chunks && c.tx.capacity() > OUT_CAPACITY / 4 {
                         let _ = c.tx.try_send(Out::Line(frame.clone()));
                     }
                 }
             }
-            EffectMsg::Done(done) => self.on_done(done),
+            EffectMsg::Done(done) => {
+                self.stalled = None;
+                self.on_done(done);
+            }
         }
     }
 
@@ -795,32 +826,32 @@ impl Runner {
             self.stall(&what, e);
         }
         let Some(effect) = effect else { return };
-        for (conn, req_id) in effect.waiters {
-            let resp = match (&committed, &op) {
-                (Ok(records), Some(op_id)) => Response::ok(
+        for (conn, req_id, op_id) in effect.waiters {
+            let resp = match &committed {
+                // The op the finish was credited to.
+                Ok(records) if op.as_deref() == Some(op_id.as_str()) => Response::ok(
                     req_id,
                     ResponseData::OpResult(OpResult {
-                        op_id: op_id.clone(),
+                        op_id,
                         outcome: OpOutcome::Applied,
                         seq: records.first().map(|r| r.seq),
                         head_seq: self.state().head_seq,
                         result: None,
                     }),
                 ),
-                // The step ended on its own before the cancel reached it.
-                (Ok(_), None) => Response::ok(
+                // Someone else's cancel (or a pause, a stop, the step's own end) got there
+                // first: nothing of this op was written.
+                Ok(_) => Response::ok(
                     req_id,
                     ResponseData::OpResult(OpResult {
-                        op_id: effect.op.clone().unwrap_or_default(),
+                        op_id,
                         outcome: OpOutcome::Noop,
                         seq: None,
                         head_seq: self.state().head_seq,
                         result: None,
                     }),
                 ),
-                (Err(e), _) => {
-                    Response::err_code(req_id, ErrorCode::Internal.as_str(), e.to_string())
-                }
+                Err(e) => Response::err_code(req_id, ErrorCode::Internal.as_str(), e.to_string()),
             };
             self.reply(conn, resp);
         }
@@ -830,7 +861,7 @@ impl Runner {
 
     /// Design §9.4: kill what the dead writer left running (only provably its processes),
     /// then record every orphaned step as interrupted. The scheduler takes it from there:
-    /// a recovery gate for write agents, an automatic retry for everything else.
+    /// a recovery gate for agents, an automatic retry for checks.
     async fn recover(&mut self) {
         let orphans: Vec<StepRun> = self.state().orphaned_steps().into_iter().cloned().collect();
         if orphans.is_empty() {
@@ -882,6 +913,9 @@ impl Runner {
             Input::Closed { conn } => {
                 self.conns.remove(&conn);
             }
+            // A line from a connection we already dropped (its queue overflowed): it can
+            // no longer be answered, so it must not act either.
+            Input::Line { conn, .. } if !self.conns.contains_key(&conn) => {}
             Input::Line { conn, line } => {
                 self.stalled = None;
                 self.on_request(conn, &line);
@@ -1084,7 +1118,7 @@ impl Runner {
                         if effect.cause == Some(CancelCause::CancelStep) {
                             effect.op.get_or_insert_with(|| req.op_id.clone());
                         }
-                        effect.waiters.push((conn, id));
+                        effect.waiters.push((conn, id, req.op_id.clone()));
                         effect.cancel.cancel();
                         // Answered when the step's `step_finished` is written.
                         return;
@@ -1264,6 +1298,31 @@ fn writer_pids(dir: &Path) -> BTreeMap<u32, (u32, String)> {
         .collect()
 }
 
+/// The instructions an attempt carries: those every earlier attempt of the same retry chain
+/// consumed (a retry must not lose what a person said, design §8.2), then its own.
+fn instruction_texts<'a>(state: &'a LoopState, plan: &StartPlan) -> Vec<&'a str> {
+    let mut chain = Vec::new();
+    let mut prev = plan.retry_of.as_deref();
+    while let Some(id) = prev {
+        if chain.contains(&id) {
+            break;
+        }
+        chain.push(id);
+        prev = state.step(id).and_then(|s| s.retry_of.as_deref());
+    }
+    let mut ids: Vec<&str> = state
+        .instructions
+        .iter()
+        .filter(|i| i.consumed_by.as_deref().is_some_and(|c| chain.contains(&c)))
+        .map(|i| i.instruction_id.as_str())
+        .collect();
+    ids.extend(plan.instructions.iter().map(String::as_str));
+    ids.iter()
+        .filter_map(|id| state.instructions.iter().find(|i| i.instruction_id == *id))
+        .map(|i| i.text.as_str())
+        .collect()
+}
+
 fn read_range(path: &Path, offset: u64, max: u64) -> std::io::Result<ResponseData> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = match std::fs::File::open(path) {
@@ -1279,10 +1338,28 @@ fn read_range(path: &Path, offset: u64, max: u64) -> std::io::Result<ResponseDat
         Err(e) => return Err(e),
     };
     let size = f.metadata()?.len();
-    let start = offset.min(size);
+    let mut start = offset.min(size);
     f.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::new();
     f.take(max).read_to_end(&mut buf)?;
+    // Page on character boundaries: skip the tail of a character cut by `offset`, and stop
+    // before one cut by `max` (the next page starts with it).
+    let lead = buf
+        .iter()
+        .take(3)
+        .take_while(|b| (**b & 0xC0) == 0x80)
+        .count();
+    if start > 0 && lead > 0 {
+        buf.drain(..lead);
+        start += lead as u64;
+    }
+    if let Err(e) = std::str::from_utf8(&buf)
+        && e.error_len().is_none()
+        && e.valid_up_to() > 0
+        && start + (buf.len() as u64) < size
+    {
+        buf.truncate(e.valid_up_to());
+    }
     Ok(ResponseData::LoopBytes {
         offset: start,
         next_offset: start + buf.len() as u64,
@@ -1387,4 +1464,46 @@ async fn replay(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(path: &Path, offset: u64, max: u64) -> (u64, u64, String) {
+        match read_range(path, offset, max).unwrap() {
+            ResponseData::LoopBytes {
+                offset,
+                next_offset,
+                text,
+                ..
+            } => (offset, next_offset, text),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn pages_never_split_a_character() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.log");
+        let text = "修正しました。テストは通ります。";
+        std::fs::write(&path, text).unwrap();
+        // Read in 7-byte pages (not a multiple of the 3-byte characters).
+        let mut offset = 0;
+        let mut joined = String::new();
+        while offset < text.len() as u64 {
+            let (_, next, chunk) = page(&path, offset, 7);
+            assert!(!chunk.contains('\u{FFFD}'), "{chunk:?}");
+            assert!(next > offset, "no progress at {offset}");
+            joined.push_str(&chunk);
+            offset = next;
+        }
+        assert_eq!(joined, text);
+        // An offset inside a character starts at the next one.
+        let (start, _, chunk) = page(&path, 1, 64);
+        assert_eq!(start, 3);
+        assert!(chunk.starts_with('正'), "{chunk}");
+        // A missing file is an empty page, not an error.
+        assert_eq!(page(&tmp.path().join("nope"), 5, 10), (5, 5, String::new()));
+    }
 }

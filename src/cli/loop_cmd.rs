@@ -274,18 +274,46 @@ fn ok(resp: Response) -> Result<ResponseData> {
 }
 
 /// The runner socket of an unfinished loop, or `None` when it has finished.
-async fn runner(loop_id: &str) -> Result<Option<PathBuf>> {
+/// One request, bounded (design §11: every client request carries a timeout).
+async fn ask(conn: &mut Conn, body: RequestBody) -> Result<Response> {
+    match tokio::time::timeout(CONTROL_TIMEOUT, conn.request_raw(body)).await {
+        Ok(resp) => resp,
+        Err(_) => bail!(
+            "no answer within {}s; check `agentpit daemon status`, or run \
+             `agentpit daemon stop` and retry",
+            CONTROL_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// Where a loop can be reached.
+enum Reach {
+    /// Its live runner.
+    Runner(PathBuf),
+    /// No runner will serve it (finished, or written by a newer agentpit): read it from
+    /// disk. The message says why.
+    Disk(String),
+}
+
+async fn reach(loop_id: &str) -> Result<Reach> {
     let mut d = daemon().await?;
-    let resp = d
-        .request_raw(RequestBody::LoopEnsure {
+    let resp = ask(
+        &mut d,
+        RequestBody::LoopEnsure {
             loop_id: loop_id.into(),
-        })
-        .await?;
-    if !resp.ok && resp.code.as_deref() == Some(ErrorCode::Gone.as_str()) {
-        return Ok(None);
+        },
+    )
+    .await?;
+    if !resp.ok
+        && matches!(
+            resp.code.as_deref(),
+            Some(c) if c == ErrorCode::Gone.as_str() || c == ErrorCode::ReadOnly.as_str()
+        )
+    {
+        return Ok(Reach::Disk(resp.error.unwrap_or_default()));
     }
     match ok(resp)? {
-        ResponseData::LoopRunner { socket, .. } => Ok(Some(PathBuf::from(socket))),
+        ResponseData::LoopRunner { socket, .. } => Ok(Reach::Runner(PathBuf::from(socket))),
         other => bail!("unexpected answer to loop_ensure: {other:?}"),
     }
 }
@@ -330,19 +358,22 @@ fn short(loop_id: &str) -> &str {
 }
 
 async fn op(loop_id: &str, op: LoopOp) -> Result<()> {
-    let Some(socket) = runner(loop_id).await? else {
-        bail!("{loop_id} has finished; nothing can change it now");
+    let socket = match reach(loop_id).await? {
+        Reach::Runner(socket) => socket,
+        Reach::Disk(why) => bail!("{why}"),
     };
     let mut conn = Conn::connect(&socket).await?;
     let name = op.name();
-    let resp = conn
-        .request_raw(RequestBody::LoopOp(OpRequest {
+    let resp = ask(
+        &mut conn,
+        RequestBody::LoopOp(OpRequest {
             loop_id: loop_id.into(),
             op_id: new_op_id(),
             expect_seq: None,
             op,
-        }))
-        .await?;
+        }),
+    )
+    .await?;
     match ok(resp)? {
         ResponseData::OpResult(r) => {
             let what = match r.outcome {
@@ -399,8 +430,9 @@ async fn start(
         BlueprintSource::Named { name: blueprint }
     };
     let mut d = daemon().await?;
-    let resp = d
-        .request_raw(RequestBody::LoopStart {
+    let resp = ask(
+        &mut d,
+        RequestBody::LoopStart {
             op_id: new_op_id(),
             blueprint: source,
             inputs: given,
@@ -412,8 +444,9 @@ async fn start(
                 client: Some(client_id()),
                 session_id: None,
             }),
-        })
-        .await?;
+        },
+    )
+    .await?;
     if !resp.ok
         && let Some(diags) = resp.details.as_ref().and_then(|d| d.get("diagnostics"))
     {
@@ -440,12 +473,14 @@ async fn start(
 
 async fn list(all: bool, json: bool) -> Result<()> {
     let mut d = daemon().await?;
-    let resp = d
-        .request_raw(RequestBody::LoopList {
+    let resp = ask(
+        &mut d,
+        RequestBody::LoopList {
             include_terminal: all,
             limit: None,
-        })
-        .await?;
+        },
+    )
+    .await?;
     let ResponseData::Loops { loops } = ok(resp)? else {
         bail!("unexpected answer to loop_list");
     };
@@ -525,15 +560,15 @@ fn stage(s: &LoopSummary) -> String {
 }
 
 async fn show(loop_id: &str, json: bool) -> Result<()> {
-    let summary = match runner(loop_id).await? {
-        Some(socket) => {
+    let summary = match reach(loop_id).await? {
+        Reach::Runner(socket) => {
             let mut conn = Conn::connect(&socket).await?;
-            match ok(conn.request_raw(RequestBody::LoopStatus).await?)? {
+            match ok(ask(&mut conn, RequestBody::LoopStatus).await?)? {
                 ResponseData::LoopSummary { summary } => *summary,
                 other => bail!("unexpected answer to loop_status: {other:?}"),
             }
         }
-        None => read_summary(loop_id)?,
+        Reach::Disk(_) => read_summary(loop_id)?,
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -602,23 +637,28 @@ fn read_summary(loop_id: &str) -> Result<LoopSummary> {
 // watch.
 
 async fn watch(loop_id: &str, output: bool) -> Result<()> {
-    let Some(socket) = runner(loop_id).await? else {
-        // Finished: the journal on disk is the whole story.
-        let (_, scan) = read_loop(&loop_dir_of(loop_id)?)?;
-        let mut state = LoopState::default();
-        for r in &scan.records {
-            state.apply(r);
-            print_record(loop_id, &state, r);
+    let socket = match reach(loop_id).await? {
+        Reach::Runner(socket) => socket,
+        // Finished (or not ours to run): the journal on disk is the whole story.
+        Reach::Disk(_) => {
+            let (_, scan) = read_loop(&loop_dir_of(loop_id)?)?;
+            let mut state = LoopState::default();
+            for r in &scan.records {
+                state.apply(r);
+                print_record(loop_id, &state, r);
+            }
+            return Ok(());
         }
-        return Ok(());
     };
     let mut conn = Conn::connect(&socket).await?;
-    let resp = conn
-        .request_raw(RequestBody::LoopAttach {
+    let resp = ask(
+        &mut conn,
+        RequestBody::LoopAttach {
             since: None,
             chunks: output,
-        })
-        .await?;
+        },
+    )
+    .await?;
     ok(resp)?;
     let mut state = LoopState::default();
     let mut at_line_start = true;
@@ -684,7 +724,9 @@ fn describe(loop_id: &str, state: &LoopState, r: &LoadedRecord) -> Option<String
             c.blueprint.name,
             c.blueprint.rev
         ),
-        LoopEvent::WriterOpened(w) if w.epoch > 1 => style(format!(
+        // Epoch 1 created the loop and 2 is its first runner: only later epochs are
+        // restarts.
+        LoopEvent::WriterOpened(w) if w.epoch > 2 => style(format!(
             "runner restarted (epoch {}){}",
             w.epoch,
             if w.truncated_tail_bytes > 0 {

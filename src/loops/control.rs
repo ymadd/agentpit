@@ -140,9 +140,16 @@ fn locate(source: &BlueprintSource, cwd: &Path) -> Result<Located, OpError> {
             } else {
                 cwd.join(p)
             };
+            // A file in the user's blueprint directory is a user blueprint wherever it is
+            // named from; any other file belongs to a project.
+            let scope = if full.starts_with(user_blueprints_dir()) {
+                BlueprintScope::User
+            } else {
+                BlueprintScope::Project
+            };
             Ok(Located {
                 doc: read_doc(&full)?,
-                scope: BlueprintScope::Project,
+                scope,
                 path: Some(full.display().to_string()),
             })
         }

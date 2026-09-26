@@ -3,6 +3,7 @@ import SettingsApp from "./settings/SettingsApp.jsx";
 import { startAutoUpdater } from "./settings/app-update.js";
 import WorkflowRunApp from "./workflow-run/WorkflowRunApp.jsx";
 import LearningApp from "./learning/LearningApp.jsx";
+import LoopsApp from "./loops/LoopsApp.jsx";
 
 // Strangler bridge (Phase 2). The legacy vanilla dashboard (public/app.js) owns
 // the page — statusbar, cockpit, swarm, CLI rail — and renders first. React
@@ -40,6 +41,14 @@ const lrEl = document.createElement("div");
 lrEl.id = "agentpit-learning";
 document.body.appendChild(lrEl);
 createRoot(lrEl).render(<LearningApp />);
+
+// Workspace loops — board, inbox (loop gates + asks) and the blueprint canvas with its
+// design/run toggle. Same island shape again; live state is pushed by the loop bridge
+// (loops:* events) instead of polled.
+const lpEl = document.createElement("div");
+lpEl.id = "agentpit-loops";
+document.body.appendChild(lpEl);
+createRoot(lpEl).render(<LoopsApp />);
 
 // Desktop is the release owner. Check the paired release after startup and, when
 // enabled in Settings, let the bundled CLI install it in the background.

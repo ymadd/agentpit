@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    instance_key, string_enum, Assignee, GateRun, GateStatus, InstanceStatus, InstructionRun,
-    IterationHead, LoopState, LoopSummary, NodeKind, Outcome, StartCause, StateWarning, StepRun,
-    StepStatus,
+    instance_key, string_enum, Assignee, BlueprintScope, GateRun, GateStatus, InstanceStatus,
+    InstructionRun, IterationHead, LoopState, LoopSummary, NodeKind, Outcome, StartCause,
+    StateWarning, StepRun, StepStatus,
 };
 
 /// Steps kept in a view (newest first).
@@ -153,6 +153,20 @@ pub struct LoopView {
     /// Why this build may not change the loop (it can still be shown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
+    /// Where the frozen blueprint came from, where the loop works, and what it was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ViewSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewSource {
+    pub scope: BlueprintScope,
+    /// The blueprint file it was started from (absent for an inline document).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, String>,
 }
 
 /// Project a fold. `None` before `loop_created`.
@@ -201,6 +215,12 @@ pub fn loop_view(state: &LoopState, with_blueprint: bool) -> Option<LoopView> {
             .cloned()
             .collect(),
         read_only: state.writable().err().map(|r| r.to_string()),
+        source: Some(ViewSource {
+            scope: created.blueprint.scope,
+            path: created.blueprint.path.clone(),
+            cwd: created.cwd.clone(),
+            inputs: created.inputs.clone(),
+        }),
     })
 }
 

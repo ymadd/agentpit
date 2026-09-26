@@ -117,6 +117,12 @@ pub struct StepRun {
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_start_id: Option<String>,
+    /// The full answer (agents), for `{{nodes.<id>.output}}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<super::BlobRef>,
+    /// What this attempt left for the next iteration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feedback: Vec<FeedbackItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -312,6 +318,9 @@ pub struct LoopState {
     pub status: LoopStatus,
     pub pause: Option<PauseMode>,
     pub stop: Option<StopMode>,
+    /// The reason given with the first stop request (`"budget"` when the budget ran out
+    /// under `on_budget: fail`, which makes the drain end `failed` instead of `cancelled`).
+    pub stop_reason: Option<String>,
     pub finish: Option<LoopFinished>,
     pub budget: Budget,
     pub usage: Usage,
@@ -554,6 +563,9 @@ impl LoopState {
                 } else {
                     self.status = LoopStatus::Stopping;
                     self.pause = None;
+                    if self.stop.is_none() {
+                        self.stop_reason = s.reason.clone();
+                    }
                     // Graceful → cancel is an escalation; cancel is never downgraded.
                     if self.stop != Some(StopMode::Cancel) {
                         self.stop = Some(s.mode);
@@ -794,6 +806,8 @@ impl LoopState {
                 cancel: None,
                 pid: None,
                 pid_start_id: None,
+                output: None,
+                feedback: vec![],
             },
         );
     }
@@ -817,6 +831,8 @@ impl LoopState {
         step.error = f.error.clone();
         step.exit_code = f.exit_code;
         step.cancel = f.cancel;
+        step.output = f.output.clone();
+        step.feedback = f.feedback.clone();
         let (node, iter, compute, epoch) = (
             step.node.clone(),
             step.iter.clone(),
@@ -936,6 +952,10 @@ impl LoopState {
             LoopEvent::LoopFinished(f) => {
                 match f.status {
                     FinishStatus::Cancelled => expect_status(status, &[LoopStatus::Stopping])?,
+                    // A stop drain caused by budget exhaustion (`on_budget: fail`) ends failed.
+                    FinishStatus::Failed => {
+                        expect_status(status, &[LoopStatus::Running, LoopStatus::Stopping])?
+                    }
                     _ => expect_status(status, &[LoopStatus::Running])?,
                 }
                 if let Some(s) = self.running_steps().first() {

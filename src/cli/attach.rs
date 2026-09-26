@@ -126,6 +126,8 @@ pub async fn run(session: Option<String>) -> Result<()> {
                 Ok(Frame::Event(Event::Notice { text })) => {
                     eprintln!("{} {text}", style("session:").yellow());
                 }
+                // A newer worker's event kind: nothing to render, and never an error.
+                Ok(Frame::Event(Event::Unknown)) => {}
                 Ok(Frame::Response(resp)) if resp.id == req_id => {
                     if !resp.ok {
                         eprintln!(

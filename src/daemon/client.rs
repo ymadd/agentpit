@@ -38,6 +38,8 @@ impl Conn {
         };
         let hello = conn.request(RequestBody::Hello {
             proto: PROTO_VERSION,
+            features: vec![],
+            client: Some(format!("agentpit/{}", env!("CARGO_PKG_VERSION"))),
         });
         let data = match tokio::time::timeout(Duration::from_secs(5), hello).await {
             Ok(res) => res?,
@@ -65,6 +67,31 @@ impl Conn {
             Err(anyhow!(
                 resp.error.unwrap_or_else(|| "request failed".into())
             ))
+        }
+    }
+
+    /// [`Conn::request`] bounded by `timeout`, for short control verbs (status, list, stop)
+    /// where a wedged peer must not hang the caller. Never use it for `send`/`repl_cell`:
+    /// those legitimately wait for a whole turn. On timeout the request is abandoned; its
+    /// late response (or a frame torn by the cancelled read) is skipped by the next
+    /// request's id match, so the connection stays usable.
+    pub async fn request_with_timeout(
+        &mut self,
+        body: RequestBody,
+        timeout: Duration,
+    ) -> Result<ResponseData> {
+        let res = tokio::time::timeout(timeout, self.request(body)).await;
+        match res {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!(
+                "the {} did not answer within {timeout:?}. It may be wedged: check \
+                 `agentpit daemon status`, or run `agentpit daemon stop` and retry.",
+                if self.role.is_empty() {
+                    "peer"
+                } else {
+                    &self.role
+                }
+            )),
         }
     }
 
@@ -200,4 +227,61 @@ pub async fn create_session(cwd: &Path, autostart: bool) -> Result<(String, Conn
     };
     let worker = Conn::connect(&PathBuf::from(socket)).await?;
     Ok((session_id, worker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn write_response(w: &mut OwnedWriteHalf, resp: &Response) {
+        let line = serde_json::to_string(resp).unwrap();
+        w.write_all(line.as_bytes()).await.unwrap();
+        w.write_all(b"\n").await.unwrap();
+    }
+
+    /// A peer that never answers costs the caller exactly `timeout`, the error names the
+    /// limit and the next step, and the abandoned request's late response is not mistaken
+    /// for the next request's answer.
+    #[tokio::test]
+    async fn request_with_timeout_names_the_limit_and_leaves_the_connection_usable() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (read_half, writer) = ours.into_split();
+        let mut conn = Conn {
+            reader: BufReader::new(read_half),
+            writer,
+            next_id: 0,
+            role: "daemon".into(),
+        };
+        let (peer_r, mut peer_w) = theirs.into_split();
+        let mut peer_r = BufReader::new(peer_r);
+
+        let err = conn
+            .request_with_timeout(RequestBody::Status, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("daemon did not answer within 50ms"), "{msg}");
+        assert!(msg.contains("agentpit daemon stop"), "{msg}");
+
+        // The peer wakes up: it answers the abandoned request (id 1) late, then the next.
+        let peer = tokio::spawn(async move {
+            let mut line = String::new();
+            for _ in 0..2 {
+                line.clear();
+                peer_r.read_line(&mut line).await.unwrap();
+            }
+            let stale = ResponseData::Lines {
+                lines: vec!["stale".into()],
+            };
+            write_response(&mut peer_w, &Response::ok(1, stale)).await;
+            write_response(&mut peer_w, &Response::ok(2, ResponseData::Unit)).await;
+            peer_w
+        });
+        let data = conn
+            .request_with_timeout(RequestBody::Status, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(data, ResponseData::Unit);
+        drop(peer.await.unwrap());
+    }
 }

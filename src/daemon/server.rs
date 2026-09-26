@@ -19,7 +19,7 @@ use crate::daemon::paths::{
     daemon_owner_path, daemon_socket_path, ensure_runtime_dir, worker_socket_path, workers_dir,
 };
 use crate::daemon::protocol::{
-    PROTO_VERSION, Request, RequestBody, Response, ResponseData, SessionRow,
+    CODE_UNSUPPORTED, PROTO_VERSION, Request, RequestBody, Response, ResponseData, SessionRow,
 };
 use crate::daemon::registry::{self, OwnerRecord, WorkerRecord};
 use crate::session::list_all;
@@ -148,7 +148,7 @@ async fn handle_connection(stream: UnixStream, shutdown: tokio_util::sync::Cance
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Err(e) => Response::err(0, format!("bad request: {e}")),
+            Err(e) => Response::bad_request(&line, e),
             Ok(req) => handle_request(req, &shutdown).await,
         };
         let Ok(resp_line) = serde_json::to_string(&response) else {
@@ -165,7 +165,7 @@ async fn handle_connection(stream: UnixStream, shutdown: tokio_util::sync::Cance
 async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationToken) -> Response {
     let id = req.id;
     match req.body {
-        RequestBody::Hello { proto } => {
+        RequestBody::Hello { proto, .. } => {
             if proto != PROTO_VERSION {
                 return Response::err(
                     id,
@@ -181,6 +181,7 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
                     proto: PROTO_VERSION,
                     role: "daemon".into(),
                     pid: std::process::id(),
+                    features: vec![],
                 },
             )
         }
@@ -318,6 +319,14 @@ async fn handle_request(req: Request, shutdown: &tokio_util::sync::CancellationT
             Response::ok(id, ResponseData::Unit)
         }
 
+        // A newer client's verb: answer it (with the caller's id), never act on it.
+        RequestBody::Unknown => Response::err_code(
+            id,
+            CODE_UNSUPPORTED,
+            "this daemon does not know that control request (it predates your agentpit); \
+             run `agentpit daemon stop` and retry so it restarts on your current version.",
+        ),
+
         // Worker-only verbs on the daemon socket = a mixup; answer clearly (mirror image
         // of the worker's guard).
         _ => Response::err(
@@ -428,6 +437,8 @@ async fn request_worker_inner(socket: &Path, body: RequestBody) -> Result<Respon
         id: 0,
         body: RequestBody::Hello {
             proto: PROTO_VERSION,
+            features: vec![],
+            client: None,
         },
     })?;
     write_half.write_all(hello.as_bytes()).await?;
@@ -508,4 +519,79 @@ fn kill_pid(pid: u32) -> Result<()> {
         let _ = pid;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::protocol::{CODE_BAD_REQUEST, CODE_UNSUPPORTED};
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+    /// Write one raw line, read one raw response line back.
+    async fn roundtrip(
+        r: &mut BufReader<OwnedReadHalf>,
+        w: &mut OwnedWriteHalf,
+        line: &str,
+    ) -> (String, Response) {
+        w.write_all(line.as_bytes()).await.unwrap();
+        w.write_all(b"\n").await.unwrap();
+        let mut raw = String::new();
+        r.read_line(&mut raw).await.unwrap();
+        let resp = serde_json::from_str(&raw).unwrap();
+        (raw, resp)
+    }
+
+    /// The daemon's line loop, driven over a socket pair (no daemon socket, no state dir):
+    /// a newer client's verb is answered `unsupported` with ITS id, a malformed line is
+    /// answered `bad_request` with the id it carried, and neither ends the connection.
+    #[tokio::test]
+    async fn unknown_verbs_and_bad_lines_are_answered_with_the_callers_id() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let conn = tokio::spawn(handle_connection(theirs, shutdown.clone()));
+        let (r, mut w) = ours.into_split();
+        let mut r = BufReader::new(r);
+
+        // An older client's bare hello gets the same bytes it always did.
+        let (raw, resp) = roundtrip(&mut r, &mut w, r#"{"id":1,"type":"hello","proto":1}"#).await;
+        assert!(resp.ok, "{raw}");
+        assert!(matches!(
+            resp.data,
+            Some(ResponseData::Hello { ref role, ref features, .. })
+                if role == "daemon" && features.is_empty()
+        ));
+        assert!(!raw.contains("features") && !raw.contains("code"), "{raw}");
+
+        let (_, resp) = roundtrip(&mut r, &mut w, r#"{"id":5,"type":"teleport","to":"x"}"#).await;
+        assert_eq!(resp.id, 5);
+        assert!(!resp.ok);
+        assert_eq!(resp.code.as_deref(), Some(CODE_UNSUPPORTED));
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap()
+                .contains("agentpit daemon stop"),
+            "{resp:?}"
+        );
+
+        // `ensure` without its `session`: a known verb with a malformed body.
+        let (_, resp) = roundtrip(&mut r, &mut w, r#"{"id":9,"type":"ensure"}"#).await;
+        assert_eq!(resp.id, 9, "{resp:?}");
+        assert!(!resp.ok);
+        assert_eq!(resp.code.as_deref(), Some(CODE_BAD_REQUEST));
+
+        // Not JSON at all: no id to echo, so 0.
+        let (_, resp) = roundtrip(&mut r, &mut w, "not json").await;
+        assert_eq!(resp.id, 0);
+        assert_eq!(resp.code.as_deref(), Some(CODE_BAD_REQUEST));
+
+        // The connection keeps serving.
+        let (_, resp) = roundtrip(&mut r, &mut w, r#"{"id":11,"type":"hello","proto":1}"#).await;
+        assert_eq!(resp.id, 11);
+        assert!(resp.ok);
+
+        drop((r, w));
+        conn.await.unwrap();
+        assert!(!shutdown.is_cancelled());
+    }
 }

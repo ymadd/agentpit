@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 pub mod loops;
 pub mod session;
 pub mod session_lease;
+pub mod wire;
 
 /// Backend agents agentpit can route to. Lives here so the event schema and the CLI
 /// share one definition. The CLI re-exports this as `crate::types::BackendId`.
